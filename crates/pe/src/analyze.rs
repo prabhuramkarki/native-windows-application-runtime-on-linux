@@ -486,7 +486,10 @@ macro_rules! extract {
                         }
                         let words = &data[off + 8..off + size.clamp(8, left)];
                         relocation_count += words.chunks_exact(2).filter(|w| w[1] >> 4 != 0).count();
-                        off += size.max(8).next_multiple_of(4).min(left);
+                        // `size` is an untrusted u32; clamp to `left` before aligning so the +3 in
+                        // next_multiple_of can't overflow usize on 32-bit targets. Result-identical
+                        // on 64-bit; the final min keeps `off` in range when `left` is not 4-aligned.
+                        off += size.max(8).min(left).next_multiple_of(4).min(left);
                     }
                     if bad.count > 0 {
                         warnings.push(format!(
