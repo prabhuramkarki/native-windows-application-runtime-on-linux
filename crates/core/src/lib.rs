@@ -5,6 +5,7 @@
 //! an [`AppId`] that exists is safe to use as a single path component.
 pub mod backend;
 pub mod dirs;
+pub mod doctor;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 pub mod id;
