@@ -340,3 +340,83 @@ fn forwarder_range_is_half_open() {
     let got: Vec<_> = i.exports.iter().map(|e| e.forwarder.as_deref()).collect();
     assert_eq!(got, vec![None, Some(""), Some("F"), None]);
 }
+
+/// Overwrites one u32 of the IMAGE_EXPORT_DIRECTORY header at offset 0 of the section.
+/// 16 Base, 20 NumberOfFunctions, 24 NumberOfNames, 28 AddressOfFunctions, 32 AddressOfNames,
+/// 36 AddressOfNameOrdinals.
+fn set_header(data: &mut [u8], at: usize, v: u32) {
+    data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+#[test]
+fn missing_name_ordinal_table_with_declared_names_is_reported() {
+    // 5 functions and 5 names, but AddressOfNameOrdinals = 0: pelite yields an empty index table,
+    // so no name can be attached to any function. That must not be silent.
+    let base = Builder::rva(0);
+    let name = base + exports_tail_off(5, 5) as u32;
+    let names: Vec<_> = (0..5).map(|i| (name, i)).collect();
+    let mut data = exports_raw(base, 1, &[SYM; 5], &names, b"N\0");
+    set_header(&mut data, 36, 0);
+    let i = run_all(data);
+    assert_warnings(
+        &i,
+        &["exports: 5 names declared but the name-ordinal table is missing (0 entries read)"],
+    );
+    assert_eq!(i.exports.len(), 5);
+    assert!(i.exports.iter().all(|e| e.name.is_none()));
+}
+
+#[test]
+fn missing_name_table_with_declared_names_is_reported() {
+    let base = Builder::rva(0);
+    let name = base + exports_tail_off(2, 2) as u32;
+    let mut data = exports_raw(base, 1, &[SYM; 2], &[(name, 0), (name, 1)], b"N\0");
+    set_header(&mut data, 32, 0);
+    let i = run_all(data);
+    assert_warnings(
+        &i,
+        &["exports: 2 names declared but the name table is missing (0 entries read)"],
+    );
+    assert_eq!(i.exports.len(), 2);
+}
+
+#[test]
+fn missing_function_table_with_declared_functions_is_reported() {
+    let base = Builder::rva(0);
+    let mut data = exports_raw(base, 1, &[SYM; 3], &[], &[]);
+    set_header(&mut data, 28, 0);
+    let i = run_all(data);
+    assert_warnings(
+        &i,
+        &["exports: 3 functions declared but the function table is missing (0 entries read)"],
+    );
+    assert!(i.exports.is_empty());
+}
+
+#[test]
+fn absent_tables_with_zero_counts_stay_silent() {
+    let base = Builder::rva(0);
+    let mut data = exports_raw(base, 1, &[], &[], &[]);
+    for at in [28, 32, 36] {
+        set_header(&mut data, at, 0);
+    }
+    let i = run_all(data);
+    assert_warnings(&i, &[]);
+    assert!(i.exports.is_empty());
+}
+
+#[test]
+fn ordinal_base_above_u16_is_not_truncated() {
+    // pelite's `ordinal_base()` casts Base to u16; the IMAGE_EXPORT_DIRECTORY field is a u32.
+    let base = Builder::rva(0);
+    for ordinal_base in [0x1_0000, 0x1_2345] {
+        let i = run_all(exports_raw(base, ordinal_base, &[SYM, SYM], &[], &[]));
+        assert_warnings(&i, &[]);
+        let got: Vec<_> = i.exports.iter().map(|e| e.ordinal).collect();
+        assert_eq!(got, vec![ordinal_base, ordinal_base + 1]);
+    }
+    // Saturates instead of wrapping at the top of u32.
+    let i = run_all(exports_raw(base, u32::MAX, &[SYM, SYM], &[], &[]));
+    let got: Vec<_> = i.exports.iter().map(|e| e.ordinal).collect();
+    assert_eq!(got, vec![u32::MAX, u32::MAX]);
+}
