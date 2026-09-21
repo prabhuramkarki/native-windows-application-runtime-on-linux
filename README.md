@@ -48,7 +48,7 @@ sanitise before displaying.
 
 `RUNTIME_DATA_DIR` (absolute path) holds the data; without it `$XDG_DATA_HOME/runtime` or
 `~/.local/share/runtime`. Each app is `<data>/apps/<id>/` with `prefix/` (the Wine prefix, `prefix/drive_c` is
-the app's `C:`), `runtime/home/` (the program's `HOME`, so it never sees yours), `logs/` (20 kept) and
+the app's `C:`), `runtime/home/` (the program's `HOME`, so Wine does not hand it yours; see `docs/SECURITY.md` for what still shows through), `logs/` (20 kept) and
 `metadata.json`. `RUNTIME_LOG=debug` turns on the runtime's own logging.
 
 ## Tests

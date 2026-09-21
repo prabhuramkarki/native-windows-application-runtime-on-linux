@@ -38,7 +38,8 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
   variable are dropped, and so is any value containing NUL (e2e: a host variable is not visible inside the app).
 - **Zip extraction defences** (`crates/core/src/unzip.rs`): the end record and central directory are validated
   strictly *before* the zip library sees the file (one valid end record at the exact end of the file, consistent
-  counts, at most 20 000 entries, directory at most 64 MiB, zip64 checked); at most 4 GiB in total and per entry;
+  counts, at most 20 000 entries and, separately, at most 20 000 directories (`max_dirs`), directory at most
+  64 MiB, zip64 checked); at most 4 GiB in total and per entry;
   a compression-ratio limit; only regular files and directories are extracted, symlink and special entries are
   skipped; names follow Windows path rules (no `..`, absolute or drive paths, reserved device names, backslash
   tricks) and are never trusted as given; files are created with `create_new` (no overwrite, never through a
@@ -83,9 +84,19 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
   app's home (`WINEHOMEDIR`, `\??\unix<data dir>/apps/<id>/runtime/home`, which contains your real home path
   with the default data directory) and of its prefix (`WINEPREFIX`), `XDG_RUNTIME_DIR` (so your uid),
   `DISPLAY`, `WAYLAND_DISPLAY`. The Windows environment shows `HOME` as unset. The variables that are passed are
-  visible to Wine and its host-side processes. Because `HOME` is now the app's directory, GPU and shader caches
-  (`runtime/home/.cache`) are per app and grow with use; an X11 session that relies on `~/.Xauthority` without
-  `XAUTHORITY` set may fail to authenticate (not tested).
+  visible to Wine and its host-side processes.
+- **What redirecting `HOME` costs.** Everything a program would look up under your home is gone, on purpose:
+  user fonts (`~/.fonts`, `~/.local/share/fonts`, `~/.config/fontconfig`; the per-app fontconfig cache is rebuilt
+  on the first run), `~/.drirc` and `~/.config/drirc.d` and other user GPU settings, `~/.asoundrc` and
+  `~/.config/pulse/client.conf` (audio), cursor and icon themes, and the default-handler configuration used by
+  `xdg-open`/`winebrowser`. Shader and GPU caches live in `runtime/home/.cache`: they are per app, start cold and
+  grow with use. X11 authentication is handled: when `DISPLAY` is set, `XAUTHORITY` is unset or empty and
+  `$HOME/.Xauthority` (the host's `HOME`) is a regular file (not a symlink or a directory), the runtime passes
+  that path as `XAUTHORITY` (the path only, never the contents; a host `XAUTHORITY` is left as it is). Checked by
+  unit tests, not against a real X server. Two things matter for Phase 4: Vulkan ICD and implicit-layer discovery
+  under `$HOME/.local/share/vulkan` and `~/.config/vulkan` (`XDG_DATA_HOME` is not allowlisted) no longer sees
+  user-installed drivers or layers (system files under `/usr/share/vulkan` still work), and the Wine Mono/Gecko
+  download cache in `~/.cache/wine` is not visible, so a dependency mechanism must use an explicit cache path.
 - **Session D-Bus.** `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are allowlisted, so a program that speaks
   D-Bus can reach the session bus (keyring/secret service, portals). Not tested.
 - **Races (TOCTOU).** Checks such as "not a symlink" are followed by uses without `openat2`/`O_PATH`
