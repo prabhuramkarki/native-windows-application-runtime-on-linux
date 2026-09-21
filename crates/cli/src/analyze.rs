@@ -1,22 +1,9 @@
+use crate::safe::safe;
 use pe::{FileKind, PeInfo, Subsystem};
 use serde_json::json;
 use std::{fmt::Write, io, path::Path};
 
 const CAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB; ponytail: mmap if throughput becomes critical
-
-/// Escapes what could drive a terminal from text taken out of the analysed file. The human
-/// output routes every such string through this; the JSON output does not (see `--json`).
-pub(crate) fn safe(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
-}
 
 pub fn run(file: &Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let file_str = file.to_string_lossy().to_string();
@@ -126,46 +113,6 @@ mod tests {
     use super::*;
     use pe::{Arch, Format, Import, ImportedFn, Installer, InstallerKind, Kind, Section, VersionInfo};
     use std::collections::BTreeMap;
-
-    #[test]
-    fn safe_escapes_control_characters() {
-        // ESC character (U+001B)
-        assert!(!safe("\x1b]0;pwned\x07").contains('\x1b'));
-        // Newline
-        assert!(!safe("line1\nline2").contains('\n'));
-        // Carriage return
-        assert!(!safe("text\roverwrite").contains('\r'));
-        // 8-bit CSI (U+009B)
-        assert!(!safe("\u{9b}[31m").contains('\u{9b}'));
-    }
-
-    #[test]
-    fn safe_escapes_bidi_overrides() {
-        // Cover range boundaries and all directions
-        for c in [
-            '\u{202a}', // LRE: Left-to-right embedding
-            '\u{202b}', // RLE: Right-to-left embedding
-            '\u{202c}', // PDF: Pop directional formatting
-            '\u{202d}', // LRO: Left-to-right override (classic RLO pair)
-            '\u{202e}', // RLO: Right-to-left override (classic RLO)
-            '\u{2066}', // LRI: Left-to-right isolate
-            '\u{2067}', // RLI: Right-to-left isolate (range edge)
-            '\u{2068}', // FSI: First strong isolate
-            '\u{2069}', // PDI: Pop directional isolate (range edge)
-        ] {
-            let s = format!("{}text", c);
-            assert!(
-                !safe(&s).contains(c),
-                "Bidi character U+{:04X} not escaped in safe()",
-                c as u32
-            );
-        }
-    }
-
-    #[test]
-    fn safe_preserves_unicode() {
-        assert_eq!(safe("Größe 日本語"), "Größe 日本語");
-    }
 
     #[test]
     fn render_names_unknown_arch_and_subsystem_with_their_raw_values() {

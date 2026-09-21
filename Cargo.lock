@@ -383,10 +383,15 @@ name = "runtime-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "libc",
+ "runtime-backend-wine",
+ "runtime-core",
  "runtime-pe",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
