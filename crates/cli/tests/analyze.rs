@@ -71,13 +71,12 @@ fn analyze_rejects_malformed_pe() {
     let out = runtime(&["analyze".as_ref(), malformed.as_os_str()]);
     let _ = std::fs::remove_file(&malformed);
     assert_eq!(out.status.code(), Some(1), "Expected exit code 1");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("error:"),
-        "stderr should contain error message: {stderr}"
+    // Deterministic: the first 512 bytes of hello64.exe cut the section table short (mingw emits
+    // far more than the ~3 section headers that would fit), which the parser reports as a bounds failure.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: malformed PE: bounds check failed\n"
     );
-    // Ensure it didn't panic
-    assert!(!stderr.contains("panicked"), "process panicked: {stderr}");
 }
 
 #[test]
@@ -153,75 +152,60 @@ fn analyze_output_sanitizes_escape_sequences() {
     );
 }
 
+/// Removes the FIFO and reaps the child on drop, so a failing assertion or timeout cannot leak either.
+struct FifoGuard {
+    path: PathBuf,
+    child: std::process::Child,
+}
+
+impl Drop for FifoGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
 fn analyze_rejects_fifo_without_blocking() {
+    use std::{
+        io::Read,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
     let fifo_path = scratch("test.fifo");
     let _ = std::fs::remove_file(&fifo_path);
-
-    // Try to create FIFO using mkfifo command
-    let mkfifo_result = std::process::Command::new("mkfifo").arg(&fifo_path).output();
-
-    match mkfifo_result {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // mkfifo not available, skip test
-            return;
-        }
+    match Command::new("mkfifo").arg(&fifo_path).output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return, // no mkfifo: skip
         Err(e) => panic!("mkfifo failed: {e}"),
-        Ok(output) if !output.status.success() => {
-            panic!("mkfifo failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
-        Ok(_) => {} // Success
+        Ok(o) => assert!(
+            o.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        ),
     }
-
-    // Spawn process with timeout to check for blocking (should reject FIFO immediately)
-    use std::time::Duration;
-    let start = std::time::Instant::now();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_runtime"))
+    let child = Command::new(env!("CARGO_BIN_EXE_runtime"))
         .arg("analyze")
         .arg(&fifo_path)
+        .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to spawn process");
+        .expect("spawn runtime");
+    let mut guard = FifoGuard { path: fifo_path, child };
 
-    // Wait with timeout (~2 seconds max for quick rejection)
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let elapsed = start.elapsed();
-                // Should have exited quickly (not blocked on FIFO open)
-                assert!(
-                    elapsed < Duration::from_secs(2),
-                    "Process took too long: {:?}, indicates FIFO open might be blocking",
-                    elapsed
-                );
-                break;
-            }
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(5) {
-                    child.kill().expect("Failed to kill process");
-                    let _ = std::fs::remove_file(&fifo_path);
-                    panic!("Process did not exit within 5 seconds; FIFO likely blocked");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&fifo_path);
-                panic!("try_wait failed: {e}");
-            }
+    // A FIFO must be rejected before open(); a blocked open would never exit.
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = guard.child.try_wait().expect("try_wait") {
+            break s;
         }
-    }
-
-    // Clean up FIFO and verify stderr in a separate run with captured output
-    let _ = std::fs::remove_file(&fifo_path);
-
-    // Re-create FIFO for second run to capture output
-    let _ = std::process::Command::new("mkfifo").arg(&fifo_path).output();
-    let out = runtime(&["analyze".as_ref(), fifo_path.as_os_str()]);
-    let _ = std::fs::remove_file(&fifo_path);
-
-    assert_eq!(out.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not a regular file"),
-        "Expected 'not a regular file' in stderr: {stderr}"
-    );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "did not exit within 5 s: FIFO open is likely blocking"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    guard.child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    assert_eq!(status.code(), Some(1));
+    assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
 }
