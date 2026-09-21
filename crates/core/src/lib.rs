@@ -19,8 +19,8 @@ pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{Call, FakeBackend};
 pub use id::{AppId, IdError};
-pub use launch::{LaunchError, Launcher, LogSink, Running};
+pub use launch::{Finished, LaunchError, Launcher, LogSink, Running};
 pub use meta::{BackendInfo, MetaError, Metadata};
-pub use proc::{RunError, run_with_timeout};
+pub use proc::{HelperOutput, RunError};
 pub use store::{AppEnv, ListEntry, Store, StoreError, StoreWarn, unique_id};
 pub use winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};

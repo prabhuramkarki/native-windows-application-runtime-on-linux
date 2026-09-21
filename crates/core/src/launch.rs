@@ -12,6 +12,9 @@
 //! the snapshot: backend variables always win over a host variable of the same name (a host `WINEPREFIX` can
 //! never redirect a prefix) and everything not allowlisted (`LD_PRELOAD`, secrets, ...) is gone.
 //!
+//! **Helper processes.** `run_helper` finalises a helper command (`wineboot`, `wineserver -k`, ...) the same way and
+//! runs it under a deadline with capped output; it is the only supported way for a backend to run one.
+//!
 //! **Streams.** stdout is inherited. stderr goes to a fresh `logs/run-<secs>-<nanos>-<pid>.log`; with
 //! [`LogSink::Tee`] it is copied to that file and to a terminal writer by a thread that [`Running::wait`] joins.
 //!
@@ -20,8 +23,8 @@
 //! Residual race (documented, not closable without `openat2`): a process of the same uid that can write to the
 //! app directory can swap `logs/` for a symlink between the check and the create; `O_EXCL` still guarantees the
 //! *file* is new, and Phase 5's sandbox is the real boundary.
-use crate::proc::{Drain, capture_pair, stdio};
-use crate::{AppEnv, allowed_env};
+use crate::proc::{Drain, capture_pair, run_with_timeout, stdio};
+use crate::{AppEnv, HelperOutput, RunError, allowed_env};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -29,7 +32,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// At most this many `run-*.log` files are kept per app.
 pub const MAX_LOGS: usize = 20;
@@ -61,10 +65,11 @@ impl LogSink {
     }
 }
 
-/// See the module docs.
+/// See the module docs. Cheap to clone (the filtered host environment is shared), so a backend can own one.
+#[derive(Clone)]
 pub struct Launcher {
     /// The host variables a child may inherit (already filtered by [`allowed_env`]).
-    host: Vec<(OsString, OsString)>,
+    host: Arc<Vec<(OsString, OsString)>>,
 }
 
 impl Default for Launcher {
@@ -87,7 +92,7 @@ impl Launcher {
         V: AsRef<OsStr>,
     {
         Launcher {
-            host: allowed_env(host),
+            host: Arc::new(allowed_env(host)),
         }
     }
 
@@ -97,8 +102,7 @@ impl Launcher {
         cmd
     }
 
-    /// Applies the environment rules (module docs) and the sandbox hook. `spawn` uses it; backends that run helper
-    /// processes (`wineboot`, `wineserver -k`) call it too before [`run_with_timeout`](crate::run_with_timeout).
+    /// Applies the environment rules (module docs) and the sandbox hook. `spawn` and `run_helper` use it.
     pub fn finalize(&self, mut cmd: Command) -> Command {
         // 1. Snapshot what the backend set: `env_clear` would discard it. `None` = an explicit removal.
         let explicit: Vec<(OsString, Option<OsString>)> = cmd
@@ -107,7 +111,7 @@ impl Launcher {
             .collect();
         // 2. Drop everything inherited from this process, 3. add the allowlisted host variables,
         cmd.env_clear();
-        for (k, v) in &self.host {
+        for (k, v) in self.host.iter() {
             cmd.env(k, v);
         }
         // 4. and re-apply the backend's own last, so they win.
@@ -122,45 +126,80 @@ impl Launcher {
 
     /// Finalises `cmd`, creates the log file and starts the child. The returned [`Running`] must be waited for.
     pub fn spawn(&self, cmd: Command, env: &AppEnv, sink: LogSink) -> Result<Running, LaunchError> {
-        let mut cmd = self.finalize(cmd);
+        let cmd = self.finalize(cmd);
         let (log, log_path) = create_log_with(&env.logs_dir(), log_names())?;
-        cmd.stdout(Stdio::inherit());
-        let mut tee = None;
-        match sink {
-            LogSink::LogOnly => {
-                cmd.stderr(Stdio::from(log));
-            }
-            LogSink::Tee(terminal) => {
-                let started = capture_pair().and_then(|(rd, wr)| {
-                    cmd.stderr(stdio(wr));
-                    tee_to(rd, log, terminal)
-                });
-                match started {
-                    Ok(t) => tee = Some(t),
-                    Err(e) => return Err(discard(&log_path, LaunchError::Log(e))),
-                }
-            }
-        }
-        let spawned = cmd.spawn();
-        // `cmd` holds the write end of the tee socket (and the log): release them so EOF can arrive.
-        drop(cmd);
-        let child = match spawned {
-            Ok(c) => c,
-            Err(e) => return Err(discard(&log_path, LaunchError::Spawn(e))),
-        };
+        let running = start_child(cmd, log, log_path, sink)?;
         // Best effort: a failed prune must not fail the launch.
-        if let Some(name) = log_path.file_name() {
-            let _ = prune_logs(&env.logs_dir(), MAX_LOGS, name);
+        if let Some(name) = running.log_path.file_name() {
+            let _ = prune_logs(&env.logs_dir(), MAX_LOGS, name, MAX_SCAN);
         }
-        Ok(Running { child, tee, log_path })
+        Ok(running)
+    }
+
+    /// Runs a helper process (`wineboot`, `wineserver -k`, `wine --version`, ...) to completion: finalises `cmd`
+    /// like [`spawn`](Self::spawn) (cleared environment + allowlist + the command's own variables), closes its
+    /// stdin, waits at most `timeout` and returns its status and combined stdout+stderr (at most 64 KiB). On
+    /// timeout the child is killed and reaped and the error carries the partial output. This is the ONLY way a
+    /// backend should run a helper: a plain `Command::output()` would pass the full host environment.
+    pub fn run_helper(&self, cmd: Command, timeout: Duration) -> Result<HelperOutput, RunError> {
+        let (status, output) = run_with_timeout(self.finalize(cmd), timeout)?;
+        Ok(HelperOutput { status, output })
+    }
+}
+
+/// Routes the child's stderr per `sink` (stdout is inherited) and starts it. On failure the log is removed.
+fn start_child(mut cmd: Command, log: File, log_path: PathBuf, sink: LogSink) -> Result<Running, LaunchError> {
+    cmd.stdout(Stdio::inherit());
+    let mut tee = None;
+    match sink {
+        LogSink::LogOnly => {
+            cmd.stderr(Stdio::from(log));
+        }
+        LogSink::Tee(terminal) => {
+            let started = capture_pair().and_then(|(rd, wr)| {
+                cmd.stderr(stdio(wr));
+                tee_to(rd, log, terminal)
+            });
+            match started {
+                Ok(t) => tee = Some(t),
+                Err(e) => return Err(discard(&log_path, LaunchError::Log(e))),
+            }
+        }
+    }
+    let spawned = cmd.spawn();
+    // `cmd` holds the write end of the tee socket (and the log): release them so EOF can arrive.
+    drop(cmd);
+    match spawned {
+        Ok(child) => Ok(Running { child, tee, log_path }),
+        Err(e) => Err(discard(&log_path, LaunchError::Spawn(e))),
     }
 }
 
 /// A started child plus its log. Dropping it without `wait` neither kills nor waits for the child.
+#[must_use = "a Running child must be waited for (or killed and waited for)"]
 pub struct Running {
     child: Child,
-    tee: Option<Drain<()>>,
+    tee: Option<Drain<TeeReport>>,
     log_path: PathBuf,
+}
+
+/// What the tee thread saw go wrong. A sink that fails is dropped (the other keeps working, the child is never
+/// blocked or failed by logging).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TeeReport {
+    log_write_failed: bool,
+    terminal_write_failed: bool,
+}
+
+/// The outcome of [`Running::wait_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Finished {
+    pub status: ExitStatus,
+    /// The log file stopped accepting writes (disk full, ...), so the log is incomplete. Only observable with
+    /// [`LogSink::Tee`]; with `LogOnly` the child writes the file itself and this is always `false`.
+    pub log_write_failed: bool,
+    /// The terminal writer of [`LogSink::Tee`] failed (closed terminal, ...); always `false` otherwise.
+    pub terminal_write_failed: bool,
 }
 
 impl std::fmt::Debug for Running {
@@ -181,13 +220,32 @@ impl Running {
         self.child.id()
     }
 
-    /// Waits for the child, then joins the tee thread (which has drained the child's stderr by then).
-    pub fn wait(mut self) -> io::Result<ExitStatus> {
+    /// Kills the child (SIGKILL; only the direct child, not what it started). Still call `wait` afterwards to
+    /// reap it and join the tee thread. Task 7's Ctrl-C forwarding uses this.
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    /// `Some(status)` once the child has exited, without blocking. `wait`/`wait_report` still work afterwards.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Waits for the child, then joins the tee thread (which has drained the child's stderr by then). Use
+    /// [`wait_report`](Self::wait_report) to learn whether the log or the terminal lost writes.
+    pub fn wait(self) -> io::Result<ExitStatus> {
+        self.wait_report().map(|f| f.status)
+    }
+
+    /// Like [`wait`](Self::wait), also reporting sink write failures.
+    pub fn wait_report(mut self) -> io::Result<Finished> {
         let status = self.child.wait();
-        if let Some(tee) = self.tee.take() {
-            tee.finish();
-        }
-        status
+        let report = self.tee.take().map(Drain::finish).unwrap_or_default();
+        status.map(|status| Finished {
+            status,
+            log_write_failed: report.log_write_failed,
+            terminal_write_failed: report.terminal_write_failed,
+        })
     }
 }
 
@@ -231,19 +289,18 @@ fn create_log_with(dir: &Path, names: impl Iterator<Item = String>) -> Result<(F
 }
 
 /// Copies `rd` (the child's stderr) to `log` and `terminal` in `CHUNK`-sized pieces. A failing sink is dropped
-/// (the other keeps working; the child is never blocked or failed by logging).
-fn tee_to(rd: UnixStream, log: File, terminal: Box<dyn Write + Send>) -> io::Result<Drain<()>> {
-    let mut sinks: (Option<File>, Option<Box<dyn Write + Send>>) = (Some(log), Some(terminal));
-    Drain::start(rd, (), move |(), chunk| {
-        if let Some(f) = &mut sinks.0
-            && f.write_all(chunk).is_err()
-        {
-            sinks.0 = None;
+/// and recorded in the [`TeeReport`]; the other keeps working and the child is never blocked.
+fn tee_to(
+    rd: UnixStream,
+    mut log: impl Write + Send + 'static,
+    mut terminal: Box<dyn Write + Send>,
+) -> io::Result<Drain<TeeReport>> {
+    Drain::start(rd, TeeReport::default(), move |report: &mut TeeReport, chunk| {
+        if !report.log_write_failed && log.write_all(chunk).is_err() {
+            report.log_write_failed = true;
         }
-        if let Some(t) = &mut sinks.1
-            && t.write_all(chunk).and_then(|()| t.flush()).is_err()
-        {
-            sinks.1 = None;
+        if !report.terminal_write_failed && terminal.write_all(chunk).and_then(|()| terminal.flush()).is_err() {
+            report.terminal_write_failed = true;
         }
     })
 }
@@ -255,17 +312,35 @@ fn is_log_name(name: &OsStr) -> bool {
 
 /// Deletes the oldest `run-*.log` regular files in `dir` so at most `keep` remain, counting `current` (never
 /// deleted). Symlinks, directories and other names are neither counted nor touched (`DirEntry::file_type` does not
-/// follow links, and `remove_file` on a link removes the link only). Returns the number deleted.
-fn prune_logs(dir: &Path, keep: usize, current: &OsStr) -> io::Result<usize> {
+/// follow links, and `remove_file` on a link removes the link only). At most `max_scan` directory entries are
+/// examined. Returns the number deleted.
+fn prune_logs(dir: &Path, keep: usize, current: &OsStr, max_scan: usize) -> io::Result<usize> {
     require_real_dir(dir).map_err(|e| match e {
         LaunchError::Log(e) => e,
         _ => io::Error::new(io::ErrorKind::InvalidInput, "logs directory is not a real directory"),
     })?;
-    let mut old: Vec<OsString> = Vec::new();
-    for entry in fs::read_dir(dir)?.take(MAX_SCAN) {
+    // `(name, is_regular_file)`; an entry whose type cannot be read is an `Err`, skipped by `prune_entries`.
+    let entries = fs::read_dir(dir)?.map(|entry| {
         let entry = entry?;
-        let name = entry.file_name();
-        if name != current && is_log_name(&name) && entry.file_type()?.is_file() {
+        let file_type = entry.file_type()?;
+        Ok((entry.file_name(), file_type.is_file()))
+    });
+    Ok(prune_entries(dir, keep, current, entries, max_scan))
+}
+
+/// The selection and deletion part of [`prune_logs`] over already-listed entries. A bad entry (`Err`) is skipped,
+/// never aborts the prune; it still counts against `max_scan`.
+fn prune_entries(
+    dir: &Path,
+    keep: usize,
+    current: &OsStr,
+    entries: impl Iterator<Item = io::Result<(OsString, bool)>>,
+    max_scan: usize,
+) -> usize {
+    let mut old: Vec<OsString> = Vec::new();
+    for entry in entries.take(max_scan) {
+        let Ok((name, is_regular_file)) = entry else { continue };
+        if name != current && is_log_name(&name) && is_regular_file {
             old.push(name);
         }
     }
@@ -278,7 +353,7 @@ fn prune_logs(dir: &Path, keep: usize, current: &OsStr) -> io::Result<usize> {
             deleted += 1;
         }
     }
-    Ok(deleted)
+    deleted
 }
 
 #[cfg(test)]
@@ -749,7 +824,7 @@ mod tests {
         symlink(&fx.outside, logs.join("run-0000000000-b.log")).unwrap();
         symlink(fx.outside.join("missing"), logs.join("run-0000000000-c.log")).unwrap();
 
-        let deleted = prune_logs(&logs, MAX_LOGS, OsStr::new(&old_name(30))).unwrap();
+        let deleted = prune_logs(&logs, MAX_LOGS, OsStr::new(&old_name(30)), MAX_SCAN).unwrap();
         assert_eq!(deleted, 10);
         let want: Vec<String> = (11..=30).map(old_name).collect();
         assert_eq!(regular_logs(&logs), want);
@@ -771,7 +846,7 @@ mod tests {
         for i in 1..=25 {
             fs::write(logs.join(old_name(i)), "x").unwrap();
         }
-        let deleted = prune_logs(&logs, MAX_LOGS, OsStr::new(&old_name(1))).unwrap();
+        let deleted = prune_logs(&logs, MAX_LOGS, OsStr::new(&old_name(1)), MAX_SCAN).unwrap();
         assert_eq!(deleted, 5);
         let left = regular_logs(&logs);
         assert_eq!(left.len(), 20);
@@ -789,7 +864,7 @@ mod tests {
         }
         fs::remove_dir(fx.env.logs_dir()).unwrap();
         symlink(&fx.outside, fx.env.logs_dir()).unwrap();
-        assert!(prune_logs(&fx.env.logs_dir(), MAX_LOGS, OsStr::new("run-none.log")).is_err());
+        assert!(prune_logs(&fx.env.logs_dir(), MAX_LOGS, OsStr::new("run-none.log"), MAX_SCAN).is_err());
         assert_eq!(regular_logs(&fx.outside).len(), 30);
     }
 
@@ -809,5 +884,254 @@ mod tests {
         assert_eq!(left.len(), MAX_LOGS, "{left:?}");
         assert!(left.contains(&new));
         assert_eq!(fs::read_to_string(logs.join(&new)).unwrap(), "new\n");
+    }
+
+    // ------------------------------------------------------------------------------ run_helper
+
+    fn env_helper(l: &Launcher, backend_var: Option<(&str, &str)>) -> Vec<String> {
+        let mut c = Command::new("/usr/bin/env");
+        if let Some((k, v)) = backend_var {
+            c.env(k, v);
+        }
+        let out = l.run_helper(c, Duration::from_secs(20)).unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.output)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn launcher_is_clone_send_sync_and_a_clone_keeps_the_host_env() {
+        fn assert_traits<T: Clone + Send + Sync>() {}
+        assert_traits::<Launcher>();
+        let l = poisoned().clone();
+        let e = envs(&l.finalize(Command::new("/bin/true")));
+        assert_eq!(e["HOME"], some("/home/u"));
+        assert!(!e.contains_key("SECRET"));
+    }
+
+    #[test]
+    fn a_helper_run_through_run_helper_sees_no_host_secret_and_the_backend_vars() {
+        let lines = env_helper(&poisoned(), Some(("WINEPREFIX", "/apps/t/prefix")));
+        // Injected host vars that are allowlisted arrive; the process's real environment does not.
+        assert!(lines.contains(&"HOME=/home/u".to_string()), "{lines:?}");
+        assert!(lines.contains(&"LC_ALL=C".to_string()));
+        assert!(lines.contains(&"WINEPREFIX=/apps/t/prefix".to_string()));
+        assert_eq!(lines.iter().filter(|l| l.starts_with("WINEPREFIX=")).count(), 1);
+        for bad in [
+            "SECRET",
+            "LD_PRELOAD",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "CARGO_MANIFEST_DIR",
+        ] {
+            assert!(!has_var(&lines, bad), "{bad} reached the helper: {lines:?}");
+        }
+        // A host WINEPREFIX never reaches a helper that did not set one.
+        let lines = env_helper(&poisoned(), None);
+        assert!(!has_var(&lines, "WINEPREFIX"), "{lines:?}");
+    }
+
+    #[test]
+    fn run_helper_over_the_real_environment_strips_it_too() {
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "run under `cargo test`"
+        );
+        let lines = env_helper(&Launcher::new(), Some(("WINEPREFIX", "/p")));
+        assert!(!has_var(&lines, "CARGO_MANIFEST_DIR"), "{lines:?}");
+        assert!(lines.contains(&"WINEPREFIX=/p".to_string()));
+    }
+
+    #[test]
+    fn run_helper_returns_status_and_capped_output() {
+        let l = poisoned();
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg("echo out; echo err >&2; exit 3");
+        let out = l.run_helper(c, Duration::from_secs(20)).unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.output, b"out\nerr\n");
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg("head -c 200000 /dev/zero");
+        assert_eq!(
+            l.run_helper(c, Duration::from_secs(20)).unwrap().output.len(),
+            crate::proc::MAX_CAPTURE
+        );
+    }
+
+    #[test]
+    fn run_helper_timeout_still_kills_and_reports_the_partial_output() {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg("echo hello; exec sleep 30");
+        let t0 = Instant::now();
+        let err = poisoned().run_helper(c, Duration::from_secs(1)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
+        match err {
+            crate::RunError::TimedOut { output, .. } => assert!(output.as_str().contains("hello"), "{output}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------------------ bounded and tolerant pruning
+
+    #[test]
+    fn pruning_looks_at_no_more_than_max_scan_entries() {
+        let fx = fx();
+        let logs = fx.env.logs_dir();
+        for i in 1..=60 {
+            fs::write(logs.join(old_name(i)), "x").unwrap();
+        }
+        // Only 10 of the 60 entries are examined (whichever the filesystem lists first); of those, keep-1 = 4
+        // survive, so exactly 6 go and 54 remain. An unbounded scan would delete 56.
+        let deleted = prune_logs(&logs, 5, OsStr::new("run-none.log"), 10).unwrap();
+        assert_eq!(deleted, 6);
+        assert_eq!(regular_logs(&logs).len(), 54);
+        // A limit of zero examines nothing.
+        assert_eq!(prune_logs(&logs, 5, OsStr::new("run-none.log"), 0).unwrap(), 0);
+        assert_eq!(regular_logs(&logs).len(), 54);
+    }
+
+    #[test]
+    fn pruning_skips_entries_it_cannot_read_and_carries_on() {
+        let fx = fx();
+        let logs = fx.env.logs_dir();
+        for i in 1..=25 {
+            fs::write(logs.join(old_name(i)), "x").unwrap();
+        }
+        let bad = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        let mut entries: Vec<io::Result<(OsString, bool)>> = vec![bad()];
+        for i in 1..=25 {
+            entries.push(Ok((OsString::from(old_name(i)), true)));
+            if i % 5 == 0 {
+                entries.push(bad());
+            }
+        }
+        let deleted = prune_entries(
+            &logs,
+            MAX_LOGS,
+            OsStr::new(&old_name(25)),
+            entries.into_iter(),
+            MAX_SCAN,
+        );
+        assert_eq!(deleted, 5);
+        let want: Vec<String> = (6..=25).map(old_name).collect();
+        assert_eq!(regular_logs(&logs), want);
+    }
+
+    // ------------------------------------------------------------------------------ Running: kill, try_wait, sink failures
+
+    #[test]
+    fn kill_stops_the_child_promptly_and_wait_reports_the_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        let fx = fx();
+        let mut r = poisoned()
+            .spawn(fake_cmd(&fx, "exec sleep 30", false), &fx.env, LogSink::LogOnly)
+            .unwrap();
+        assert!(r.id() > 0);
+        assert!(r.try_wait().unwrap().is_none(), "still running");
+        let t0 = Instant::now();
+        r.kill().unwrap();
+        let st = r.wait().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+        assert_eq!(st.signal(), Some(9));
+        assert_eq!(st.code(), None);
+    }
+
+    #[test]
+    fn kill_also_works_in_tee_mode_and_try_wait_sees_the_exit() {
+        let fx = fx();
+        let mut r = poisoned()
+            .spawn(
+                fake_cmd(&fx, "exec sleep 30", true),
+                &fx.env,
+                LogSink::Tee(Box::new(SharedBuf::default())),
+            )
+            .unwrap();
+        r.kill().unwrap();
+        let t0 = Instant::now();
+        let st = loop {
+            if let Some(st) = r.try_wait().unwrap() {
+                break st;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!st.success());
+        assert!(r.wait().is_ok(), "wait after try_wait still works");
+    }
+
+    #[test]
+    fn healthy_sinks_report_no_failure() {
+        let fx = fx();
+        let r = poisoned()
+            .spawn(
+                fake_cmd(&fx, "echo e >&2; exit 2", true),
+                &fx.env,
+                LogSink::Tee(Box::new(SharedBuf::default())),
+            )
+            .unwrap();
+        let f = r.wait_report().unwrap();
+        assert_eq!(f.status.code(), Some(2));
+        assert!(!f.log_write_failed && !f.terminal_write_failed, "{f:?}");
+    }
+
+    #[test]
+    fn a_full_log_sink_is_reported_and_the_child_is_not_blocked() {
+        // /dev/full accepts open() and fails every write with ENOSPC. The path given is a scratch name: it is
+        // only what `Running::log_path` says (and what would be removed if the start failed).
+        let fx = fx();
+        let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let term = SharedBuf::default();
+        let cmd = poisoned().finalize(fake_cmd(&fx, "head -c 300000 /dev/zero >&2; exit 5", true));
+        let scratch = fx.env.logs_dir().join("not-created.log");
+        let r = start_child(cmd, full, scratch, LogSink::Tee(Box::new(term.clone()))).unwrap();
+        let f = r.wait_report().unwrap();
+        assert_eq!(f.status.code(), Some(5));
+        assert!(f.log_write_failed);
+        assert!(!f.terminal_write_failed);
+        assert_eq!(term.bytes().len(), 300_000, "the terminal side kept working");
+    }
+
+    #[test]
+    fn a_broken_terminal_is_reported_and_the_log_is_complete() {
+        let fx = fx();
+        let r = poisoned()
+            .spawn(
+                fake_cmd(&fx, "head -c 100000 /dev/zero >&2", true),
+                &fx.env,
+                LogSink::Tee(Box::new(BrokenTerminal)),
+            )
+            .unwrap();
+        let path = r.log_path().to_path_buf();
+        let f = r.wait_report().unwrap();
+        assert!(f.terminal_write_failed && !f.log_write_failed, "{f:?}");
+        assert_eq!(fs::metadata(path).unwrap().len(), 100_000);
+    }
+
+    #[test]
+    fn a_grandchild_that_never_stops_writing_cannot_keep_the_tee_alive() {
+        // The direct child exits at once; a background loop keeps writing 16 MB to stderr. Once the child has
+        // exited the reader takes at most MAX_AFTER_STOP more and closes (the writer then gets EPIPE and dies).
+        let fx = fx();
+        let term = SharedBuf::default();
+        let script =
+            "( i=0; while [ $i -lt 500000 ]; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >&2; i=$((i+1)); done ) & exit 0";
+        let r = poisoned()
+            .spawn(
+                fake_cmd(&fx, script, true),
+                &fx.env,
+                LogSink::Tee(Box::new(term.clone())),
+            )
+            .unwrap();
+        let path = r.log_path().to_path_buf();
+        let t0 = Instant::now();
+        assert!(r.wait().unwrap().success());
+        assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
+        // Cap (1 MiB) plus generous room for what was read before the child exited; an uncapped reader takes 16 MB.
+        let teed = term.bytes().len();
+        assert!(teed <= 8 * 1024 * 1024, "teed {teed} bytes");
+        assert_eq!(fs::metadata(path).unwrap().len(), teed as u64);
     }
 }

@@ -6,8 +6,13 @@
 //! `env_clear()` itself and must not spawn. The one place a `Command` is finalised (environment cleared, allowlist
 //! applied, backend variables re-applied, sandbox hook) and started is the `Launcher`.
 //!
+//! **Helper processes** (`wineboot`, `wineserver -k`, `wine --version`) must be run with
+//! [`Launcher::run_helper`](crate::Launcher::run_helper) on a `Launcher` the backend owns (it is `Clone`).
+//! Never `Command::status()/output()/spawn()` directly: that would hand the helper the FULL host environment
+//! (secrets, `LD_PRELOAD`). Convert its error with [`BackendError::from_run`].
+//!
 //! POSIX only: the crate is Linux-first and uses `OsStrExt` for byte-level name checks.
-use crate::AppEnv;
+use crate::{AppEnv, RunError};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -56,8 +61,13 @@ pub enum BackendError {
     /// A backend step ran and failed; `detail` is (capped) output of the step.
     #[error("{what} failed: {detail}")]
     Failed { what: &'static str, detail: Detail },
-    #[error("{what} did not finish within {secs} s")]
-    TimedOut { what: &'static str, secs: u64 },
+    /// The step was killed at its deadline; `output` is what it had printed (capped at 4 KiB).
+    #[error("{what} did not finish within {secs} s; output: {output}")]
+    TimedOut {
+        what: &'static str,
+        secs: u64,
+        output: Detail,
+    },
     #[error("{what}: {source}")]
     Io {
         what: &'static str,
@@ -74,6 +84,21 @@ impl BackendError {
             detail: Detail::from_bytes(output),
         }
     }
+
+    /// Converts the error of a helper run (`Launcher::run_helper`) for the step called `what`. A timeout keeps
+    /// its (already capped) partial output.
+    pub fn from_run(what: &'static str, e: RunError) -> BackendError {
+        match e {
+            RunError::TimedOut { after, output } => BackendError::TimedOut {
+                what,
+                secs: after.as_secs(),
+                output,
+            },
+            RunError::Capture(source) | RunError::Spawn(source) | RunError::Wait(source) => {
+                BackendError::Io { what, source }
+            }
+        }
+    }
 }
 
 /// Per-run options. `debug`: verbose backend logging and the child's stderr also shown on the terminal.
@@ -87,7 +112,7 @@ pub trait CompatBackend: Send + Sync {
     /// The backend's version string (what `doctor` and metadata record).
     fn version(&self) -> Result<String, BackendError>;
     /// Creates and hardens the prefix under `env.prefix()`. Idempotent; a failure may leave a partial prefix
-    /// (the caller removes the whole environment).
+    /// (the caller removes the whole environment). Helper processes go through `Launcher::run_helper`.
     fn prepare(&self, env: &AppEnv) -> Result<(), BackendError>;
     /// Describes the process for `exe_unix` (in `cwd_unix`, with `args` verbatim). The paths come from
     /// `winpath::resolve_under`; a backend rejects ones outside `env.drive_c()`. Does not spawn.
@@ -99,7 +124,8 @@ pub trait CompatBackend: Send + Sync {
         args: &[OsString],
         opts: &RunOpts,
     ) -> Result<Command, BackendError>;
-    /// Stops whatever the backend runs for this app (Wine: `wineserver -k`). "Nothing running" is success.
+    /// Stops whatever the backend runs for this app (Wine: `wineserver -k`, via `Launcher::run_helper`).
+    /// "Nothing running" is success.
     fn stop(&self, env: &AppEnv) -> Result<(), BackendError>;
     /// Directories with the backend's built-in DLLs (for `doctor`).
     fn dll_dirs(&self) -> Vec<PathBuf>;
@@ -269,6 +295,32 @@ mod tests {
         // Invalid bytes become U+FFFD (3 bytes each): the cap still holds after decoding.
         let d = Detail::from_bytes(&vec![0xffu8; 100_000]);
         assert!(d.as_str().len() <= MAX_DETAIL_BYTES, "{}", d.as_str().len());
+    }
+
+    #[test]
+    fn from_run_keeps_the_timeout_output_and_maps_io_errors() {
+        let out = Detail::from_bytes(b"partial output");
+        let e = BackendError::from_run(
+            "wineboot",
+            RunError::TimedOut {
+                after: std::time::Duration::from_millis(2500),
+                output: out.clone(),
+            },
+        );
+        match &e {
+            BackendError::TimedOut { what, secs, output } => {
+                assert_eq!((*what, *secs), ("wineboot", 2));
+                assert_eq!(output, &out);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.to_string().contains("partial output"), "{e}");
+        let e = BackendError::from_run("wineboot", RunError::Spawn(io::Error::from(io::ErrorKind::NotFound)));
+        assert!(matches!(e, BackendError::Io { what: "wineboot", .. }), "{e:?}");
+        let e = BackendError::from_run("x", RunError::Wait(io::Error::from(io::ErrorKind::Other)));
+        assert!(matches!(e, BackendError::Io { .. }));
+        let e = BackendError::from_run("x", RunError::Capture(io::Error::from(io::ErrorKind::Other)));
+        assert!(matches!(e, BackendError::Io { .. }));
     }
 
     #[test]
