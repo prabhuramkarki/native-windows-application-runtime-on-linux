@@ -1,0 +1,19 @@
+#include <windows.h>
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,2,3,4
+PRODUCTVERSION 1,2,3,4
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileVersion", "1.2.3.4"
+      VALUE "ProductName", "Runtime Fixture"
+      VALUE "FileDescription", "hello fixture"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
