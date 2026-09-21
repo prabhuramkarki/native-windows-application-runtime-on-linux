@@ -150,3 +150,36 @@ impl Bytes {
 pub fn analyze(b: &Builder) -> pe::PeInfo {
     pe::analyze(&b.build()).expect("analyze")
 }
+
+#[rustfmt::skip]
+pub fn imports_data(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(base + 68).u32(0).u32(0).u32(base + 48).u32(base + 68) // descriptor: OFT, ts, fwd, name, FT
+        .pad_to(20 + 20) // null terminator descriptor
+        .pad_to(48)
+        .cstr("kernel32.dll")
+        .pad_to(68) // 68 % 8 == 4: deliberately misaligned
+        .u64(u64::from(base + 96)) // by name
+        .u64(0x8000_0000_0000_0005) // by ordinal 5
+        .u64(0)
+        .pad_to(96)
+        .u16(0)
+        .cstr("ExitProcess")
+        .0
+}
+
+#[rustfmt::skip]
+pub fn delay_data(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(1).u32(base + 64).u32(0).u32(base + 112).u32(base + 80).u32(0).u32(0).u32(0) // descriptor
+        .pad_to(64) // (terminator descriptor is the zeroed 32..64)
+        .cstr("dxgi.dll")
+        .pad_to(80)
+        .u64(u64::from(base + 128))
+        .u64(0x8000_0000_0000_0007)
+        .u64(0)
+        .pad_to(128)
+        .u16(0)
+        .cstr("CreateDXGIFactory")
+        .0
+}
