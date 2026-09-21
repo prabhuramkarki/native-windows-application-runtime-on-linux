@@ -1,6 +1,7 @@
 //! The install service: turns a portable `.exe` or a `.zip` archive into an isolated app environment.
 //!
-//! Pipeline (every step before `Store::create` leaves nothing behind):
+//! Pipeline (nothing is written to the store before `Store::create`; a failing `create` itself can leave a
+//! partially created directory behind, see `Store::create`, and is reported unchanged, never cleaned up here):
 //!
 //! 1. host must be x86-64 (ARM64 hosts are Phase 9);
 //! 2. the input is read (regular files only, at most 4 GiB) and classified by CONTENT with `pe::detect`. A PE
@@ -9,20 +10,23 @@
 //! 3. the program is refused when it is a kernel driver, a DLL, not x86/x86-64, or looks like an installer
 //!    (Phase 3). A .NET program only produces a warning;
 //! 4. name (`--name`, else the version resource's `ProductName`, else the file stem; control characters removed,
-//!    at most 256 bytes) and id (`unique_id(AppId::slug(name))`); the metadata is built and VALIDATED;
+//!    at most 256 bytes) and id (`unique_id(AppId::slug(name))`); the metadata is built and VALIDATED (again for
+//!    every retried id, before its `create`);
 //! 5. only now `Store::create` (retrying with the next id when it reports `AlreadyExists`, and never removing
 //!    anything on that path: the existing directory belongs to someone else), `backend.prepare`, then the program
 //!    (or the archive contents) is copied below `drive_c/Program Files/<id>/` with `create_new` and no symlink
 //!    following, and `metadata.json` is written LAST. Metadata is the commit point: `list` only sees complete apps;
 //! 6. any failure after `create` returned `Ok` stops the backend and removes the whole environment. When the
 //!    backend cannot be stopped a Wine process may still be running in the prefix, so nothing is removed and the
-//!    error says so. Cleanup problems are appended to the returned error ([`InstallError::WithCleanup`]).
+//!    error says so. Cleanup problems are appended to the returned error ([`InstallError::WithCleanup`]). A PANIC
+//!    in that section (zip, PE or backend code) triggers the same best-effort cleanup from a drop guard; it can only
+//!    be logged (`tracing::error!`), not reported.
 //!
 //! **Not a sandbox.** Extraction runs while no Wine process is in the prefix (`prepare` stops the wineserver
 //! before it returns). There is no locking: two installs of the same name race on `Store::create`, which
 //! arbitrates (`mkdir` is atomic); the loser takes the next id.
 use crate::text::{clean, quote};
-use crate::unzip::{self, Limits, Plan, ZipError};
+use crate::unzip::{self, Archive, Limits, Plan, ZipError};
 use crate::winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};
 use crate::{
     AppEnv, AppId, BackendError, BackendInfo, CompatBackend, MetaError, Metadata, Store, StoreError, unique_id,
@@ -32,7 +36,6 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
-use zip::ZipArchive;
 
 /// Largest input file, in bytes (the same cap as `runtime analyze`).
 pub const INPUT_CAP: u64 = 4 * 1024 * 1024 * 1024;
@@ -182,6 +185,7 @@ fn read_input(path: &Path) -> Result<Input, InstallError> {
         };
     }
     // `pe::detect` needs the whole file to follow `e_lfanew`; the size was capped above.
+    // ponytail: the whole PE is held in RAM (up to 4 GiB); mmap or streaming if that ever matters
     let mut bytes = head;
     // A failed allocation aborts the process; ask first so a huge file on a small machine is an error instead.
     bytes
@@ -317,7 +321,7 @@ struct Chosen {
 
 /// Reads one archive entry (already known to be within the caps) and analyses it.
 fn analyse_entry(
-    archive: &mut ZipArchive<File>,
+    archive: &mut Archive,
     plan: &Plan,
     file: usize,
     budget: &mut u64,
@@ -341,14 +345,9 @@ fn analyse_entry(
 }
 
 /// `--exe`, else the only `.exe`, else the largest GUI program that passes the rules; see the module docs.
-fn select_exe(
-    archive: &mut ZipArchive<File>,
-    plan: &Plan,
-    want: Option<&str>,
-    limits: &Limits,
-) -> Result<Chosen, InstallError> {
+fn select_exe(archive: &mut Archive, plan: &Plan, want: Option<&str>, limits: &Limits) -> Result<Chosen, InstallError> {
     let mut budget = limits.max_analysis_bytes;
-    let strict = |archive: &mut ZipArchive<File>, file: usize, budget: &mut u64| -> Result<Chosen, InstallError> {
+    let strict = |archive: &mut Archive, file: usize, budget: &mut u64| -> Result<Chosen, InstallError> {
         let info = analyse_entry(archive, plan, file, budget, limits)?;
         let warnings = check_pe(&info)?;
         Ok(Chosen { file, info, warnings })
@@ -381,9 +380,19 @@ fn select_exe(
         _ => {
             // The largest GUI program that passes every rule; a tie for the largest is ambiguous.
             let mut best: Vec<Chosen> = Vec::new();
+            let mut skipped = 0usize;
+            let mut first_reason = String::new();
             for &file in &exes {
-                let Ok(chosen) = strict(archive, file, &mut budget) else {
-                    continue;
+                let chosen = match strict(archive, file, &mut budget) {
+                    Ok(chosen) => chosen,
+                    Err(e) => {
+                        // Not an error for the install (another program may win) but never silent.
+                        if skipped == 0 {
+                            first_reason = clean(&e.to_string(), 100);
+                        }
+                        skipped += 1;
+                        continue;
+                    }
                 };
                 if chosen.info.subsystem != Subsystem::Gui {
                     continue;
@@ -401,7 +410,17 @@ fn select_exe(
                     exes.len(),
                     list_names(plan, &exes)
                 ))),
-                1 => Ok(best.remove(0)),
+                1 => {
+                    let mut chosen = best.remove(0);
+                    if skipped > 0 {
+                        chosen.warnings.push(format!(
+                            "{skipped} of the {} .exe files could not be considered as the program (first reason: {})",
+                            exes.len(),
+                            quote(&first_reason)
+                        ));
+                    }
+                    Ok(chosen)
+                }
                 _ => {
                     let tied: Vec<usize> = best.iter().map(|c| c.file).collect();
                     Err(InstallError::Select(format!(
@@ -422,7 +441,7 @@ enum Payload {
         bytes: Vec<u8>,
     },
     Zip {
-        archive: ZipArchive<File>,
+        archive: Archive,
         plan: Plan,
         exe: Vec<String>,
     },
@@ -529,11 +548,11 @@ fn place(env: &AppEnv, payload: Payload, limits: &Limits) -> Result<(), InstallE
     Ok(())
 }
 
-/// Stops the backend, then removes the environment. When the backend cannot be stopped a Wine process may still
-/// be using the prefix: nothing is removed and the error says so.
-fn cleanup(store: &Store, backend: &dyn CompatBackend, env: &AppEnv, cause: InstallError) -> InstallError {
+/// Stops the backend, then removes the environment; returns what went wrong, if anything. When the backend cannot
+/// be stopped a Wine process may still be using the prefix: nothing is removed and the text says so.
+fn cleanup_problem(store: &Store, backend: &dyn CompatBackend, env: &AppEnv) -> Option<String> {
     let id = env.id();
-    let problem = match backend.stop(env) {
+    match backend.stop(env) {
         Err(e) => Some(format!(
             "the backend could not be stopped ({}); the partly installed app `{id}` was left in place: \
              remove it with `runtime remove {id}` once no Wine process is running",
@@ -545,13 +564,46 @@ fn cleanup(store: &Store, backend: &dyn CompatBackend, env: &AppEnv, cause: Inst
                 quote(&e.to_string())
             )
         }),
-    };
-    match problem {
+    }
+}
+
+fn cleanup(store: &Store, backend: &dyn CompatBackend, env: &AppEnv, cause: InstallError) -> InstallError {
+    match cleanup_problem(store, backend, env) {
         None => cause,
         Some(p) => InstallError::WithCleanup {
             cause: Box::new(cause),
             problems: vec![p],
         },
+    }
+}
+
+/// Best-effort cleanup when the section after `Store::create` unwinds (a panic in zip, PE or backend code): the
+/// half-made environment would otherwise stay in the store. Disarmed on the normal path, where `cleanup` reports
+/// its problems in the returned error; here they can only be logged. A panic inside the cleanup itself is
+/// contained (a second panic during unwinding would abort the process).
+struct UnwindCleanup<'a> {
+    store: &'a Store,
+    backend: &'a dyn CompatBackend,
+    env: &'a AppEnv,
+    armed: bool,
+}
+
+impl Drop for UnwindCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let id = self.env.id();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cleanup_problem(self.store, self.backend, self.env)
+        }));
+        match outcome {
+            Ok(None) => tracing::error!("install of `{id}` panicked; the half-made environment was removed"),
+            Ok(Some(problem)) => tracing::error!("install of `{id}` panicked; cleanup problem: {problem}"),
+            Err(_) => {
+                tracing::error!("install of `{id}` panicked and the cleanup panicked too; `{id}` may be left behind")
+            }
+        }
     }
 }
 
@@ -614,12 +666,13 @@ pub(crate) fn install_with(
         Ok((md, exe))
     };
     let mut id = (t.pick_id)(store, &base)?;
-    metadata_for(&id)?;
 
     // `create` is the arbiter. `AlreadyExists` means the directory belongs to someone else: pick again and NEVER
-    // remove anything. Cleanup below happens only for an id whose `create` returned `Ok`.
+    // remove anything. Cleanup below happens only for an id whose `create` returned `Ok`. The metadata for each
+    // candidate id is validated before its `create`, so an invalid one leaves nothing behind.
     let mut env = None;
     for _ in 0..CREATE_ATTEMPTS {
+        metadata_for(&id)?;
         match store.create(&id) {
             Ok(created) => {
                 env = Some(created);
@@ -633,6 +686,12 @@ pub(crate) fn install_with(
         return Err(StoreError::AlreadyExists.into());
     };
 
+    let mut unwind = UnwindCleanup {
+        store,
+        backend,
+        env: &env,
+        armed: true,
+    };
     let committed = (|| -> Result<WinPath, InstallError> {
         backend.prepare(&env)?;
         let (md, exe) = metadata_for(env.id())?;
@@ -648,6 +707,7 @@ pub(crate) fn install_with(
         store.write_metadata(&env, &md)?;
         Ok(exe)
     })();
+    unwind.armed = false;
     match committed {
         Ok(executable) => Ok(InstallOutcome {
             id: env.id().clone(),

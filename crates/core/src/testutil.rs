@@ -238,31 +238,116 @@ pub fn raw_zip(entries: &[Raw]) -> Vec<u8> {
     out
 }
 
-/// Rewrites the end of a [`raw_zip`] archive into the zip64 form: a zip64 end record and locator in front of the
-/// classic end record, whose counts become the `0xFFFF` sentinel. `entries` is what the zip64 record states.
-pub fn to_zip64(mut zip: Vec<u8>, entries: u64) -> Vec<u8> {
-    let end = zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
-    let cd_size = u32::from_le_bytes(zip[end + 12..end + 16].try_into().unwrap());
-    let cd_offset = u32::from_le_bytes(zip[end + 16..end + 20].try_into().unwrap());
-    for at in [end + 8, end + 10] {
-        zip[at..at + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+/// Offset of the (last) end-of-central-directory record.
+pub fn eocd_at(zip: &[u8]) -> usize {
+    zip.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap()
+}
+
+pub fn put16(zip: &mut [u8], at: usize, v: u16) {
+    zip[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+pub fn put32(zip: &mut [u8], at: usize, v: u32) {
+    zip[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Gives the end record a comment (of `comment.len()` bytes, appended after it).
+pub fn with_comment(mut zip: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+    let end = eocd_at(&zip);
+    put16(&mut zip, end + 20, comment.len() as u16);
+    zip.extend_from_slice(comment);
+    zip
+}
+
+/// The fields of a zip64 end record and which classic end-record fields become `0xFFFF`/`0xFFFFFFFF` sentinels.
+#[derive(Clone)]
+pub struct Z64 {
+    pub disk: u32,
+    pub disk_cd: u32,
+    pub entries_disk: u64,
+    pub total: u64,
+    pub cd_size: u64,
+    pub cd_offset: u64,
+    /// The record's own "size of the remaining record" field (44 when honest).
+    pub size_field: u64,
+    /// Where the locator says the zip64 record is (`None` = honestly, right before the locator).
+    pub locator_target: Option<u64>,
+    /// The locator's "disk with the zip64 record" and "total number of disks" fields (0 and 1 when honest).
+    pub locator_disk: u32,
+    pub locator_disks: u32,
+    /// Bytes of "extensible data" after the 56-byte record (`size_field` must account for them).
+    pub extensible: Vec<u8>,
+    pub sentinel_count: bool,
+    pub sentinel_size: bool,
+    pub sentinel_offset: bool,
+}
+
+impl Z64 {
+    /// Honest values for `zip` (a [`raw_zip`] archive), with the entry count as the only sentinel.
+    pub fn honest(zip: &[u8]) -> Z64 {
+        let end = eocd_at(zip);
+        let n = u64::from(u16::from_le_bytes([zip[end + 10], zip[end + 11]]));
+        let word = |at: usize| u64::from(u32::from_le_bytes(zip[at..at + 4].try_into().unwrap()));
+        Z64 {
+            disk: 0,
+            disk_cd: 0,
+            entries_disk: n,
+            total: n,
+            cd_size: word(end + 12),
+            cd_offset: word(end + 16),
+            size_field: 44,
+            locator_target: None,
+            locator_disk: 0,
+            locator_disks: 1,
+            extensible: Vec::new(),
+            sentinel_count: true,
+            sentinel_size: false,
+            sentinel_offset: false,
+        }
     }
-    let mut z64 = Vec::new();
-    z64.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
-    z64.extend_from_slice(&44u64.to_le_bytes());
-    z64.extend_from_slice(&45u16.to_le_bytes());
-    z64.extend_from_slice(&45u16.to_le_bytes());
-    z64.extend_from_slice(&0u32.to_le_bytes());
-    z64.extend_from_slice(&0u32.to_le_bytes());
-    z64.extend_from_slice(&entries.to_le_bytes()); // on this disk
-    z64.extend_from_slice(&entries.to_le_bytes()); // total
-    z64.extend_from_slice(&u64::from(cd_size).to_le_bytes());
-    z64.extend_from_slice(&u64::from(cd_offset).to_le_bytes());
+}
+
+/// Rewrites the end of a [`raw_zip`] archive into the zip64 form (a zip64 end record and its locator in front of
+/// the classic end record) with exactly the fields `z` says, honest or not.
+pub fn to_zip64_with(mut zip: Vec<u8>, z: &Z64) -> Vec<u8> {
+    let end = eocd_at(&zip);
+    if z.sentinel_count {
+        put16(&mut zip, end + 8, 0xFFFF);
+        put16(&mut zip, end + 10, 0xFFFF);
+    }
+    if z.sentinel_size {
+        put32(&mut zip, end + 12, 0xFFFF_FFFF);
+    }
+    if z.sentinel_offset {
+        put32(&mut zip, end + 16, 0xFFFF_FFFF);
+    }
+    let mut rec = Vec::new();
+    rec.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+    rec.extend_from_slice(&z.size_field.to_le_bytes());
+    rec.extend_from_slice(&45u16.to_le_bytes());
+    rec.extend_from_slice(&45u16.to_le_bytes());
+    rec.extend_from_slice(&z.disk.to_le_bytes());
+    rec.extend_from_slice(&z.disk_cd.to_le_bytes());
+    rec.extend_from_slice(&z.entries_disk.to_le_bytes());
+    rec.extend_from_slice(&z.total.to_le_bytes());
+    rec.extend_from_slice(&z.cd_size.to_le_bytes());
+    rec.extend_from_slice(&z.cd_offset.to_le_bytes());
+    rec.extend_from_slice(&z.extensible);
     let mut locator = Vec::new();
     locator.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
-    locator.extend_from_slice(&0u32.to_le_bytes());
-    locator.extend_from_slice(&(end as u64).to_le_bytes());
-    locator.extend_from_slice(&1u32.to_le_bytes());
-    zip.splice(end..end, z64.into_iter().chain(locator));
+    locator.extend_from_slice(&z.locator_disk.to_le_bytes());
+    locator.extend_from_slice(&z.locator_target.unwrap_or(end as u64).to_le_bytes());
+    locator.extend_from_slice(&z.locator_disks.to_le_bytes());
+    zip.splice(end..end, rec.into_iter().chain(locator));
     zip
+}
+
+/// A zip64 archive whose record states `entries` and is otherwise honest.
+pub fn to_zip64(zip: Vec<u8>, entries: u64) -> Vec<u8> {
+    let z = Z64 {
+        entries_disk: entries,
+        total: entries,
+        ..Z64::honest(&zip)
+    };
+    to_zip64_with(zip, &z)
 }

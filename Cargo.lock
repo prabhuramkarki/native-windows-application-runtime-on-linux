@@ -400,6 +400,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
  "zip",
 ]
 
