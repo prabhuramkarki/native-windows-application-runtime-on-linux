@@ -54,6 +54,10 @@ pub fn run(arg: &str, lines: u32) -> Result<(), CmdError> {
         return Ok(());
     };
     let (chunk, whole_file) = read_tail(&path)?;
+    if chunk.is_empty() {
+        eprintln!("note: the newest log is empty (use --debug for Wine diagnostics)");
+        return Ok(());
+    }
     let tail = render_tail(&chunk, !whole_file, lines, CAP_BYTES);
     crate::emit(&tail.text)?;
     if tail.truncated {

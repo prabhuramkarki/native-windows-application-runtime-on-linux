@@ -1,27 +1,11 @@
 //! Terminal safety for text that came from a file, the file system or the user: what could drive a terminal
-//! (control characters, C1 controls, bidi overrides, invisible formatting characters) is escaped. EVERY command
+//! (control characters, C1 controls, bidi overrides, invisible formatting characters: `rt_core::is_format`, the one
+//! table shared with the core's own message escaping) is escaped. EVERY command
 //! prints untrusted text through this module; do not write another sanitiser.
 use std::fmt::Write;
 
-/// Characters that draw nothing or reorder text besides the control characters: soft hyphen, bidi controls
-/// (U+061C, U+200E/F, U+202A-E, U+2066-9), zero-width characters (U+200B-D), line/paragraph separators, word
-/// joiner and invisible operators (U+2060-4), BOM, interlinear annotation and the tag characters.
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{61c}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2069}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{e0000}'..='\u{e007f}'
-    )
-}
-
 fn is_dangerous(c: char) -> bool {
-    c.is_control() || is_invisible(c)
+    c.is_control() || rt_core::is_format(c)
 }
 
 /// Escapes what could drive a terminal from text taken out of an untrusted source (`\x1b` becomes the
@@ -140,6 +124,14 @@ mod tests {
         '\u{e0000}',
         '\u{e0041}',
         '\u{e007f}',
+        '\u{34f}',
+        '\u{115f}',
+        '\u{1160}',
+        '\u{180e}',
+        '\u{3164}',
+        '\u{fe00}',
+        '\u{fe0f}',
+        '\u{fffc}',
     ];
 
     #[test]

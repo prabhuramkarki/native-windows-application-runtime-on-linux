@@ -27,10 +27,11 @@
 //! **What this does not do.**
 //! * TOCTOU: the checks and the caller's later `open`/`create` are separate system calls. A process that can
 //!   write inside the root (another user of the prefix, or the Windows program itself) can swap a component for a
-//!   symlink between them. Without `openat2(RESOLVE_NO_SYMLINKS)` (not used: no libc dependency) this cannot be
-//!   closed here. Callers must treat the returned path as a hint: open the final component with `O_NOFOLLOW` /
-//!   `create_new`, and only resolve while no Windows process is running in the prefix. Phase 5's sandbox is the
-//!   real boundary.
+//!   symlink between them. This module opens nothing, so it cannot close this itself. `libc` is a dependency of
+//!   this crate, and `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS` at the point of use is the Phase 5
+//!   lever. Until then callers must treat the returned path as a hint: open the final component with
+//!   `O_NOFOLLOW` / `create_new`, and only resolve while no Windows process is running in the prefix. Phase 5's
+//!   sandbox is the real boundary.
 //! * Only `root` itself is checked for being a symlink. Its ancestors are the runtime's own layout and trusted, and
 //!   hard links and bind mounts inside the root are not detected.
 //! * Nothing is ever created, modified or deleted by this module.

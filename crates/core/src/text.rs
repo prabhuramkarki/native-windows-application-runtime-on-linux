@@ -7,21 +7,33 @@
 /// Longest quoted string, in characters of the escaped output (excluding the two quotes and the `...`).
 pub const MAX_QUOTED: usize = 120;
 
-/// Characters that draw nothing or change how surrounding text is laid out or read: bidi controls (U+061C, U+200E/F,
-/// U+202A-E, U+2066-9), zero-width and joiner characters (U+200B-D), line/paragraph separators (U+2028/9), word
-/// joiner and invisible operators (U+2060-4), the soft hyphen (U+00AD), interlinear annotation (U+FFF9-B), the
-/// BOM (U+FEFF) and the tag characters (U+E0000-E007F). Control characters (`char::is_control`) are handled
+/// THE table of characters that draw nothing or change how surrounding text is laid out or read; the CLI's
+/// `safe()` uses it too (`rt_core::is_format`), so there is exactly one list to keep. Bidi controls (U+061C,
+/// U+200E/F, U+202A-E, U+2066-9), zero-width and joiner characters (U+200B-D), line/paragraph separators
+/// (U+2028/9), word joiner and invisible operators (U+2060-4), the soft hyphen (U+00AD), the combining grapheme
+/// joiner (U+034F), the Hangul fillers (U+115F, U+1160, U+3164), the Mongolian vowel separator (U+180E), variation
+/// selectors (U+FE00-FE0F), the BOM (U+FEFF), the object replacement character (U+FFFC), interlinear annotation
+/// (U+FFF9-B) and the tag characters (U+E0000-E007F). Control characters (`char::is_control`) are handled
 /// separately.
-fn is_format(c: char) -> bool {
+///
+/// Consequences accepted on purpose: U+200D (zero-width joiner) is in the table, so an emoji ZWJ sequence is
+/// shown as its parts, and U+FE0F (emoji presentation) is escaped or removed from names. Everything else
+/// printable (CJK, Hangul, Arabic, precomposed and combining accents other than U+034F, plain emoji) is untouched.
+pub fn is_format(c: char) -> bool {
     matches!(
         c,
         '\u{ad}'
+            | '\u{34f}'
             | '\u{61c}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
+            | '\u{fff9}'..='\u{fffc}'
             | '\u{e0000}'..='\u{e007f}'
     )
 }
@@ -138,7 +150,34 @@ mod tests {
         '\u{e0001}',
         '\u{e0020}',
         '\u{e007f}',
+        // added by the final review: invisible fillers, joiner and selectors, object replacement
+        '\u{34f}',
+        '\u{115f}',
+        '\u{1160}',
+        '\u{180e}',
+        '\u{3164}',
+        '\u{fe00}',
+        '\u{fe0f}',
+        '\u{fffc}',
     ];
+
+    #[test]
+    fn is_format_is_public_and_matches_the_table_and_nothing_printable() {
+        for &c in INVISIBLE {
+            assert!(is_format(c), "U+{:04X}", c as u32);
+        }
+        // Neighbours of every added range end, and ordinary printable text of many scripts, are NOT format
+        // characters (U+200D is in the table on purpose: an emoji ZWJ sequence is shown as its parts).
+        for c in [
+            '\u{34e}', '\u{350}', '\u{301}', '\u{115e}', '\u{1161}', '\u{180d}', '\u{180f}', '\u{3163}', '\u{3165}',
+            '\u{fdff}', '\u{fe10}', '\u{fffd}',
+        ] {
+            assert!(!is_format(c), "U+{:04X}", c as u32);
+        }
+        let plain = "Gr\u{f6}\u{df}e e\u{301} \u{65e5}\u{672c}\u{8a9e} \u{d55c}\u{ae00} \u{3b5}\u{3bb} \u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629} \u{1f600} \u{fdfa} \u{a4}";
+        assert_eq!(clean(plain, 256), plain);
+        assert!(plain.chars().all(|c| !is_format(c) && !c.is_control()));
+    }
 
     #[test]
     fn clean_strips_every_invisible_formatting_character() {

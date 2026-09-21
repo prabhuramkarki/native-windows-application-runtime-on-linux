@@ -1,24 +1,38 @@
 //! Data directory resolution.
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Component, Path, PathBuf},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DirsError {
     #[error("{var} must be an absolute path, got {value:?}")]
     NotAbsolute { var: &'static str, value: PathBuf },
+    #[error("{var} must not contain `.` or `..` components, got {value:?}")]
+    NonCanonical { var: &'static str, value: PathBuf },
     #[error("cannot determine the data directory: set RUNTIME_DATA_DIR, XDG_DATA_HOME or HOME")]
     Unresolvable,
 }
 
-/// A set, non-empty variable (empty counts as unset, as the XDG spec says), which must be absolute.
+/// `..` (which can hide a symlink) or `.` as a component: what `Store::new` and the prefix hardening refuse.
+pub(crate) fn has_dot_components(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+}
+
+/// A set, non-empty variable (empty counts as unset, as the XDG spec says), which must be absolute and free of
+/// `.`/`..` components (the same rule as `Store::new`, so a bad value fails here, not late at install).
 fn abs_var(env: &impl Fn(&str) -> Option<OsString>, var: &'static str) -> Result<Option<PathBuf>, DirsError> {
     match env(var).filter(|v| !v.is_empty()) {
         None => Ok(None),
         Some(v) => {
             let value = PathBuf::from(v);
-            if value.is_absolute() {
-                Ok(Some(value))
-            } else {
+            if !value.is_absolute() {
                 Err(DirsError::NotAbsolute { var, value })
+            } else if has_dot_components(&value) {
+                Err(DirsError::NonCanonical { var, value })
+            } else {
+                Ok(Some(value))
             }
         }
     }
@@ -28,7 +42,7 @@ fn abs_var(env: &impl Fn(&str) -> Option<OsString>, var: &'static str) -> Result
 /// then `$HOME/.local/share/runtime`. A variable that is set but relative is an error (never a silent fall
 /// through to another location). Values are `OsString`: a non-UTF-8 absolute path is a legal Linux path and is
 /// kept as is, so nothing here can panic on odd bytes. The result is trusted configuration and is not
-/// normalised (a `..` inside an absolute value is the user's business).
+/// normalised; a `..` or `.` component is an error ([`DirsError::NonCanonical`]).
 pub fn data_root_from(env: &impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, DirsError> {
     if let Some(p) = abs_var(env, "RUNTIME_DATA_DIR")? {
         return Ok(p);
@@ -128,6 +142,41 @@ mod tests {
                 var: "HOME",
                 value: PathBuf::from("rel")
             })
+        );
+    }
+
+    #[test]
+    fn a_dot_or_dotdot_component_is_refused_like_store_new_does() {
+        // `Store::new` refuses `..` (it can hide a symlink); the same value must fail here, early, not at install.
+        for var in ["RUNTIME_DATA_DIR", "XDG_DATA_HOME", "HOME"] {
+            for val in ["/a/../b", "/..", "/a/b/..", "/../a"] {
+                let e = env(&[(var, val)]);
+                assert_eq!(
+                    data_root_from(&e),
+                    Err(DirsError::NonCanonical {
+                        var,
+                        value: PathBuf::from(val)
+                    }),
+                    "{var}={val}"
+                );
+                assert!(apps_dir_from(&e).is_err());
+            }
+        }
+        // and it does not fall through to the next variable
+        let e = env(&[("RUNTIME_DATA_DIR", "/a/../b"), ("HOME", "/h")]);
+        assert!(matches!(data_root_from(&e), Err(DirsError::NonCanonical { .. })));
+        // dots inside a name are fine, and so is a value `Store::new` accepts
+        assert_eq!(
+            data_root_from(&env(&[("RUNTIME_DATA_DIR", "/a/..b/c.")])),
+            Ok(PathBuf::from("/a/..b/c."))
+        );
+        assert!(
+            crate::Store::new(
+                data_root_from(&env(&[("RUNTIME_DATA_DIR", "/a/b")]))
+                    .unwrap()
+                    .join("apps")
+            )
+            .is_ok()
         );
     }
 

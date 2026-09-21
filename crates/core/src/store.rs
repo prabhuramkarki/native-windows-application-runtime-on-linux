@@ -33,7 +33,7 @@ pub const MAX_UNIQUE_SUFFIX: u32 = 999;
 pub enum StoreError {
     #[error("apps directory must be an absolute path")]
     RelativeRoot,
-    #[error("apps directory must not end with a separator, `.` or `..`")]
+    #[error("apps directory must not end with a separator, or contain `.` or `..` components")]
     NonCanonicalRoot,
     #[error("app environment already exists")]
     AlreadyExists,
@@ -138,8 +138,12 @@ impl Store {
         }
         let raw = apps_dir.as_os_str().as_bytes();
         // `file_name` is None for `/` and a trailing `..`; the byte checks catch a trailing `/` and `/.`, which
-        // `Path` would silently drop.
-        if raw.ends_with(b"/") || raw.ends_with(b"/.") || apps_dir.file_name().is_none() {
+        // `Path` would silently drop; a `..` anywhere can hide a symlink (`harden` refuses the same spellings).
+        if raw.ends_with(b"/")
+            || raw.ends_with(b"/.")
+            || apps_dir.file_name().is_none()
+            || crate::dirs::has_dot_components(&apps_dir)
+        {
             return Err(StoreError::NonCanonicalRoot);
         }
         Ok(Store { apps_dir })
@@ -378,11 +382,16 @@ mod tests {
             "/tmp/apps/.",
             "/tmp/apps/..",
             "/tmp/apps/./",
+            "/tmp/../apps",
+            "/tmp/apps/../other",
+            "/../apps",
+            "/tmp/a/../../apps",
         ] {
             assert!(matches!(Store::new(p), Err(StoreError::NonCanonicalRoot)), "{p:?}");
         }
         Store::new("/tmp/apps").unwrap();
         Store::new("/tmp/a.b/apps").unwrap();
+        Store::new("/tmp/..a/.b/apps..").unwrap(); // dots inside a name are fine
     }
 
     // -------------------------------------------------------------------- create / get / accessors

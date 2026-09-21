@@ -158,6 +158,8 @@ pub enum PeState<'a> {
     /// No program to look at (a system report, or the program could not be found: the `program` check says why).
     Skipped,
     Analysed(&'a PeInfo),
+    /// A zip archive: nothing is wrong with it, it is just not a program (`runtime install` takes it).
+    Archive,
     /// Why the file could not be analysed (not a PE, malformed, unreadable).
     Unreadable(&'a str),
 }
@@ -178,6 +180,10 @@ pub struct DoctorInput<'a> {
     /// a file target). At most [`MAX_LISTING`] of its names are used.
     pub app_dir: Option<&'a ListResult>,
     pub prefix: PrefixState,
+    /// `Some` for an installed app: the result of the backend's check of the app's own `HOME` directory (the
+    /// CLI passes `backend_wine::check_app_home`), `Err` with its text. `run` refuses such an app, so `doctor`
+    /// must not call it healthy.
+    pub app_home: Option<Result<(), &'a str>>,
     /// The prefix directory (its `system32`/`syswow64` count as DLL sources), if there is one.
     pub prefix_root: Option<&'a Path>,
 }
@@ -309,6 +315,13 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
             format!("the file cannot be analysed: {}", clean(why, 200)),
         );
     }
+    if matches!(input.pe, PeState::Archive) {
+        out.add(
+            Area::Pe,
+            Status::Warn,
+            "this is a zip archive: install it first (`runtime install <file>`), then run doctor on the app".into(),
+        );
+    }
     if let PeState::Analysed(info) = input.pe {
         pe_facts(info, &mut out);
         imports(info, &input, &mut out);
@@ -320,6 +333,7 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     audio(&input, &mut out);
     prefix(&input.prefix, &mut out);
     program(input.program, &mut out);
+    app_home(input.app_home, &mut out);
     let checks = out.0;
     Report {
         subject: input.subject,
@@ -858,6 +872,13 @@ fn program(program: Option<Result<&str, &str>>, out: &mut Out) {
         None => {}
         Some(Ok(exe)) => out.add(Area::Program, Status::Ok, format!("program found: {}", clean(exe, 150))),
         Some(Err(why)) => out.add(Area::Program, Status::Fail, clean(why, 250)),
+    }
+}
+
+/// A missing or replaced app home is a failure: `runtime run` refuses the app with the same text.
+fn app_home(state: Option<Result<(), &str>>, out: &mut Out) {
+    if let Some(Err(why)) = state {
+        out.add(Area::Program, Status::Fail, clean(why, 250));
     }
 }
 

@@ -350,6 +350,25 @@ fn list_json_has_a_null_version_when_there_is_none() {
 }
 
 #[test]
+fn list_says_no_usable_apps_when_every_entry_is_corrupt() {
+    let r = rig().no_wine();
+    let bad = r.plant("badjson", "x");
+    fs::write(bad.join("metadata.json"), "{ not json").unwrap();
+    fs::write(r.apps().join("notadir"), "file").unwrap();
+    let o = r.rt(&["list"]);
+    assert_ok(&o);
+    let (out, err) = (s(&o.stdout), s(&o.stderr));
+    assert!(out.starts_with("No usable apps"), "{out}");
+    assert!(!out.contains("No apps installed"), "{out}");
+    assert_eq!(err.lines().count(), 2, "one warning per bad entry: {err}");
+    // json stays an empty array; a good app next to a bad one prints the table, not an empty state
+    assert_eq!(json(&r.rt(&["list", "--json"])), serde_json::json!([]));
+    r.plant("good", "Good App");
+    let out = s(&r.rt(&["list"]).stdout);
+    assert!(out.contains("Good App") && !out.contains("No "), "{out}");
+}
+
+#[test]
 fn list_survives_and_sanitises_hostile_entries() {
     let r = rig().no_wine();
     r.plant("good", "Good App");
@@ -950,6 +969,25 @@ fn logs_of_an_app_without_logs_and_of_bad_ids() {
 }
 
 #[test]
+fn logs_of_an_empty_newest_log_says_so_on_stderr() {
+    let r = rig().no_wine();
+    r.plant("app", "A");
+    log_file(&r, "app", "run-1-1-1.log", b"older, not shown\n");
+    log_file(&r, "app", "run-2-1-1.log", b"");
+    let o = r.rt(&["logs", "app"]);
+    assert_ok(&o);
+    assert!(o.stdout.is_empty(), "{}", s(&o.stdout));
+    assert_eq!(
+        s(&o.stderr),
+        "note: the newest log is empty (use --debug for Wine diagnostics)\n"
+    );
+    // a log with content stays silent on stderr
+    log_file(&r, "app", "run-3-1-1.log", b"x\n");
+    let o = r.rt(&["logs", "app"]);
+    assert_eq!((s(&o.stdout).as_str(), s(&o.stderr).as_str()), ("x\n", ""));
+}
+
+#[test]
 fn logs_caps_the_number_of_lines() {
     let r = rig().no_wine();
     r.plant("app", "A");
@@ -1436,7 +1474,6 @@ fn doctor_of_a_file_analyses_it_without_installing_anything() {
 fn doctor_of_a_file_that_is_not_a_program_reports_a_failure_and_never_hangs() {
     let r = rig();
     let text = r.input("notes.txt", b"just text");
-    let zip = r.input("archive.zip", b"PK\x03\x04rest");
     let dir = r.inputs.join("adir.exe");
     fs::create_dir(&dir).unwrap();
     let fifo = r.inputs.join("pipe.exe");
@@ -1446,7 +1483,6 @@ fn doctor_of_a_file_that_is_not_a_program_reports_a_failure_and_never_hangs() {
     let before = snapshot(&r);
     for (what, target, needle) in [
         ("text", &text, "cannot be analysed"),
-        ("zip", &zip, "ZIP"),
         ("directory", &dir, "not a regular file"),
         ("fifo", &fifo, "not a regular file"),
     ] {
@@ -1477,6 +1513,58 @@ fn doctor_of_a_file_that_is_not_a_program_reports_a_failure_and_never_hangs() {
         assert!(out.stderr.is_empty(), "{what}: {}", s(&out.stderr));
     }
     assert_eq!(snapshot(&r), before);
+}
+
+#[test]
+fn doctor_of_a_zip_archive_says_to_install_it_first_and_is_not_a_failure() {
+    let r = rig();
+    let zip = r.input("archive.zip", b"PK\x03\x04rest");
+    let before = snapshot(&r);
+    let o = r.cmd().arg("doctor").arg(&zip).output().unwrap();
+    let text = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(0), "nothing is wrong with the file: {text}");
+    let line = lines_with(&text, "zip archive")[0];
+    assert!(line.contains("[warn]") && line.contains("runtime install"), "{text}");
+    assert!(!text.contains("[FAIL]"), "{text}");
+    assert!(o.stderr.is_empty(), "{}", s(&o.stderr));
+    assert_eq!(snapshot(&r), before);
+}
+
+#[test]
+fn doctor_of_an_app_without_its_home_fails_and_agrees_with_run() {
+    let r = rig();
+    let id = r.install();
+    let home = r.apps().join(&id).join("runtime/home");
+    for (damage, words) in [("missing", "reinstall it"), ("symlink", "not a real directory")] {
+        let _ = fs::remove_dir_all(&home);
+        if damage == "symlink" {
+            symlink(&r.inputs, &home).unwrap();
+        }
+        let o = r.desktop().args(["doctor", &id]).output().unwrap();
+        let out = s(&o.stdout);
+        assert_eq!(o.status.code(), Some(1), "{damage}: {out}");
+        let line = lines_with(&out, "app home")[0];
+        assert!(line.contains("[FAIL]") && line.contains(words), "{damage}: {out}");
+        // `run` refuses the same app, with the same words.
+        let err = assert_fails(&r.rt(&["run", &id]));
+        assert!(err.contains("app home") && err.contains(words), "{damage}: {err}");
+    }
+    // Also when the program itself cannot be resolved: both failures are reported.
+    fs::remove_dir_all(&home).unwrap();
+    fs::remove_file(
+        r.apps()
+            .join(format!("{id}/prefix/drive_c/Program Files/{id}/hello64.exe")),
+    )
+    .unwrap();
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(lines_with(&out, "app home")[0].contains("[FAIL]"), "{out}");
+    assert!(lines_with(&out, "cannot be found")[0].contains("[FAIL]"), "{out}");
+    // A restored home is fine again: no such line.
+    fs::create_dir(&home).unwrap();
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    assert!(lines_with(&out, "app home").is_empty(), "{out}");
 }
 
 #[test]

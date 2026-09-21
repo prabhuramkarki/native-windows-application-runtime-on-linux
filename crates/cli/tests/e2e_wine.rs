@@ -55,9 +55,24 @@ fn fixture(name: &str) -> PathBuf {
 
 /// `Some(version text)` when the installed Wine is older than 10 and so cannot run 32-bit programs in a 64-bit
 /// prefix (no new WoW64); the caller skips its 32-bit steps and says so. Unknown versions are not skipped.
-/// (Found like the CLI finds it, except that `RUNTIME_WINE`, which the rig removes for the CLI, is honoured here.)
+/// Wine is found exactly as the CLI rig lets the CLI find it: the same search over the same environment, with
+/// `RUNTIME_WINE` and `RUNTIME_WINESERVER` removed (see [`Rig::exec`]), so this decision cannot disagree with the
+/// Wine the CLI runs.
 fn wine_without_wow64() -> Option<String> {
-    let version = WineBackend::discover().ok()?.version().ok()?;
+    let env = |k: &str| match k {
+        "RUNTIME_WINE" | "RUNTIME_WINESERVER" => None,
+        _ => std::env::var_os(k),
+    };
+    let found = backend_wine::discover::discover(
+        &env,
+        &backend_wine::discover::is_executable_file,
+        &backend_wine::discover::is_dir,
+        &backend_wine::discover::canonicalize,
+    )
+    .ok()?;
+    let version = WineBackend::from_found(found, rt_core::Launcher::new())
+        .version()
+        .ok()?;
     let major: u32 = version.strip_prefix("wine-")?.split('.').next()?.parse().ok()?;
     (major < 10).then_some(version)
 }
