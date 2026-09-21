@@ -1,5 +1,5 @@
 //! Child-process plumbing shared by the launcher and the backends: draining a child's output without blocking it
-//! (`Drain`) and running a helper command under a deadline ([`run_with_timeout`]).
+//! (`Drain`) and running a helper command under a deadline (`run_with_timeout`).
 //!
 //! **Why a socket pair and not a pipe.** Wine's `wineboot` leaves a `wineserver` daemon behind that inherits the
 //! child's stdout/stderr. With a pipe the reader would see EOF only when that daemon exits (seconds later, or

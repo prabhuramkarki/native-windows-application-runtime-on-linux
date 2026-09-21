@@ -1,23 +1,76 @@
 # Native Windows application runtime on Linux
 
-A Linux runtime for running Windows applications. **Status: Phase 0-1 only.** What exists today is
-PE analysis: a hardened parser for untrusted Windows executables (`crates/pe`) and the
-`runtime analyze` command that reports what a binary is and needs (`crates/cli`). Nothing here runs
-a Windows program yet; environments, a Wine backend and the rest come in later phases.
+A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
+
+**Status: Phase 2, an early MVP, and it is NOT sandboxed.** Windows programs run as your Linux user, with your
+network, GPU, audio and files; Wine can still reach the whole host (see [docs/SECURITY.md](docs/SECURITY.md)
+for what is and is not protected). Only run software you would run directly on your account. Installers and MSI
+packages are refused (Phase 3), .NET programs fail until Phase 4, and the sandbox is Phase 5.
+
+## Commands
+
+The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
+
+| Command | What it does |
+|---|---|
+| `install <file.exe\|file.zip> [--name N] [--exe PATH]` | Creates an app with its own hardened Wine prefix and copies the program in. For a zip, `--exe` names the program inside it. |
+| `run <app\|file> [--debug] [-- args...]` | Runs an installed app; a `.exe`/`.zip` path is installed first (a new app on every call). The exit code is the program's. |
+| `list [--json]` | Lists installed apps. |
+| `remove <app>` | Stops the app's Wine processes and deletes the app and its prefix. Takes an id, never a path. |
+| `logs <app> [--lines N]` | Shows the end of the newest log (the app's stderr from its last run). |
+| `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, Vulkan, audio. Exit 1 when a check fails. |
+| `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 
 ```sh
-cargo build                          # stable Rust 1.88 or newer
-tools/build-fixtures.sh              # builds test .exe/.dll files into tests/fixtures/build; needs mingw-w64
-cargo test --workspace               # needs the fixtures above
-RUNTIME_SAMPLES=dir1:dir2 cargo test -p runtime-pe --test real_world -- --ignored --nocapture
-                                     # oracle: compares every PE under those dirs with file(1); ignored by default
-cargo run -p runtime-cli -- analyze [--json] <file>   # binary name: `runtime`
+runtime install ~/Downloads/tool.exe --name tool
+runtime run tool -- --some-arg
+runtime list
+runtime remove tool
 ```
 
-`analyze` detects the format from the file's contents, not its extension. `--json` output is the
-stable interface; the warning lines in it are free-form text, do not parse them. Strings in the
-output come from the analysed file: the human output escapes control and bidi characters, the JSON
-does not, so sanitise before displaying it.
+`--json` output is the stable interface for `list`, `doctor` and `analyze`; free-form text fields (warnings,
+check texts) may change, do not parse them. Strings from files are escaped in human output; in JSON,
+sanitise before displaying.
 
-The roadmap and the Phase 0-1 plan, with notes on where the code departs from it, are in
-`docs/superpowers/plans/`. Third-party components and licences: `docs/THIRD_PARTY.md`.
+## Requirements
+
+- Linux on x86-64 with **Wine 10** (`wine64` and `wineserver`; on Debian/Ubuntu `apt install wine`). 32-bit
+  programs run through Wine's WoW64, no 32-bit Wine is needed. Wine is found on `PATH`, or with
+  `RUNTIME_WINE=/abs/path/to/wine` and `RUNTIME_WINESERVER=/abs/path/to/wineserver`.
+- Stable Rust 1.88 or newer to build (`cargo build`).
+- mingw-w64 (`apt install mingw-w64`) only to build the test fixtures, never to use the program.
+
+## Where things live
+
+`RUNTIME_DATA_DIR` (absolute path) holds the data; without it `$XDG_DATA_HOME/runtime` or
+`~/.local/share/runtime`. Each app is `<data>/apps/<id>/` with `prefix/` (the Wine prefix, `prefix/drive_c` is
+the app's `C:`), `logs/` (20 kept) and `metadata.json`. `RUNTIME_LOG=debug` turns on the runtime's own logging.
+
+## Tests
+
+```sh
+tools/build-fixtures.sh                 # test .exe/.dll files into tests/fixtures/build (mingw-w64)
+cargo test --workspace                  # unit, hostile-input and hermetic CLI tests; no Wine needed
+cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
+                                        # real-Wine end-to-end tests (minutes; needs Wine 10 and the fixtures)
+RUNTIME_SAMPLES=dir1:dir2 cargo test -p runtime-pe -- --ignored --nocapture
+                                        # PE oracle: compares every PE under those dirs with file(1)
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+```
+
+The Wine tests use temporary data directories, stop and kill their `wineserver` on exit, and never run
+`gui64.exe` (a modal message box; run it by hand to look at a window). Run them with `--test-threads=1`.
+Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
+directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`.
+
+## Layout
+
+- `crates/pe`: hardened parser for untrusted PE files (Phase 1).
+- `crates/core`: app ids, data dir, Windows path handling, metadata and store, install/run services,
+  `doctor`, the `CompatBackend` trait and the `Launcher` (the one place child processes are started).
+- `crates/backend-wine`: the system-Wine backend: discovery, prefix creation and hardening.
+- `crates/cli`: the `runtime` binary, a thin front end over the above.
+- `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
+
+The roadmap and the phase plans, with notes on where the code departs from them, are in
+`docs/superpowers/plans/`. Third-party components and licences: [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).

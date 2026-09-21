@@ -147,6 +147,8 @@ struct AppEnv    // id, root dir, metadata.json, backend id, arch
 **Exit criteria:** hello.exe, a GUI msgbox fixture, and 7-Zip/Notepad++ portable run on Wayland; `list/remove` clean; second app cannot see first's files.
 **Risks:** Wine version drift → pin & record Wine version in `metadata.json`; wineserver zombies → supervise and test.
 
+**Amendments after the Phase 2 implementation (see `2026-09-21-phase-2-environments-and-wine-backend.md` and `docs/SECURITY.md`):** the trait is `CompatBackend { id, version, prepare, command, stop, dll_dirs }` (the backend builds a `Command`; the `Launcher` finalises and spawns it, so `spawn`/`capabilities` are not on the trait). Removing `Z:` and the home symlinks is defence in depth only: Wine still reaches the host through `\\?\unix\...` NT paths and recreates the `com*` device links on every start, so the roadmap's test "app cannot read `~`" is NOT achievable without the Phase 5 sandbox and is not claimed; the isolation test that exists is "a second app cannot see the first app's files" (separate prefixes). The GUI fixture and 7-Zip/Notepad++ portable are manual checks, not CI (CI runs console fixtures headless). Wine 10.0 is the version tested.
+
 ---
 
 ## Phase 3 — Installers + desktop integration → v0.2 (≈4–6 weeks)
