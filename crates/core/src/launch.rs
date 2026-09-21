@@ -10,12 +10,14 @@
 //! **Environment.** `Command::env_clear()` also forgets variables set earlier with `.env()`, so `finalize`
 //! first snapshots what the backend set, clears, applies the allowlisted host variables and only then re-applies
 //! the snapshot: backend variables always win over a host variable of the same name (a host `WINEPREFIX` can
-//! never redirect a prefix) and everything not allowlisted (`LD_PRELOAD`, secrets, ...) is gone.
+//! never redirect a prefix, and the Wine backend's `HOME` replaces the host's) and everything not allowlisted (`LD_PRELOAD`, secrets, ...) is gone.
 //!
 //! **Helper processes.** `run_helper` finalises a helper command (`wineboot`, `wineserver -k`, ...) the same way and
 //! runs it under a deadline with capped output; it is the only supported way for a backend to run one.
 //!
-//! **Streams.** stdout is inherited. stderr goes to a fresh `logs/run-<secs>-<nanos>-<pid>.log`; with
+//! **Streams.** stdout AND stdin are inherited by `spawn` (interactive console programs need both), so the program
+//! can write terminal escape sequences to the terminal and read what the user types; `run_helper` closes stdin.
+//! stdout is inherited raw. stderr goes to a fresh `logs/run-<secs>-<nanos>-<pid>.log`; with
 //! [`LogSink::Tee`] it is copied to that file and to a terminal writer by a thread that [`Running::wait`] joins.
 //!
 //! **Log files** are created with `O_CREAT|O_EXCL` (never through a symlink) and mode 0600 after `symlink_metadata`

@@ -635,6 +635,25 @@ fn run_an_installed_app_passes_the_exit_code_stdout_and_verbatim_args() {
 }
 
 #[test]
+fn the_program_gets_the_apps_own_home_not_the_hosts() {
+    let r = rig();
+    let id = r.install();
+    let hostile = "/home/hostile-host-user";
+    let out = r
+        .cmd()
+        .env("HOME", hostile)
+        .args(["run", id.as_str()])
+        .output()
+        .unwrap();
+    assert_ok(&out);
+    let env = fs::read_to_string(r.log.join("env.txt")).unwrap();
+    let want = format!("HOME={}", r.apps().join(&id).join("runtime/home").display());
+    assert!(env.lines().any(|l| l == want), "want {want}\n{env}");
+    assert!(!env.contains(hostile), "the host HOME reached the program:\n{env}");
+    assert!(r.apps().join(&id).join("runtime/home").is_dir());
+}
+
+#[test]
 fn run_reports_a_signal_death_as_128_plus_the_signal() {
     let r = rig();
     let id = r.install();

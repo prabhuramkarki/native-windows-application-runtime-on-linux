@@ -5,6 +5,14 @@
 //! `Launcher::run_helper`: cleared environment, allowlist, then the backend's own variables. The process that
 //! runs the app is only *described* by [`WineBackend::command`]; `Launcher::spawn` starts it.
 //!
+//! **`HOME` is the app's own directory.** Wine derives the Windows environment (`WINEHOMEDIR`, the shell
+//! folders, its caches) from `HOME`, so a host `HOME` would hand the real home to every app. The backend
+//! therefore sets `HOME` itself, to [`app_home`] (`<app>/runtime/home`, created 0700 by `prepare`), for `wineboot`,
+//! `command()` and `wineserver -k` alike (backend variables win over the host allowlist in the `Launcher`).
+//! `command()` refuses to run when that directory is not a real directory. `wine --version` has no app and keeps
+//! the allowlisted host `HOME` (it prints the version and exits). This is hygiene, not a boundary: the app is
+//! still the same uid and Wine's `\\?\unix\` paths still reach the real home.
+//!
 //! **Not a sandbox.** Wine can still reach the host (`\\?\unix\...` NT paths, the `com*` device links Wine
 //! recreates on every start); see `harden` and Phase 5.
 //!
@@ -31,6 +39,52 @@ pub const BACKEND_ID: &str = "wine";
 /// Wine's own `WINEDLLOVERRIDES` for every process: no menu spam, no Mono/Gecko download dialogs (.NET apps
 /// fail until Phase 4; `doctor` says so).
 pub const WINEDLLOVERRIDES: &str = "winemenubuilder.exe=d;mscoree=d;mshtml=d";
+
+/// The per-app `HOME` (see the module docs): `<app>/runtime/home`.
+pub fn app_home(env: &AppEnv) -> PathBuf {
+    env.root().join("runtime").join("home")
+}
+
+/// Requires a real directory (by `lstat`: a link, even to a directory, is refused) at `path`.
+fn require_real_dir(path: &Path, what: &'static str) -> Result<(), BackendError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(BackendError::failed(
+            what,
+            b"not a real directory (a link or another kind of file)",
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BackendError::failed(
+            what,
+            b"missing: this app was not prepared by this version, reinstall it",
+        )),
+        Err(source) => Err(BackendError::Io { what, source }),
+    }
+}
+
+/// `prepare`: creates `<app>/runtime/home` (0700) if it is missing; `runtime/` and `home` must be real
+/// directories (Wine is about to write below `home`; a link there would send it elsewhere).
+fn ensure_app_home(env: &AppEnv) -> Result<(), BackendError> {
+    let runtime = env.root().join("runtime");
+    require_real_dir(&runtime, "app runtime directory")?;
+    let mut builder = std::fs::DirBuilder::new();
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    match builder.create(app_home(env)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            require_real_dir(&app_home(env), "app home directory")
+        }
+        Err(source) => Err(BackendError::Io {
+            what: "app home directory",
+            source,
+        }),
+    }
+}
+
+/// `command`: `runtime/` and `home` are real directories (nothing is created here).
+fn check_app_home(env: &AppEnv) -> Result<(), BackendError> {
+    require_real_dir(&env.root().join("runtime"), "app runtime directory")?;
+    require_real_dir(&app_home(env), "app home directory")
+}
 
 /// Deadlines of the helper steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +268,7 @@ impl WineBackend {
     fn wine_command(&self, env: &AppEnv, winedebug: &str) -> Command {
         let mut cmd = Command::new(&self.wine);
         cmd.env("WINEPREFIX", env.prefix())
+            .env("HOME", app_home(env))
             .env("WINEARCH", "win64")
             .env("WINEDEBUG", winedebug)
             .env("WINEDLLOVERRIDES", WINEDLLOVERRIDES)
@@ -247,6 +302,7 @@ impl CompatBackend for WineBackend {
         let prefix = env.prefix();
         // Wine follows links: refuse before it writes anything through one.
         harden::precheck(&prefix).map_err(|e| harden_error("prefix", e))?;
+        ensure_app_home(env)?;
         let mut cmd = self.wine_command(env, "-all");
         cmd.args(["wineboot", "-u"]);
         let booted = self.launcher.run_helper(cmd, self.timeouts.prepare);
@@ -266,7 +322,8 @@ impl CompatBackend for WineBackend {
         Ok(())
     }
 
-    /// `<wine> <exe> <args...>` with the backend variables and `current_dir(cwd)`. `exe_unix` and `cwd_unix`
+    /// `<wine> <exe> <args...>` with the backend variables (`HOME` is [`app_home`], which must be a real
+    /// directory) and `current_dir(cwd)`. `exe_unix` and `cwd_unix`
     /// are the RESOLVED host paths the caller got from `winpath::resolve_under` (never Windows text: Wine would
     /// expand `PROGRA~1` and follow links). They are re-checked here because the fake backend does not:
     /// absolute, no `..`, component-wise under `env.drive_c()`, no symlink on the way, the exe a regular file
@@ -279,6 +336,7 @@ impl CompatBackend for WineBackend {
         args: &[OsString],
         opts: &RunOpts,
     ) -> Result<Command, BackendError> {
+        check_app_home(env)?;
         let root = env.drive_c();
         // Wine gets the NORMALISED paths (`drive_c` + the verified components), not the caller's spelling.
         let exe_unix = check_inside(&root, exe_unix, "executable", Want::File)?;
@@ -291,7 +349,7 @@ impl CompatBackend for WineBackend {
     /// `wineserver -k` for this prefix (deadline 20 s). Exit 0, and 1 (no server running), are success.
     fn stop(&self, env: &AppEnv) -> Result<(), BackendError> {
         let mut cmd = Command::new(&self.wineserver);
-        cmd.arg("-k").env("WINEPREFIX", env.prefix());
+        cmd.arg("-k").env("WINEPREFIX", env.prefix()).env("HOME", app_home(env));
         let out = self
             .launcher
             .run_helper(cmd, self.timeouts.stop)
@@ -492,6 +550,8 @@ esac
         );
         let store = Store::new(root.join("apps")).unwrap();
         let env = store.create(&AppId::parse("t").unwrap()).unwrap();
+        // Like an app that `prepare` has already been run for.
+        fs::create_dir(app_home(&env)).unwrap();
         Rig {
             _t: t,
             root,
@@ -552,7 +612,13 @@ esac
     /// The helper saw exactly the allowlisted host variables plus the backend's own ones, nothing else.
     fn assert_only_allowlist_and_backend_vars(got: &[(String, String)], backend_vars: &[(&str, &str)]) {
         let get = |k: &str| got.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        assert_eq!(get("HOME"), Some("/injected-home"), "{got:?}");
+        // HOME is the host's (injected) one unless the backend sets it: then the backend's value must win.
+        let want_home = backend_vars
+            .iter()
+            .find(|(k, _)| *k == "HOME")
+            .map_or("/injected-home", |(_, v)| *v);
+        assert_eq!(get("HOME"), Some(want_home), "{got:?}");
+        assert_eq!(got.iter().filter(|(k, _)| k == "HOME").count(), 1, "{got:?}");
         assert_eq!(get("PATH"), Some("/usr/bin:/bin"), "{got:?}");
         let shell_added = ["PWD", "SHLVL", "_", "OLDPWD"];
         let expected: BTreeSet<&str> = ["HOME", "PATH"]
@@ -589,9 +655,11 @@ esac
         let ws = r.bin.join("wineserver");
         r.backend().prepare(&r.env).unwrap();
         let prefix = r.env.prefix();
+        let home = app_home(&r.env);
         assert_only_allowlist_and_backend_vars(
             &r.env_of("env-wine.txt"),
             &[
+                ("HOME", home.to_str().unwrap()),
                 ("WINEPREFIX", prefix.to_str().unwrap()),
                 ("WINEARCH", "win64"),
                 ("WINEDEBUG", "-all"),
@@ -607,7 +675,10 @@ esac
         r.backend().stop(&r.env).unwrap();
         assert_only_allowlist_and_backend_vars(
             &r.env_of("env-wineserver.txt"),
-            &[("WINEPREFIX", r.env.prefix().to_str().unwrap())],
+            &[
+                ("HOME", app_home(&r.env).to_str().unwrap()),
+                ("WINEPREFIX", r.env.prefix().to_str().unwrap()),
+            ],
         );
     }
 
@@ -816,6 +887,154 @@ esac
         assert!(r.calls().is_empty(), "{:?}", r.calls());
     }
 
+    // ---- the per-app HOME ----
+
+    #[test]
+    fn prepare_creates_the_app_home_private_and_wineboot_runs_with_it() {
+        let r = rig();
+        let home = r.env.root().join("runtime/home");
+        fs::remove_dir(&home).unwrap();
+        r.backend().prepare(&r.env).unwrap();
+        let m = fs::symlink_metadata(&home).unwrap();
+        assert!(m.is_dir(), "the app home is a real directory");
+        assert_eq!(m.permissions().mode() & 0o777, 0o700);
+        let seen = r.env_of("env-wine.txt");
+        assert_eq!(
+            seen.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str()),
+            home.to_str(),
+            "wineboot must not see the host HOME (/injected-home)"
+        );
+        // A second prepare accepts the existing directory.
+        r.backend().prepare(&r.env).unwrap();
+    }
+
+    #[test]
+    fn prepare_refuses_an_app_home_that_is_a_link_or_a_file_before_running_wine() {
+        for kind in ["symlink", "file"] {
+            let r = rig();
+            let home = r.env.root().join("runtime/home");
+            fs::remove_dir(&home).unwrap();
+            if kind == "symlink" {
+                let victim = r.root.join("victim");
+                fs::create_dir(&victim).unwrap();
+                symlink(&victim, &home).unwrap();
+            } else {
+                fs::write(&home, b"x").unwrap();
+            }
+            let e = r.backend().prepare(&r.env).unwrap_err();
+            assert!(
+                matches!(
+                    &e,
+                    BackendError::Failed {
+                        what: "app home directory",
+                        ..
+                    }
+                ),
+                "{kind}: {e:?}"
+            );
+            assert!(r.calls().is_empty(), "{kind}: wine must not have run: {:?}", r.calls());
+        }
+        // `runtime/` itself a link: refused as well (creating `home` would go through it).
+        let r = rig();
+        let victim = r.root.join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::remove_dir(app_home(&r.env)).unwrap();
+        fs::remove_dir(r.env.root().join("runtime")).unwrap();
+        symlink(&victim, r.env.root().join("runtime")).unwrap();
+        let e = r.backend().prepare(&r.env).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                BackendError::Failed {
+                    what: "app runtime directory",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert_eq!(
+            fs::read_dir(&victim).unwrap().count(),
+            0,
+            "nothing was created through the link"
+        );
+        assert!(r.calls().is_empty());
+    }
+
+    #[test]
+    fn command_refuses_a_missing_or_linked_app_home() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/a.exe");
+        let b = r.backend();
+        let go = || b.command(&r.env, &exe, &dir, &[], &RunOpts::default());
+        assert!(go().is_ok());
+        let home = app_home(&r.env);
+        fs::remove_dir(&home).unwrap();
+        assert!(
+            matches!(
+                go(),
+                Err(BackendError::Failed {
+                    what: "app home directory",
+                    ..
+                })
+            ),
+            "missing"
+        );
+        let victim = r.root.join("victim");
+        fs::create_dir(&victim).unwrap();
+        symlink(&victim, &home).unwrap();
+        assert!(
+            matches!(
+                go(),
+                Err(BackendError::Failed {
+                    what: "app home directory",
+                    ..
+                })
+            ),
+            "a link to a directory"
+        );
+        fs::remove_file(&home).unwrap();
+        fs::write(&home, b"x").unwrap();
+        assert!(matches!(go(), Err(BackendError::Failed { .. })), "a file");
+        fs::remove_file(&home).unwrap();
+        fs::create_dir(&home).unwrap();
+        // `runtime/` replaced by a link to a directory that has a `home` inside: refused too.
+        fs::create_dir(victim.join("home")).unwrap();
+        fs::remove_dir(&home).unwrap();
+        fs::remove_dir(r.env.root().join("runtime")).unwrap();
+        symlink(&victim, r.env.root().join("runtime")).unwrap();
+        assert!(
+            matches!(
+                go(),
+                Err(BackendError::Failed {
+                    what: "app runtime directory",
+                    ..
+                })
+            ),
+            "runtime/ is a link"
+        );
+    }
+
+    #[test]
+    fn the_program_runs_with_the_app_home_whatever_the_host_home_is() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/a.exe");
+        let cmd = r
+            .backend()
+            .command(&r.env, &exe, &dir, &[], &RunOpts::default())
+            .unwrap();
+        // The launcher's host environment says HOME=/injected-home (and other secrets): the backend wins.
+        let out = r.backend().launcher().run_helper(cmd, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        let seen = r.env_of("env-wine.txt");
+        let home = app_home(&r.env);
+        assert_eq!(
+            seen.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.as_str()),
+            home.to_str(),
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|(_, v)| v.contains("/injected-home")), "{seen:?}");
+    }
+
     // ---- stop ----
 
     #[test]
@@ -914,6 +1133,10 @@ esac
         );
         assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
         let mut want = vec![
+            (
+                "HOME".to_string(),
+                r.env.root().join("runtime/home").display().to_string(),
+            ),
             ("WINEARCH".to_string(), "win64".to_string()),
             ("WINEDEBUG".to_string(), "-all".to_string()),
             (
