@@ -245,24 +245,94 @@ macro_rules! extract {
                     let base = ex.ordinal_base() as u32;
                     match ex.by() {
                         Ok(by) => {
+                            const MAX_STRING_LEN: usize = 1024;
+                            const BYTES_BUDGET: usize = 4 * 1024 * 1024; // ~4 MiB
                             let mut names = BTreeMap::new();
+                            let mut bad_names = 0;
+                            let mut first_bad_name_idx = None;
+                            let mut bytes_used = 0usize;
+                            let funcs_len = by.functions().len().min(65_536);
+                            // Collect names, skipping those out-of-bounds or over the byte budget
                             for (name, idx) in by.iter_name_indices() {
-                                if let Ok(n) = name {
-                                    names.insert(idx, n.to_string());
+                                if idx >= funcs_len {
+                                    continue; // skip name-table entries for non-existent function slots
+                                }
+                                match name {
+                                    Ok(n) => {
+                                        if n.len() > MAX_STRING_LEN {
+                                            bad_names += 1;
+                                            if first_bad_name_idx.is_none() {
+                                                first_bad_name_idx = Some(idx);
+                                            }
+                                        } else if bytes_used.checked_add(n.len()).unwrap_or(BYTES_BUDGET + 1)
+                                            <= BYTES_BUDGET
+                                        {
+                                            bytes_used += n.len();
+                                            names.insert(idx, n.to_string());
+                                        } else {
+                                            warnings.push(format!(
+                                                "exports: name budget exceeded; total bytes {} >= ~{}",
+                                                bytes_used, BYTES_BUDGET
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        bad_names += 1;
+                                        if first_bad_name_idx.is_none() {
+                                            first_bad_name_idx = Some(idx);
+                                        }
+                                    }
                                 }
                             }
-                            for idx in 0..by.functions().len().min(65_536) {
+                            if bad_names > 0 {
+                                warnings.push(format!(
+                                    "exports: {} names unreadable/too-long (first at index {})",
+                                    bad_names,
+                                    first_bad_name_idx.unwrap_or(0)
+                                ));
+                            }
+                            // Walk function table
+                            let mut bad_forwards = 0;
+                            let mut first_bad_fwd_idx = None;
+                            for idx in 0..funcs_len {
                                 let forwarder = match by.index(idx) {
-                                    Ok(pelite::$pe::exports::Export::Forward(fwd)) => Some(fwd.to_string()),
+                                    Ok(pelite::$pe::exports::Export::Forward(fwd)) => {
+                                        if fwd.len() > MAX_STRING_LEN {
+                                            bad_forwards += 1;
+                                            if first_bad_fwd_idx.is_none() {
+                                                first_bad_fwd_idx = Some(idx);
+                                            }
+                                            None
+                                        } else if bytes_used.checked_add(fwd.len()).unwrap_or(BYTES_BUDGET + 1)
+                                            <= BYTES_BUDGET
+                                        {
+                                            bytes_used += fwd.len();
+                                            Some(fwd.to_string())
+                                        } else {
+                                            warnings.push(format!(
+                                                "exports: forwarder budget exceeded at slot {}; total bytes {} >= ~{}",
+                                                idx, bytes_used, BYTES_BUDGET
+                                            ));
+                                            break;
+                                        }
+                                    }
                                     Ok(pelite::$pe::exports::Export::Symbol(&0)) => continue, // unused slot
                                     Ok(_) => None,
-                                    Err(_) => continue,
+                                    Err(_) => continue, // skip unreadable entries without warning
                                 };
                                 exports.push(Export {
                                     name: names.remove(&idx),
-                                    ordinal: base + idx as u32,
+                                    ordinal: base.saturating_add(idx as u32),
                                     forwarder,
                                 });
+                            }
+                            if bad_forwards > 0 {
+                                warnings.push(format!(
+                                    "exports: {} forwarders too-long (first at index {})",
+                                    bad_forwards,
+                                    first_bad_fwd_idx.unwrap_or(0)
+                                ));
                             }
                         }
                         Err(e) => warnings.push(format!("exports: {e}")),

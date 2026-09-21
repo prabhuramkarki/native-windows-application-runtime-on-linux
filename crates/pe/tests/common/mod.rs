@@ -205,3 +205,58 @@ pub fn exports_data(base: u32) -> Vec<u8> {
         .cstr("Fwd")
         .0
 }
+
+/// Ordinal-only export: slot 0 unnamed, ordinal base 5.
+#[rustfmt::skip]
+pub fn exports_ordinal_only_data(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(5).u32(1).u32(0).u32(base + 64).u32(0).u32(base + 80)
+        .pad_to(40)
+        .cstr("mylib.dll")
+        .pad_to(64)
+        .u32(0x1000).u32(base + 96).u32(0)
+        .pad_to(80)
+        .u16(0)
+        .pad_to(96)
+        .0
+}
+
+/// Long name string (2000 bytes) referenced by multiple name-table entries.
+#[rustfmt::skip]
+pub fn exports_long_name_data(base: u32) -> Vec<u8> {
+    let long_name = "a".repeat(2000);
+    let long_name_rva = base + 112;
+    Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(10).u32(3).u32(2).u32(base + 64).u32(base + 80).u32(base + 96)
+        .pad_to(40)
+        .cstr("mylib.dll")
+        .pad_to(64)
+        .u32(0x2000).u32(base + 128).u32(0)
+        .pad_to(80)
+        .u32(long_name_rva).u32(long_name_rva)
+        .pad_to(96)
+        .u16(0).u16(1)
+        .pad_to(112)
+        .cstr(&long_name)
+        .0
+}
+
+/// Name-table entry with idx >= functions().len() should be ignored.
+#[rustfmt::skip]
+pub fn exports_oob_name_idx_data(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(10).u32(2).u32(1).u32(base + 64).u32(base + 80).u32(base + 96)
+        .pad_to(40)
+        .cstr("mylib.dll")
+        .pad_to(64)
+        .u32(0x1000).u32(base + 112).u32(0)
+        .pad_to(80)
+        .u32(base + 144)  // points to name at idx=5 but only 2 function slots
+        .pad_to(96)
+        .u16(5)  // idx 5, out of bounds
+        .pad_to(112)
+        .cstr("OnlyOne")
+        .pad_to(144)
+        .cstr("OutOfBounds")
+        .0
+}
