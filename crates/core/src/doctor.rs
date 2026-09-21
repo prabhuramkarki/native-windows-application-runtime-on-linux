@@ -713,11 +713,7 @@ fn name_list_short(names: &[String], shown: usize) -> String {
 fn program(program: Option<Result<&str, &str>>, out: &mut Out) {
     match program {
         None => {}
-        Some(Ok(exe)) => out.add(
-            Area::Program,
-            Status::Ok,
-            format!("program found: {}", quote_max(exe, 120)),
-        ),
+        Some(Ok(exe)) => out.add(Area::Program, Status::Ok, format!("program found: {}", clean(exe, 150))),
         Some(Err(why)) => out.add(Area::Program, Status::Fail, clean(why, 250)),
     }
 }

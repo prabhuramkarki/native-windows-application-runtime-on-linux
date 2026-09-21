@@ -26,7 +26,7 @@ pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{Call, FakeBackend};
 pub use id::{AppId, IdError};
-pub use install::{InstallError, InstallOpts, InstallOutcome, install};
+pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, install, read_input};
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running};
 pub use meta::{BackendInfo, MetaError, Metadata};
 pub use proc::{HelperOutput, RunError};
