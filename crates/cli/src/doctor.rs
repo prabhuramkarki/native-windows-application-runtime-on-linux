@@ -23,8 +23,8 @@ use crate::safe::{json_safe, safe};
 use backend_wine::harden::{HardenError, audit_prefix};
 use pe::PeInfo;
 use rt_core::doctor::{
-    Area, DoctorInput, FsProbe, HostFs, MAX_LISTING, PeState, PrefixAudit, PrefixState, Report, Status, Subject,
-    Verdict, doctor,
+    Area, DoctorInput, FsProbe, HostFs, ListResult, MAX_LISTING, PeState, PrefixAudit, PrefixState, Report, Status,
+    Subject, Verdict, doctor,
 };
 use rt_core::{AppId, CompatBackend, Input, Launcher, Store, Target};
 use serde_json::json;
@@ -41,22 +41,21 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         }
         None => None,
     };
-    let wine = backend_wine::WineBackend::discover_with(Launcher::new());
+    // The error as text: what `doctor` shows for a Wine that could not be found.
+    let wine = backend_wine::WineBackend::discover_with(Launcher::new()).map_err(|e| e.to_string());
     let facts = match found {
         None => Facts::system(),
         Some((store, Target::Installed(id))) => Facts::app(&store, &id),
         Some((_, Target::File(path))) => Facts::file(&path),
     };
-    let wine_error = wine.as_ref().err().map(ToString::to_string);
     let report = doctor(DoctorInput {
         subject: facts.subject,
         host_arch: std::env::consts::ARCH,
         env: &|k| std::env::var_os(k),
         fs: &HostFs,
-        backend: match (&wine, &wine_error) {
-            (Ok(b), _) => Ok(b as &dyn CompatBackend),
-            (Err(_), Some(e)) => Err(e),
-            (Err(_), None) => unreachable!("wine_error is Some exactly when discovery failed"),
+        backend: match &wine {
+            Ok(b) => Ok(b as &dyn CompatBackend),
+            Err(e) => Err(e.as_str()),
         },
         pe: match &facts.pe {
             Pe::Skipped => PeState::Skipped,
@@ -67,7 +66,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             .program
             .as_ref()
             .map(|r| r.as_ref().map(String::as_str).map_err(String::as_str)),
-        app_dir: &facts.app_dir,
+        app_dir: facts.app_dir.as_ref(),
         prefix: facts.prefix,
         prefix_root: facts.prefix_root.as_deref(),
     });
@@ -90,7 +89,8 @@ struct Facts {
     subject: Subject,
     pe: Pe,
     program: Option<Result<String, String>>,
-    app_dir: Vec<String>,
+    /// `None`: no program directory to look at.
+    app_dir: Option<ListResult>,
     prefix: PrefixState,
     prefix_root: Option<PathBuf>,
 }
@@ -101,7 +101,7 @@ impl Facts {
             subject: Subject::System,
             pe: Pe::Skipped,
             program: None,
-            app_dir: vec![],
+            app_dir: None,
             prefix: PrefixState::NotApplicable,
             prefix_root: None,
         }
@@ -128,7 +128,8 @@ impl Facts {
                 },
                 pe: read_pe(&p.exe),
                 program: Some(Ok(p.metadata.executable.clone())),
-                app_dir: HostFs.list(&p.cwd, MAX_LISTING).unwrap_or_default(),
+                // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
+                app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
                 prefix: prefix_state(&p.env.prefix()),
                 prefix_root: Some(p.env.prefix()),
             },
@@ -184,10 +185,18 @@ fn prefix_state(prefix: &Path) -> PrefixState {
                 ..PrefixAudit::default()
             })
         }
-        Err(e) => match std::fs::symlink_metadata(prefix) {
-            Err(io) if io.kind() == std::io::ErrorKind::NotFound => PrefixState::Missing,
-            _ => PrefixState::Unexaminable(e.to_string()),
-        },
+        Err(e) => {
+            let gone =
+                |p: &Path| matches!(std::fs::symlink_metadata(p), Err(io) if io.kind() == std::io::ErrorKind::NotFound);
+            if gone(prefix) {
+                PrefixState::Missing
+            } else if matches!(e, HardenError::NotADirectory { .. }) && gone(&prefix.join("drive_c")) {
+                // A prefix directory without drive_c: something began to create it and did not finish.
+                PrefixState::Incomplete("drive_c missing".into())
+            } else {
+                PrefixState::Unexaminable(e.to_string())
+            }
+        }
     }
 }
 
@@ -447,9 +456,16 @@ mod tests {
         fs::rename(p.join("drive_c"), t.path().join("real")).unwrap();
         symlink(t.path().join("real"), p.join("drive_c")).unwrap();
         assert!(matches!(audit_of(&t), PrefixState::Unexaminable(_)));
-        // the prefix exists but has no drive_c
+        // the prefix exists but has no drive_c: incomplete (a warning), not "cannot be examined"
         let t = tempfile::tempdir().unwrap();
         fs::create_dir_all(t.path().join("prefix")).unwrap();
+        assert_eq!(audit_of(&t), PrefixState::Incomplete("drive_c missing".into()));
+        // drive_c is a file, the prefix is a file: those are not "missing"
+        fs::create_dir_all(t.path().join("prefix")).unwrap();
+        fs::write(t.path().join("prefix/drive_c"), b"x").unwrap();
+        assert!(matches!(audit_of(&t), PrefixState::Unexaminable(_)));
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("prefix"), b"x").unwrap();
         assert!(matches!(audit_of(&t), PrefixState::Unexaminable(_)));
         // too deep to examine: incomplete, not clean and not a failure
         let t = prefix_with_c();

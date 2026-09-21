@@ -13,6 +13,10 @@ struct Host {
     env: HashMap<String, String>,
     files: HashSet<PathBuf>,
     dirs: HashMap<PathBuf, Vec<String>>,
+    /// Directories that exist but cannot be read.
+    unreadable: HashSet<PathBuf>,
+    /// Entries of a directory that could not be read.
+    errors: HashMap<PathBuf, usize>,
     /// The `cap` of every `list` call, in order.
     list_caps: RefCell<Vec<usize>>,
     listed: RefCell<Vec<PathBuf>>,
@@ -22,10 +26,18 @@ impl FsProbe for Host {
     fn exists(&self, p: &Path) -> bool {
         self.files.contains(p) || self.dirs.contains_key(p)
     }
-    fn list(&self, dir: &Path, cap: usize) -> Option<Vec<String>> {
+    fn list(&self, dir: &Path, cap: usize) -> ListResult {
         self.list_caps.borrow_mut().push(cap);
         self.listed.borrow_mut().push(dir.to_owned());
-        self.dirs.get(dir).map(|v| v.iter().take(cap).cloned().collect())
+        if self.unreadable.contains(dir) {
+            return Err(ListError::Unreadable);
+        }
+        let names = self.dirs.get(dir).ok_or(ListError::NotFound)?;
+        Ok(Listing {
+            names: names.iter().take(cap).cloned().collect(),
+            truncated: names.len() > cap,
+            errors: self.errors.get(dir).copied().unwrap_or(0),
+        })
     }
 }
 
@@ -43,6 +55,14 @@ impl Host {
             .insert(p.into(), names.iter().map(|s| (*s).to_owned()).collect());
         self
     }
+    fn unreadable(mut self, p: &str) -> Host {
+        self.unreadable.insert(p.into());
+        self
+    }
+    fn errors(mut self, p: &str, n: usize) -> Host {
+        self.errors.insert(p.into(), n);
+        self
+    }
     /// A desktop with Wayland, PipeWire and Vulkan.
     fn desktop() -> Host {
         Host::default()
@@ -55,6 +75,14 @@ impl Host {
 }
 
 const WINE_DLLS: &str = "/wine/x86_64-windows";
+
+/// A complete listing of `names`.
+fn listing(names: &[&str]) -> Listing {
+    Listing {
+        names: names.iter().map(|s| (*s).to_owned()).collect(),
+        ..Listing::default()
+    }
+}
 
 fn pe_info() -> PeInfo {
     PeInfo {
@@ -98,7 +126,7 @@ struct Sc {
     backend: Result<FakeBackend, String>,
     pe: Option<Result<PeInfo, String>>,
     program: Option<Result<String, String>>,
-    app_dir: Vec<String>,
+    app_dir: Option<ListResult>,
     prefix: PrefixState,
     prefix_root: Option<PathBuf>,
 }
@@ -112,7 +140,7 @@ fn sc() -> Sc {
         backend: Ok(FakeBackend::new().with_dll_dirs(vec![WINE_DLLS.into()])),
         pe: None,
         program: None,
-        app_dir: vec![],
+        app_dir: None,
         prefix: PrefixState::NotApplicable,
         prefix_root: None,
     }
@@ -164,7 +192,7 @@ impl Sc {
                 Ok(s) => Ok(s.as_str()),
                 Err(s) => Err(s.as_str()),
             }),
-            app_dir: &self.app_dir,
+            app_dir: self.app_dir.as_ref(),
             prefix: self.prefix.clone(),
             prefix_root: self.prefix_root.as_deref(),
         })
@@ -299,7 +327,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         backend: Ok(&NoVersion(None)),
         pe: PeState::Skipped,
         program: None,
-        app_dir: &[],
+        app_dir: None,
         prefix: PrefixState::NotApplicable,
         prefix_root: None,
     });
@@ -322,7 +350,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         backend: Ok(&NoVersion(Some(hostile))),
         pe: PeState::Skipped,
         program: None,
-        app_dir: &[],
+        app_dir: None,
         prefix: PrefixState::NotApplicable,
         prefix_root: None,
     });
@@ -685,7 +713,7 @@ fn imports_are_found_ignoring_case_in_wine_the_app_directory_and_the_prefix() {
         import("wow.dll", true),
         import("kernel32", false), // no extension: Windows appends .dll
     ]);
-    s.app_dir = vec!["MyLib.dll".into(), "mylib2.dll".into(), "readme.txt".into()];
+    s.app_dir = Some(Ok(listing(&["MyLib.dll", "mylib2.dll", "readme.txt"])));
     s.prefix_root = Some("/prefix".into());
     s.host = s
         .host
@@ -1097,7 +1125,10 @@ fn everything_is_bounded_under_hostile_input() {
             (0..60_000).map(|n| format!("f{n}.dll")).collect(),
         );
     }
-    s.app_dir = (0..100_000).map(|n| format!("a{n}.dll")).collect();
+    s.app_dir = Some(Ok(Listing {
+        names: (0..100_000).map(|n| format!("a{n}.dll")).collect(),
+        ..Listing::default()
+    }));
     s.prefix_root = Some("/prefix".into());
     let r = s.run();
     assert!(r.checks.len() <= 40, "{} checks", r.checks.len());
@@ -1130,23 +1161,6 @@ fn everything_is_bounded_under_hostile_input() {
 }
 
 #[test]
-fn a_listing_longer_than_the_cap_is_not_read_beyond_it() {
-    // Names past the cap are simply not seen (documented limit); the point is the cap is what the probe is given.
-    let mut s = app(vec![import("f59999.dll", false)]);
-    s.host
-        .dirs
-        .insert(WINE_DLLS.into(), (0..60_000).map(|n| format!("f{n}.dll")).collect());
-    let r = s.run();
-    assert!(s.host.list_caps.borrow().contains(&MAX_LISTING));
-    assert_eq!(MAX_LISTING, 50_000);
-    assert_eq!(
-        imports_of(&r)[0].status,
-        Status::Warn,
-        "f59999.dll is beyond the cap of 50000"
-    );
-}
-
-#[test]
 fn a_check_text_is_cut_at_its_limit() {
     let mut out = Out(vec![]);
     out.add(Area::Runtime, Status::Ok, "x".repeat(5000));
@@ -1173,16 +1187,36 @@ fn the_host_probe_lists_names_capped_and_answers_none_for_anything_that_is_not_a
         std::fs::write(d.join(format!("f{n}.dll")), b"").unwrap();
     }
     let all = HostFs.list(d, MAX_LISTING).unwrap();
-    assert_eq!(all.len(), 30);
-    assert!(all.contains(&"f7.dll".to_owned()));
-    assert_eq!(HostFs.list(d, 10).unwrap().len(), 10, "the cap is honoured");
-    assert_eq!(HostFs.list(d, 0).unwrap().len(), 0);
-    assert_eq!(HostFs.list(&d.join("nope"), 10), None);
-    assert_eq!(HostFs.list(&d.join("f1.dll"), 10), None, "a file is not a directory");
+    assert_eq!(all.names.len(), 30);
+    assert!(all.is_complete());
+    assert!(all.names.contains(&"f7.dll".to_owned()));
+    // The cap boundary: `cap` entries are complete, `cap + 1` are not (the reader looks one entry further).
+    let ten = HostFs.list(d, 10).unwrap();
+    assert_eq!(
+        (ten.names.len(), ten.truncated),
+        (10, true),
+        "the cap is honoured and reported"
+    );
+    let exact = HostFs.list(d, 30).unwrap();
+    assert_eq!(
+        (exact.names.len(), exact.truncated),
+        (30, false),
+        "exactly the cap is complete"
+    );
+    let one_short = HostFs.list(d, 29).unwrap();
+    assert_eq!((one_short.names.len(), one_short.truncated), (29, true));
+    let zero = HostFs.list(d, 0).unwrap();
+    assert_eq!((zero.names.len(), zero.truncated), (0, true));
+    assert_eq!(HostFs.list(&d.join("nope"), 10), Err(ListError::NotFound));
+    assert_eq!(
+        HostFs.list(&d.join("f1.dll"), 10),
+        Err(ListError::NotFound),
+        "a file is not a directory"
+    );
     // A name that is not UTF-8 is listed lossily, not skipped and not a panic.
     let odd = std::ffi::OsString::from_vec(b"bad-\xff-name".to_vec());
     std::fs::write(d.join(&odd), b"").unwrap();
-    assert!(HostFs.list(d, 100).unwrap().iter().any(|n| n.starts_with("bad-")));
+    assert!(HostFs.list(d, 100).unwrap().names.iter().any(|n| n.starts_with("bad-")));
     assert!(HostFs.exists(d) && HostFs.exists(&d.join("f1.dll")));
     assert!(!HostFs.exists(&d.join("nope")));
     // Sockets and FIFOs exist (the Wayland and PipeWire sockets); a dangling symlink does not.
@@ -1191,4 +1225,405 @@ fn the_host_probe_lists_names_capped_and_answers_none_for_anything_that_is_not_a
     drop(sock);
     std::os::unix::fs::symlink(d.join("gone"), d.join("dangling")).unwrap();
     assert!(!HostFs.exists(&d.join("dangling")));
+}
+
+#[test]
+fn a_directory_that_exists_but_cannot_be_read_is_unreadable_not_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("locked");
+    std::fs::create_dir(&d).unwrap();
+    std::fs::write(d.join("a.dll"), b"").unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = std::fs::read_dir(&d).is_ok();
+    let got = HostFs.list(&d, 10);
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable_anyway {
+        eprintln!("SKIPPED: running as root, a mode 000 directory is still readable");
+        return;
+    }
+    assert_eq!(got, Err(ListError::Unreadable));
+}
+
+#[test]
+fn collect_listing_reports_the_cap_boundary_and_unreadable_entries() {
+    let ok = |n: &str| -> std::io::Result<String> { Ok(n.to_owned()) };
+    let bad = || -> std::io::Result<String> { Err(std::io::Error::other("vanished")) };
+    let list = |v: Vec<std::io::Result<String>>, cap| collect_listing(v.into_iter(), cap);
+
+    assert_eq!(list(vec![], 3), Listing::default(), "empty is complete");
+    let l = list(vec![ok("a"), ok("b"), ok("c")], 3);
+    assert_eq!(
+        (l.names.len(), l.truncated, l.errors),
+        (3, false, 0),
+        "exactly cap: complete"
+    );
+    let l = list(vec![ok("a"), ok("b"), ok("c"), ok("d")], 3);
+    assert_eq!(
+        (l.names.len(), l.truncated, l.errors),
+        (3, true, 0),
+        "cap + 1: truncated"
+    );
+    let l = list(vec![ok("a")], 0);
+    assert_eq!((l.names.len(), l.truncated), (0, true));
+    // Unreadable entries are counted and do not use up the cap.
+    let l = list(vec![bad(), ok("a"), bad(), ok("b")], 2);
+    assert_eq!(
+        (l.names, l.truncated, l.errors),
+        (vec!["a".to_owned(), "b".to_owned()], false, 2)
+    );
+    let l = list(vec![ok("a"), ok("b"), bad()], 2);
+    assert_eq!((l.names.len(), l.truncated, l.errors), (2, false, 1));
+    assert!(!l.is_complete(), "unreadable entries make a listing incomplete");
+    // Bounded: an endless directory stops, whether its entries are names or errors.
+    let l = collect_listing(std::iter::repeat_with(|| ok("x")), 5);
+    assert_eq!((l.names.len(), l.truncated), (5, true));
+    // (finite, so that a missing bound fails this test instead of hanging it)
+    let l = collect_listing(std::iter::repeat_with(bad).take(1_000_000), 5);
+    assert!(l.truncated && l.errors <= 5 + 1000, "{l:?}");
+}
+
+// ---------------------------------------------------------------- incomplete listings are reported
+
+fn incomplete_warns(r: &Report) -> Vec<&Check> {
+    imports_of(r)
+        .into_iter()
+        .filter(|c| c.text.contains("DLL listing incomplete"))
+        .collect()
+}
+
+/// The check that lists the regular missing DLLs.
+fn missing_line(r: &Report) -> &Check {
+    imports_of(r)
+        .into_iter()
+        .find(|c| c.text.contains("imported DLL"))
+        .expect("a missing-DLL check")
+}
+
+#[test]
+fn a_wine_directory_cut_at_the_cap_is_reported_and_names_past_it_are_not_claimed_missing() {
+    // The replacement of the test that used to lock in "f59999.dll is not found" for a 60 000-name directory.
+    let mut s = app(vec![import("f59999.dll", false), import("f5.dll", false)]);
+    s.host
+        .dirs
+        .insert(WINE_DLLS.into(), (0..60_000).map(|n| format!("f{n}.dll")).collect());
+    let r = s.run();
+    assert!(s.host.list_caps.borrow().contains(&MAX_LISTING));
+    assert_eq!(MAX_LISTING, 50_000);
+    let warns = incomplete_warns(&r);
+    assert_eq!(warns.len(), 1, "{:#?}", r.checks);
+    assert_eq!(warns[0].status, Status::Warn);
+    assert!(
+        warns[0].text.contains("Wine DLL directory: directory too large"),
+        "{}",
+        warns[0].text
+    );
+    assert!(
+        warns[0].text.contains("missing-DLL results may be wrong"),
+        "{}",
+        warns[0].text
+    );
+    assert!(warns[0].text.chars().count() <= 300);
+    // The name past the cap is reported, but as "not found in the listed files", never as a fact about Wine.
+    let m = missing_line(&r);
+    assert!(
+        m.text.contains("f59999.dll") && !m.text.contains("f5.dll"),
+        "{}",
+        m.text
+    );
+    assert!(m.text.contains("the listed files"), "{}", m.text);
+    assert!(!m.text.contains("Wine, the program's directory"), "{}", m.text);
+    assert_eq!(r.verdict, Verdict::MayFail);
+}
+
+#[test]
+fn the_cap_boundary_exactly_the_cap_is_complete_and_one_more_is_not() {
+    let mut s = app(vec![import("f0.dll", false)]);
+    s.host.dirs.insert(
+        WINE_DLLS.into(),
+        (0..MAX_LISTING).map(|n| format!("f{n}.dll")).collect(),
+    );
+    let r = s.run();
+    assert!(incomplete_warns(&r).is_empty(), "{:#?}", r.checks);
+    assert_eq!(imports_of(&r).len(), 1);
+    assert_eq!(imports_of(&r)[0].status, Status::Ok);
+    s.host.dirs.insert(
+        WINE_DLLS.into(),
+        (0..=MAX_LISTING).map(|n| format!("f{n}.dll")).collect(),
+    );
+    assert_eq!(incomplete_warns(&s.run()).len(), 1);
+}
+
+#[test]
+fn a_truncated_or_unreadable_program_directory_is_reported() {
+    for (label, dir, what) in [
+        (
+            "truncated",
+            Ok(Listing {
+                names: vec!["a.dll".into()],
+                truncated: true,
+                errors: 0,
+            }),
+            "program directory: directory too large",
+        ),
+        (
+            "unreadable",
+            Err(ListError::Unreadable),
+            "program directory: unreadable",
+        ),
+        (
+            "entries vanished",
+            Ok(Listing {
+                names: vec!["a.dll".into()],
+                truncated: false,
+                errors: 3,
+            }),
+            "program directory: 3 unreadable entries",
+        ),
+    ] {
+        let mut s = app(vec![import("zzz.dll", false), import("zzz-late.dll", true)]);
+        s.app_dir = Some(dir);
+        let r = s.run();
+        let warns = incomplete_warns(&r);
+        assert_eq!(warns.len(), 1, "{label}: {:#?}", r.checks);
+        assert!(warns[0].text.contains(what), "{label}: {}", warns[0].text);
+        // Both missing lists are still there (the incomplete Warn is in addition), and neither claims a fact.
+        for c in imports_of(&r).into_iter().filter(|c| c.text.contains("zzz")) {
+            assert!(c.text.contains("the listed files"), "{label}: {}", c.text);
+            assert!(!c.text.contains("the program's directory"), "{label}: {}", c.text);
+        }
+        assert_eq!(
+            imports_of(&r).len(),
+            3,
+            "{label}: regular list, delay list, incomplete warn"
+        );
+        assert_eq!(r.verdict, Verdict::MayFail);
+    }
+}
+
+#[test]
+fn a_program_directory_that_does_not_exist_is_silent_and_a_complete_look_says_not_found() {
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.app_dir = Some(Err(ListError::NotFound));
+    let r = s.run();
+    assert!(incomplete_warns(&r).is_empty());
+    assert!(
+        missing_line(&r)
+            .text
+            .contains("not found in Wine, the program's directory or the prefix")
+    );
+    s.app_dir = None;
+    assert!(incomplete_warns(&s.run()).is_empty());
+}
+
+#[test]
+fn one_unreadable_wine_directory_among_two_is_reported_and_the_other_still_counts() {
+    let mut s = app(vec![import("kernel32.dll", false), import("zzz.dll", false)]);
+    s.backend = Ok(FakeBackend::new().with_dll_dirs(vec![WINE_DLLS.into(), "/wine/i386-windows".into()]));
+    s.host = s.host.dir("/wine/i386-windows", &[]).unreadable("/wine/i386-windows");
+    let r = s.run();
+    let warns = incomplete_warns(&r);
+    assert_eq!(warns.len(), 1, "{:#?}", r.checks);
+    assert!(
+        warns[0].text.contains("Wine DLL directory: unreadable"),
+        "{}",
+        warns[0].text
+    );
+    let m = missing_line(&r);
+    assert!(
+        m.text.contains("zzz.dll") && !m.text.contains("kernel32"),
+        "verified against the readable one: {}",
+        m.text
+    );
+    assert!(m.text.contains("the listed files"), "{}", m.text);
+    // A Wine directory that has vanished (not unreadable) is silent.
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.backend = Ok(FakeBackend::new().with_dll_dirs(vec![WINE_DLLS.into(), "/wine/gone".into()]));
+    assert!(incomplete_warns(&s.run()).is_empty());
+}
+
+#[test]
+fn when_every_wine_directory_is_unreadable_the_answer_is_not_verified() {
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.host = s.host.unreadable(WINE_DLLS);
+    let r = s.run();
+    let c = imports_of(&r);
+    assert_eq!(c.len(), 1, "{c:#?}");
+    assert!(
+        c[0].text
+            .contains("DLL availability not verified (Wine DLL directory unreadable)"),
+        "{}",
+        c[0].text
+    );
+    assert!(!c[0].text.contains("zzz"));
+}
+
+#[test]
+fn an_unreadable_prefix_system_directory_or_lost_entries_are_reported() {
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.prefix_root = Some("/prefix".into());
+    s.host = s
+        .host
+        .dir("/prefix/drive_c/windows/system32", &["a.dll"])
+        .unreadable("/prefix/drive_c/windows/system32");
+    let r = s.run();
+    let warns = incomplete_warns(&r);
+    assert_eq!(warns.len(), 1, "{:#?}", r.checks);
+    assert!(
+        warns[0].text.contains("prefix system32: unreadable"),
+        "{}",
+        warns[0].text
+    );
+    assert!(!warns[0].text.contains("syswow64"), "syswow64 does not exist: silent");
+    // entries that vanished mid-listing are only counted
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.prefix_root = Some("/prefix".into());
+    s.host = s
+        .host
+        .dir("/prefix/drive_c/windows/syswow64", &["a.dll"])
+        .errors("/prefix/drive_c/windows/syswow64", 7);
+    let warns = incomplete_warns(&s.run()).into_iter().cloned().collect::<Vec<_>>();
+    assert_eq!(warns.len(), 1);
+    assert!(
+        warns[0].text.contains("prefix syswow64: 7 unreadable entries"),
+        "{}",
+        warns[0].text
+    );
+    let mut s = app(vec![]);
+    s.host = s.host.errors(WINE_DLLS, 2);
+    assert!(
+        incomplete_warns(&s.run())[0]
+            .text
+            .contains("Wine DLL directory: 2 unreadable entries")
+    );
+}
+
+#[test]
+fn an_incomplete_listing_adds_a_warn_even_when_every_import_was_found() {
+    let mut s = app(vec![import("kernel32.dll", false)]);
+    s.host = s.host.errors(WINE_DLLS, 1);
+    let r = s.run();
+    let c = imports_of(&r);
+    assert_eq!(c.len(), 2, "{c:#?}");
+    assert!(
+        c.iter()
+            .any(|c| c.status == Status::Ok && c.text.contains("all imported DLLs were found"))
+    );
+    assert_eq!(incomplete_warns(&r).len(), 1);
+}
+
+#[test]
+fn the_incomplete_warning_is_short_however_many_listings_are_bad() {
+    let mut s = app(vec![import("zzz.dll", false)]);
+    s.prefix_root = Some("/prefix".into());
+    s.backend =
+        Ok(FakeBackend::new().with_dll_dirs((0..MAX_DLL_DIRS + 5).map(|i| PathBuf::from(format!("/w{i}"))).collect()));
+    for i in 0..MAX_DLL_DIRS {
+        s.host = s
+            .host
+            .dir(&format!("/w{i}"), &["a.dll"])
+            .errors(&format!("/w{i}"), 100_000 + i);
+    }
+    s.host = s
+        .host
+        .dir("/prefix/drive_c/windows/system32", &[])
+        .unreadable("/prefix/drive_c/windows/system32")
+        .dir("/prefix/drive_c/windows/syswow64", &[])
+        .unreadable("/prefix/drive_c/windows/syswow64");
+    s.app_dir = Some(Err(ListError::Unreadable));
+    let r = s.run();
+    let warns = incomplete_warns(&r);
+    assert_eq!(warns.len(), 1, "{:#?}", r.checks);
+    assert!(
+        warns[0].text.chars().count() <= 300,
+        "{}",
+        warns[0].text.chars().count()
+    );
+    assert!(warns[0].text.contains("and "), "the tail is counted: {}", warns[0].text);
+    assert_tame(&warns[0].text);
+}
+
+// ---------------------------------------------------------------- ASCII case folding only
+
+#[test]
+fn unicode_lookalikes_do_not_fold_to_ascii_dll_names() {
+    let mut s = app(vec![
+        import("KERNEL32.dll", false),            // a real match
+        import("\u{212A}ERNEL32.dll", false),     // Kelvin sign: `to_lowercase` would make this `kernel32.dll`
+        import("WIN\u{131}NET.dll", false),       // dotless i
+        import("W\u{130}N\u{130}NET.dll", false), // dotted capital I (Turkish)
+        import("WININET.DLL", false),
+        import("\u{17F}hell32.dll", false), // long s
+    ]);
+    s.host = s.host.dir(WINE_DLLS, &["kernel32.dll", "wininet.dll", "shell32.dll"]);
+    let r = s.run();
+    let m = missing_line(&r);
+    assert!(m.text.contains("4 imported DLLs"), "{}", m.text);
+    // (printable non-ASCII letters are shown as they are: the Kelvin sign looks like a K)
+    for bad in ['\u{212A}', '\u{131}', '\u{130}', '\u{17F}'] {
+        assert!(m.text.contains(bad), "{bad:?} missing from {}", m.text);
+    }
+    assert!(
+        !m.text.contains("\"KERNEL32.dll\"") && !m.text.contains("WININET"),
+        "{}",
+        m.text
+    );
+    // and on the listing side: a FILE named with a Kelvin sign does not satisfy `kernel32.dll`
+    let mut s = app(vec![import("kernel32.dll", false)]);
+    s.host = s.host.dir(WINE_DLLS, &[]);
+    s.app_dir = Some(Ok(listing(&["\u{212A}ernel32.dll"])));
+    let r = s.run();
+    assert_eq!(missing_line(&r).status, Status::Warn, "{:#?}", r.checks);
+    // ASCII case-insensitivity still works on both sides
+    let mut s = app(vec![import("KeRnEl32.DLL", false)]);
+    s.host = s.host.dir(WINE_DLLS, &["KERNEL32.dll"]);
+    assert_eq!(imports_of(&s.run())[0].status, Status::Ok);
+}
+
+#[test]
+fn duplicates_are_folded_only_ascii_wise() {
+    let r = app(vec![
+        import("\u{212A}a.dll", false),
+        import("ka.dll", false),
+        import("KA.DLL", false),
+    ])
+    .run();
+    let m = missing_line(&r);
+    assert!(
+        m.text.starts_with("2 imported DLLs"),
+        "the Kelvin name is a different name: {}",
+        m.text
+    );
+}
+
+// ---------------------------------------------------------------- an incomplete prefix
+
+#[test]
+fn a_prefix_without_drive_c_is_an_incomplete_prefix_warning() {
+    let r = with_prefix(PrefixState::Incomplete("drive_c missing".into()));
+    let c = of(&r, Area::Prefix);
+    assert_eq!(c.len(), 1, "{c:#?}");
+    assert_eq!(c[0].status, Status::Warn);
+    assert!(
+        c[0].text.contains("incomplete prefix (drive_c missing)"),
+        "{}",
+        c[0].text
+    );
+    assert_eq!(r.verdict, Verdict::MayFail);
+    let r = with_prefix(PrefixState::Incomplete("\x1b[31m\u{202e}".repeat(200)));
+    assert_tame(&of(&r, Area::Prefix)[0].text);
+    assert!(of(&r, Area::Prefix)[0].text.chars().count() <= 300);
+}
+
+#[test]
+fn api_set_names_are_counted_ascii_case_insensitively_only() {
+    let r = app(vec![
+        import("api-ms-win-core-k-l1-1-0.dll", false),
+        import("API-MS-WIN-CORE-K-L1-1-0.DLL", false),
+        import("api-ms-win-core-\u{212A}-l1-1-0.dll", false), // Kelvin sign: a different name
+    ])
+    .run();
+    let c = imports_of(&r);
+    assert_eq!(c.len(), 1);
+    assert!(c[0].text.contains("(2 API-set names not verified"), "{}", c[0].text);
 }
