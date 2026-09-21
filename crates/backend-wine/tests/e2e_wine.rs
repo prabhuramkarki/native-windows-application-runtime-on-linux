@@ -56,9 +56,10 @@ fn wineservers_for(prefix: &Path) -> Vec<u32> {
             continue;
         };
         let proc = entry.path();
+        // `wineserver`, or `wineserver64` (Ubuntu's Wine 9)
         let is_wineserver = fs::read_link(proc.join("exe"))
             .ok()
-            .and_then(|p| p.file_name().map(|n| n == "wineserver"))
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("wineserver")))
             == Some(true);
         if !is_wineserver {
             continue;
@@ -186,6 +187,13 @@ fn dosdevices(prefix: &Path) -> Vec<String> {
 
 const HELLO: &str = "hello from windows";
 
+/// `Some(version)` when Wine is older than 10 (no new WoW64: 32-bit programs cannot run in a 64-bit prefix).
+fn wine_without_wow64(backend: &WineBackend) -> Option<String> {
+    let version = backend.version().ok()?;
+    let major: u32 = version.strip_prefix("wine-")?.split('.').next()?.parse().ok()?;
+    (major < 10).then_some(version)
+}
+
 #[test]
 #[ignore = "needs Wine and the mingw fixtures; run with --ignored --test-threads=1"]
 fn e2e_prepare_hardens_and_both_fixtures_run() {
@@ -227,9 +235,8 @@ fn e2e_prepare_hardens_and_both_fixtures_run() {
     );
     sb.assert_no_wineserver(); // prepare stops the server it started
 
-    // ---- run both fixtures (32-bit runs in the win64 prefix through WoW64) ----
+    // ---- run the fixtures (32-bit runs in the win64 prefix through WoW64, Wine >= 10) ----
     let (exe64, dir) = sb.install("hello64.exe");
-    let (exe32, _) = sb.install("hello32.exe");
     let (out, t64) = sb.run_captured(&exe64, &dir, &[]);
     eprintln!("hello64 first run took {t64:?}");
     assert_eq!(out.status.code(), Some(7), "hello64 exit code");
@@ -239,17 +246,26 @@ fn e2e_prepare_hardens_and_both_fixtures_run() {
         out.stdout
     );
 
-    let (out, t32) = sb.run_captured(&exe32, &dir, &[]);
-    eprintln!("hello32 (second run, reuses the prefix) took {t32:?}");
-    assert_eq!(out.status.code(), Some(7), "hello32 exit code");
+    // The second run reuses the prefix: hello32 where Wine can run 32-bit programs in a 64-bit prefix (Wine >= 10),
+    // hello64 again otherwise (the 32-bit step is skipped, loudly).
+    let (second, second_name) = match wine_without_wow64(&sb.backend) {
+        Some(version) => {
+            eprintln!("SKIPPED 32-bit: needs Wine >= 10 (found {version})");
+            (exe64.clone(), "hello64")
+        }
+        None => (sb.install("hello32.exe").0, "hello32"),
+    };
+    let (out, t2) = sb.run_captured(&second, &dir, &[]);
+    eprintln!("{second_name} (second run, reuses the prefix) took {t2:?}");
+    assert_eq!(out.status.code(), Some(7), "{second_name} exit code");
     assert!(
         String::from_utf8_lossy(&out.stdout).contains(HELLO),
-        "hello32 stdout: {:?}",
+        "{second_name} stdout: {:?}",
         out.stdout
     );
     assert!(
-        t32 < Duration::from_secs(15),
-        "a second run must reuse the prefix, took {t32:?}"
+        t2 < Duration::from_secs(15),
+        "a second run must reuse the prefix, took {t2:?}"
     );
 
     // ---- the real launcher path: stderr to the 0600 log file, exit code through Running::wait ----
