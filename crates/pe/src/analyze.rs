@@ -1,4 +1,5 @@
-use crate::{Error, FileKind, detect, installer, model::*};
+use crate::{Error, FileKind, detect, installer, model::*, version};
+use pelite::resources::FindError;
 use pelite::{PeFile, Wrap};
 use std::collections::BTreeMap;
 
@@ -107,6 +108,7 @@ impl Tally {
     }
 }
 
+const DIR_RESOURCE: usize = 2;
 const DIR_SECURITY: usize = 4;
 const DIR_DELAY_IMPORT: usize = 13;
 const DIR_CLR: usize = 14;
@@ -430,30 +432,29 @@ macro_rules! extract {
                 Err(e) => warnings.push(format!("tls: {e}")),
             }
 
+            // RT_VERSION is read as raw bytes and parsed by `version::parse`; pelite's own
+            // VersionInfo walker panics on crafted input. No resource directory (or fewer than
+            // three data directories) means no version info, silently.
             let mut version = None;
-            match f.resources() {
-                Ok(res) => {
-                    if let Ok(vi) = res.version_info() {
-                        let mut strings = BTreeMap::new();
-                        if let Some(&lang) = vi.translation().first() {
-                            vi.strings(lang, |k, v| {
-                                strings.insert(k.to_owned(), v.to_owned());
-                            });
-                        }
-                        let file_version = strings.get("FileVersion").cloned().or_else(|| {
-                            vi.fixed().map(|x| {
-                                let v = x.dwFileVersion;
-                                format!("{}.{}.{}.{}", v.Major, v.Minor, v.Patch, v.Build)
-                            })
-                        });
-                        version = Some(VersionInfo {
-                            file_version,
-                            strings,
-                        });
+            let (res_rva, res_size) = dir(DIR_RESOURCE);
+            if res_rva != 0 && res_size != 0 {
+                if res_rva % 4 != 0 {
+                    // pelite would read 4-aligned directory structures from misaligned memory.
+                    warnings.push(format!("resources: directory RVA {res_rva:#x} is not 4-byte aligned"));
+                } else {
+                    match f.resources() {
+                        Ok(res) => match version::find(&res) {
+                            Ok(raw) => match version::parse(raw) {
+                                Ok(v) => version = Some(v),
+                                Err(e) => warnings.push(format!("version info: {e}")),
+                            },
+                            Err(FindError::NotFound) => {}
+                            Err(e) => warnings.push(format!("version info: {e}")),
+                        },
+                        Err(pelite::Error::Null) => {}
+                        Err(e) => warnings.push(format!("resources: {e}")),
                     }
                 }
-                Err(pelite::Error::Null) => {}
-                Err(e) => warnings.push(format!("resources: {e}")),
             }
 
             PeInfo {

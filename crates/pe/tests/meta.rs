@@ -18,3 +18,14 @@ fn installer_markers() {
     assert_eq!(analyze(&burn).installer.unwrap().kind, InstallerKind::WixBurn);
     assert!(analyze(&Builder::x86()).installer.is_none());
 }
+
+#[test]
+fn installshield_marker() {
+    let b = Builder {
+        overlay: b"....InstallShield....".to_vec(),
+        ..Builder::x86()
+    };
+    let i = analyze(&b).installer.unwrap();
+    assert_eq!(i.kind, InstallerKind::InstallShield);
+    assert_eq!(i.evidence, "InstallShield");
+}

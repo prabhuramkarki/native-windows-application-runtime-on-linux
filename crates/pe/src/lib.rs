@@ -3,6 +3,7 @@ mod analyze;
 mod detect;
 mod installer;
 mod model;
+mod version;
 
 pub use analyze::analyze;
 pub use detect::{FileKind, detect};
