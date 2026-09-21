@@ -272,3 +272,27 @@ pub fn tls_data(base: u32) -> Vec<u8> {
         .u64(image_base + 0x1000).u64(image_base + 0x1010).u64(0)
         .0
 }
+
+/// TLS with AddressOfCallBacks pointing outside the image (image_base + 0x00FF_0000).
+#[rustfmt::skip]
+pub fn tls_data_oob_callbacks(base: u32) -> Vec<u8> {
+    let image_base = 0x1_4000_0000u64;
+    let va = |off: u32| image_base + u64::from(base + off);
+    Bytes::default()
+        .u64(va(48)).u64(va(56)).u64(va(56)).u64(image_base + 0x00FF_0000).u32(0).u32(0)
+        .pad_to(64)
+        .u64(image_base + 0x1000).u64(image_base + 0x1010).u64(0)
+        .0
+}
+
+/// TLS with AddressOfCallBacks == 0 (no callbacks, should be silent Null).
+#[rustfmt::skip]
+pub fn tls_data_no_callbacks(base: u32) -> Vec<u8> {
+    let image_base = 0x1_4000_0000u64;
+    let va = |off: u32| image_base + u64::from(base + off);
+    Bytes::default()
+        .u64(va(48)).u64(va(56)).u64(va(56)).u64(0).u32(0).u32(0)
+        .pad_to(64)
+        .u64(image_base + 0x1000).u64(image_base + 0x1010).u64(0)
+        .0
+}
