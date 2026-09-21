@@ -348,8 +348,8 @@ macro_rules! extract {
             let mut exports = Vec::new();
             match f.exports() {
                 Ok(ex) => {
-                    let base = ex.ordinal_base() as u32;
-                    // Note: pelite's Ordinal is u16; bases above 0xFFFF silently truncate. No panic, wrong ordinals.
+                    // Not `ex.ordinal_base()`: pelite's `Ordinal` is a u16, which would truncate Base.
+                    let base = ex.image().Base;
                     match ex.by() {
                         Ok(by) => {
                             // pelite's `&str`/`Forward` accessors scan to the NUL with no limit, so
@@ -375,6 +375,25 @@ macro_rules! extract {
                                 }
                             };
                             let funcs = by.functions();
+                            // pelite turns a table whose RVA is 0 into an empty slice, whatever the
+                            // count says. Compare with the counts in the directory (the uncapped
+                            // lengths, so the MAX_EXPORT_ENTRIES cut below never triggers this).
+                            let img = ex.image();
+                            for (declared, got, what) in [
+                                (img.NumberOfFunctions, funcs.len(), "functions declared but the function"),
+                                (img.NumberOfNames, by.names().len(), "names declared but the name"),
+                                (
+                                    img.NumberOfNames,
+                                    by.name_indices().len(),
+                                    "names declared but the name-ordinal",
+                                ),
+                            ] {
+                                if got != declared as usize {
+                                    warnings.push(format!(
+                                        "exports: {declared} {what} table is missing ({got} entries read)"
+                                    ));
+                                }
+                            }
                             let funcs_len = funcs.len().min(MAX_EXPORT_ENTRIES);
                             let name_rvas = by.names();
                             let name_len = name_rvas.len().min(MAX_EXPORT_ENTRIES);
