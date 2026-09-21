@@ -39,6 +39,7 @@ fn matches_file_command_on_real_binaries() {
     }
     let (mut checked, mut skipped_non_pe, mut failures) = (0, 0, vec![]);
     let (mut unreadable, mut arch_unchecked) = (vec![], vec![]);
+    let mut native_kind_skipped = 0;
     for f in &files {
         let bytes = match fs::read(f) {
             Ok(b) => b,
@@ -86,7 +87,14 @@ fn matches_file_command_on_real_binaries() {
             Some(_) => {}
             None => arch_unchecked.push(format!("{}: {oracle}", f.display())),
         }
-        if oracle.contains("(DLL)") != (info.kind == Kind::Dll) {
+        if oracle.contains("(native)") {
+            // file(1) prints "(native)" for subsystem 1 and drops "(DLL)", so kernel drivers
+            // (.sys, IMAGE_FILE_DLL set) can't be compared on kind; check the subsystem instead.
+            native_kind_skipped += 1;
+            if info.subsystem != Subsystem::Native {
+                bad.push("subsystem (file says native)");
+            }
+        } else if oracle.contains("(DLL)") != (info.kind == Kind::Dll) {
             bad.push("kind");
         }
         if oracle.contains("(console)") && info.subsystem != Subsystem::Console
@@ -111,6 +119,7 @@ fn matches_file_command_on_real_binaries() {
     println!("skipped_non_pe {skipped_non_pe}");
     println!("skipped_unreadable {}", unreadable.len());
     println!("arch_unchecked {}", arch_unchecked.len());
+    println!("native_kind_skipped {native_kind_skipped}");
     assert!(checked > 0, "no PE files found under RUNTIME_SAMPLES");
     assert!(
         failures.is_empty(),
