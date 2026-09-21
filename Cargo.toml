@@ -6,6 +6,8 @@ members = ["crates/*"]
 version = "0.0.1"
 edition = "2024"
 publish = false
+# as_chunks needs 1.88 (is_multiple_of 1.87)
+rust-version = "1.88"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
