@@ -55,6 +55,7 @@ fn analyze_rejects_a_non_windows_file_even_if_named_exe() {
 #[test]
 fn analyze_human_output_lists_imports() {
     let out = runtime(&["analyze".as_ref(), fixture("hello64.exe").as_os_str()]);
+    assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("Pe32Plus X86_64 Exe (Console)"), "{text}");
     assert!(text.to_lowercase().contains("kernel32.dll"), "{text}");
@@ -64,12 +65,12 @@ fn analyze_human_output_lists_imports() {
 fn analyze_rejects_malformed_pe() {
     let malformed = scratch("malformed.exe");
     let hello = fixture("hello64.exe");
-    let first_512 = std::fs::read(&hello).unwrap();
-    let truncated = &first_512[..512.min(first_512.len())];
-    std::fs::write(&malformed, truncated).unwrap();
+    let full_file = std::fs::read(&hello).unwrap();
+    let truncated_bytes = &full_file[..512.min(full_file.len())];
+    std::fs::write(&malformed, truncated_bytes).unwrap();
     let out = runtime(&["analyze".as_ref(), malformed.as_os_str()]);
     let _ = std::fs::remove_file(&malformed);
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1), "Expected exit code 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("error:"),
@@ -116,41 +117,111 @@ fn analyze_rejects_directory() {
     let _ = std::fs::remove_dir(&dir);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("error:"), "stderr: {stderr}");
-}
-
-#[test]
-fn analyze_human_output_has_success_before_stdout() {
-    let out = runtime(&["analyze".as_ref(), fixture("hello64.exe").as_os_str()]);
-    assert!(out.status.success());
+    assert!(
+        stderr.contains("not a regular file"),
+        "stderr should contain 'not a regular file': {stderr}"
+    );
 }
 
 #[test]
 fn analyze_output_sanitizes_escape_sequences() {
-    // Copy hello64.exe and try to patch DLL name if possible
+    // Copy hello64.exe and patch DLL name with escape byte
     let patched = scratch("patched.exe");
     let hello = fixture("hello64.exe");
     let bytes = std::fs::read(&hello).unwrap();
 
-    // Try to find and patch KERNEL32.dll string in the binary
-    // Look for the ASCII string "KERNEL32.dll" or similar
+    // Find and patch KERNEL32.dll string in the binary
     let mut patched_bytes = bytes.clone();
-    if let Some(pos) = bytes.windows(12).position(|w| w.eq_ignore_ascii_case(b"KERNEL32.dll")) {
-        // Replace first byte with ESC
-        patched_bytes[pos] = 0x1b;
-        std::fs::write(&patched, &patched_bytes).unwrap();
-        let out = runtime(&["analyze".as_ref(), patched.as_os_str()]);
-        let _ = std::fs::remove_file(&patched);
+    let pos = bytes
+        .windows(12)
+        .position(|w| w.eq_ignore_ascii_case(b"KERNEL32.dll"))
+        .expect("KERNEL32.dll pattern must be found in fixture");
+    // Replace first byte with ESC
+    patched_bytes[pos] = 0x1b;
+    std::fs::write(&patched, &patched_bytes).unwrap();
+    let out = runtime(&["analyze".as_ref(), patched.as_os_str()]);
+    let _ = std::fs::remove_file(&patched);
 
-        // Check that output doesn't contain raw ESC bytes
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            !stdout.contains('\x1b'),
-            "ESC byte found in stdout: {:?}",
-            stdout.as_bytes().iter().position(|&b| b == 0x1b)
-        );
-    } else {
-        // If we can't find the string, just clean up and skip
-        let _ = std::fs::remove_file(&patched);
+    // Check that process succeeded
+    assert!(out.status.success(), "analyze should succeed on patched binary");
+    // Check that output doesn't contain raw ESC bytes
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\x1b'),
+        "ESC byte found in stdout at position: {:?}",
+        stdout.as_bytes().iter().position(|&b| b == 0x1b)
+    );
+}
+
+#[test]
+fn analyze_rejects_fifo_without_blocking() {
+    let fifo_path = scratch("test.fifo");
+    let _ = std::fs::remove_file(&fifo_path);
+
+    // Try to create FIFO using mkfifo command
+    let mkfifo_result = std::process::Command::new("mkfifo").arg(&fifo_path).output();
+
+    match mkfifo_result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // mkfifo not available, skip test
+            return;
+        }
+        Err(e) => panic!("mkfifo failed: {e}"),
+        Ok(output) if !output.status.success() => {
+            panic!("mkfifo failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(_) => {} // Success
     }
+
+    // Spawn process with timeout to check for blocking (should reject FIFO immediately)
+    use std::time::Duration;
+    let start = std::time::Instant::now();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_runtime"))
+        .arg("analyze")
+        .arg(&fifo_path)
+        .spawn()
+        .expect("Failed to spawn process");
+
+    // Wait with timeout (~2 seconds max for quick rejection)
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let elapsed = start.elapsed();
+                // Should have exited quickly (not blocked on FIFO open)
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "Process took too long: {:?}, indicates FIFO open might be blocking",
+                    elapsed
+                );
+                break;
+            }
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(5) {
+                    child.kill().expect("Failed to kill process");
+                    let _ = std::fs::remove_file(&fifo_path);
+                    panic!("Process did not exit within 5 seconds; FIFO likely blocked");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&fifo_path);
+                panic!("try_wait failed: {e}");
+            }
+        }
+    }
+
+    // Clean up FIFO and verify stderr in a separate run with captured output
+    let _ = std::fs::remove_file(&fifo_path);
+
+    // Re-create FIFO for second run to capture output
+    let _ = std::process::Command::new("mkfifo").arg(&fifo_path).output();
+    let out = runtime(&["analyze".as_ref(), fifo_path.as_os_str()]);
+    let _ = std::fs::remove_file(&fifo_path);
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a regular file"),
+        "Expected 'not a regular file' in stderr: {stderr}"
+    );
 }
