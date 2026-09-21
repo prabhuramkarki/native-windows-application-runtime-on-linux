@@ -1643,3 +1643,46 @@ fn doctor_arguments_are_checked() {
         assert!(o.stdout.is_empty());
     }
 }
+
+#[test]
+fn doctor_reports_an_unreadable_program_directory_as_failures_never_as_missing_dlls() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    r.wine_dlls(&[]); // an empty DLL directory: every import would be "missing" if the program were looked at
+    let id = r.install();
+    let dir = r.apps().join(&id).join("prefix/drive_c/Program Files").join(&id);
+    // Searchable but not listable: locating the program (a case-insensitive lookup) and the prefix audit both need
+    // to list it, so the failure is reported there. (The import check's own handling of a program directory that
+    // cannot be listed is tested in core, where the listing is injected.)
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o111)).unwrap();
+    let readable_anyway = fs::read_dir(&dir).is_ok();
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap(); // so the tempdir can be removed
+    if readable_anyway {
+        eprintln!("SKIPPED: running as root, a mode 111 directory is still listable");
+        return;
+    }
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(lines_with(&out, "cannot be examined")[0].contains("[FAIL]"), "{out}");
+    assert!(
+        lines_with(&out, "cannot be found or used")[0].contains("[FAIL]"),
+        "{out}"
+    );
+    assert!(!out.contains("not found in"), "no DLL is called missing: {out}");
+    assert!(!out.contains("Imports"), "{out}");
+}
+
+#[test]
+fn doctor_calls_a_prefix_without_drive_c_incomplete() {
+    let r = rig();
+    let id = r.install();
+    let prefix = r.apps().join(&id).join("prefix");
+    fs::rename(prefix.join("drive_c"), r.root.join("moved-drive_c")).unwrap();
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    let l = lines_with(&out, "incomplete prefix");
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(l[0].contains("[warn]") && l[0].contains("drive_c missing"), "{}", l[0]);
+    assert!(!out.contains("cannot be examined"), "{out}");
+}

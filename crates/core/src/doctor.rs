@@ -8,16 +8,20 @@
 //! [`Verdict`] are the contract.
 //!
 //! **Bounds.** Directory listings are read through [`FsProbe::list`] with a cap of [`MAX_LISTING`] names (at most
-//! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (imports) 1200: at
-//! most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the code, not by the input.
+//! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (the import and the
+//! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
+//! code, not by the input.
 //! Names printed from the input go through `text::quote_max` (control, bidi and other invisible characters are
 //! escaped); free-form messages through `text::clean` (those characters are removed).
 //!
-//! **What "available" means for an imported DLL** (case-insensitive): an `api-ms-win-*`/`ext-ms-win-*` API-set
+//! **What "available" means for an imported DLL** (ASCII case-insensitive on both sides: `str::to_lowercase`
+//! would fold the Kelvin sign U+212A to `k`, so a hostile `\u{212A}ERNEL32.dll` would count as `kernel32.dll`): an `api-ms-win-*`/`ext-ms-win-*` API-set
 //! name (Wine 10 has no stub files: it resolves them inside `ntdll`, so this is NOT verified and the text says
 //! so), or a file in one of the backend's DLL directories, in the app's own directory, or in the prefix's
 //! `system32`/`syswow64`. When the backend reports no DLL directory (or none can be listed) the answer is "not
-//! verified", never "missing". Names past the listing cap are not seen.
+//! verified", never "missing". A listing that is cut at the cap or that had unreadable entries or was unreadable
+//! itself (a directory that does not exist is fine and silent) is REPORTED: the imports get one extra Warn
+//! "DLL listing incomplete", and the missing-DLL lines then say "not found in the listed files", not "not found".
 use crate::CompatBackend;
 use crate::text::{clean, quote_max};
 use pe::{Arch, InstallerKind, Kind, PeInfo, Subsystem};
@@ -82,12 +86,44 @@ pub struct Report {
     pub verdict: Verdict,
 }
 
+/// One directory listing: at most `cap` names, and what could not be seen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// Entry names (lossy UTF-8), at most the cap the probe was given.
+    pub names: Vec<String>,
+    /// The directory holds more than `cap` entries: the names past the cap are not in `names`.
+    pub truncated: bool,
+    /// Entries that could not be read (they vanished during the listing, or an I/O error).
+    pub errors: usize,
+}
+
+impl Listing {
+    /// Every entry of the directory is in `names`.
+    pub fn is_complete(&self) -> bool {
+        !self.truncated && self.errors == 0
+    }
+}
+
+/// Why a directory could not be listed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListError {
+    /// It does not exist (or is not a directory): nothing to report, e.g. a prefix that is not there yet.
+    NotFound,
+    /// It exists but cannot be read (permissions, I/O error): a listing that MUST be reported as missing.
+    Unreadable,
+}
+
+/// What [`FsProbe::list`] answers.
+pub type ListResult = Result<Listing, ListError>;
+
 /// The file system as `doctor` sees it: two questions about specific paths, so a test can answer them without a host.
 pub trait FsProbe {
     /// The path exists (symlinks followed; sockets and FIFOs count).
     fn exists(&self, path: &Path) -> bool;
-    /// At most `cap` entry names of the directory `dir` (lossy UTF-8); `None` when it is not a listable directory.
-    fn list(&self, dir: &Path, cap: usize) -> Option<Vec<String>>;
+    /// The entries of the directory `dir`: at most `cap` names; `truncated` when there were more (the reader asks
+    /// for one entry beyond `cap` to know); `errors` counts entries that could not be read. A directory that does
+    /// not exist is [`ListError::NotFound`], one that exists but cannot be read [`ListError::Unreadable`].
+    fn list(&self, dir: &Path, cap: usize) -> ListResult;
 }
 
 /// What the read-only audit of a prefix found (the CLI converts `backend_wine::AuditReport`).
@@ -110,6 +146,8 @@ pub enum PrefixState {
     NotApplicable,
     /// The app has no prefix (yet).
     Missing,
+    /// The prefix directory exists but is not complete (no `drive_c`): why.
+    Incomplete(String),
     Audit(PrefixAudit),
     /// The audit refused or failed (a symlinked `drive_c`, an I/O error): why.
     Unexaminable(String),
@@ -136,8 +174,9 @@ pub struct DoctorInput<'a> {
     pub pe: PeState<'a>,
     /// `Some` for an installed app: the program's executable text, or why `resolve_program` refused it.
     pub program: Option<Result<&'a str, &'a str>>,
-    /// Names in the program's own directory (only what is capped at [`MAX_LISTING`] is used).
-    pub app_dir: &'a [String],
+    /// The listing of the program's own directory (`None`: no such directory to look at, e.g. a system report or
+    /// a file target). At most [`MAX_LISTING`] of its names are used.
+    pub app_dir: Option<&'a ListResult>,
     pub prefix: PrefixState,
     /// The prefix directory (its `system32`/`syswow64` count as DLL sources), if there is one.
     pub prefix_root: Option<&'a Path>,
@@ -174,17 +213,50 @@ impl FsProbe for HostFs {
         std::fs::metadata(path).is_ok()
     }
 
-    fn list(&self, dir: &Path, cap: usize) -> Option<Vec<String>> {
-        let entries = std::fs::read_dir(dir).ok()?;
-        // An entry that cannot be read is skipped; the number of names is bounded by `cap`, however big the directory.
-        Some(
-            entries
-                .filter_map(Result::ok)
-                .take(cap)
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect(),
-        )
+    fn list(&self, dir: &Path, cap: usize) -> ListResult {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Err(ListError::NotFound);
+            }
+            Err(_) => return Err(ListError::Unreadable),
+        };
+        Ok(collect_listing(
+            entries.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned())),
+            cap,
+        ))
     }
+}
+
+/// Unreadable entries tolerated on top of `cap` before the walk of a directory stops (and counts as cut).
+const MAX_SKIPPED: usize = 1000;
+
+/// A [`Listing`] of the entries of `entries`: the first `cap` names, `truncated` when one more entry follows
+/// (so exactly `cap` entries are complete and `cap + 1` are not), unreadable entries counted in `errors`. The
+/// walk stops after `cap + MAX_SKIPPED` entries whatever they are, so a huge directory of unreadable entries is
+/// bounded too (it then counts as truncated).
+pub fn collect_listing(entries: impl Iterator<Item = std::io::Result<String>>, cap: usize) -> Listing {
+    let mut listing = Listing::default();
+    for (seen, entry) in entries.enumerate() {
+        if seen >= cap.saturating_add(MAX_SKIPPED) {
+            listing.truncated = true;
+            break;
+        }
+        match entry {
+            Ok(name) if listing.names.len() < cap => listing.names.push(name),
+            Ok(_) => {
+                listing.truncated = true;
+                break;
+            }
+            Err(_) => listing.errors += 1,
+        }
+    }
+    listing
 }
 
 pub fn verdict(checks: &[Check]) -> Verdict {
@@ -389,25 +461,76 @@ fn name_list(names: &[String]) -> String {
     s
 }
 
-/// The lowercase names of one listing, added to `into`.
-fn add_names(into: &mut HashSet<String>, names: &[String]) {
-    into.extend(names.iter().take(MAX_LISTING).map(|n| n.to_lowercase()));
+/// The DLL names known so far (ASCII-lowercase) and what was wrong with the listings they came from.
+#[derive(Default)]
+struct Known {
+    names: HashSet<String>,
+    /// One entry per incomplete listing: what and why.
+    incomplete: Vec<String>,
+}
+
+impl Known {
+    /// Adds a listing. `true` when it could be read (even partly). A directory that does not exist is silent;
+    /// one that is cut, has unreadable entries or cannot be read at all is noted in `incomplete`.
+    fn absorb(&mut self, what: &str, listing: &ListResult) -> bool {
+        match listing {
+            Ok(l) => {
+                self.names
+                    .extend(l.names.iter().take(MAX_LISTING).map(|n| n.to_ascii_lowercase()));
+                if l.truncated {
+                    self.incomplete.push(format!("{what}: directory too large"));
+                }
+                if l.errors > 0 {
+                    self.incomplete.push(format!("{what}: {} unreadable entries", l.errors));
+                }
+                true
+            }
+            Err(ListError::Unreadable) => {
+                self.incomplete.push(format!("{what}: unreadable"));
+                false
+            }
+            Err(ListError::NotFound) => false,
+        }
+    }
+
+    /// The text of the one Warn for incomplete listings, if there are any: at most 4 distinct notes are named.
+    fn incomplete_text(&self) -> Option<String> {
+        if self.incomplete.is_empty() {
+            return None;
+        }
+        let mut distinct: Vec<&str> = Vec::new();
+        for n in &self.incomplete {
+            if !distinct.contains(&n.as_str()) {
+                distinct.push(n);
+            }
+        }
+        let mut what = distinct.iter().take(4).copied().collect::<Vec<_>>().join("; ");
+        if distinct.len() > 4 {
+            what.push_str(&format!(" and {} more", distinct.len() - 4));
+        }
+        Some(format!(
+            "DLL listing incomplete ({what}): missing-DLL results may be wrong"
+        ))
+    }
 }
 
 fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
     // Where the DLLs of Wine are: without any listing nothing can be called missing.
-    let mut known: HashSet<String> = HashSet::new();
+    let mut known = Known::default();
     let mut listed_wine = 0;
     let unverified = match &input.backend {
         Err(_) => Some("Wine not found"),
         Ok(backend) => {
             for dir in backend.dll_dirs().iter().take(MAX_DLL_DIRS) {
-                if let Some(names) = input.fs.list(dir, MAX_LISTING) {
-                    add_names(&mut known, &names);
+                if known.absorb("Wine DLL directory", &input.fs.list(dir, MAX_LISTING)) {
                     listed_wine += 1;
                 }
             }
-            (listed_wine == 0).then_some("Wine DLL directory not found")
+            (listed_wine == 0).then_some(if known.incomplete.is_empty() {
+                "Wine DLL directory not found"
+            } else {
+                "Wine DLL directory unreadable"
+            })
         }
     };
     if let Some(reason) = unverified {
@@ -418,17 +541,22 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
         );
         return;
     }
-    add_names(&mut known, input.app_dir);
+    if let Some(listing) = input.app_dir {
+        known.absorb("program directory", listing);
+    }
     if let Some(root) = input.prefix_root {
-        for sub in ["drive_c/windows/system32", "drive_c/windows/syswow64"] {
+        for (what, sub) in [
+            ("prefix system32", "drive_c/windows/system32"),
+            ("prefix syswow64", "drive_c/windows/syswow64"),
+        ] {
             // A prefix that does not exist yet has no listing: skipped silently.
-            if let Some(names) = input.fs.list(&root.join(sub), MAX_LISTING) {
-                add_names(&mut known, &names);
-            }
+            known.absorb(what, &input.fs.list(&root.join(sub), MAX_LISTING));
         }
     }
+    let incomplete = known.incomplete_text();
+    let known = known.names;
     let available = |name: &str| -> bool {
-        let lower = name.to_lowercase();
+        let lower = name.to_ascii_lowercase();
         known.contains(&lower) || (!lower.contains('.') && known.contains(&format!("{lower}.dll")))
     };
     let mut api_sets: HashSet<String> = HashSet::new();
@@ -440,14 +568,14 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
     let entries = || info.imports.iter().take(MAX_IMPORTS);
     for imp in entries().filter(|i| !i.delay).chain(entries().filter(|i| i.delay)) {
         if is_api_set(&imp.dll) {
-            api_sets.insert(imp.dll.to_lowercase());
+            api_sets.insert(imp.dll.to_ascii_lowercase());
         } else if available(&imp.dll) {
             found += 1;
         } else if !imp.delay {
-            if seen.insert(imp.dll.to_lowercase()) {
+            if seen.insert(imp.dll.to_ascii_lowercase()) {
                 missing.push(imp.dll.clone());
             }
-        } else if !seen.contains(&imp.dll.to_lowercase()) && seen_delay.insert(imp.dll.to_lowercase()) {
+        } else if !seen.contains(&imp.dll.to_ascii_lowercase()) && seen_delay.insert(imp.dll.to_ascii_lowercase()) {
             missing_delay.push(imp.dll.clone());
         }
     }
@@ -459,6 +587,12 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
             api_sets.len()
         )
     };
+    // Only a complete look can say a DLL is "not found"; otherwise it is "not found in the listed files".
+    let place = if incomplete.is_some() {
+        "the listed files"
+    } else {
+        "Wine, the program's directory or the prefix"
+    };
     if missing.is_empty() && missing_delay.is_empty() {
         let text = if found == 0 && api_sets.is_empty() {
             "the program imports no DLLs".to_owned()
@@ -466,7 +600,6 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
             format!("all imported DLLs were found{note}")
         };
         out.add_list(Area::Imports, Status::Ok, text);
-        return;
     }
     if !missing.is_empty() {
         let s = if missing.len() == 1 { "" } else { "s" };
@@ -474,7 +607,7 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
             Area::Imports,
             Status::Warn,
             format!(
-                "{} imported DLL{s} not found in Wine, the program's directory or the prefix: {}{note}",
+                "{} imported DLL{s} not found in {place}: {}{note}",
                 missing.len(),
                 name_list(&missing)
             ),
@@ -486,11 +619,14 @@ fn imports(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
             Area::Imports,
             Status::Warn,
             format!(
-                "{} optional (delay-loaded) DLL{s} not found: {}",
+                "{} optional (delay-loaded) DLL{s} not found in {place}: {}",
                 missing_delay.len(),
                 name_list(&missing_delay)
             ),
         );
+    }
+    if let Some(text) = incomplete {
+        out.add(Area::Imports, Status::Warn, text);
     }
 }
 
@@ -613,6 +749,13 @@ fn prefix(state: &PrefixState, out: &mut Out) {
                 Area::Prefix,
                 Status::Warn,
                 "no Wine prefix yet (`runtime install` creates it)".into(),
+            );
+        }
+        PrefixState::Incomplete(why) => {
+            return out.add(
+                Area::Prefix,
+                Status::Warn,
+                format!("incomplete prefix ({}): `runtime install` creates it", clean(why, 150)),
             );
         }
         PrefixState::Unexaminable(why) => {
