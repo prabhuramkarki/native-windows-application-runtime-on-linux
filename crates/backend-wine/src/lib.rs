@@ -25,6 +25,9 @@ use std::time::Duration;
 pub mod discover;
 pub mod harden;
 
+/// [`CompatBackend::id`] of [`WineBackend`]: what `metadata.json` records as `backend.id`.
+pub const BACKEND_ID: &str = "wine";
+
 /// Wine's own `WINEDLLOVERRIDES` for every process: no menu spam, no Mono/Gecko download dialogs (.NET apps
 /// fail until Phase 4; `doctor` says so).
 pub const WINEDLLOVERRIDES: &str = "winemenubuilder.exe=d;mscoree=d;mshtml=d";
@@ -221,7 +224,7 @@ impl WineBackend {
 
 impl CompatBackend for WineBackend {
     fn id(&self) -> &'static str {
-        "wine"
+        BACKEND_ID
     }
 
     fn version(&self) -> Result<String, BackendError> {

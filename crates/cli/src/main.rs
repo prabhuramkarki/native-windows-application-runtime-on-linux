@@ -1,4 +1,5 @@
 mod analyze;
+mod doctor;
 mod install;
 mod list;
 mod logs;
@@ -62,6 +63,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Check the system, an installed app or a file for problems (read-only: nothing is installed or changed).
+    /// With no argument only the system is checked (Wine, host architecture, Vulkan, display, audio); with an app
+    /// id its program and prefix too; a file (contains `/` or ends in .exe/.zip) is analysed but NOT installed.
+    /// Exit code 1 when a check FAILS (a warning is not a failure).
+    Doctor {
+        /// An app id from `runtime list`, or a path to a program
+        target: Option<String>,
+        /// Machine-readable output: {subject, verdict, checks: [{area, status, text}]}. `area`, `status` and
+        /// `verdict` are stable; `text` is prose for people, may change, and must not be parsed. Strings carry
+        /// untrusted content: C1 controls and bidi characters are written as \uXXXX escapes.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop an app's Wine processes and delete the app and its environment (takes an app id, never a path)
     Remove { app: String },
     /// Show the newest log of an app (its last run's stderr)
@@ -111,6 +125,7 @@ fn main() -> ExitCode {
         Cmd::Analyze { file, json } => analyze::run(&file, json).map(|()| 0),
         Cmd::Install { file, name, exe } => install::run(&file, name, exe).map(|()| 0),
         Cmd::Run { target, debug, args } => run::run(&target, &args, debug),
+        Cmd::Doctor { target, json } => doctor::run(target.as_deref(), json),
         Cmd::List { json } => list::run(json).map(|()| 0),
         Cmd::Remove { app } => remove::run(&app).map(|()| 0),
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),

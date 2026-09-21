@@ -1123,3 +1123,523 @@ fn a_usage_error_is_reported_without_running_anything() {
     }
     assert!(r.calls().is_empty());
 }
+
+// ================================================================ doctor
+
+/// Every entry below the rig root (the fake Wine's `bin/` and `log/` excluded) with its type, size and mtime:
+/// any modification, creation or deletion changes it.
+fn snapshot(r: &Rig) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd {
+            let e = e.unwrap();
+            let name = format!("{rel}/{}", e.file_name().to_string_lossy());
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            out.push(format!(
+                "{name} mode={:o} len={} mtime={}.{}",
+                m.mode(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec()
+            ));
+            if m.is_dir() {
+                walk(&e.path(), &name, out);
+            }
+        }
+    }
+    let mut v = vec![];
+    walk(&r.root, "", &mut v);
+    v.retain(|l| !l.starts_with("/log") && !l.starts_with("/bin"));
+    v.sort();
+    v
+}
+
+/// The lines of `out` that contain `needle`.
+fn lines_with<'a>(out: &'a str, needle: &str) -> Vec<&'a str> {
+    out.lines().filter(|l| l.contains(needle)).collect()
+}
+
+/// The section header lines (not indented) of a doctor report, in order.
+fn sections(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|l| {
+            [
+                "Architecture",
+                "PE",
+                "Imports",
+                "Graphics",
+                "Audio",
+                "Runtime",
+                "Prefix",
+                "Program",
+            ]
+            .contains(l)
+        })
+        .collect()
+}
+
+impl Rig {
+    /// A fake Wine DLL directory next to the fake `wineserver` (where `dll_dirs` looks).
+    fn wine_dlls(&self, names: &[&str]) {
+        let d = self.bin.join("x86_64-windows");
+        fs::create_dir_all(&d).unwrap();
+        for n in names {
+            fs::write(d.join(n), b"").unwrap();
+        }
+    }
+
+    /// The runtime as a desktop user sees it: display, PipeWire.
+    fn desktop(&self) -> Command {
+        let run = self.root.join("run");
+        fs::create_dir_all(&run).unwrap();
+        if !run.join("pipewire-0").exists() {
+            fs::write(run.join("pipewire-0"), b"").unwrap();
+        }
+        let mut c = self.cmd();
+        c.env("DISPLAY", ":0").env("XDG_RUNTIME_DIR", &run);
+        c
+    }
+}
+
+#[test]
+fn doctor_without_arguments_runs_the_system_checks_only_and_is_read_only() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll"]);
+    let _ = r.desktop(); // creates the runtime dir: part of the "before" state
+    let before = snapshot(&r);
+    let o = r.desktop().arg("doctor").output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(snapshot(&r), before, "doctor modified something");
+    assert!(o.stderr.is_empty(), "{}", s(&o.stderr));
+    assert!(out.starts_with("Runtime Diagnostics\n"), "{out}");
+    assert!(out.contains("System checks"), "{out}");
+    assert_eq!(
+        sections(&out),
+        ["Architecture", "Graphics", "Audio", "Runtime"],
+        "{out}"
+    );
+    let wine = lines_with(&out, "Wine: wine-10.0 (Fake 1)");
+    assert_eq!(wine.len(), 1, "{out}");
+    assert!(wine[0].trim_start().starts_with("[ok]"), "{}", wine[0]);
+    assert!(lines_with(&out, "PipeWire")[0].contains("[ok]"), "{out}");
+    assert!(lines_with(&out, "X11")[0].contains("[ok]"), "{out}");
+    if cfg!(target_arch = "x86_64") {
+        assert!(lines_with(&out, "host architecture")[0].contains("[ok]"), "{out}");
+        assert_eq!(o.status.code(), Some(0), "{out}");
+    }
+    let result = out.lines().last().unwrap();
+    assert!(
+        result == "Result: Looks good." || result == "Result: Application may fail to start.",
+        "{result}: only Vulkan (a host library) can differ here"
+    );
+    assert!(r.calls().is_empty(), "wine was not started: {:?}", r.calls());
+}
+
+#[test]
+fn doctor_says_may_fail_without_a_display_or_pipewire() {
+    let r = rig();
+    let o = r.rt(&["doctor"]); // a cleared environment: no display session, no PipeWire
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(0), "warnings are not failures: {out}");
+    assert!(lines_with(&out, "no display session")[0].contains("[warn]"), "{out}");
+    assert!(lines_with(&out, "PipeWire")[0].contains("[warn]"), "{out}");
+    assert_eq!(out.lines().last().unwrap(), "Result: Application may fail to start.");
+}
+
+#[test]
+fn doctor_without_wine_fails_with_the_install_hint_and_still_reports_the_rest() {
+    // Neither $RUNTIME_WINE nor a wine on PATH: the discovery error carries the install hint.
+    let r = rig();
+    let empty = r.root.join("emptybin");
+    fs::create_dir_all(&empty).unwrap();
+    let o = r
+        .cmd()
+        .env_remove("RUNTIME_WINE")
+        .env_remove("RUNTIME_WINESERVER")
+        .env("PATH", &empty)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    let wine = lines_with(&out, "Wine is not usable");
+    assert_eq!(wine.len(), 1, "{out}");
+    assert!(
+        wine[0].contains("[FAIL]") && wine[0].contains("sudo apt install wine"),
+        "{}",
+        wine[0]
+    );
+    assert!(
+        out.contains("Architecture") && out.contains("Graphics"),
+        "the other checks still run: {out}"
+    );
+    assert!(
+        out.lines()
+            .last()
+            .unwrap()
+            .starts_with("Result: Application cannot run"),
+        "{out}"
+    );
+    // A bad override: also a failure, the text says which variable.
+    let r = rig().no_wine();
+    let o = r.rt(&["doctor"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        lines_with(&s(&o.stdout), "RUNTIME_WINE")[0].contains("[FAIL]"),
+        "{}",
+        s(&o.stdout)
+    );
+}
+
+#[test]
+fn doctor_of_an_installed_app_runs_every_check_and_reads_only() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll", "msvcrt.dll"]);
+    let id = r.install();
+    let _ = r.desktop(); // creates the runtime dir: part of the "before" state
+    let before = snapshot(&r);
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(snapshot(&r), before, "doctor modified the app environment");
+    assert!(o.stderr.is_empty(), "{}", s(&o.stderr));
+    assert_eq!(
+        sections(&out),
+        [
+            "Architecture",
+            "PE",
+            "Imports",
+            "Graphics",
+            "Audio",
+            "Runtime",
+            "Prefix",
+            "Program"
+        ],
+        "{out}"
+    );
+    assert!(out.contains(&format!("Application: Runtime Fixture ({id})")), "{out}");
+    assert!(lines_with(&out, "valid PE")[0].contains("[ok]"), "{out}");
+    assert!(lines_with(&out, "program architecture")[0].contains("[ok]"), "{out}");
+    assert!(
+        lines_with(&out, "imported DLLs")[0].contains("[ok]"),
+        "both imports are in Wine's directory: {out}"
+    );
+    assert!(lines_with(&out, "prefix hardened")[0].contains("[ok]"), "{out}");
+    assert!(lines_with(&out, "program found")[0].contains("hello64.exe"), "{out}");
+    // Calls to the fake wine: none but `--version`, which does not log.
+    assert!(
+        r.calls()
+            .iter()
+            .all(|c| c == "wine wineboot" || c.starts_with("wineserver")),
+        "{:?}",
+        r.calls()
+    );
+    assert_eq!(
+        r.calls().len(),
+        2,
+        "install ran wineboot + wineserver -k; doctor started nothing: {:?}",
+        r.calls()
+    );
+    if cfg!(target_arch = "x86_64") {
+        assert_ne!(o.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn doctor_lists_missing_dlls_and_never_calls_them_missing_without_a_dll_directory() {
+    let r = rig();
+    let id = r.install();
+    // The fake Wine has no DLL directory: not verified.
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    assert!(
+        lines_with(&out, "DLL availability not verified")[0].contains("[warn]"),
+        "{out}"
+    );
+    assert!(!out.contains("KERNEL32") && !out.contains("not found in Wine"), "{out}");
+    // An empty DLL directory: everything the program imports is reported.
+    r.wine_dlls(&[]);
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = lines_with(&out, "not found in Wine");
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("\"KERNEL32.dll\"") && l[0].contains("\"msvcrt.dll\""),
+        "{}",
+        l[0]
+    );
+    assert!(l[0].contains("[warn]"));
+}
+
+#[test]
+fn doctor_of_a_file_analyses_it_without_installing_anything() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll", "msvcrt.dll"]);
+    let exe = fixture("hello64.exe");
+    let _ = r.desktop(); // creates the runtime dir: part of the "before" state
+    let before = snapshot(&r);
+    let o = r.desktop().arg("doctor").arg(&exe).output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(0), "{out}\n{}", s(&o.stderr));
+    assert_eq!(snapshot(&r), before, "doctor installed or changed something");
+    assert!(r.app_dirs().is_empty());
+    assert!(r.calls().is_empty());
+    assert!(out.contains("File: ") && out.contains("hello64.exe"), "{out}");
+    assert_eq!(
+        sections(&out),
+        ["Architecture", "PE", "Imports", "Graphics", "Audio", "Runtime"],
+        "{out}"
+    );
+    assert!(lines_with(&out, "valid PE")[0].contains("[ok]"));
+    // A DLL is not launchable: a failure, exit 1.
+    let o = r
+        .desktop()
+        .arg("doctor")
+        .arg(fixture("exports64.dll"))
+        .output()
+        .unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(lines_with(&out, "DLL")[0].contains("[FAIL]"), "{out}");
+    assert!(
+        out.lines()
+            .last()
+            .unwrap()
+            .starts_with("Result: Application cannot run"),
+        "{out}"
+    );
+    // x86 works too.
+    let o = r.desktop().arg("doctor").arg(fixture("hello32.exe")).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", s(&o.stdout));
+    assert!(s(&o.stdout).contains("x86 (32-bit"), "{}", s(&o.stdout));
+}
+
+#[test]
+fn doctor_of_a_file_that_is_not_a_program_reports_a_failure_and_never_hangs() {
+    let r = rig();
+    let text = r.input("notes.txt", b"just text");
+    let zip = r.input("archive.zip", b"PK\x03\x04rest");
+    let dir = r.inputs.join("adir.exe");
+    fs::create_dir(&dir).unwrap();
+    let fifo = r.inputs.join("pipe.exe");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let before = snapshot(&r);
+    for (what, target, needle) in [
+        ("text", &text, "cannot be analysed"),
+        ("zip", &zip, "ZIP"),
+        ("directory", &dir, "not a regular file"),
+        ("fifo", &fifo, "not a regular file"),
+    ] {
+        let mut child = r
+            .cmd()
+            .arg("doctor")
+            .arg(target)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: doctor hangs");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let out = child.wait_with_output().unwrap();
+        let text = s(&out.stdout);
+        assert_eq!(status.code(), Some(1), "{what}: {text}");
+        assert!(lines_with(&text, needle)[0].contains("[FAIL]"), "{what}: {text}");
+        assert!(out.stderr.is_empty(), "{what}: {}", s(&out.stderr));
+    }
+    assert_eq!(snapshot(&r), before);
+}
+
+#[test]
+fn doctor_of_an_unknown_id_or_a_missing_file_is_an_error_with_a_hint_and_needs_no_wine() {
+    let r = rig().no_wine();
+    let o = r.rt(&["doctor", "nothing"]);
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("runtime list") && err.contains("runtime install <file>"),
+        "{err}"
+    );
+    assert!(o.stdout.is_empty(), "no half report: {}", s(&o.stdout));
+    let err = assert_fails(&r.rt(&["doctor", "nothing.exe"]));
+    assert!(err.contains("no such file"), "{err}");
+    let o = r
+        .cmd()
+        .args(["doctor", "Hello\u{1b}]0;x\u{7}\u{202e}"])
+        .output()
+        .unwrap();
+    assert_tame(&assert_fails(&o), "stderr");
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn doctor_never_creates_the_data_dir() {
+    let r = rig();
+    fs::remove_dir_all(&r.data).unwrap();
+    let before = snapshot(&r);
+    for args in [
+        vec!["doctor".to_string()],
+        vec!["doctor".into(), "nothing".into()],
+        vec!["doctor".into(), fixture("hello64.exe").to_str().unwrap().into()],
+        vec!["doctor".into(), "--json".into()],
+    ] {
+        let _ = r.rt(&args);
+        assert!(!r.data.exists(), "{args:?} created the data dir");
+        assert_eq!(snapshot(&r), before, "{args:?}");
+    }
+}
+
+#[test]
+fn doctor_sanitises_a_hostile_app_name_and_reports_a_broken_program() {
+    let r = rig();
+    // Valid metadata, no program in the prefix; the name is hostile.
+    r.plant("evil", "Evil\u{1b}]0;pwned\u{7}\u{202e}\u{9b}[2J name");
+    let o = r.desktop().args(["doctor", "evil"]).output().unwrap();
+    let out = s(&o.stdout);
+    assert_tame(&out, "stdout");
+    assert!(out.contains("Application: Evil"), "{out}");
+    assert!(out.contains("\\u{1b}"), "escaped, not dropped: {out}");
+    let l = lines_with(&out, "cannot be found or used");
+    assert!(l[0].contains("[FAIL]") && l[0].contains("runtime remove evil"), "{out}");
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    // JSON: escapes, the same text.
+    let o = r.desktop().args(["doctor", "evil", "--json"]).output().unwrap();
+    assert_tame(&s(&o.stdout), "json");
+    let v = json(&o);
+    assert_eq!(v["subject"]["kind"], "app");
+    assert_eq!(
+        v["subject"]["name"], "Evil\u{1b}]0;pwned\u{7}\u{202e}\u{9b}[2J name",
+        "the JSON is faithful, only escaped"
+    );
+}
+
+#[test]
+fn doctor_flags_an_unhardened_prefix() {
+    let r = rig();
+    let id = r.install();
+    let prefix = r.apps().join(&id).join("prefix");
+    // z: back, and a link that leaves drive_c.
+    symlink("/", prefix.join("dosdevices/z:")).unwrap();
+    symlink("/etc", prefix.join("drive_c/users/tester/Desktop")).unwrap();
+    let _ = r.desktop(); // creates the runtime dir: part of the "before" state
+    let before = snapshot(&r);
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(snapshot(&r), before, "doctor repaired something");
+    assert!(
+        lines_with(&out, "host root drive present")[0].contains("[warn]"),
+        "{out}"
+    );
+    let l = lines_with(&out, "Desktop");
+    assert!(l[0].contains("[FAIL]"), "{out}");
+    assert_eq!(o.status.code(), Some(1));
+    // Wine's com* links alone are tolerated.
+    let r = rig();
+    let id = r.install();
+    let prefix = r.apps().join(&id).join("prefix");
+    symlink("/dev/ttyS0", prefix.join("dosdevices/com1")).unwrap();
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = lines_with(&out, "prefix hardened");
+    assert!(l[0].contains("[ok]") && l[0].contains("com"), "{out}");
+}
+
+#[test]
+fn doctor_json_has_a_stable_shape() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll", "msvcrt.dll"]);
+    let id = r.install();
+    let statuses = ["ok", "warn", "fail"];
+    let areas = [
+        "architecture",
+        "pe",
+        "imports",
+        "graphics",
+        "audio",
+        "runtime",
+        "prefix",
+        "program",
+    ];
+    let verdicts = ["good", "may_fail", "fail"];
+    let exe = fixture("hello64.exe");
+    for (args, kind, expect_areas) in [
+        (
+            vec!["doctor".as_ref(), "--json".as_ref()],
+            "system",
+            vec!["architecture", "graphics", "audio", "runtime"],
+        ),
+        (
+            vec!["doctor".as_ref(), id.as_ref(), "--json".as_ref()],
+            "app",
+            areas.to_vec(),
+        ),
+        (
+            vec!["doctor".as_ref(), exe.as_os_str(), "--json".as_ref()],
+            "file",
+            vec!["architecture", "pe", "imports", "graphics", "audio", "runtime"],
+        ),
+    ] {
+        let o = r.desktop().args(&args).output().unwrap();
+        assert!(o.stderr.is_empty(), "{}", s(&o.stderr));
+        let v = json(&o);
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["checks", "subject", "verdict"]);
+        assert_eq!(v["subject"]["kind"], kind);
+        assert!(verdicts.contains(&v["verdict"].as_str().unwrap()), "{v}");
+        let checks = v["checks"].as_array().unwrap();
+        assert!(!checks.is_empty());
+        let mut seen: Vec<&str> = vec![];
+        for c in checks {
+            let mut k: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
+            k.sort_unstable();
+            assert_eq!(k, ["area", "status", "text"], "{c}");
+            assert!(areas.contains(&c["area"].as_str().unwrap()), "{c}");
+            assert!(statuses.contains(&c["status"].as_str().unwrap()), "{c}");
+            assert!(c["text"].is_string());
+            if !seen.contains(&c["area"].as_str().unwrap()) {
+                seen.push(c["area"].as_str().unwrap());
+            }
+        }
+        let mut want = expect_areas.clone();
+        want.sort_unstable();
+        seen.sort_unstable();
+        assert_eq!(seen, want, "{kind}");
+        // The verdict matches the statuses and the exit code.
+        let worst = if checks.iter().any(|c| c["status"] == "fail") {
+            "fail"
+        } else if checks.iter().any(|c| c["status"] == "warn") {
+            "may_fail"
+        } else {
+            "good"
+        };
+        assert_eq!(v["verdict"], worst);
+        assert_eq!(o.status.code(), Some(i32::from(worst == "fail")));
+    }
+    // A file's subject carries its path.
+    let o = r
+        .desktop()
+        .args(["doctor".as_ref(), exe.as_os_str(), "--json".as_ref()])
+        .output()
+        .unwrap();
+    assert!(json(&o)["subject"]["path"].as_str().unwrap().ends_with("hello64.exe"));
+}
+
+#[test]
+fn doctor_arguments_are_checked() {
+    let r = rig();
+    for args in [&["doctor", "a", "b"][..], &["doctor", "--nope"]] {
+        let o = r.rt(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert!(o.stdout.is_empty());
+    }
+}

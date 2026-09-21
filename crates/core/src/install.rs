@@ -152,16 +152,20 @@ pub fn install(
 
 // ---------------------------------------------------------------- reading the input
 
-enum Input {
+/// What [`read_input`] found.
+pub enum Input {
+    /// A PE file, read whole.
     Pe(Vec<u8>),
+    /// A zip archive, left as an open file.
     Zip(File),
 }
 
 /// Reads and classifies the input. `metadata()` BEFORE `open()`, so a FIFO cannot block the open, then `O_NONBLOCK`
 /// and an fstat of the handle (the path may have been swapped since), then the size cap on the fstat length
 /// BEFORE any bulk read (a 5 GiB sparse file is refused unread). Symlinks to regular files are followed, like
-/// `runtime analyze`. Only PE files are read into memory; an archive stays a file handle.
-fn read_input(path: &Path) -> Result<Input, InstallError> {
+/// `runtime analyze`. Only PE files are read into memory; an archive stays a file handle. `runtime doctor` reads
+/// a file to check with this too (the same caps and the same FIFO safety).
+pub fn read_input(path: &Path) -> Result<Input, InstallError> {
     let stat = fs::metadata(path).map_err(InstallError::Read)?;
     if !stat.is_file() {
         return Err(InstallError::NotRegular);

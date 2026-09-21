@@ -250,18 +250,21 @@ fn a_missing_wine_fails_with_the_install_hint_and_hostile_text_is_escaped() {
     assert!(c.text.chars().count() <= 300, "{}", c.text.chars().count());
 }
 
-/// A backend whose `wine --version` fails.
-struct NoVersion;
+/// A backend whose `wine --version` fails, or prints hostile text (`Some`).
+struct NoVersion(Option<&'static str>);
 
 impl CompatBackend for NoVersion {
     fn id(&self) -> &'static str {
         "wine"
     }
     fn version(&self) -> Result<String, BackendError> {
-        Err(BackendError::Failed {
-            what: "wine --version",
-            detail: Detail::from_bytes(b"boom \x1b[31m"),
-        })
+        match self.0 {
+            Some(v) => Ok(v.to_owned()),
+            None => Err(BackendError::Failed {
+                what: "wine --version",
+                detail: Detail::from_bytes(b"boom \x1b[31m"),
+            }),
+        }
     }
     fn prepare(&self, _: &crate::AppEnv) -> Result<(), BackendError> {
         unreachable!()
@@ -293,7 +296,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         host_arch: "x86_64",
         env: &env,
         fs: &s.host,
-        backend: Ok(&NoVersion),
+        backend: Ok(&NoVersion(None)),
         pe: PeState::Skipped,
         program: None,
         app_dir: &[],
@@ -304,6 +307,29 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
     assert_eq!(c.status, Status::Warn);
     assert_tame(&c.text);
     assert!(c.text.contains("boom"));
+}
+
+#[test]
+fn a_hostile_wine_version_is_cleaned_and_shortened() {
+    let s = sc();
+    let env = |k: &str| s.host.env.get(k).map(OsString::from);
+    let hostile: &'static str = Box::leak(format!("wine-10\x1b]0;x\x07\u{202e}{}", "9".repeat(500)).into_boxed_str());
+    let r = doctor(DoctorInput {
+        subject: Subject::System,
+        host_arch: "x86_64",
+        env: &env,
+        fs: &s.host,
+        backend: Ok(&NoVersion(Some(hostile))),
+        pe: PeState::Skipped,
+        program: None,
+        app_dir: &[],
+        prefix: PrefixState::NotApplicable,
+        prefix_root: None,
+    });
+    let c = one(&r, Area::Runtime, "Wine: wine-10");
+    assert_eq!(c.status, Status::Ok);
+    assert_tame(&c.text);
+    assert!(c.text.chars().count() < 100, "{}", c.text.chars().count());
 }
 
 #[test]
@@ -421,6 +447,14 @@ fn a_hostile_display_value_is_escaped() {
     for c in &r.checks {
         assert_tame(&c.text);
     }
+    // the Wayland name too (an absolute path that exists)
+    let name = "/tmp/\x1b[31m\u{202e}sock";
+    let mut s = sc();
+    s.host = Host::default().env("WAYLAND_DISPLAY", name).file(name);
+    let r = s.run();
+    let c = one(&r, Area::Graphics, "Wayland");
+    assert_eq!(c.status, Status::Ok);
+    assert_tame(&c.text);
 }
 
 #[test]
@@ -1013,6 +1047,11 @@ fn the_program_is_ok_or_a_failure_with_sanitised_text() {
     let r = app(vec![]).run();
     let c = one(&r, Area::Program, "app.exe");
     assert_eq!(c.status, Status::Ok);
+    assert!(
+        c.text.contains("C:\\Program Files\\app\\app.exe"),
+        "a Windows path stays readable: {}",
+        c.text
+    );
     let mut s = app(vec![]);
     s.program = Some(Err(
         "app app: its program \"C:\\x\" cannot be found\x1b[31m\u{202e}".into()
