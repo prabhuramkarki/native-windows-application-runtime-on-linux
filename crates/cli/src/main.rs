@@ -15,7 +15,9 @@ enum Cmd {
     /// Inspect a Windows binary or installer (header-based, extension ignored)
     Analyze {
         file: PathBuf,
-        /// Machine-readable output
+        /// Machine-readable output. Strings carry raw file content: only control characters below
+        /// U+0020 are escaped (by JSON itself); C1 controls and bidi characters are emitted as is.
+        /// Sanitise before displaying them.
         #[arg(long)]
         json: bool,
     },

@@ -4,6 +4,8 @@ use std::{fmt::Write, io, path::Path};
 
 const CAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB; ponytail: mmap if throughput becomes critical
 
+/// Escapes what could drive a terminal from text taken out of the analysed file. The human
+/// output routes every such string through this; the JSON output does not (see `--json`).
 pub(crate) fn safe(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -25,14 +27,14 @@ pub fn run(file: &Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>>
     }
     let file_handle = std::fs::File::open(file).map_err(|e| format!("{}: {e}", safe(&file_str)))?;
     // Re-check the opened handle: the path may have been swapped for a FIFO/device since the stat above.
-    if !file_handle
+    let opened = file_handle
         .metadata()
-        .map_err(|e| format!("{}: {e}", safe(&file_str)))?
-        .is_file()
-    {
+        .map_err(|e| format!("{}: {e}", safe(&file_str)))?;
+    if !opened.is_file() {
         return Err(format!("{}: not a regular file", safe(&file_str)).into());
     }
-    let mut bytes = Vec::new();
+    // Pre-size to the file (capped) so read_to_end does not grow and copy a large buffer.
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len().min(CAP + 1)).unwrap_or(0));
     use std::io::Read;
     (&file_handle)
         .take(CAP + 1)

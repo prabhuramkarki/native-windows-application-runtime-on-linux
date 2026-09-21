@@ -9,7 +9,12 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn runtime(args: &[&std::ffi::OsStr]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_runtime")).args(args).output().unwrap()
+    // RUNTIME_LOG from the caller's shell would add tracing lines to the stderr the tests pin.
+    Command::new(env!("CARGO_BIN_EXE_runtime"))
+        .env_remove("RUNTIME_LOG")
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 fn scratch(name: &str) -> PathBuf {
