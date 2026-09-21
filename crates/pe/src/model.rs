@@ -174,5 +174,9 @@ pub struct PeInfo {
     pub version: Option<VersionInfo>,
     pub installer: Option<Installer>,
     /// Tables that exist but failed to parse. Analysis continues past them.
+    ///
+    /// Free-form human text: the wording may change between versions, so consumers must not
+    /// parse it. The structured fields of this object are the contract; a warning only says
+    /// that the field it concerns may be incomplete.
     pub warnings: Vec<String>,
 }

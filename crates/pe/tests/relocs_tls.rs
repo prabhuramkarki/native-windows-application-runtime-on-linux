@@ -45,3 +45,16 @@ fn tls_with_no_callbacks_is_silent() {
     assert!(i.warnings.is_empty(), "{:?}", i.warnings);
     assert_eq!(i.tls.unwrap().callback_count, 0);
 }
+
+#[test]
+fn highadj_parameter_word_is_not_a_relocation() {
+    // HIGHADJ (type 4) is followed by one extra word carrying its low 16 bits. That word can look
+    // like any type; here 0xA123 would count as a DIR64 fixup if read as an entry.
+    let base = Builder::rva(0);
+    let words = [0x4010, 0xA123, 0xA020, 0x0000];
+    let data = reloc_block(0x1000, 8 + 2 * words.len() as u32, &words);
+    let len = data.len() as u32;
+    let i = analyze(&Builder::x64().section(".reloc", DATA_R, data).dir(5, base, len));
+    assert!(i.warnings.is_empty(), "{:?}", i.warnings);
+    assert_eq!(i.relocation_count, 2); // HIGHADJ and the DIR64 after its parameter word
+}
