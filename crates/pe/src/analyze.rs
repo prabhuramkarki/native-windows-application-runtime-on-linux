@@ -100,6 +100,7 @@ macro_rules! extract {
                     warnings.push(format!("imports: {dll} zero table RVA"));
                     return functions;
                 }
+                let mut terminated = false;
                 for _ in 0..65_536 {
                     if budget == 0 {
                         warnings.push(format!(
@@ -113,15 +114,31 @@ macro_rules! extract {
                         break;
                     };
                     if v == 0 {
+                        terminated = true;
                         break;
                     }
+                    // Compute next_rva FIRST, before handling value
+                    let word_size = std::mem::size_of::<$word>() as u32;
+                    let Some(next_rva) = rva.checked_add(word_size) else {
+                        warnings.push(format!("imports: {dll} RVA overflow"));
+                        break;
+                    };
+                    // Charge budget unconditionally
+                    budget -= 1;
+                    // Advance rva BEFORE handling value (so all continue paths advance)
+                    rva = next_rva;
+                    // Handle ordinal or by-name import
                     if v & $ord_flag != 0 {
                         functions.push(ImportedFn::Ordinal((v & 0xFFFF) as u16));
-                        budget -= 1;
                     } else {
+                        // For by-name: check value fits in 31 bits (ordinal flag in bit 31/63)
+                        if v > 0x7FFF_FFFF {
+                            warnings.push(format!("imports: {dll} thunk value overflows 31 bits ({:#x})", v));
+                            continue;
+                        }
                         let name_rva = (v as u32).checked_add(2).unwrap_or(0);
                         if name_rva == 0 {
-                            warnings.push(format!("imports: {dll} thunk value overflows u32 ({:#x})", v));
+                            warnings.push(format!("imports: {dll} thunk value overflow at {:#x}", v));
                             continue;
                         }
                         match f.derva_c_str(name_rva) {
@@ -131,7 +148,6 @@ macro_rules! extract {
                                     continue;
                                 }
                                 functions.push(ImportedFn::Name(n.to_string()));
-                                budget -= 1;
                             }
                             Err(_) => {
                                 warnings.push(format!(
@@ -141,12 +157,11 @@ macro_rules! extract {
                             }
                         }
                     }
-                    let word_size = std::mem::size_of::<$word>() as u32;
-                    let Some(next_rva) = rva.checked_add(word_size) else {
-                        warnings.push(format!("imports: {dll} RVA overflow"));
-                        break;
-                    };
-                    rva = next_rva;
+                }
+                if !terminated {
+                    warnings.push(format!(
+                        "imports: {dll} thunk table not terminated within 65536 entries"
+                    ));
                 }
                 functions
             };
@@ -187,20 +202,16 @@ macro_rules! extract {
             // pelite has no delay-import support: walk IMAGE_DELAYLOAD_DESCRIPTOR (8 x u32) by hand.
             if dir(DIR_DELAY_IMPORT).0 != 0 {
                 let mut rva = dir(DIR_DELAY_IMPORT).0;
-                let mut delay_count = 0;
+                let mut terminated = false;
                 for _ in 0..4096 {
-                    if delay_count >= 4096 {
-                        warnings.push("delay imports: descriptor limit (4096) exceeded".to_owned());
-                        break;
-                    }
                     let Ok(d) = f.derva_copy::<[u32; 8]>(rva) else {
                         warnings.push("delay imports: truncated descriptor".to_owned());
                         break;
                     };
                     if d[1] == 0 {
+                        terminated = true;
                         break;
                     }
-                    delay_count += 1;
                     let next_rva = rva.checked_add(32).unwrap_or(0);
                     if next_rva == 0 {
                         warnings.push("delay imports: RVA overflow".to_owned());
@@ -221,6 +232,9 @@ macro_rules! extract {
                         delay: true,
                         functions: thunks(d[4], &dll_str, &mut warnings),
                     });
+                }
+                if !terminated {
+                    warnings.push("delay imports: descriptor table not terminated within 4096 entries".to_owned());
                 }
             }
 
