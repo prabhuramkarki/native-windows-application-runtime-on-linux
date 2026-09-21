@@ -3,6 +3,14 @@ use pelite::resources::FindError;
 use pelite::{PeFile, Wrap};
 use std::collections::BTreeMap;
 
+/// Analyses a Windows PE image. `bytes` may be any slice, of any alignment (an unaligned one is
+/// copied first); nothing in it is trusted, and this never panics or reads outside it.
+///
+/// `Err(Error::NotPe)`: the bytes are not a PE image at all. `Err(Error::Malformed)`: it starts
+/// like one but the headers cannot be used, so nothing is reported. `Ok` means the headers are
+/// sound: every table that could not be read (imports, exports, relocations, resources, ...)
+/// is left empty and named in `PeInfo::warnings` instead, so `Ok` with warnings is a partial
+/// result, not a clean one.
 pub fn analyze(bytes: &[u8]) -> Result<PeInfo, Error> {
     if detect(bytes) != FileKind::Pe {
         return Err(Error::NotPe);
@@ -504,7 +512,17 @@ macro_rules! extract {
                             bad.hit(off);
                         }
                         let words = &data[off + 8..off + size.clamp(8, left)];
-                        relocation_count += words.chunks_exact(2).filter(|w| w[1] >> 4 != 0).count();
+                        // Entry = type (high 4 bits) | offset. Type 0 is ABSOLUTE padding. HIGHADJ
+                        // (type 4) is followed by one parameter word that is not an entry, so it
+                        // is skipped or it could be counted as a fixup of any type.
+                        let mut entries = words.chunks_exact(2);
+                        while let Some(w) = entries.next() {
+                            let kind = w[1] >> 4;
+                            relocation_count += usize::from(kind != 0);
+                            if kind == 4 {
+                                entries.next();
+                            }
+                        }
                         // `size` is an untrusted u32; clamp to `left` before aligning so the +3 in
                         // next_multiple_of can't overflow usize on 32-bit targets. Result-identical
                         // on 64-bit; the final min keeps `off` in range when `left` is not 4-aligned.

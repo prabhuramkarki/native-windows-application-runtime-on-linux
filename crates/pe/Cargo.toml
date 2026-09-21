@@ -3,6 +3,7 @@ name = "runtime-pe"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "pe"
