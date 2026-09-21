@@ -221,102 +221,37 @@ pub fn exports_ordinal_only_data(base: u32) -> Vec<u8> {
         .0
 }
 
-/// Long name string (2000 bytes) referenced by multiple name-table entries.
-#[rustfmt::skip]
-pub fn exports_long_name_data(base: u32) -> Vec<u8> {
-    let long_name = "a".repeat(2000);
-    let long_name_rva = base + 112;
-    Bytes::default()
-        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(10).u32(3).u32(2).u32(base + 64).u32(base + 80).u32(base + 96)
-        .pad_to(40)
-        .cstr("mylib.dll")
-        .pad_to(64)
-        .u32(0x2000).u32(base + 128).u32(0)
-        .pad_to(80)
-        .u32(long_name_rva).u32(long_name_rva)
-        .pad_to(96)
-        .u16(0).u16(1)
-        .pad_to(112)
-        .cstr(&long_name)
-        .0
+/// Offset (within the section) of the free-form `tail` passed to `exports_raw`.
+pub fn exports_tail_off(nf: usize, nn: usize) -> usize {
+    (64 + 4 * nf + 4 * nn + 2 * nn).next_multiple_of(8)
 }
 
-/// Name-table entry with idx >= functions().len() should be ignored.
+/// Export section from raw parts. Header at 0, DLL name at 40, function table at 64, then the
+/// name RVA table, the name-index (u16) table and finally `tail` (strings) at `exports_tail_off`.
+/// `names` is (name RVA, function index) per name-table entry. Nothing is validated, so tests
+/// can point RVAs anywhere.
 #[rustfmt::skip]
-pub fn exports_oob_name_idx_data(base: u32) -> Vec<u8> {
-    Bytes::default()
-        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(10).u32(2).u32(1).u32(base + 64).u32(base + 80).u32(base + 96)
+pub fn exports_raw(base: u32, ordinal_base: u32, funcs: &[u32], names: &[(u32, u16)], tail: &[u8]) -> Vec<u8> {
+    let (nf, nn) = (funcs.len(), names.len());
+    let f_off = 64u32;
+    let n_off = f_off + 4 * nf as u32;
+    let i_off = n_off + 4 * nn as u32;
+    let mut b = Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(ordinal_base).u32(nf as u32).u32(nn as u32)
+        .u32(base + f_off).u32(base + n_off).u32(base + i_off)
         .pad_to(40)
         .cstr("mylib.dll")
-        .pad_to(64)
-        .u32(0x1000).u32(base + 112).u32(0)
-        .pad_to(80)
-        .u32(base + 144)  // points to name at idx=5 but only 2 function slots
-        .pad_to(96)
-        .u16(5)  // idx 5, out of bounds
-        .pad_to(112)
-        .cstr("OnlyOne")
-        .pad_to(144)
-        .cstr("OutOfBounds")
-        .0
-}
-
-/// Unreadable forwarder: slot RVA inside export dir claim but outside mapped section.
-#[rustfmt::skip]
-pub fn exports_unreadable_forwarder_data(base: u32) -> Vec<u8> {
-    // Claim export dir extends to base+500, but actual section ends at base+96
-    // Slot 0 has forwarder RVA = base + 400 (inside claimed dir, outside actual section)
-    Bytes::default()
-        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(1).u32(1).u32(0).u32(base + 64).u32(0).u32(base + 80)
-        .pad_to(40)
-        .cstr("mylib.dll")
-        .pad_to(64)
-        .u32(base + 400)  // forwarder RVA inside claimed dir, outside actual mapped data
-        .pad_to(80)
-        .u16(0)
-        .pad_to(96)
-        .0
-}
-
-/// Budget test: 5000 functions with shared 1000-byte name each => >4MiB total.
-#[rustfmt::skip]
-pub fn exports_budget_test_data(base: u32) -> Vec<u8> {
-    const NUM_FUNCS: u32 = 5000;
-    const NUM_NAMES: u32 = 5000;
-    const SHARED_NAME_LEN: usize = 1000;
-
-    // Shared name is 1000 bytes (under per-string cap)
-    let shared_name = "n".repeat(SHARED_NAME_LEN);
-    let mut b = Bytes::default();
-
-    // Export directory header
-    let funcs_tbl_rva = base + 40;
-    let names_tbl_rva = base + 40 + NUM_FUNCS * 4; // after function RVAs
-    let ordinals_tbl_rva = base + 40 + NUM_FUNCS * 4 + NUM_NAMES * 4; // after name RVAs
-    let name_str_rva = base + 40 + NUM_FUNCS * 4 + NUM_NAMES * 4 + NUM_NAMES * 2; // after ordinals
-
-    b = b.u32(0).u32(0).u16(0).u16(0).u32(base + 40 - 36).u32(1); // name at base+4, ordinal base 1
-    b = b.u32(NUM_FUNCS).u32(NUM_NAMES).u32(funcs_tbl_rva).u32(names_tbl_rva).u32(ordinals_tbl_rva);
-    b = b.pad_to(40_usize);
-
-    // Function RVAs: all are 0x2000 (symbol outside export dir)
-    for _ in 0..NUM_FUNCS {
-        b = b.u32(0x2000);
+        .pad_to(64);
+    for &f in funcs {
+        b = b.u32(f);
     }
-
-    // Name RVAs: all point to the same shared string
-    for _ in 0..NUM_NAMES {
-        b = b.u32(name_str_rva);
+    for &(rva, _) in names {
+        b = b.u32(rva);
     }
-
-    // Ordinals: sequential (0..NUM_NAMES)
-    for i in 0..NUM_NAMES {
-        b = b.u16((i & 0xFFFF) as u16);
+    for &(_, idx) in names {
+        b = b.u16(idx);
     }
-
-    // Shared name string (1000 bytes + NUL)
-    b.0.extend_from_slice(shared_name.as_bytes());
-    b.0.push(0);
-
-    b.0
+    let mut out = b.pad_to(exports_tail_off(nf, nn)).0;
+    out.extend_from_slice(tail);
+    out
 }
