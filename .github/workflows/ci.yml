@@ -22,9 +22,12 @@ jobs:
   # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
   # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
   # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on
-  # Linux only): expect to adjust the Wine package, its first-run time or timeouts after the first run.
+  # Linux only). ubuntu-latest may ship Wine 9 (`wineserver64`, no new WoW64): the tests then skip their 32-bit
+  # steps with a `SKIPPED 32-bit` message. `continue-on-error` keeps a failure here from blocking a pull request
+  # until one green run on a real runner shows the job is stable; then remove it.
   wine-e2e:
     runs-on: ubuntu-latest
+    continue-on-error: true
     timeout-minutes: 30
     env:
       WINEDEBUG: "-all"
@@ -33,10 +36,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
       - uses: dtolnay/rust-toolchain@stable
       - run: tools/build-fixtures.sh
-      - run: cargo build
       # Only the crates with real-Wine tests: `--workspace --ignored` would also run the runtime-pe oracle tests,
       # which need RUNTIME_SAMPLES (a directory of real binaries) and fail without it.
-      - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
+      - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1 --nocapture
   deny:
     runs-on: ubuntu-latest
     steps:
