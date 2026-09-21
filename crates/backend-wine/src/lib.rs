@@ -97,20 +97,90 @@ fn valid_version_token(token: &str) -> bool {
     (2..=3).contains(&parts.len()) && parts.iter().all(|p| digits(p)) && rc.is_none_or(digits)
 }
 
+/// A hardening failure as `BackendError::Io` whose source wraps the typed [`harden::HardenError`]
+/// (retrievable with [`harden_cause`]; `TooDeep`, `TooManyEntries` and `Symlink` stay distinguishable).
 fn harden_error(what: &'static str, e: harden::HardenError) -> BackendError {
-    BackendError::failed(what, e.to_string().as_bytes())
+    BackendError::Io {
+        what,
+        source: std::io::Error::other(e),
+    }
+}
+
+/// The typed hardening failure behind an error of [`WineBackend::prepare`], if it was one (a refused prefix
+/// before `wineboot`, or a failed/incomplete hardening after it).
+pub fn harden_cause(e: &BackendError) -> Option<&harden::HardenError> {
+    match e {
+        BackendError::Io { source, .. } => source.get_ref()?.downcast_ref(),
+        _ => None,
+    }
+}
+
+/// `err` (the failure of `wineboot`) with the failure of the `stop` that followed, if any: the caller must learn
+/// that a wineserver may still be running in the prefix (Task 6 deletes the environment on a failed `prepare`).
+/// Both parts are capped, the result stays within one `Detail`.
+fn with_stop_note(err: BackendError, stopped: Result<(), BackendError>) -> BackendError {
+    let Err(stop) = stopped else {
+        return err;
+    };
+    let stop_text = stop.to_string();
+    let note = format!(
+        "; ALSO `wineserver -k` failed ({}): a wineserver may still be running in this prefix",
+        Detail::from_bytes(&stop_text.as_bytes()[..stop_text.len().min(1200)])
+    );
+    let join = |head: &Detail| {
+        let head = &head.as_str().as_bytes()[..head.as_str().len().min(2000)];
+        Detail::from_bytes(&[head, note.as_bytes()].concat())
+    };
+    match err {
+        BackendError::Failed { what, detail } => BackendError::Failed {
+            what,
+            detail: join(&detail),
+        },
+        BackendError::TimedOut { what, secs, output } => BackendError::TimedOut {
+            what,
+            secs,
+            output: join(&output),
+        },
+        other => BackendError::Failed {
+            what: "wineboot",
+            detail: join(&Detail::from_bytes(other.to_string().as_bytes())),
+        },
+    }
 }
 
 impl WineBackend {
     /// Finds the system Wine (see [`discover`]); the error tells the user how to install it.
     pub fn discover() -> Result<WineBackend, BackendError> {
-        let found = discover::discover(
+        WineBackend::discover_with(Launcher::new())
+    }
+
+    /// Like [`discover`](Self::discover), with the `Launcher` the services also use for `spawn`.
+    pub fn discover_with(launcher: Launcher) -> Result<WineBackend, BackendError> {
+        WineBackend::discover_using(
+            launcher,
             &|k| std::env::var_os(k),
             &discover::is_executable_file,
             &discover::is_dir,
+            &discover::canonicalize,
         )
-        .map_err(|e| BackendError::Unavailable(Detail::from_bytes(e.to_string().as_bytes())))?;
-        Ok(WineBackend::from_found(found, Launcher::new()))
+    }
+
+    pub(crate) fn discover_using(
+        launcher: Launcher,
+        env: &impl Fn(&str) -> Option<OsString>,
+        is_file: &impl Fn(&Path) -> bool,
+        is_dir: &impl Fn(&Path) -> bool,
+        canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
+    ) -> Result<WineBackend, BackendError> {
+        let found = discover::discover(env, is_file, is_dir, canonicalize)
+            .map_err(|e| BackendError::Unavailable(Detail::from_bytes(e.to_string().as_bytes())))?;
+        Ok(WineBackend::from_found(found, launcher))
+    }
+
+    /// The launcher this backend runs its helpers with; services use the same one to `spawn` (one place for the
+    /// Phase 5 sandbox `wrap` hook).
+    pub fn launcher(&self) -> &Launcher {
+        &self.launcher
     }
 
     pub fn from_found(found: discover::Found, launcher: Launcher) -> WineBackend {
@@ -178,11 +248,14 @@ impl CompatBackend for WineBackend {
         cmd.args(["wineboot", "-u"]);
         let booted = self.launcher.run_helper(cmd, self.timeouts.prepare);
         let stopped = self.stop(env);
-        let out = booted.map_err(|e| BackendError::from_run("wineboot", e))?;
+        let out = match booted {
+            Ok(out) => out,
+            Err(e) => return Err(with_stop_note(BackendError::from_run("wineboot", e), stopped)),
+        };
         if !out.status.success() {
             let mut detail = format!("{}: ", out.status).into_bytes();
             detail.extend_from_slice(&out.output);
-            return Err(BackendError::failed("wineboot", &detail));
+            return Err(with_stop_note(BackendError::failed("wineboot", &detail), stopped));
         }
         stopped?;
         let report = harden::harden_prefix(&prefix).map_err(|e| harden_error("prefix hardening", e))?;
@@ -204,10 +277,11 @@ impl CompatBackend for WineBackend {
         opts: &RunOpts,
     ) -> Result<Command, BackendError> {
         let root = env.drive_c();
-        check_inside(&root, exe_unix, "executable", Want::File)?;
-        check_inside(&root, cwd_unix, "working directory", Want::Dir)?;
+        // Wine gets the NORMALISED paths (`drive_c` + the verified components), not the caller's spelling.
+        let exe_unix = check_inside(&root, exe_unix, "executable", Want::File)?;
+        let cwd_unix = check_inside(&root, cwd_unix, "working directory", Want::Dir)?;
         let mut cmd = self.wine_command(env, if opts.debug { "err+all,fixme-all" } else { "-all" });
-        cmd.arg(exe_unix).args(args).current_dir(cwd_unix);
+        cmd.arg(&exe_unix).args(args).current_dir(&cwd_unix);
         Ok(cmd)
     }
 
@@ -236,8 +310,8 @@ enum Want {
 }
 
 /// See [`WineBackend::command`]. `root` is absolute (`AppEnv` guarantees it), so a relative `p` fails the
-/// `strip_prefix`.
-fn check_inside(root: &Path, p: &Path, what: &'static str, want: Want) -> Result<(), BackendError> {
+/// `strip_prefix`. Returns the normalised path: `root` plus the verified components.
+fn check_inside(root: &Path, p: &Path, what: &'static str, want: Want) -> Result<PathBuf, BackendError> {
     let outside = || BackendError::OutsideDriveC { what };
     if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(outside());
@@ -260,7 +334,7 @@ fn check_inside(root: &Path, p: &Path, what: &'static str, want: Want) -> Result
     match want {
         Want::File if !file_type.is_file() => Err(not(b"not a regular file")),
         Want::Dir if !file_type.is_dir() => Err(not(b"not a directory")),
-        _ => Ok(()),
+        _ => Ok(cur),
     }
 }
 
@@ -714,7 +788,11 @@ esac
         fs::create_dir(&victim).unwrap();
         symlink(&victim, r.env.prefix()).unwrap();
         let e = r.backend().prepare(&r.env).unwrap_err();
-        assert!(matches!(e, BackendError::Failed { what: "prefix", .. }), "{e:?}");
+        assert!(matches!(e, BackendError::Io { what: "prefix", .. }), "{e:?}");
+        assert!(
+            matches!(harden_cause(&e), Some(harden::HardenError::Symlink { what: "prefix" })),
+            "{e:?}"
+        );
         assert!(r.calls().is_empty(), "wine must not have run: {:?}", r.calls());
         assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
     }
@@ -727,7 +805,11 @@ esac
         fs::create_dir(r.env.prefix()).unwrap();
         symlink(&victim, r.env.drive_c()).unwrap();
         let e = r.backend().prepare(&r.env).unwrap_err();
-        assert!(matches!(e, BackendError::Failed { what: "prefix", .. }), "{e:?}");
+        assert!(matches!(e, BackendError::Io { what: "prefix", .. }), "{e:?}");
+        assert!(
+            matches!(harden_cause(&e), Some(harden::HardenError::Symlink { what: "drive_c" })),
+            "{e:?}"
+        );
         assert!(r.calls().is_empty(), "{:?}", r.calls());
     }
 
@@ -1094,6 +1176,214 @@ esac
         assert!(go(&dir.join("missing")).is_err());
         // drive_c itself is a fine cwd.
         assert!(go(&r.env.drive_c()).is_ok());
+    }
+
+    // ---- a failing stop is never swallowed (Task 5 review, Important 2) ----
+
+    const STOP_FAILS: &str = "echo 'STOP-OUT: cannot kill the server' >&2; exit 5";
+
+    #[test]
+    fn a_failed_wineboot_and_a_failed_stop_are_both_reported() {
+        let r = rig_with(
+            "case \"$1\" in wineboot) echo 'BOOT-OUT: boom' >&2; exit 3;; esac",
+            STOP_FAILS,
+        );
+        let e = r.backend().prepare(&r.env).unwrap_err();
+        let text = e.to_string();
+        assert!(matches!(e, BackendError::Failed { what: "wineboot", .. }), "{e:?}");
+        for needle in ["BOOT-OUT: boom", "wineserver -k", "STOP-OUT", "may still be running"] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn a_wineboot_timeout_and_a_failed_stop_are_both_reported() {
+        let r = rig_with(
+            "case \"$1\" in wineboot) echo 'BOOT-OUT: slow'; exec sleep 30;; esac",
+            STOP_FAILS,
+        );
+        let t = Timeouts {
+            prepare: Duration::from_secs(1),
+            ..Timeouts::default()
+        };
+        let e = r.backend().with_timeouts(t).prepare(&r.env).unwrap_err();
+        let text = e.to_string();
+        assert!(
+            matches!(
+                e,
+                BackendError::TimedOut {
+                    what: "wineboot",
+                    secs: 1,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        for needle in ["BOOT-OUT: slow", "wineserver -k", "STOP-OUT", "may still be running"] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn a_wineboot_that_cannot_start_and_a_failed_stop_are_both_reported() {
+        let r = rig_with(WINE_DEFAULT, STOP_FAILS);
+        let mut b = r.backend();
+        b.wine = r.root.join("missing/wine");
+        let e = b.prepare(&r.env).unwrap_err();
+        let text = e.to_string();
+        assert!(text.contains("wineboot") && text.contains("STOP-OUT"), "{text}");
+        assert!(text.contains("may still be running"), "{text}");
+    }
+
+    #[test]
+    fn the_merged_failure_text_stays_bounded() {
+        let big = "yes 'BOOT-OUT xxxxxxxxxxxxxxxx' | head -c 200000 >&2; exit 3";
+        let r = rig_with(
+            &format!("case \"$1\" in wineboot) {big};; esac"),
+            "yes 'STOP-OUT yyyyyyyyyyyyyyyy' | head -c 200000 >&2; exit 5",
+        );
+        let e = r.backend().prepare(&r.env).unwrap_err();
+        match &e {
+            BackendError::Failed { detail, .. } => {
+                assert!(detail.as_str().len() <= 4096, "{}", detail.as_str().len());
+                let text = detail.as_str();
+                assert!(text.contains("BOOT-OUT") && text.contains("STOP-OUT"), "{text}");
+                assert!(
+                    text.contains("may still be running"),
+                    "the warning must survive the cap"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(e.to_string().len() < 4200);
+    }
+
+    #[test]
+    fn a_failed_wineboot_with_a_working_stop_is_reported_as_before() {
+        let r = rig_with(
+            "case \"$1\" in wineboot) echo 'BOOT-OUT: boom' >&2; exit 3;; esac",
+            "exit 0",
+        );
+        let text = r.backend().prepare(&r.env).unwrap_err().to_string();
+        assert!(
+            text.contains("BOOT-OUT") && !text.contains("may still be running"),
+            "{text}"
+        );
+    }
+
+    // ---- typed hardening failures (Task 5 review, Minor 10) ----
+
+    #[test]
+    fn a_hardening_failure_after_wineboot_is_matchable() {
+        // wineboot "creates" a tree deeper than the walk examines: harden refuses, and the cause is typed.
+        let r = rig_with(
+            "case \"$1\" in wineboot) mkdir -p \"$WINEPREFIX/dosdevices\" \"$WINEPREFIX/drive_c/a/b/c/d/e/f/g/h/i/j/k/l/m\"; ln -s ../drive_c \"$WINEPREFIX/dosdevices/c:\";; esac",
+            "exit 0",
+        );
+        let e = r.backend().prepare(&r.env).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                BackendError::Io {
+                    what: "prefix hardening",
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(
+            matches!(harden_cause(&e), Some(harden::HardenError::TooDeep { max: 12 })),
+            "{e:?}"
+        );
+        assert!(e.to_string().contains("directory levels"), "{e}");
+        // Other errors carry no hardening cause.
+        let other = BackendError::failed("x", b"y");
+        assert!(harden_cause(&other).is_none());
+        let io = BackendError::Io {
+            what: "x",
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert!(harden_cause(&io).is_none());
+    }
+
+    // ---- API for the services ----
+
+    #[test]
+    fn launcher_is_the_one_the_backend_runs_with() {
+        let r = rig();
+        let b = r.backend();
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("FROM_BACKEND", "1");
+        let out = b.launcher().run_helper(cmd, Duration::from_secs(10)).unwrap();
+        let text = String::from_utf8_lossy(&out.output).into_owned();
+        assert!(
+            text.contains("HOME=/injected-home"),
+            "the injected host env of the backend's launcher: {text}"
+        );
+        assert!(text.contains("FROM_BACKEND=1"));
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[test]
+    fn discover_using_reports_a_missing_wine_with_a_hint_and_keeps_the_launcher() {
+        let none = |_: &str| None::<OsString>;
+        let no_file = |_: &Path| false;
+        let no_canon = |_: &Path| None::<PathBuf>;
+        let launcher = Launcher::with_host_env([("HOME", "/injected-home"), ("PATH", "/usr/bin:/bin")]);
+        let e = WineBackend::discover_using(launcher, &none, &no_file, &no_file, &no_canon).unwrap_err();
+        assert!(matches!(e, BackendError::Unavailable(_)), "{e:?}");
+        assert!(e.to_string().contains("apt install wine"), "{e}");
+
+        let launcher = Launcher::with_host_env([("HOME", "/injected-home"), ("PATH", "/usr/bin:/bin")]);
+        let env = |k: &str| (k == "PATH").then(|| OsString::from("/opt/x/bin"));
+        let files = |p: &Path| p == Path::new("/opt/x/bin/wine64") || p == Path::new("/opt/x/bin/wineserver");
+        let dirs = |p: &Path| p == Path::new("/opt/x/lib/wine/x86_64-windows");
+        let b = WineBackend::discover_using(launcher, &env, &files, &dirs, &no_canon).unwrap();
+        assert_eq!(b.wine_path(), Path::new("/opt/x/bin/wine64"));
+        assert_eq!(b.dll_dirs(), [PathBuf::from("/opt/x/lib/wine/x86_64-windows")]);
+        let out = b
+            .launcher()
+            .run_helper(Command::new("/usr/bin/env"), Duration::from_secs(10))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.output).contains("HOME=/injected-home"));
+    }
+
+    // ---- the path Wine gets is normalised (Task 5 review, Minor 6) ----
+
+    #[test]
+    fn wine_gets_the_normalised_path_not_the_callers_spelling() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/a.exe");
+        let dc = r.env.drive_c();
+        let dc = dc.to_str().unwrap();
+        let spelled_exe = PathBuf::from(format!("{dc}/./Program Files//t/./a.exe"));
+        let spelled_dir = PathBuf::from(format!("{dc}//Program Files/t/"));
+        assert_ne!(spelled_exe.as_os_str(), exe.as_os_str());
+        assert_ne!(spelled_dir.as_os_str(), dir.as_os_str());
+        let cmd = r
+            .backend()
+            .command(
+                &r.env,
+                &spelled_exe,
+                &spelled_dir,
+                &[OsString::from("x")],
+                &RunOpts::default(),
+            )
+            .unwrap();
+        assert_eq!(cmd.get_args().next().unwrap(), exe.as_os_str());
+        // `Path` equality ignores `.` and `//`: compare the raw bytes.
+        assert_eq!(cmd.get_current_dir().map(Path::as_os_str), Some(dir.as_os_str()));
+        // ... and it really runs that path.
+        let launcher = Launcher::with_host_env([("PATH", "/usr/bin:/bin")]);
+        assert!(
+            launcher
+                .run_helper(cmd, Duration::from_secs(10))
+                .unwrap()
+                .status
+                .success()
+        );
+        let raw = fs::read(r.log.join("argv.bin")).unwrap();
+        assert_eq!(raw.split(|b| *b == 0).next().unwrap(), exe.as_os_str().as_bytes());
     }
 
     // ---- small things ----

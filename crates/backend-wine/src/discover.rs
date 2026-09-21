@@ -5,7 +5,8 @@
 //!
 //! Order for `wine`: `$RUNTIME_WINE` (absolute; a bad value is an ERROR, never a silent fallback to another
 //! Wine), then `wine64`, then `wine` on `$PATH`. For `wineserver` (it is usually NOT on `PATH`): `$RUNTIME_WINESERVER`
-//! (absolute, same rule), `wineserver` on `PATH`, then a fixed list of well-known locations. `PATH` entries that
+//! (absolute, same rule); when `$RUNTIME_WINE` is set, the `wineserver` next to it; `wineserver` on `PATH`; then a
+//! fixed list of well-known locations. `PATH` entries that
 //! are empty or relative are skipped (an empty entry means "the current directory": a planted `wine` there must
 //! never be picked up). An empty override variable counts as unset.
 //!
@@ -35,7 +36,9 @@ pub const WINESERVER_CANDIDATES: &[&str] = &[
 pub struct Found {
     pub wine: PathBuf,
     pub wineserver: PathBuf,
-    /// `<dir of wineserver>/x86_64-windows` and `/i386-windows`, those that exist.
+    /// The built-in DLL directories that exist (see `find_dll_dirs`: next to the wineserver, next to its
+    /// canonical location, `../lib/wine`, `../lib64/wine`). EMPTY means "could not be found": callers (`doctor`)
+    /// must report "DLL availability not verified", not "DLL missing".
     pub dll_dirs: Vec<PathBuf>,
 }
 
@@ -66,15 +69,22 @@ pub fn is_dir(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.is_dir())
 }
 
-/// Runs the search described in the module docs.
+/// `fs::canonicalize`, `None` on any error.
+pub fn canonicalize(p: &Path) -> Option<PathBuf> {
+    fs::canonicalize(p).ok()
+}
+
+/// Runs the search described in the module docs. `canonicalize` resolves symlinks (`None`: cannot be resolved).
 pub fn discover(
     env: &impl Fn(&str) -> Option<OsString>,
     is_file: &impl Fn(&Path) -> bool,
     is_dir: &impl Fn(&Path) -> bool,
+    canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
 ) -> Result<Found, DiscoverError> {
     let path = env("PATH").unwrap_or_default();
-    let wine = match override_var(env, ENV_WINE, is_file)? {
-        Some(p) => p,
+    let wine_override = override_var(env, ENV_WINE, is_file)?;
+    let wine = match &wine_override {
+        Some(p) => p.clone(),
         None => ["wine64", "wine"]
             .iter()
             .find_map(|name| on_path(name, &path, is_file))
@@ -82,23 +92,56 @@ pub fn discover(
     };
     let wineserver = match override_var(env, ENV_WINESERVER, is_file)? {
         Some(p) => p,
-        None => on_path("wineserver", &path, is_file)
+        None => wine_override
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("wineserver"))
+            .filter(|sibling| is_file(sibling))
+            .or_else(|| on_path("wineserver", &path, is_file))
             .or_else(|| WINESERVER_CANDIDATES.iter().map(PathBuf::from).find(|c| is_file(c)))
             .ok_or(DiscoverError::WineserverNotFound)?,
     };
-    let dll_dirs = match wineserver.parent() {
-        Some(dir) => ["x86_64-windows", "i386-windows"]
-            .iter()
-            .map(|d| dir.join(d))
-            .filter(|d| is_dir(d))
-            .collect(),
-        None => Vec::new(),
-    };
+    let dll_dirs = find_dll_dirs(&wineserver, is_dir, canonicalize);
     Ok(Found {
         wine,
         wineserver,
         dll_dirs,
     })
+}
+
+/// The built-in DLL directories that exist, for the wineserver path as given AND its canonical location (a
+/// `/usr/bin/wineserver` symlink points into the real Wine directory). Per directory `D` (`<parent>` of the
+/// wineserver): `D/{x86_64,i386}-windows`, then `D/../lib/wine/...` and `D/../lib64/wine/...` (the `/opt/wine-*`
+/// layout). Deduplicated, in that order. Empty when nothing is found: that means "not verified", not "missing".
+fn find_dll_dirs(
+    wineserver: &Path,
+    is_dir: &impl Fn(&Path) -> bool,
+    canonicalize: &impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = Vec::new();
+    let real = canonicalize(wineserver);
+    for server in std::iter::once(wineserver).chain(real.as_deref()) {
+        if let Some(dir) = server.parent() {
+            bases.push(dir.to_path_buf());
+        }
+    }
+    let mut found: Vec<PathBuf> = Vec::new();
+    for base in bases {
+        let mut roots = vec![base.clone()];
+        if let Some(up) = base.parent() {
+            roots.push(up.join("lib/wine"));
+            roots.push(up.join("lib64/wine"));
+        }
+        for root in roots {
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let dir = root.join(arch);
+                if is_dir(&dir) && !found.contains(&dir) {
+                    found.push(dir);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// `Ok(None)` when the variable is unset or empty; an error when it is set but not an absolute executable file.
@@ -143,6 +186,8 @@ mod tests {
         env: HashMap<&'static str, OsString>,
         files: HashSet<PathBuf>,
         dirs: HashSet<PathBuf>,
+        /// What `canonicalize` returns for a path (a symlink, in the fake host); anything else: itself.
+        canon: HashMap<PathBuf, PathBuf>,
     }
 
     impl Host {
@@ -158,10 +203,17 @@ mod tests {
             self.dirs.insert(p.into());
             self
         }
+        fn link(mut self, from: &str, to: &str) -> Host {
+            self.canon.insert(from.into(), to.into());
+            self
+        }
         fn run(&self) -> Result<Found, DiscoverError> {
-            discover(&|k| self.env.get(k).cloned(), &|p| self.files.contains(p), &|p| {
-                self.dirs.contains(p)
-            })
+            discover(
+                &|k| self.env.get(k).cloned(),
+                &|p| self.files.contains(p),
+                &|p| self.dirs.contains(p),
+                &|p| Some(self.canon.get(p).cloned().unwrap_or_else(|| p.to_path_buf())),
+            )
         }
     }
 
@@ -406,6 +458,182 @@ mod tests {
         let e = h.run().unwrap_err();
         assert_eq!(e, DiscoverError::WineserverNotFound);
         assert!(e.to_string().contains("apt install wine"), "{e}");
+    }
+
+    // ---- dll dirs: the wineserver path may be a symlink or live in an /opt layout ----
+
+    #[test]
+    fn dll_dirs_of_a_symlinked_wineserver_come_from_its_canonical_parent() {
+        // Debian alternatives style: /usr/bin/wineserver -> the real one next to the DLL directories.
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/usr/bin/wineserver")
+            .link("/usr/bin/wineserver", "/usr/lib/x86_64-linux-gnu/wine/wineserver")
+            .dir("/usr/lib/x86_64-linux-gnu/wine/x86_64-windows")
+            .dir("/usr/lib/x86_64-linux-gnu/wine/i386-windows");
+        let found = h.run().unwrap();
+        assert_eq!(
+            found.wineserver,
+            p("/usr/bin/wineserver"),
+            "the path as given is what runs"
+        );
+        assert_eq!(
+            found.dll_dirs,
+            vec![
+                p("/usr/lib/x86_64-linux-gnu/wine/x86_64-windows"),
+                p("/usr/lib/x86_64-linux-gnu/wine/i386-windows")
+            ]
+        );
+    }
+
+    #[test]
+    fn dll_dirs_in_an_opt_layout_are_found_under_lib_wine() {
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/opt/wine-x/bin/wineserver")
+            .var("RUNTIME_WINESERVER", "/opt/wine-x/bin/wineserver")
+            .dir("/opt/wine-x/lib/wine/x86_64-windows")
+            .dir("/opt/wine-x/lib/wine/i386-windows");
+        assert_eq!(
+            h.run().unwrap().dll_dirs,
+            vec![
+                p("/opt/wine-x/lib/wine/x86_64-windows"),
+                p("/opt/wine-x/lib/wine/i386-windows")
+            ]
+        );
+        // lib64 too.
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/opt/wine-y/bin/wineserver")
+            .var("RUNTIME_WINESERVER", "/opt/wine-y/bin/wineserver")
+            .dir("/opt/wine-y/lib64/wine/x86_64-windows");
+        assert_eq!(
+            h.run().unwrap().dll_dirs,
+            vec![p("/opt/wine-y/lib64/wine/x86_64-windows")]
+        );
+    }
+
+    #[test]
+    fn dll_dir_candidates_are_tried_for_the_given_and_the_canonical_parent_and_deduplicated() {
+        // /usr/local/bin/wineserver -> /opt/w/bin/wineserver: DLLs are only in the canonical layout, one of the
+        // directories is next to the link as well (found via the given path), none is listed twice.
+        let h = Host::default()
+            .var("PATH", "/usr/local/bin:/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/usr/local/bin/wineserver")
+            .link("/usr/local/bin/wineserver", "/opt/w/bin/wineserver")
+            .dir("/usr/local/lib/wine/i386-windows")
+            .dir("/opt/w/lib/wine/x86_64-windows")
+            .dir("/opt/w/lib/wine/i386-windows");
+        assert_eq!(
+            h.run().unwrap().dll_dirs,
+            vec![
+                p("/usr/local/lib/wine/i386-windows"),
+                p("/opt/w/lib/wine/x86_64-windows"),
+                p("/opt/w/lib/wine/i386-windows"),
+            ]
+        );
+        // A canonical path equal to the given one adds nothing twice.
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/usr/lib/wine/wineserver")
+            .dir("/usr/lib/wine/x86_64-windows");
+        let h = h.var("RUNTIME_WINESERVER", "/usr/lib/wine/wineserver");
+        assert_eq!(h.run().unwrap().dll_dirs, vec![p("/usr/lib/wine/x86_64-windows")]);
+    }
+
+    #[test]
+    fn the_same_directory_reached_two_ways_is_listed_once() {
+        // /usr/bin/wineserver -> /usr/lib/wine/wineserver: `/usr/lib/wine/x86_64-windows` is both
+        // `<given dir>/../lib/wine/...` and `<canonical dir>/...`.
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/usr/bin/wineserver")
+            .link("/usr/bin/wineserver", "/usr/lib/wine/wineserver")
+            .dir("/usr/lib/wine/x86_64-windows");
+        assert_eq!(h.run().unwrap().dll_dirs, vec![p("/usr/lib/wine/x86_64-windows")]);
+    }
+
+    #[test]
+    fn no_dll_dir_found_is_an_empty_list_not_an_error() {
+        // `doctor` must then say "DLL availability not verified", never "missing".
+        let h = Host::default()
+            .var("PATH", "/usr/bin")
+            .file("/usr/bin/wine")
+            .file("/usr/bin/wineserver")
+            .dir("/somewhere/else/x86_64-windows");
+        let found = h.run().unwrap();
+        assert_eq!(found.dll_dirs, Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_real_symlinked_wineserver_in_a_tempdir() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        let real = root.join("real/lib/wine");
+        fs::create_dir_all(real.join("x86_64-windows")).unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        write(&real.join("wineserver"), 0o755);
+        write(&root.join("bin/wine64"), 0o755);
+        symlink(real.join("wineserver"), root.join("bin/wineserver")).unwrap();
+        let path = root.join("bin");
+        let found = discover(
+            &|k| (k == "PATH").then(|| path.clone().into_os_string()),
+            &is_executable_file,
+            &is_dir,
+            &canonicalize,
+        )
+        .unwrap();
+        assert_eq!(found.wineserver, root.join("bin/wineserver"));
+        assert_eq!(found.dll_dirs, vec![real.join("x86_64-windows")]);
+    }
+
+    #[test]
+    fn canonicalize_on_a_real_filesystem() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().canonicalize().unwrap();
+        fs::write(root.join("f"), b"").unwrap();
+        symlink(root.join("f"), root.join("l")).unwrap();
+        assert_eq!(canonicalize(&root.join("l")), Some(root.join("f")));
+        assert_eq!(canonicalize(&root.join("missing")), None);
+    }
+
+    // ---- wineserver next to an overridden wine ----
+
+    #[test]
+    fn with_runtime_wine_set_the_wineserver_next_to_it_is_tried_first() {
+        let base = || {
+            Host::default()
+                .var("PATH", "/usr/bin")
+                .var("RUNTIME_WINE", "/opt/w/bin/wine")
+                .file("/opt/w/bin/wine")
+                .file("/usr/bin/wineserver")
+                .file("/usr/lib/wine/wineserver")
+        };
+        // The sibling beats PATH and the fixed candidates ...
+        let h = base().file("/opt/w/bin/wineserver");
+        assert_eq!(h.run().unwrap().wineserver, p("/opt/w/bin/wineserver"));
+        // ... but not RUNTIME_WINESERVER ...
+        let h = h.var("RUNTIME_WINESERVER", "/usr/lib/wine/wineserver");
+        assert_eq!(h.run().unwrap().wineserver, p("/usr/lib/wine/wineserver"));
+        // ... and a missing sibling falls through to PATH.
+        assert_eq!(base().run().unwrap().wineserver, p("/usr/bin/wineserver"));
+    }
+
+    #[test]
+    fn the_sibling_rule_is_for_an_overridden_wine_only() {
+        // wine64 comes from PATH (/b), wineserver exists in /a and /b: plain PATH order (/a) applies.
+        let h = Host::default()
+            .var("PATH", "/a:/b")
+            .file("/b/wine64")
+            .file("/a/wineserver")
+            .file("/b/wineserver");
+        assert_eq!(h.run().unwrap().wineserver, p("/a/wineserver"));
     }
 
     // ---- the real filesystem checks ----

@@ -12,6 +12,7 @@
 //! (and kills it if it will not stop), so no Wine process survives a test, even a failed one. The GUI fixture
 //! (`gui64.exe`, a modal message box) is never run here.
 use backend_wine::WineBackend;
+use backend_wine::harden::audit_prefix;
 use rt_core::{AppEnv, AppId, CompatBackend, Launcher, LogSink, RunOpts, Store};
 use std::ffi::OsString;
 use std::fs;
@@ -84,13 +85,15 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Sandbox {
-        let backend = WineBackend::discover().expect("Wine must be installed for the e2e tests (apt install wine)");
+        let launcher = Launcher::new();
+        let backend = WineBackend::discover_with(launcher.clone())
+            .expect("Wine must be installed for the e2e tests (apt install wine)");
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().join("apps")).unwrap();
         let env = store.create(&AppId::parse("e2e").unwrap()).unwrap();
         Sandbox {
             backend,
-            launcher: Launcher::new(),
+            launcher,
             env,
             _tmp: tmp,
         }
@@ -207,6 +210,16 @@ fn e2e_prepare_hardens_and_both_fixtures_run() {
         "no link below drive_c may leave drive_c"
     );
     assert!(sb.prefix().join("system.reg").is_file());
+    let audit = audit_prefix(&sb.prefix()).expect("audit");
+    assert_eq!(
+        (audit.extra_devices.len(), audit.c_link_ok, audit.outward.len()),
+        (0, true, 0),
+        "{audit:?}"
+    );
+    // The built-in DLL directories were resolved (needed by `doctor`).
+    let dlls = sb.backend.dll_dirs();
+    eprintln!("dll dirs: {dlls:?}");
+    assert!(!dlls.is_empty() && dlls.iter().all(|d| d.is_dir()), "{dlls:?}");
     let users = sb.env.drive_c().join("users");
     assert!(
         users.is_dir(),

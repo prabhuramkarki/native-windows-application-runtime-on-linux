@@ -21,8 +21,9 @@
 //! Run it with no Wine process in the prefix (`prepare` stops the server first): a same-uid process racing the
 //! walk can swap entries between the check and the fix; that race is out of scope for Phase 2.
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Directory levels below `drive_c` that are examined. A directory this deep is refused: its children would
@@ -76,6 +77,77 @@ impl HardenReport {
     }
 }
 
+/// What [`audit_prefix`] found. Paths are relative to the prefix and sorted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuditReport {
+    /// `dosdevices` entries other than `c:` (`z:`, `com*`, `lpt*`, ...): the caller decides which to tolerate
+    /// (Wine recreates `com*` on every start).
+    pub extra_devices: Vec<OsString>,
+    /// `dosdevices/c:` is a symlink to `../drive_c`.
+    pub c_link_ok: bool,
+    /// Symlinks below `drive_c` that do not resolve inside it (dangling and looping ones included).
+    pub outward: Vec<PathBuf>,
+}
+
+/// Read-only twin of [`harden_prefix`]: reports what it WOULD change, and changes nothing (no write, no
+/// create, no remove; the only `mkdir`/`unlink` calls in this module are in the fix phase of `harden_prefix`).
+/// Same refusals (symlinked or non-canonical `prefix`, symlinked or missing `drive_c`, symlinked `dosdevices`) and
+/// the same caps: a tree that cannot be examined completely is an error (`TooDeep`, `TooManyEntries`), so a caller
+/// (`doctor`) reports "audit incomplete" instead of a false "clean". A missing `dosdevices` is reported as
+/// `c_link_ok: false`, not an error.
+pub fn audit_prefix(prefix: &Path) -> Result<AuditReport, HardenError> {
+    audit_with_limits(prefix, MAX_DEPTH, MAX_ENTRIES)
+}
+
+pub(crate) fn audit_with_limits(
+    prefix: &Path,
+    max_depth: usize,
+    max_entries: usize,
+) -> Result<AuditReport, HardenError> {
+    let ex = examine(prefix, max_depth, max_entries)?;
+    let mut extra_devices: Vec<OsString> = ex.devices.into_iter().flatten().filter(|n| n != "c:").collect();
+    extra_devices.sort();
+    let c_link_ok = fs::read_link(ex.dosdevices.join("c:")).is_ok_and(|t| t == Path::new("../drive_c"));
+    let mut outward: Vec<PathBuf> = ex
+        .scan
+        .fixes
+        .into_iter()
+        .map(|(path, _)| path.strip_prefix(prefix).unwrap_or(&path).to_path_buf())
+        .collect();
+    outward.sort();
+    Ok(AuditReport {
+        extra_devices,
+        c_link_ok,
+        outward,
+    })
+}
+
+/// The result of the read-only examination shared by [`harden_prefix`] and [`audit_prefix`].
+struct Examined {
+    dosdevices: PathBuf,
+    /// `dosdevices` entry names (`c:` included); `None` when the directory is missing.
+    devices: Option<Vec<OsString>>,
+    scan: Scan,
+}
+
+/// Checks the roots (refusing links) and scans `dosdevices` and `drive_c` WITHOUT modifying anything.
+fn examine(prefix: &Path, max_depth: usize, max_entries: usize) -> Result<Examined, HardenError> {
+    check_spelling(prefix)?;
+    require_dir(prefix, "prefix")?;
+    let drive_c = prefix.join("drive_c");
+    require_dir(&drive_c, "drive_c")?;
+    let dosdevices = prefix.join("dosdevices");
+    // Resolved once: link targets are resolved too, so the comparison is between real paths.
+    let real_drive_c = fs::canonicalize(&drive_c).map_err(|e| io_err(&drive_c, e))?;
+    let devices = scan_dosdevices(&dosdevices, max_entries)?;
+    let scan = scan_drive_c(&drive_c, &real_drive_c, max_depth, max_entries)?;
+    Ok(Examined {
+        dosdevices,
+        devices,
+        scan,
+    })
+}
+
 /// Refuses a prefix that hardening (or Wine, which follows links) must not touch: a symlinked or non-canonical
 /// `prefix`, or a symlinked / non-directory `drive_c` or `dosdevices` where one already exists. Missing parts are
 /// fine (Wine creates them). `prepare` calls this BEFORE `wineboot`.
@@ -99,17 +171,12 @@ pub(crate) fn harden_with_limits(
     max_depth: usize,
     max_entries: usize,
 ) -> Result<HardenReport, HardenError> {
-    check_spelling(prefix)?;
-    require_dir(prefix, "prefix")?;
-    let drive_c = prefix.join("drive_c");
-    require_dir(&drive_c, "drive_c")?;
-    let dosdevices = prefix.join("dosdevices");
-    // Resolved once: link targets are resolved too, so the comparison is between real paths.
-    let real_drive_c = fs::canonicalize(&drive_c).map_err(|e| io_err(&drive_c, e))?;
-
-    // 1. Examine everything. Nothing has been modified yet, so any error below leaves the prefix as it was.
-    let devices = scan_dosdevices(&dosdevices, max_entries)?;
-    let scan = scan_drive_c(&drive_c, &real_drive_c, max_depth, max_entries)?;
+    // 1. Examine everything. Nothing has been modified yet, so any error here leaves the prefix as it was.
+    let Examined {
+        dosdevices,
+        devices,
+        scan,
+    } = examine(prefix, max_depth, max_entries)?;
 
     // 2. Fix.
     let mut report = HardenReport {
@@ -122,7 +189,11 @@ pub(crate) fn harden_with_limits(
         let relative = path.strip_prefix(prefix).unwrap_or(&path).to_path_buf();
         match fix {
             Fix::ReplaceWithDir => {
-                fs::create_dir(&path).map_err(|e| io_err(&path, e))?;
+                // 0700: the replacement is the app's own profile folder, never group/world accessible.
+                DirBuilder::new()
+                    .mode(0o700)
+                    .create(&path)
+                    .map_err(|e| io_err(&path, e))?;
                 report.links_replaced.push(relative);
             }
             Fix::Remove => report.links_removed.push(relative),
@@ -756,7 +827,8 @@ mod tests {
 
     #[test]
     fn a_wide_and_deep_hostile_tree_is_walked_within_the_caps() {
-        // 3 levels x 20 dirs = 8 000 dirs + a link loop in each: finishes, and is bounded by the entry cap.
+        // 20 x 20 = 400 leaf directories (+ 20 parents), a link to the parent in each: finishes, and is bounded by the
+        // entry cap.
         let fx = fixture();
         for a in 0..20 {
             for b in 0..20 {
@@ -769,6 +841,238 @@ mod tests {
         assert!(r.inside_links_kept >= 400);
         let e = harden_with_limits(&fx.prefix, MAX_DEPTH, 300).unwrap_err();
         assert!(matches!(e, HardenError::TooManyEntries { .. }));
+    }
+
+    // ---- mode of the replacement directories ----
+
+    #[test]
+    fn replacement_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = fixture();
+        let report = harden_prefix(&fx.prefix).unwrap();
+        assert!(!report.links_replaced.is_empty());
+        for rel in &report.links_replaced {
+            let mode = fs::symlink_metadata(fx.prefix.join(rel)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", rel.display());
+        }
+    }
+
+    // ---- audit_prefix: the read-only twin ----
+
+    /// Everything about the tree below `root` that a modification could change, by lstat: type, mode, size,
+    /// mtime (ns), file content, link target. Reading (audit) may change atimes only, which are not recorded.
+    fn snapshot(root: &Path) -> Vec<String> {
+        use std::os::unix::fs::MetadataExt;
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            let mut all = vec![dir.to_path_buf()];
+            while let Some(d) = all.pop() {
+                let m = fs::symlink_metadata(&d).unwrap();
+                let rel = d.strip_prefix(root).unwrap().display().to_string();
+                let mut line = format!("{rel}|{:o}|{}|{}.{}", m.mode(), m.size(), m.mtime(), m.mtime_nsec());
+                if m.file_type().is_symlink() {
+                    line += &format!("|-> {}", fs::read_link(&d).unwrap().display());
+                } else if m.file_type().is_file() {
+                    line += &format!("|{:?}", fs::read(&d).unwrap());
+                } else if m.file_type().is_dir() {
+                    for e in fs::read_dir(&d).unwrap() {
+                        all.push(e.unwrap().path());
+                    }
+                }
+                out.push(line);
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    const UNHARDENED_OUTWARD: [&str; 11] = [
+        "drive_c/users/u/AppData/Roaming/Microsoft/Windows/Templates",
+        "drive_c/users/u/Desktop",
+        "drive_c/users/u/Documents",
+        "drive_c/users/u/Videos",
+        "drive_c/users/u/chain_a",
+        "drive_c/users/u/chain_b",
+        "drive_c/users/u/dangling",
+        "drive_c/users/u/file_link",
+        "drive_c/users/u/loop_a",
+        "drive_c/users/u/loop_b",
+        "drive_c/users/u/rel_out",
+    ];
+
+    fn os(names: &[&str]) -> Vec<OsString> {
+        names.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn audit_of_an_unhardened_prefix_lists_exactly_what_hardening_would_fix() {
+        let fx = fixture();
+        let report = audit_prefix(&fx.prefix).unwrap();
+        assert_eq!(
+            report,
+            AuditReport {
+                extra_devices: os(&["com1", "lpt1", "z:"]),
+                c_link_ok: true,
+                outward: rel(&UNHARDENED_OUTWARD),
+            }
+        );
+        // Cross-check against the fixer: it changes exactly these.
+        let fixed = harden_prefix(&fx.prefix).unwrap();
+        let mut union: Vec<PathBuf> = fixed
+            .links_replaced
+            .iter()
+            .chain(&fixed.links_removed)
+            .cloned()
+            .collect();
+        union.sort();
+        assert_eq!(union, report.outward);
+        assert_eq!(fixed.devices_removed, report.extra_devices);
+    }
+
+    #[test]
+    fn audit_of_a_hardened_prefix_is_clean() {
+        let fx = fixture();
+        harden_prefix(&fx.prefix).unwrap();
+        assert_eq!(
+            audit_prefix(&fx.prefix).unwrap(),
+            AuditReport {
+                extra_devices: vec![],
+                c_link_ok: true,
+                outward: vec![]
+            }
+        );
+        // Wine puts the com* links back on every start: reported as extra devices, nothing else.
+        symlink("/dev/ttyS0", fx.prefix.join("dosdevices/com1")).unwrap();
+        let r = audit_prefix(&fx.prefix).unwrap();
+        assert_eq!((r.extra_devices, r.c_link_ok, r.outward), (os(&["com1"]), true, vec![]));
+    }
+
+    #[test]
+    fn audit_changes_nothing_at_all() {
+        let fx = fixture();
+        // Add the awkward things: a directory in dosdevices, a wrong nothing-to-do state.
+        mkdirs(&fx.prefix.join("dosdevices/d:/sub"));
+        let before = (snapshot(&fx.prefix), snapshot(&fx.outside));
+        assert!(before.0.len() > 25, "{}", before.0.len());
+        let first = audit_prefix(&fx.prefix).unwrap();
+        assert!(!first.outward.is_empty());
+        let second = audit_prefix(&fx.prefix).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            (snapshot(&fx.prefix), snapshot(&fx.outside)),
+            before,
+            "audit modified something"
+        );
+        // Also when it fails on a cap.
+        audit_with_limits(&fx.prefix, MAX_DEPTH, 5).unwrap_err();
+        assert_eq!((snapshot(&fx.prefix), snapshot(&fx.outside)), before);
+    }
+
+    #[test]
+    fn audit_reports_a_wrong_or_missing_c_link_without_repairing_it() {
+        for setup in ["missing", "to-root", "real-dir", "no-dosdevices"] {
+            let fx = fixture();
+            let dd = fx.prefix.join("dosdevices");
+            match setup {
+                "missing" => fs::remove_file(dd.join("c:")).unwrap(),
+                "to-root" => {
+                    fs::remove_file(dd.join("c:")).unwrap();
+                    symlink("/", dd.join("c:")).unwrap();
+                }
+                "real-dir" => {
+                    fs::remove_file(dd.join("c:")).unwrap();
+                    mkdirs(&dd.join("c:/x"));
+                }
+                _ => fs::remove_dir_all(&dd).unwrap(),
+            }
+            let before = snapshot(&fx.prefix);
+            let r = audit_prefix(&fx.prefix).unwrap();
+            assert!(!r.c_link_ok, "{setup}");
+            assert!(
+                !r.extra_devices.iter().any(|d| d == "c:"),
+                "{setup}: c: is never an extra device"
+            );
+            assert_eq!(snapshot(&fx.prefix), before, "{setup}: audit must not repair");
+        }
+    }
+
+    #[test]
+    fn audit_refuses_what_harden_refuses() {
+        let fx = fixture();
+        let link = fx.root.join("prefix-link");
+        symlink(&fx.prefix, &link).unwrap();
+        assert!(matches!(
+            audit_prefix(&link).unwrap_err(),
+            HardenError::Symlink { what: "prefix" }
+        ));
+        for spelling in [format!("{}/", link.display()), format!("{}/.", link.display())] {
+            assert!(matches!(
+                audit_prefix(Path::new(&spelling)).unwrap_err(),
+                HardenError::NonCanonical
+            ));
+        }
+        assert!(matches!(
+            audit_prefix(&fx.root.join("nope")).unwrap_err(),
+            HardenError::NotADirectory { what: "prefix" }
+        ));
+
+        let real = fx.root.join("elsewhere");
+        fs::rename(fx.drive_c(), &real).unwrap();
+        symlink(&real, fx.drive_c()).unwrap();
+        assert!(matches!(
+            audit_prefix(&fx.prefix).unwrap_err(),
+            HardenError::Symlink { what: "drive_c" }
+        ));
+        fs::remove_file(fx.drive_c()).unwrap();
+        assert!(matches!(
+            audit_prefix(&fx.prefix).unwrap_err(),
+            HardenError::NotADirectory { what: "drive_c" }
+        ));
+        fs::rename(&real, fx.drive_c()).unwrap();
+
+        let dd = fx.root.join("devices");
+        fs::rename(fx.prefix.join("dosdevices"), &dd).unwrap();
+        symlink(&dd, fx.prefix.join("dosdevices")).unwrap();
+        assert!(matches!(
+            audit_prefix(&fx.prefix).unwrap_err(),
+            HardenError::Symlink { what: "dosdevices" }
+        ));
+    }
+
+    #[test]
+    fn audit_reports_an_incomplete_walk_as_an_error() {
+        let fx = fixture();
+        let mut deep = fx.drive_c();
+        for i in 0..12 {
+            deep = deep.join(format!("d{i}"));
+        }
+        mkdirs(&deep);
+        assert!(matches!(
+            audit_prefix(&fx.prefix).unwrap_err(),
+            HardenError::TooDeep { max: 12 }
+        ));
+        fs::remove_dir_all(fx.drive_c().join("d0")).unwrap();
+        assert!(matches!(
+            audit_with_limits(&fx.prefix, MAX_DEPTH, 10).unwrap_err(),
+            HardenError::TooManyEntries { max: 10 }
+        ));
+        // dosdevices counts against the cap as well.
+        let t = tempfile::tempdir().unwrap();
+        let prefix = t.path().join("prefix");
+        mkdirs(&prefix.join("drive_c"));
+        mkdirs(&prefix.join("dosdevices"));
+        for i in 0..10 {
+            symlink("/dev/null", prefix.join(format!("dosdevices/com{i}"))).unwrap();
+        }
+        assert!(matches!(
+            audit_with_limits(&prefix, MAX_DEPTH, 5).unwrap_err(),
+            HardenError::TooManyEntries { max: 5 }
+        ));
+        assert_eq!(
+            audit_with_limits(&prefix, MAX_DEPTH, 50).unwrap().extra_devices.len(),
+            10
+        );
     }
 
     #[test]
