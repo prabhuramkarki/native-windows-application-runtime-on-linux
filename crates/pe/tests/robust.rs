@@ -194,7 +194,10 @@ fn corrupt_directories(m: &mut [u8], rng: &mut Rng, image_size: u32) {
 /// `$TMPDIR/pe-fuzz-fail-<seed>-<n>.bin` BEFORE the panic message, which also covers a hard abort
 /// (SIGABRT from a non-unwinding panic in a dependency), where `catch_unwind` cannot help. To
 /// reproduce: `RUNTIME_FUZZ_SEED=<seed> RUNTIME_FUZZ_ITERS=<n+1> cargo test -p runtime-pe --test
-/// robust corrupted`, or feed the saved file to `pe::analyze`.
+/// robust corrupted -- --nocapture`, or feed the dump `$TMPDIR/pe-fuzz-fail-<seed>-<n>.bin` to
+/// `pe::analyze`. Pass `--nocapture`: libtest captures test output, and on an abort the process
+/// dies before the captured hook line is flushed, so without it the seed/iteration line is lost
+/// (the dump file is still written).
 #[test]
 fn corrupted_input_never_panics() {
     let original = rich_sample();

@@ -26,7 +26,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn file_says(f: &Path) -> String {
-    String::from_utf8(Command::new("file").arg("-b").arg(f).output().unwrap().stdout).unwrap()
+    String::from_utf8_lossy(&Command::new("file").arg("-b").arg(f).output().unwrap().stdout).into_owned()
 }
 
 #[test]
