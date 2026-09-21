@@ -12,6 +12,10 @@
 //! the snapshot: backend variables always win over a host variable of the same name (a host `WINEPREFIX` can
 //! never redirect a prefix, and the Wine backend's `HOME` replaces the host's) and everything not allowlisted (`LD_PRELOAD`, secrets, ...) is gone.
 //!
+//! **X11 cookie.** The Wine backend replaces `HOME`, which hides `~/.Xauthority`; when `DISPLAY` is kept and
+//! `XAUTHORITY` is not, [`Launcher::with_host_env`] adds the host's `<HOME>/.Xauthority` (path only) if it is a
+//! regular file, so X authentication keeps working. A host `XAUTHORITY` is never overridden.
+//!
 //! **Helper processes.** `run_helper` finalises a helper command (`wineboot`, `wineserver -k`, ...) the same way and
 //! runs it under a deadline with capped output; it is the only supported way for a backend to run one.
 //!
@@ -93,9 +97,18 @@ impl Launcher {
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
     {
-        Launcher {
-            host: Arc::new(allowed_env(host)),
+        let mut kept = allowed_env(host); // a later duplicate wins in `finalize`, so pushing shadows an empty XAUTHORITY
+        let value = |name: &str| kept.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        let xauth = default_xauthority(
+            &value("HOME").unwrap_or_default(),
+            value("DISPLAY").is_some(),
+            value("XAUTHORITY").is_some_and(|v| !v.is_empty()),
+            is_regular_file_nofollow,
+        );
+        if let Some(path) = xauth {
+            kept.push((OsString::from("XAUTHORITY"), path.into_os_string()));
         }
+        Launcher { host: Arc::new(kept) }
     }
 
     /// The sandbox hook. Identity in Phase 2 (Phase 5 wraps the command here); it runs last, on the finished
@@ -147,6 +160,30 @@ impl Launcher {
         let (status, output) = run_with_timeout(self.finalize(cmd), timeout)?;
         Ok(HelperOutput { status, output })
     }
+}
+
+/// The X11 cookie file to pass when the host did not name one. The Wine backend redirects `HOME`, which hides
+/// `~/.Xauthority` from clients that fall back to it (`startx`, `ssh -X`, `xdm`; GDM/SDDM/KDE export
+/// `XAUTHORITY`). Returns `<home>/.Xauthority` only if `DISPLAY` is set, `XAUTHORITY` is unset or empty, `home` is
+/// absolute and `is_regular_file` says it is a regular file (the caller's probe must not follow symlinks). Only
+/// the PATH is handed over, never the contents.
+fn default_xauthority(
+    home: &OsStr,
+    has_display: bool,
+    has_xauthority: bool,
+    is_regular_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let home = Path::new(home);
+    if !has_display || has_xauthority || !home.is_absolute() {
+        return None;
+    }
+    let path = home.join(".Xauthority");
+    is_regular_file(&path).then_some(path)
+}
+
+/// `symlink_metadata`: a symlink (even to a regular file) or a directory is refused.
+fn is_regular_file_nofollow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// Routes the child's stderr per `sink` (stdout is inherited) and starts it. On failure the log is removed.
@@ -974,6 +1011,114 @@ mod tests {
             crate::RunError::TimedOut { output, .. } => assert!(output.as_str().contains("hello"), "{output}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------------------ default XAUTHORITY
+
+    fn xauth(home: &str, display: bool, xauthority: bool, regular: bool) -> Option<PathBuf> {
+        default_xauthority(OsStr::new(home), display, xauthority, |_| regular)
+    }
+
+    #[test]
+    fn a_regular_home_xauthority_is_passed_when_xauthority_is_unset() {
+        assert_eq!(
+            xauth("/home/u", true, false, true),
+            Some(PathBuf::from("/home/u/.Xauthority"))
+        );
+    }
+
+    #[test]
+    fn no_default_xauthority_when_the_file_is_not_a_regular_file() {
+        // missing, a directory and a symlink all answer `false` from the no-follow probe
+        assert_eq!(xauth("/home/u", true, false, false), None);
+    }
+
+    #[test]
+    fn no_default_xauthority_for_a_relative_or_empty_home() {
+        assert_eq!(xauth("home/u", true, false, true), None);
+        assert_eq!(xauth("", true, false, true), None);
+        assert_eq!(xauth(".", true, false, true), None);
+    }
+
+    #[test]
+    fn no_default_xauthority_without_display_or_when_the_host_names_one() {
+        assert_eq!(xauth("/home/u", false, false, true), None, "no DISPLAY");
+        assert_eq!(xauth("/home/u", true, true, true), None, "host XAUTHORITY wins");
+    }
+
+    #[test]
+    fn the_default_xauthority_probe_gets_the_exact_path_and_is_not_asked_when_pointless() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let probe = |p: &Path| {
+            seen.borrow_mut().push(p.to_owned());
+            true
+        };
+        assert!(default_xauthority(OsStr::new("/h"), true, false, probe).is_some());
+        assert_eq!(*seen.borrow(), [PathBuf::from("/h/.Xauthority")]);
+        let never = |_: &Path| -> bool { panic!("probed although nothing can be returned") };
+        assert_eq!(default_xauthority(OsStr::new("/h"), false, false, never), None);
+        assert_eq!(default_xauthority(OsStr::new("rel"), true, false, never), None);
+        assert_eq!(default_xauthority(OsStr::new("/h"), true, true, never), None);
+    }
+
+    #[test]
+    fn the_real_probe_accepts_a_file_and_refuses_missing_directory_symlink_and_dangling_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("file"), "cookie").unwrap();
+        fs::create_dir(d.join("dir")).unwrap();
+        symlink(d.join("file"), d.join("link")).unwrap();
+        symlink(d.join("nothing"), d.join("dangling")).unwrap();
+        assert!(is_regular_file_nofollow(&d.join("file")));
+        for no in ["dir", "link", "dangling", "missing"] {
+            assert!(!is_regular_file_nofollow(&d.join(no)), "{no}");
+        }
+        // and end to end through the real probe: HOME=<d> has no .Xauthority yet, then a file, then a symlink
+        let host = |home: &Path| {
+            let l = Launcher::with_host_env([
+                (OsString::from("DISPLAY"), OsString::from(":0")),
+                (OsString::from("HOME"), home.as_os_str().to_owned()),
+            ]);
+            envs(&l.finalize(Command::new("/bin/true"))).remove("XAUTHORITY")
+        };
+        assert_eq!(host(d), None);
+        fs::write(d.join(".Xauthority"), "cookie").unwrap();
+        assert_eq!(host(d), Some(Some(format!("{}/.Xauthority", d.display()))));
+        fs::remove_file(d.join(".Xauthority")).unwrap();
+        symlink(d.join("file"), d.join(".Xauthority")).unwrap();
+        assert_eq!(host(d), None, "a symlinked .Xauthority is refused");
+    }
+
+    #[test]
+    fn launcher_passes_the_default_xauthority_to_a_real_child_and_an_empty_one_is_replaced() {
+        let fx = fx();
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join(".Xauthority"), "cookie").unwrap();
+        let want = format!("XAUTHORITY={}/.Xauthority", home.path().display());
+        for empty in [None, Some("")] {
+            let mut host = vec![
+                ("PATH", home.path().to_str().unwrap().to_owned()),
+                ("HOME", home.path().to_str().unwrap().to_owned()),
+                ("DISPLAY", ":1".to_owned()),
+            ];
+            host.extend(empty.map(|e| ("XAUTHORITY", e.to_owned())));
+            let lines = child_env(&fx, &Launcher::with_host_env(host));
+            let got: Vec<_> = lines.iter().filter(|l| l.starts_with("XAUTHORITY=")).collect();
+            assert_eq!(got, [&want], "{lines:?}");
+        }
+        // a host XAUTHORITY is untouched although the default file exists; without DISPLAY nothing is added
+        let h = home.path().to_str().unwrap();
+        let named = Launcher::with_host_env([
+            ("HOME", h),
+            ("DISPLAY", ":1"),
+            ("XAUTHORITY", "/run/user/1/xauth"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let got: Vec<_> = child_env(&fx, &named);
+        let got: Vec<_> = got.iter().filter(|l| l.starts_with("XAUTHORITY=")).collect();
+        assert_eq!(got, [&"XAUTHORITY=/run/user/1/xauth".to_string()]);
+        let headless = Launcher::with_host_env([("HOME", h), ("PATH", "/usr/bin")]);
+        assert!(!has_var(&child_env(&fx, &headless), "XAUTHORITY"));
     }
 
     // ------------------------------------------------------------------------------ bounded and tolerant pruning
