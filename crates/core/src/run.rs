@@ -11,6 +11,11 @@
 //!                  backend.command(env, exe, cwd, args, RunOpts{debug}) --> Launcher::spawn(.., sink) --> wait
 //! ```
 //!
+//! [`find_target`] does the first step alone (no backend needed: a front end reports "no such app" before it looks
+//! for Wine) and [`resolve_program`] the middle (`get` to regular-file check; `doctor` uses it too). When the
+//! target was a file, a failure after its install is wrapped in [`RunAppError::AfterInstall`], which names the new
+//! app and says how to remove it.
+//!
 //! **Untrusted input.** The target text, `metadata.json` and the file system below the app directory are all
 //! untrusted. A path or command is never built from a free metadata string: `architecture`, `backend.id` and
 //! `environment` are only compared with known values, and the executable is a canonical `WinPath` mapped with
@@ -30,8 +35,8 @@
 use crate::text::quote;
 use crate::winpath::{ResolveError, WinPath, WinPathError, resolve_under};
 use crate::{
-    AppId, BackendError, CompatBackend, InstallError, InstallOpts, InstallOutcome, LaunchError, Launcher, LogSink,
-    Metadata, RunOpts, Running, Store, StoreError, install,
+    AppEnv, AppId, BackendError, CompatBackend, InstallError, InstallOpts, InstallOutcome, LaunchError, Launcher,
+    LogSink, Metadata, RunOpts, Running, Store, StoreError, install,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -93,6 +98,13 @@ pub enum RunAppError {
         id: AppId,
         #[source]
         source: WinPathError,
+    },
+    /// The file WAS installed (and stays installed) but starting it failed: the message says how to undo that.
+    #[error("{source}; the program was already installed as {id}: undo that with `runtime remove {id}`")]
+    AfterInstall {
+        id: AppId,
+        #[source]
+        source: Box<RunAppError>,
     },
     #[error("{0}")]
     Store(#[from] StoreError),
@@ -202,27 +214,34 @@ pub(crate) fn start_in(
     opts: &RunOptions,
     env: &Env<'_>,
 ) -> Result<Started, RunAppError> {
-    let (id, installed) = resolve_target(store, backend, target, env.base)?;
-    let app = store.get(&id)?;
-    // `read_metadata`, not just `get`: it validates the file and that its id is the directory's.
-    let md = store.read_metadata(&app)?;
-    check_known(&id, &md, backend.id())?;
-
-    let exe_text = WinPath::parse(&md.executable).map_err(|source| RunAppError::Path { id: id.clone(), source })?;
-    let unusable = |why: String| RunAppError::ExecutableMissing {
-        id: id.clone(),
-        exe: quote(&md.executable),
-        why,
+    let (id, installed) = match find_target(store, target, env.base)? {
+        Target::Installed(id) => (id, None),
+        Target::File(file) => {
+            let outcome = install(store, backend, &file, &InstallOpts::default())?;
+            (outcome.id.clone(), Some(outcome))
+        }
     };
-    // Contained in `drive_c`, no symlink on the way; the last component may still be a directory or special file.
-    let exe = resolve_under(&app.drive_c(), &exe_text).map_err(|e: ResolveError| unusable(e.to_string()))?;
-    match fs::symlink_metadata(&exe) {
-        Ok(m) if m.file_type().is_file() => {}
-        Ok(_) => return Err(unusable("not a regular file".into())),
-        Err(e) => return Err(unusable(e.to_string())),
+    match launch(store, backend, launcher, &id, args, opts, env) {
+        Ok(running) => Ok(Started { id, installed, running }),
+        // The install is done and stays: a failure now must not leave an app the user never heard of.
+        Err(e) if installed.is_some() => Err(RunAppError::AfterInstall {
+            id,
+            source: Box::new(e),
+        }),
+        Err(e) => Err(e),
     }
-    let cwd = exe.parent().ok_or_else(|| unusable("it has no directory".into()))?;
+}
 
+fn launch(
+    store: &Store,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    id: &AppId,
+    args: &[OsString],
+    opts: &RunOptions,
+    env: &Env<'_>,
+) -> Result<Running, RunAppError> {
+    let p = resolve_program(store, id, backend.id())?;
     // One flag, two effects: the backend's verbosity and the sink.
     let run_opts = RunOpts { debug: opts.debug };
     let sink = if opts.debug {
@@ -230,45 +249,93 @@ pub(crate) fn start_in(
     } else {
         LogSink::LogOnly
     };
-    let cmd = backend.command(&app, &exe, cwd, args, &run_opts)?;
-    let running = launcher.spawn(cmd, &app, sink)?;
-    Ok(Started { id, installed, running })
+    let cmd = backend.command(&p.env, &p.exe, &p.cwd, args, &run_opts)?;
+    Ok(launcher.spawn(cmd, &p.env, sink)?)
 }
 
-/// Which app the target names, installing the file first when it is one (see [`TargetKind`]). An installed app
-/// always wins over a file of the same name.
-fn resolve_target(
-    store: &Store,
-    backend: &dyn CompatBackend,
-    target: &str,
-    base: &Path,
-) -> Result<(AppId, Option<InstallOutcome>), RunAppError> {
-    let file = base.join(target);
-    let install_file = || -> Result<(AppId, Option<InstallOutcome>), RunAppError> {
-        let outcome = install(store, backend, &file, &InstallOpts::default())?;
-        Ok((outcome.id.clone(), Some(outcome)))
+/// An installed app's program, checked and mapped into the host file system.
+#[derive(Debug, Clone)]
+pub struct ResolvedProgram {
+    pub env: AppEnv,
+    /// Read with `Store::read_metadata` (validated, its id is the directory's) and passed the known-values checks.
+    pub metadata: Metadata,
+    /// The program's host path: contained in `drive_c`, no symlink on the way, a regular file.
+    pub exe: PathBuf,
+    /// The directory of `exe` (the program's working directory).
+    pub cwd: PathBuf,
+}
+
+/// Everything `run` checks before it starts an installed app, shared with `doctor`: the app exists, its
+/// metadata is valid and passes the known-values checks (see the module docs; `backend_id` is the current
+/// backend's), and its executable resolves to a regular file inside `drive_c`. Reads only; nothing is spawned.
+pub fn resolve_program(store: &Store, id: &AppId, backend_id: &'static str) -> Result<ResolvedProgram, RunAppError> {
+    let env = match store.get(id) {
+        Ok(env) => env,
+        Err(StoreError::NotFound) => return Err(RunAppError::NotInstalled { id: id.to_string() }),
+        Err(e) => return Err(e.into()),
     };
+    // `read_metadata`, not just `get`: it validates the file and that its id is the directory's.
+    let metadata = store.read_metadata(&env)?;
+    check_known(id, &metadata, backend_id)?;
+
+    let exe_text =
+        WinPath::parse(&metadata.executable).map_err(|source| RunAppError::Path { id: id.clone(), source })?;
+    let unusable = |why: String| RunAppError::ExecutableMissing {
+        id: id.clone(),
+        exe: quote(&metadata.executable),
+        why,
+    };
+    // Contained in `drive_c`, no symlink on the way; the last component may still be a directory or special file.
+    let exe = resolve_under(&env.drive_c(), &exe_text).map_err(|e: ResolveError| unusable(e.to_string()))?;
+    match fs::symlink_metadata(&exe) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => return Err(unusable("not a regular file".into())),
+        Err(e) => return Err(unusable(e.to_string())),
+    }
+    let cwd = exe
+        .parent()
+        .ok_or_else(|| unusable("it has no directory".into()))?
+        .to_owned();
+    Ok(ResolvedProgram {
+        env,
+        metadata,
+        exe,
+        cwd,
+    })
+}
+
+/// What a target names (see [`find_target`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Installed(AppId),
+    /// A file (not yet installed), joined onto the base directory.
+    File(PathBuf),
+}
+
+/// Which app or file the target names (see [`TargetKind`]); an installed app always wins over a file of the same
+/// name. Needs no backend, so a front end can report "no such app" before it looks for Wine.
+pub fn find_target(store: &Store, target: &str, base: &Path) -> Result<Target, RunAppError> {
+    let file = base.join(target);
     let no_such_file = || RunAppError::NoSuchFile { path: quote(target) };
+    let file_or_missing = |file: PathBuf| {
+        if file.exists() {
+            Ok(Target::File(file))
+        } else {
+            Err(no_such_file())
+        }
+    };
     if target.is_empty() {
         return Err(no_such_file());
     }
     if classify(target) == TargetKind::Path {
-        return if file.exists() {
-            install_file()
-        } else {
-            Err(no_such_file())
-        };
+        return file_or_missing(file);
     }
     let Ok(id) = AppId::parse(target) else {
-        return if file.exists() {
-            install_file()
-        } else {
-            Err(no_such_file())
-        };
+        return file_or_missing(file);
     };
     match store.get(&id) {
-        Ok(_) => Ok((id, None)),
-        Err(StoreError::NotFound) if file.exists() => install_file(),
+        Ok(_) => Ok(Target::Installed(id)),
+        Err(StoreError::NotFound) if file.exists() => Ok(Target::File(file)),
         Err(StoreError::NotFound) => Err(RunAppError::NotInstalled { id: id.to_string() }),
         Err(e) => Err(e.into()),
     }

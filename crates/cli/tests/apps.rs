@@ -731,10 +731,55 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
     fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
     assert_tame(&assert_fails(&r.rt(&["run", &id2])), "stderr");
     assert!(!r.log.join("argv.bin").exists());
-    // No Wine at all.
+    // No Wine at all, for an installed app.
     let r2 = rig().no_wine();
+    r2.plant("x", "X");
     let err = assert_fails(&r2.rt(&["run", "x"]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
+}
+
+#[test]
+fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
+    let r = rig().no_wine();
+    let err = assert_fails(&r.rt(&["run", "nothing"]));
+    assert!(
+        err.contains("runtime list") && err.contains("runtime install <file>"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("RUNTIME_WINE"),
+        "the Wine error hides the real one: {err}"
+    );
+    let err = assert_fails(&r.rt(&["run", "nothing.exe"]));
+    assert!(err.contains("no such file"), "{err}");
+    assert!(!err.contains("RUNTIME_WINE"), "{err}");
+    // What does need Wine still says so: a file to install, and an installed app.
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let err = assert_fails(&r.rt(&["run".as_ref(), p.as_os_str()]));
+    assert!(err.contains("RUNTIME_WINE"), "{err}");
+    assert!(r.app_dirs().is_empty(), "nothing was installed: {:?}", r.app_dirs());
+}
+
+#[test]
+fn run_of_a_file_whose_start_fails_names_the_app_it_installed() {
+    let r = rig();
+    // The fake Wine deletes itself once the prefix exists, so installing works and starting the program cannot.
+    let wine = WINE.replace("@LOG@", r.log.to_str().unwrap()).replace(
+        ": > \"$P/system.reg\" ;;",
+        &format!(": > \"$P/system.reg\"; rm -f {} ;;", r.bin.join("wine").display()),
+    );
+    assert!(wine.contains("rm -f"), "the rig text changed");
+    script(&r.bin.join("wine"), &wine);
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let o = r.rt(&["run".as_ref(), p.as_os_str()]);
+    let err = assert_fails(&o);
+    let ids = r.app_dirs();
+    assert_eq!(ids.len(), 1, "the install stays: {ids:?}");
+    assert!(
+        err.contains(&format!("installed as {}", ids[0])) && err.contains(&format!("runtime remove {}", ids[0])),
+        "{err}"
+    );
+    assert_tame(&err, "stderr");
 }
 
 // ================================================================ remove
