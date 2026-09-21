@@ -129,6 +129,24 @@ pub(crate) fn open_nonblocking(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)
 }
 
+/// Best effort: makes a rename in `dir` durable. Opened with `O_DIRECTORY|O_NONBLOCK`, so if `dir` was swapped for
+/// a FIFO (by a process of the same uid) in the meantime, the open fails with `ENOTDIR` at once instead of
+/// blocking until a writer appears. Any failure here is ignored: the rename already happened.
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = open_dir_nonblocking(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// Opens `dir` read-only, and only if it is a directory (`O_DIRECTORY`: `ENOTDIR` for a FIFO, a file, ...), without
+/// blocking (`O_NONBLOCK`).
+fn open_dir_nonblocking(dir: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(dir)
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Metadata {
@@ -250,10 +268,7 @@ impl Metadata {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
-        // Make the rename durable; failure here does not undo it.
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+        sync_dir(dir);
         Ok(())
     }
 }
@@ -769,6 +784,31 @@ mod tests {
         mkfifo(&fifo);
         let file = within_10s(move || open_nonblocking(&fifo)).unwrap();
         assert!(!file.metadata().unwrap().file_type().is_file());
+    }
+
+    #[test]
+    fn syncing_a_directory_that_became_a_fifo_or_a_file_returns_at_once_and_fails_nothing() {
+        // What this proves: the best-effort directory fsync never blocks and never reports an error when the
+        // path is not a directory (a plain `File::open` on a FIFO with no writer blocks forever). It cannot
+        // prove that a real directory is synced (not observable), only that the call is harmless.
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("dir-swapped-for-a-fifo");
+        mkfifo(&fifo);
+        let f = fifo.clone();
+        let err = within_10s(move || open_dir_nonblocking(&f)).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err:?}");
+        within_10s(move || sync_dir(&fifo));
+        let file = tmp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let err = open_dir_nonblocking(&file).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR), "{err:?}");
+        sync_dir(&file);
+        assert!(open_dir_nonblocking(tmp.path()).is_ok());
+        sync_dir(&tmp.path().join("missing"));
+        sync_dir(tmp.path());
+        // and a write into a real directory still succeeds end to end
+        sample("app").write_atomic(&tmp.path().join("metadata.json")).unwrap();
+        assert!(Metadata::read(&tmp.path().join("metadata.json")).is_ok());
     }
 
     #[test]

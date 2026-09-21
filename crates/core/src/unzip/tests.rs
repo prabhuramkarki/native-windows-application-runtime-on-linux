@@ -1290,3 +1290,25 @@ mod prevalidate_tests {
         assert_eq!(o.archive.central_directory_start(), pv(&base3()).unwrap().cd_offset);
     }
 }
+
+#[test]
+fn the_guarded_reader_masks_from_the_files_real_cursor_not_from_zero() {
+    // 100 bytes of 0xAA, directory at 20, cursor at 10: the first read shows 10 zero bytes (10..20) and then the
+    // real data. A reader that assumed position 0 would blank 20 bytes.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_file(tmp.path(), "f", &[0xAA; 100]);
+    let mut file = File::open(path).unwrap();
+    file.seek(SeekFrom::Start(10)).unwrap();
+    let mut g = Guarded::new(file, 20, Arc::new(AtomicBool::new(true))).unwrap();
+    let mut buf = [0xFF; 30];
+    g.read_exact(&mut buf).unwrap();
+    assert_eq!(buf[..10], [0; 10]);
+    assert_eq!(buf[10..], [0xAA; 20]);
+    // and once the mask is off, or past the directory start, nothing is touched
+    let mut file = File::open(tmp.path().join("f")).unwrap();
+    file.seek(SeekFrom::Start(40)).unwrap();
+    let mut g = Guarded::new(file, 20, Arc::new(AtomicBool::new(true))).unwrap();
+    let mut buf = [0xFF; 8];
+    g.read_exact(&mut buf).unwrap();
+    assert_eq!(buf, [0xAA; 8]);
+}

@@ -6,11 +6,15 @@ use serde_json::json;
 pub fn run(as_json: bool) -> Result<(), CmdError> {
     let store = crate::store()?;
     let mut apps = Vec::new();
+    let mut warned = false;
     for entry in store.list() {
         match entry {
             Ok((_env, md)) => apps.push(md),
             // A bad entry (corrupt metadata, a symlink, a stray file) never stops the listing.
-            Err(w) => warn(&w.to_string()),
+            Err(w) => {
+                warned = true;
+                warn(&w.to_string());
+            }
         }
     }
     if as_json {
@@ -24,6 +28,11 @@ pub fn run(as_json: bool) -> Result<(), CmdError> {
             })
             .collect();
         return crate::emit(&format!("{}\n", json_safe(&serde_json::to_string_pretty(&rows)?)));
+    }
+    if apps.is_empty() && warned {
+        return crate::emit(
+            "No usable apps (every entry was skipped, see the warnings above). Install one with: runtime install <file>\n",
+        );
     }
     if apps.is_empty() {
         return crate::emit("No apps installed. Install one with: runtime install <file>\n");

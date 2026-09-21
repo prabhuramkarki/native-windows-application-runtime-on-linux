@@ -80,8 +80,9 @@ fn ensure_app_home(env: &AppEnv) -> Result<(), BackendError> {
     }
 }
 
-/// `command`: `runtime/` and `home` are real directories (nothing is created here).
-fn check_app_home(env: &AppEnv) -> Result<(), BackendError> {
+/// `command`: `runtime/` and `home` are real directories (nothing is created here). `doctor` makes the same
+/// check, so it and `run` agree on which apps are usable.
+pub fn check_app_home(env: &AppEnv) -> Result<(), BackendError> {
     require_real_dir(&env.root().join("runtime"), "app runtime directory")?;
     require_real_dir(&app_home(env), "app home directory")
 }

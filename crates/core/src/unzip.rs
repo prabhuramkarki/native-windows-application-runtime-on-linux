@@ -458,6 +458,20 @@ pub struct Guarded {
     masked: Arc<AtomicBool>,
 }
 
+impl Guarded {
+    /// `pos` starts at the file's real cursor (not at 0), so the mask is right even if the reader is used before
+    /// its first seek. `prevalidate` reads through a shared `&File`, so the cursor is not necessarily at 0.
+    fn new(mut file: File, below: u64, masked: Arc<AtomicBool>) -> io::Result<Guarded> {
+        let pos = file.stream_position()?;
+        Ok(Guarded {
+            file,
+            below,
+            pos,
+            masked,
+        })
+    }
+}
+
 impl Read for Guarded {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
@@ -493,12 +507,8 @@ pub fn open(file: File, limits: &Limits) -> Result<(Archive, Plan), ZipError> {
         .len();
     let info = prevalidate(&mut &file, len, limits)?;
     let masked = Arc::new(AtomicBool::new(true));
-    let guarded = Guarded {
-        file,
-        below: info.cd_offset,
-        pos: 0,
-        masked: masked.clone(),
-    };
+    let guarded =
+        Guarded::new(file, info.cd_offset, masked.clone()).map_err(|e| ZipError::Format(clean(&e.to_string(), 200)))?;
     let parsed = ZipArchive::new(guarded);
     masked.store(false, Ordering::Relaxed);
     let mut archive = parsed.map_err(|e| format_err(&e))?;

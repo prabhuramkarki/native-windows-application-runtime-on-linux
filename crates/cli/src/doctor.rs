@@ -61,6 +61,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             Pe::Skipped => PeState::Skipped,
             Pe::Analysed(info) => PeState::Analysed(info),
             Pe::Unreadable(why) => PeState::Unreadable(why),
+            Pe::Archive => PeState::Archive,
         },
         program: facts
             .program
@@ -68,6 +69,10 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             .map(|r| r.as_ref().map(String::as_str).map_err(String::as_str)),
         app_dir: facts.app_dir.as_ref(),
         prefix: facts.prefix,
+        app_home: facts
+            .app_home
+            .as_ref()
+            .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
         prefix_root: facts.prefix_root.as_deref(),
     });
     crate::emit(&if as_json {
@@ -82,6 +87,8 @@ enum Pe {
     Skipped,
     Analysed(Box<PeInfo>),
     Unreadable(String),
+    /// A zip archive: not analysed, and not an error either.
+    Archive,
 }
 
 /// Everything about the target that is read from disk.
@@ -92,6 +99,8 @@ struct Facts {
     /// `None`: no program directory to look at.
     app_dir: Option<ListResult>,
     prefix: PrefixState,
+    /// Installed apps only: [`backend_wine::check_app_home`], the check `run` makes, as text.
+    app_home: Option<Result<(), String>>,
     prefix_root: Option<PathBuf>,
 }
 
@@ -103,6 +112,7 @@ impl Facts {
             program: None,
             app_dir: None,
             prefix: PrefixState::NotApplicable,
+            app_home: None,
             prefix_root: None,
         }
     }
@@ -131,6 +141,7 @@ impl Facts {
                 // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
                 app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
                 prefix: prefix_state(&p.env.prefix()),
+                app_home: Some(home_state(&p.env)),
                 prefix_root: Some(p.env.prefix()),
             },
             // The program cannot be used, and that is the report: the name and the prefix are still shown.
@@ -146,6 +157,7 @@ impl Facts {
                     prefix: env
                         .as_ref()
                         .map_or(PrefixState::NotApplicable, |env| prefix_state(&env.prefix())),
+                    app_home: env.as_ref().map(home_state),
                     prefix_root: env.map(|env| env.prefix()),
                     ..Facts::system()
                 }
@@ -161,11 +173,14 @@ fn read_pe(path: &Path) -> Pe {
             Ok(info) => Pe::Analysed(Box::new(info)),
             Err(e) => Pe::Unreadable(e.to_string()),
         },
-        Ok(Input::Zip(_)) => Pe::Unreadable(
-            "a ZIP archive, not a program: install it with `runtime install`, then run `runtime doctor <app>`".into(),
-        ),
+        Ok(Input::Zip(_)) => Pe::Archive,
         Err(e) => Pe::Unreadable(e.to_string()),
     }
+}
+
+/// What `run` would say about the app's `HOME` directory (`Ok` when it is a real directory).
+fn home_state(env: &rt_core::AppEnv) -> Result<(), String> {
+    backend_wine::check_app_home(env).map_err(|e| e.to_string())
 }
 
 /// The read-only audit of `prefix`, in the words of `doctor`.

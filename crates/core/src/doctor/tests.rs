@@ -128,6 +128,7 @@ struct Sc {
     program: Option<Result<String, String>>,
     app_dir: Option<ListResult>,
     prefix: PrefixState,
+    app_home: Option<Result<(), String>>,
     prefix_root: Option<PathBuf>,
 }
 
@@ -142,6 +143,7 @@ fn sc() -> Sc {
         program: None,
         app_dir: None,
         prefix: PrefixState::NotApplicable,
+        app_home: None,
         prefix_root: None,
     }
 }
@@ -158,6 +160,7 @@ fn app(imports: Vec<Import>) -> Sc {
         },
         pe: Some(Ok(info)),
         program: Some(Ok("C:\\Program Files\\app\\app.exe".into())),
+        app_home: Some(Ok(())),
         prefix: PrefixState::Audit(PrefixAudit {
             c_link_ok: true,
             ..PrefixAudit::default()
@@ -194,6 +197,10 @@ impl Sc {
             }),
             app_dir: self.app_dir.as_ref(),
             prefix: self.prefix.clone(),
+            app_home: self
+                .app_home
+                .as_ref()
+                .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
             prefix_root: self.prefix_root.as_deref(),
         })
     }
@@ -329,6 +336,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         program: None,
         app_dir: None,
         prefix: PrefixState::NotApplicable,
+        app_home: None,
         prefix_root: None,
     });
     let c = one(&r, Area::Runtime, "version");
@@ -352,6 +360,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         program: None,
         app_dir: None,
         prefix: PrefixState::NotApplicable,
+        app_home: None,
         prefix_root: None,
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
@@ -1626,4 +1635,71 @@ fn api_set_names_are_counted_ascii_case_insensitively_only() {
     let c = imports_of(&r);
     assert_eq!(c.len(), 1);
     assert!(c[0].text.contains("(2 API-set names not verified"), "{}", c[0].text);
+}
+
+// ------------------------------------------------------------------------------ app home and archives
+
+const HOME_GONE: &str = "app home directory failed: missing: this app was not prepared by this version, reinstall it";
+
+#[test]
+fn a_missing_app_home_is_a_program_failure_with_the_reinstall_text() {
+    let mut s = app(vec![]);
+    s.app_home = Some(Err(HOME_GONE.into()));
+    let r = s.run();
+    let c = one(&r, Area::Program, "app home");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.text.contains("reinstall it"), "{}", c.text);
+    assert_eq!(r.verdict, Verdict::Fail);
+    // The program check itself is untouched and there is exactly one home line.
+    assert_eq!(one(&r, Area::Program, "program found").status, Status::Ok);
+    assert_eq!(of(&r, Area::Program).len(), 2, "{:#?}", of(&r, Area::Program));
+}
+
+#[test]
+fn a_usable_app_home_or_none_adds_no_check() {
+    for home in [Some(Ok(())), None] {
+        let mut s = app(vec![]);
+        s.app_home = home;
+        let r = s.run();
+        assert_eq!(of(&r, Area::Program).len(), 1, "{:#?}", of(&r, Area::Program));
+        assert_ne!(r.verdict, Verdict::Fail, "{:#?}", r.checks);
+    }
+}
+
+#[test]
+fn a_hostile_app_home_text_is_cleaned_and_shortened() {
+    let mut s = app(vec![]);
+    s.app_home = Some(Err(format!("app home\x1b]0;x\x07\u{202e} {}", "y".repeat(600))));
+    let r = s.run();
+    let c = one(&r, Area::Program, "app home");
+    assert_tame(&c.text);
+    assert!(c.text.chars().count() <= 300, "{}", c.text.chars().count());
+}
+
+#[test]
+fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
+    let s = sc();
+    let env = |k: &str| s.host.env.get(k).map(OsString::from);
+    let r = doctor(DoctorInput {
+        subject: Subject::File { path: "a.zip".into() },
+        host_arch: "x86_64",
+        env: &env,
+        fs: &s.host,
+        backend: Ok(s.backend.as_ref().unwrap() as &dyn CompatBackend),
+        pe: PeState::Archive,
+        program: None,
+        app_dir: None,
+        prefix: PrefixState::NotApplicable,
+        app_home: None,
+        prefix_root: None,
+    });
+    let c = one(&r, Area::Pe, "zip archive");
+    assert_eq!(c.status, Status::Warn);
+    assert!(
+        c.text.contains("install it first") && c.text.contains("runtime install"),
+        "{}",
+        c.text
+    );
+    assert_ne!(r.verdict, Verdict::Fail, "{:#?}", r.checks);
+    assert!(r.checks.iter().all(|c| c.status != Status::Fail), "{:#?}", r.checks);
 }
