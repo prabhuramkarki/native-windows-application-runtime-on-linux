@@ -101,3 +101,55 @@ fn unaligned_input_slice_is_handled() {
     assert_eq!(view.as_ptr() as usize % 8, 1);
     assert_eq!(pe::analyze(view).unwrap().arch, Arch::X86_64);
 }
+
+/// `analyze` result as the JSON value the CLI prints under `pe`.
+fn json(b: &Builder) -> serde_json::Value {
+    serde_json::to_value(analyze(b)).unwrap()
+}
+
+#[test]
+fn json_names_known_arch_and_subsystem_and_keeps_the_raw_numbers() {
+    let v = json(&Builder::x64());
+    assert_eq!(v["arch"], "x86_64");
+    assert_eq!(v["machine"], 34404);
+    assert_eq!(v["subsystem"], "console");
+    assert_eq!(v["subsystem_raw"], 3);
+
+    // Every named variant keeps its snake_case string.
+    for (machine, name) in [
+        (0x014C, "x86"),
+        (0x8664, "x86_64"),
+        (0xAA64, "arm64"),
+        (0xA641, "arm64_ec"),
+    ] {
+        let b = Builder {
+            machine,
+            ..Builder::x64()
+        };
+        assert_eq!(json(&b)["arch"], name, "machine {machine:#x}");
+    }
+    for (subsystem, name) in [(1, "native"), (2, "gui"), (3, "console"), (10, "efi")] {
+        let b = Builder {
+            subsystem,
+            ..Builder::x64()
+        };
+        assert_eq!(json(&b)["subsystem"], name, "subsystem {subsystem}");
+    }
+}
+
+#[test]
+fn json_unknown_arch_and_subsystem_are_strings_with_raw_numbers() {
+    // 0x01C4 is ARMNT (Windows RT), subsystem 9 is Windows CE GUI: neither has a named variant.
+    let b = Builder {
+        machine: 0x01C4,
+        subsystem: 9,
+        ..Builder::x86()
+    };
+    let i = analyze(&b);
+    assert_eq!((i.arch, i.subsystem), (Arch::Other(0x01C4), Subsystem::Other(9)));
+    let v = serde_json::to_value(&i).unwrap();
+    assert_eq!(v["arch"], "other");
+    assert_eq!(v["machine"], 452);
+    assert_eq!(v["subsystem"], "other");
+    assert_eq!(v["subsystem_raw"], 9);
+}
