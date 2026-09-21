@@ -1,9 +1,18 @@
 mod common;
 use common::*;
+use std::{
+    cell::RefCell,
+    panic::{self, PanicHookInfo},
+    path::PathBuf,
+    sync::Arc,
+};
 
-/// File offset of data directory 0 in an x64 image built by `Builder` (PE header at 0x40, file
-/// header 20 bytes, optional header fields up to the directories 112 bytes).
+/// File offset of data directory 0 in an x64 (PE32+) image built by `Builder` (PE header at 0x40,
+/// file header 20 bytes, optional header fields up to the directories 112 bytes). The structure
+/// mutator below only knows this PE32+ layout; PE32 (x86) headers get byte-flip coverage only.
 const X64_DIRS: usize = 0x44 + 20 + 112;
+/// File offset of SizeOfImage in the same layout (optional header + 56).
+const X64_SIZE_OF_IMAGE: usize = 0x44 + 20 + 56;
 
 /// Every table at once, so mutations hit real structures rather than empty space.
 fn rich_sample() -> Vec<u8> {
@@ -48,6 +57,8 @@ fn directory_offset_matches_the_builder_layout() {
     };
     assert_eq!((field(1, 0), field(1, 1)), (Builder::rva(0), 40));
     assert_eq!(field(2, 0), Builder::rva(5));
+    let size = &img[X64_SIZE_OF_IMAGE..X64_SIZE_OF_IMAGE + 4];
+    assert_eq!(u32::from_le_bytes(size.try_into().unwrap()), Builder::rva(6));
 }
 
 struct Rng(u64);
@@ -60,18 +71,92 @@ impl Rng {
     }
 }
 
-/// Env override parsed as decimal or `0x` hex.
+/// Env override parsed as decimal or `0x` hex. A set-but-unusable value is an error, never a
+/// silent fallback to the default.
 fn env_u64(name: &str, default: u64) -> u64 {
-    match std::env::var(name) {
-        Ok(s) => {
-            let s = s.trim();
-            match s.strip_prefix("0x") {
-                Some(h) => u64::from_str_radix(h, 16),
-                None => s.parse(),
-            }
-            .unwrap_or_else(|e| panic!("{name}={s:?}: {e}"))
+    let s = match std::env::var(name) {
+        Ok(s) => s,
+        Err(std::env::VarError::NotPresent) => return default,
+        Err(e) => panic!("{name}: {e}"),
+    };
+    let s = s.trim();
+    match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => s.parse(),
+    }
+    .unwrap_or_else(|e| panic!("{name}={s:?}: {e}"))
+}
+
+/// What the fuzz thread is analysing right now, so the panic hook can say which input killed the
+/// process even when the panic is followed by a non-unwinding abort (pelite does that).
+struct Current {
+    seed: u64,
+    iteration: u64,
+    mode: &'static str,
+    input: Vec<u8>,
+}
+
+thread_local! {
+    static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
+}
+
+fn track(seed: u64, iteration: u64, mode: &'static str, input: &[u8]) {
+    CURRENT.with_borrow_mut(|c| {
+        let cur = c.get_or_insert_with(|| Current {
+            seed,
+            iteration,
+            mode,
+            input: vec![],
+        });
+        (cur.seed, cur.iteration, cur.mode) = (seed, iteration, mode);
+        cur.input.clear();
+        cur.input.extend_from_slice(input);
+    });
+}
+
+fn dump_path(seed: u64, iteration: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("pe-fuzz-fail-{seed:x}-{iteration}.bin"))
+}
+
+type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// While alive, any panic on this thread first prints seed/iteration/mode and saves the failing
+/// input, then runs the previous hook. Drop puts the previous hook back (not reached on abort).
+struct DiagnoseGuard(Option<Arc<Hook>>);
+
+impl DiagnoseGuard {
+    fn install() -> Self {
+        let prev = Arc::new(panic::take_hook());
+        let chained = Arc::clone(&prev);
+        panic::set_hook(Box::new(move |info| {
+            CURRENT.with_borrow(|c| {
+                if let Some(c) = c {
+                    let path = dump_path(c.seed, c.iteration);
+                    let saved = std::fs::write(&path, &c.input)
+                        .map_or(String::from("unsaved"), |()| path.display().to_string());
+                    eprintln!(
+                        "corruption test: seed={:#x} iteration={} mode={} input={saved}",
+                        c.seed, c.iteration, c.mode
+                    );
+                }
+            });
+            chained(info);
+        }));
+        Self(Some(prev))
+    }
+}
+
+impl Drop for DiagnoseGuard {
+    fn drop(&mut self) {
+        CURRENT.with_borrow_mut(|c| *c = None);
+        // The hook cannot be swapped while unwinding; our hook is inert once CURRENT is cleared.
+        if std::thread::panicking() {
+            return;
         }
-        Err(_) => default,
+        drop(panic::take_hook()); // our hook, releasing its clone of the Arc
+        if let Some(Ok(prev)) = self.0.take().map(Arc::try_unwrap) {
+            panic::set_hook(prev);
+        }
     }
 }
 
@@ -102,16 +187,24 @@ fn corrupt_directories(m: &mut [u8], rng: &mut Rng, image_size: u32) {
 /// integer overflow. (cargo-fuzz needs nightly; add a fuzz target once CI has one.)
 ///
 /// Two mutators run each iteration: the byte-flip/truncate one, and a second that damages the
-/// data-directory entries (optionally followed by a byte flip). A hard abort (not a panic) kills
-/// the whole test binary, so `RUNTIME_FUZZ_SEED` / `RUNTIME_FUZZ_ITERS` make runs reproducible
-/// and let a long run be requested.
+/// data-directory entries (optionally followed by a byte flip).
+///
+/// Diagnosing a failure: a panic hook prints `corruption test: seed=<hex> iteration=<n>
+/// mode=<bytes|directories> input=<path>` and saves the offending input to
+/// `$TMPDIR/pe-fuzz-fail-<seed>-<n>.bin` BEFORE the panic message, which also covers a hard abort
+/// (SIGABRT from a non-unwinding panic in a dependency), where `catch_unwind` cannot help. To
+/// reproduce: `RUNTIME_FUZZ_SEED=<seed> RUNTIME_FUZZ_ITERS=<n+1> cargo test -p runtime-pe --test
+/// robust corrupted`, or feed the saved file to `pe::analyze`.
 #[test]
 fn corrupted_input_never_panics() {
     let original = rich_sample();
     let seed = env_u64("RUNTIME_FUZZ_SEED", 0x9E37_79B9_7F4A_7C15);
     let iters = env_u64("RUNTIME_FUZZ_ITERS", 30_000);
     assert_ne!(seed, 0, "xorshift needs a non-zero seed");
-    let image_size = Builder::rva(6);
+    assert!(iters > 0, "RUNTIME_FUZZ_ITERS must be at least 1");
+    let at = X64_SIZE_OF_IMAGE;
+    let image_size = u32::from_le_bytes(original[at..at + 4].try_into().unwrap());
+    let _hook = DiagnoseGuard::install();
     let mut rng = Rng(seed);
     for n in 0..iters {
         let mut m = original.clone();
@@ -132,11 +225,16 @@ fn corrupted_input_never_panics() {
             s[at] = rng.next() as u8;
         }
         for (mode, input) in [("bytes", &m), ("directories", &s)] {
-            let r = std::panic::catch_unwind(|| {
+            track(seed, n, mode, input);
+            let r = panic::catch_unwind(|| {
                 let _ = pe::analyze(input);
                 let _ = pe::detect(input);
             });
-            assert!(r.is_ok(), "panicked on iteration {n} ({mode} mutator, seed {seed:#x})");
+            assert!(
+                r.is_ok(),
+                "panicked on iteration {n} ({mode} mutator, seed {seed:#x}); input saved to {}",
+                dump_path(seed, n).display()
+            );
         }
     }
 }

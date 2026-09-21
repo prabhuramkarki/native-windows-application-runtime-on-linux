@@ -25,6 +25,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn file_says(f: &Path) -> String {
+    String::from_utf8(Command::new("file").arg("-b").arg(f).output().unwrap().stdout).unwrap()
+}
+
 #[test]
 #[ignore]
 fn matches_file_command_on_real_binaries() {
@@ -33,13 +37,26 @@ fn matches_file_command_on_real_binaries() {
     for r in roots.split(':') {
         walk(Path::new(r), &mut files);
     }
-    let (mut checked, mut failures) = (0, vec![]);
+    let (mut checked, mut skipped_non_pe, mut failures) = (0, 0, vec![]);
+    let (mut unreadable, mut arch_unchecked) = (vec![], vec![]);
     for f in &files {
-        let Ok(bytes) = fs::read(f) else { continue };
+        let bytes = match fs::read(f) {
+            Ok(b) => b,
+            Err(e) => {
+                unreadable.push(format!("{}: {e}", f.display()));
+                continue;
+            }
+        };
+        let oracle = file_says(f);
         if pe::detect(&bytes) != pe::FileKind::Pe {
+            // Not detected as PE: only acceptable if `file` agrees it is not one.
+            if oracle.contains("PE32") {
+                failures.push(format!("{}: misdetected, file(1) says: {oracle}", f.display()));
+            } else {
+                skipped_non_pe += 1;
+            }
             continue;
         }
-        let oracle = String::from_utf8(Command::new("file").arg("-b").arg(f).output().unwrap().stdout).unwrap();
         let info = match pe::analyze(&bytes) {
             Ok(i) => i,
             Err(e) => {
@@ -49,20 +66,25 @@ fn matches_file_command_on_real_binaries() {
         };
         checked += 1;
         let mut bad = vec![];
+        if !oracle.contains("PE32") {
+            bad.push("oracle does not call this a PE");
+        }
         if oracle.contains("PE32+") != (info.format == Format::Pe32Plus) {
             bad.push("format");
         }
         let want_arch = if oracle.contains("x86-64") {
             Some(Arch::X86_64)
-        } else if oracle.contains("Intel 80386") {
+        } else if oracle.contains("Intel 80386") || oracle.contains("Intel i386") {
             Some(Arch::X86)
         } else if oracle.contains("ARM64") {
             Some(Arch::Arm64)
         } else {
             None
         };
-        if want_arch.is_some_and(|a| a != info.arch) {
-            bad.push("arch");
+        match want_arch {
+            Some(a) if a != info.arch => bad.push("arch"),
+            Some(_) => {}
+            None => arch_unchecked.push(format!("{}: {oracle}", f.display())),
         }
         if oracle.contains("(DLL)") != (info.kind == Kind::Dll) {
             bad.push("kind");
@@ -79,7 +101,16 @@ fn matches_file_command_on_real_binaries() {
             println!("note {}: {:?}", f.display(), info.warnings);
         }
     }
+    for u in &unreadable {
+        println!("unreadable {u}");
+    }
+    for a in &arch_unchecked {
+        println!("arch not checked (unrecognised by this test) {a}");
+    }
     println!("checked {checked} PE files");
+    println!("skipped_non_pe {skipped_non_pe}");
+    println!("skipped_unreadable {}", unreadable.len());
+    println!("arch_unchecked {}", arch_unchecked.len());
     assert!(checked > 0, "no PE files found under RUNTIME_SAMPLES");
     assert!(
         failures.is_empty(),
