@@ -26,10 +26,21 @@ fn is_format(c: char) -> bool {
     )
 }
 
-/// `"..."` with `char::escape_debug` applied to every character, at most [`MAX_QUOTED`] output characters, and a
-/// `...` before the closing quote when cut. Never longer than `MAX_QUOTED + 5` characters.
+/// [`escape`] between double quotes: `"..."`, at most [`MAX_QUOTED`] escaped characters. Never longer than
+/// `MAX_QUOTED + 5` characters.
 pub fn quote(s: &str) -> String {
-    let mut out = String::from("\"");
+    quote_max(s, MAX_QUOTED)
+}
+
+/// [`quote`] with the cut at `max` escaped characters instead (for lists of names: at most `max + 5` characters).
+pub fn quote_max(s: &str, max: usize) -> String {
+    format!("\"{}\"", escape(s, max))
+}
+
+/// `char::escape_debug` applied to every character (format characters as `\u{..}`), at most `max` output
+/// characters, and `...` appended when cut. Reads no more than `max + 1` characters of `s`.
+pub fn escape(s: &str, max: usize) -> String {
+    let mut out = String::new();
     let mut shown = 0;
     for c in s.chars() {
         let escaped: String = if is_format(c) {
@@ -38,13 +49,12 @@ pub fn quote(s: &str) -> String {
             c.escape_debug().collect()
         };
         shown += escaped.chars().count();
-        if shown > MAX_QUOTED {
+        if shown > max {
             out.push_str("...");
             break;
         }
         out.push_str(&escaped);
     }
-    out.push('"');
     out
 }
 
@@ -76,6 +86,17 @@ mod tests {
         }
         assert!(q.starts_with('"') && q.ends_with('"'));
         assert!(q.contains("\\u{202e}"), "{q}");
+    }
+
+    #[test]
+    fn escape_and_quote_max_cut_at_the_given_width() {
+        assert_eq!(escape("abcdef", 4), "abcd...");
+        assert_eq!(escape("abcd", 4), "abcd");
+        assert_eq!(quote_max("abcdef", 4), "\"abcd...\"");
+        let q = quote_max(&"\u{202e}".repeat(1000), 40);
+        assert!(q.chars().count() <= 40 + 5, "{q}");
+        assert!(!q.contains('\u{202e}'));
+        assert_eq!(escape("a\x1bb", 20), "a\\u{1b}b");
     }
 
     #[test]
