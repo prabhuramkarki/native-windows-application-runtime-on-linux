@@ -106,10 +106,38 @@ impl Tally {
             warnings.push(format!("exports: {} {what} (first at {at} {})", self.count, self.first));
         }
     }
+    /// Same, for one import table; the position is an RVA.
+    fn warn_rva(&self, warnings: &mut Vec<String>, scope: &str, dll: &str, what: &str, at: &str) {
+        if self.count > 0 {
+            warnings.push(format!(
+                "{scope}: {dll}: {} {what} (first at {at} RVA {:#x})",
+                self.count, self.first
+            ));
+        }
+    }
 }
 
+/// Reads a DLL name (import or delay-import descriptor): `Err` says what is wrong with it.
+fn dll_name(bytes: Option<&[u8]>) -> Result<String, &'static str> {
+    match bytes.map_or(Str::Unreadable, read_bounded) {
+        Str::Ok(n) => Ok(n),
+        Str::TooLong => Err("DLL name too long"),
+        Str::Unterminated => Err("unterminated DLL name"),
+        Str::Unreadable => Err("unreadable DLL name"),
+    }
+}
+
+// Import walk limits: thunks per table, thunks over the whole file, descriptors per directory.
+const MAX_THUNKS_PER_TABLE: usize = 65_536;
+const MAX_IMPORT_THUNKS: usize = 200_000;
+const MAX_DESCRIPTORS: usize = 4096;
+
+const DIR_EXPORT: usize = 0;
+const DIR_IMPORT: usize = 1;
 const DIR_RESOURCE: usize = 2;
 const DIR_SECURITY: usize = 4;
+const DIR_BASERELOC: usize = 5;
+const DIR_TLS: usize = 9;
 const DIR_DELAY_IMPORT: usize = 13;
 const DIR_CLR: usize = 14;
 
@@ -144,150 +172,176 @@ macro_rules! extract {
                 .collect();
 
             // Walk import thunk arrays by hand. pelite's `int()` demands aligned tables and
-            // rejects the 4-byte-aligned ones GNU ld emits for PE32+. Shared budget prevents
-            // resource exhaustion (hostile files with unbounded thunk tables).
-            let mut budget = 200_000usize;
-            let mut thunks = |mut rva: u32, dll: &str, warnings: &mut Vec<String>| {
+            // rejects the 4-byte-aligned ones GNU ld emits for PE32+. Every string is read through
+            // `read_bounded` (pelite's `derva_c_str` scans to the NUL without limit), and two shared
+            // budgets bound what a hostile file can make us do: MAX_IMPORT_THUNKS thunks and
+            // BYTES_BUDGET bytes of function names, over all tables together.
+            let mut budget = MAX_IMPORT_THUNKS;
+            let mut name_bytes = BYTES_BUDGET;
+            let mut thunks = |mut rva: u32, scope: &str, dll: &str, warnings: &mut Vec<String>| {
                 let mut functions = Vec::new();
                 if rva == 0 {
-                    warnings.push(format!("imports: {dll} zero table RVA"));
+                    warnings.push(format!("{scope}: {dll} zero table RVA"));
                     return functions;
                 }
-                let mut terminated = false;
-                for _ in 0..65_536 {
-                    if budget == 0 {
-                        warnings.push(format!(
-                            "imports: {dll} budget exhausted at {} functions",
-                            functions.len()
-                        ));
-                        break;
-                    }
+                // Per-thunk problems are counted, not listed: a hostile table would otherwise turn
+                // each of up to 200_000 thunks into a warning string.
+                let (mut wide, mut long, mut open, mut bad, mut no_room) = (
+                    Tally::default(),
+                    Tally::default(),
+                    Tally::default(),
+                    Tally::default(),
+                    Tally::default(),
+                );
+                // Why the walk stopped early; None when the table ended with its terminator.
+                let mut stop = None;
+                let mut n = 0usize;
+                loop {
                     let Ok(v) = f.derva_copy::<$word>(rva) else {
-                        warnings.push(format!("imports: {dll} truncated table at offset {:#x}", rva));
+                        stop = Some(format!("{scope}: {dll} truncated table at RVA {rva:#x}"));
                         break;
                     };
                     if v == 0 {
-                        terminated = true;
                         break;
                     }
-                    // Compute next_rva FIRST, before handling value
-                    let word_size = std::mem::size_of::<$word>() as u32;
-                    let Some(next_rva) = rva.checked_add(word_size) else {
-                        warnings.push(format!("imports: {dll} RVA overflow"));
+                    if n == MAX_THUNKS_PER_TABLE {
+                        stop = Some(format!(
+                            "{scope}: {dll} thunk table not terminated within {MAX_THUNKS_PER_TABLE} entries"
+                        ));
+                        break;
+                    }
+                    if budget == 0 {
+                        stop = Some(format!("{scope}: {dll} budget exhausted at {} functions", functions.len()));
+                        break;
+                    }
+                    let Some(next_rva) = rva.checked_add(std::mem::size_of::<$word>() as u32) else {
+                        stop = Some(format!("{scope}: {dll} RVA overflow at {rva:#x}"));
                         break;
                     };
-                    // Charge budget unconditionally
+                    let thunk_rva = rva;
                     budget -= 1;
-                    // Advance rva BEFORE handling value (so all continue paths advance)
+                    n += 1;
                     rva = next_rva;
-                    // Handle ordinal or by-name import
                     if v & $ord_flag != 0 {
                         functions.push(ImportedFn::Ordinal((v & 0xFFFF) as u16));
+                    } else if v > 0x7FFF_FFFF {
+                        // Only reachable for PE32+: an RVA has 31 bits, the rest must be zero.
+                        wide.hit(thunk_rva as usize);
                     } else {
-                        // For by-name: check value fits in 31 bits (ordinal flag in bit 31/63)
-                        if v > 0x7FFF_FFFF {
-                            warnings.push(format!("imports: {dll} thunk value overflows 31 bits ({:#x})", v));
-                            continue;
-                        }
-                        let name_rva = (v as u32).checked_add(2).unwrap_or(0);
-                        if name_rva == 0 {
-                            warnings.push(format!("imports: {dll} thunk value overflow at {:#x}", v));
-                            continue;
-                        }
-                        match f.derva_c_str(name_rva) {
-                            Ok(n) => {
-                                if n.len() > 1024 {
-                                    warnings.push(format!("imports: {dll} name too long ({} bytes)", n.len()));
-                                    continue;
-                                }
-                                functions.push(ImportedFn::Name(n.to_string()));
+                        let name_rva = v as u32 + 2; // skips the u16 hint; cannot overflow
+                        match f.slice_bytes(name_rva).map_or(Str::Unreadable, read_bounded) {
+                            Str::Ok(name) if name.len() <= name_bytes => {
+                                name_bytes -= name.len();
+                                functions.push(ImportedFn::Name(name));
                             }
-                            Err(_) => {
-                                warnings.push(format!(
-                                    "imports: {dll} unreadable function name at {:#x}",
-                                    name_rva
-                                ));
-                            }
+                            Str::Ok(_) => no_room.hit(name_rva as usize),
+                            Str::TooLong => long.hit(name_rva as usize),
+                            Str::Unterminated => open.hit(name_rva as usize),
+                            Str::Unreadable => bad.hit(name_rva as usize),
                         }
                     }
                 }
-                if !terminated {
-                    warnings.push(format!(
-                        "imports: {dll} thunk table not terminated within 65536 entries"
-                    ));
-                }
+                wide.warn_rva(warnings, scope, dll, "thunk values overflow 31 bits", "thunk");
+                long.warn_rva(warnings, scope, dll, "names too long", "name");
+                open.warn_rva(warnings, scope, dll, "names unterminated", "name");
+                bad.warn_rva(warnings, scope, dll, "names unreadable", "name");
+                no_room.warn_rva(warnings, scope, dll, "names dropped, string budget exhausted", "name");
+                warnings.extend(stop);
                 functions
             };
 
             let mut imports = Vec::new();
             match f.imports() {
                 Ok(list) => {
-                    let mut desc_count = 0;
-                    for desc in list {
-                        if desc_count >= 4096 {
-                            warnings.push("imports: descriptor limit (4096) exceeded".to_owned());
+                    let dir_rva = dir(DIR_IMPORT).0;
+                    let at = |idx: usize| dir_rva.wrapping_add((idx * 20) as u32);
+                    let count = list.image().len();
+                    for (idx, desc) in list.into_iter().enumerate() {
+                        if idx >= MAX_DESCRIPTORS {
+                            warnings.push(format!("imports: descriptor limit ({MAX_DESCRIPTORS}) exceeded"));
                             break;
                         }
-                        desc_count += 1;
-                        let Ok(dll) = desc.dll_name() else {
-                            warnings.push("imports: unreadable DLL name".to_owned());
-                            continue;
-                        };
-                        let dll_str = dll.to_string();
                         let d = desc.image();
+                        let dll = match dll_name(f.slice_bytes(d.Name).ok()) {
+                            Ok(n) => n,
+                            Err(why) => {
+                                warnings.push(format!("imports: {why} (descriptor {idx}, RVA {:#x})", at(idx)));
+                                continue;
+                            }
+                        };
                         // Fall back to the IAT when the lookup table is absent (old linkers).
                         let table = if d.OriginalFirstThunk != 0 {
                             d.OriginalFirstThunk
                         } else {
                             d.FirstThunk
                         };
+                        let functions = thunks(table, "imports", &dll, &mut warnings);
                         imports.push(Import {
-                            dll: dll_str.clone(),
+                            dll,
                             delay: false,
-                            functions: thunks(table, &dll_str, &mut warnings),
+                            functions,
                         });
+                    }
+                    // pelite ends the list at the first descriptor with FirstThunk == 0 (so a
+                    // zero table RVA cannot reach `thunks` from here). Real linkers write an
+                    // all-zero terminator; anything else there was cut off, so say so.
+                    if let Ok(t) = f.derva_copy::<[u32; 5]>(at(count)) {
+                        if t != [0; 5] {
+                            warnings.push(format!(
+                                "imports: descriptor {count} (RVA {:#x}) has FirstThunk 0 but other fields set; \
+                                 list ends there",
+                                at(count)
+                            ));
+                        }
                     }
                 }
                 Err(pelite::Error::Null) => {}
+                Err(pelite::Error::Bounds) if dirs.len() <= DIR_IMPORT => {}
                 Err(e) => warnings.push(format!("imports: {e}")),
             }
 
             // pelite has no delay-import support: walk IMAGE_DELAYLOAD_DESCRIPTOR (8 x u32) by hand.
             if dir(DIR_DELAY_IMPORT).0 != 0 {
                 let mut rva = dir(DIR_DELAY_IMPORT).0;
-                let mut terminated = false;
-                for _ in 0..4096 {
+                let mut idx = 0usize;
+                loop {
+                    let ctx = format!("descriptor {idx}, RVA {rva:#x}");
                     let Ok(d) = f.derva_copy::<[u32; 8]>(rva) else {
-                        warnings.push("delay imports: truncated descriptor".to_owned());
+                        warnings.push(format!("delay imports: truncated descriptor ({ctx})"));
                         break;
                     };
                     if d[1] == 0 {
-                        terminated = true;
                         break;
                     }
-                    let next_rva = rva.checked_add(32).unwrap_or(0);
-                    if next_rva == 0 {
-                        warnings.push("delay imports: RVA overflow".to_owned());
+                    if idx == MAX_DESCRIPTORS {
+                        warnings.push(format!(
+                            "delay imports: descriptor table not terminated within {MAX_DESCRIPTORS} entries"
+                        ));
                         break;
                     }
-                    rva = next_rva;
-                    if d[0] & 1 == 0 {
-                        warnings.push("delay imports: VA-based descriptor unsupported".to_owned());
-                        continue;
-                    }
-                    let Ok(dll) = f.derva_c_str(d[1]) else {
-                        warnings.push("delay imports: unreadable DLL name".to_owned());
-                        continue;
+                    let Some(next_rva) = rva.checked_add(32) else {
+                        warnings.push(format!("delay imports: RVA overflow ({ctx})"));
+                        break;
                     };
-                    let dll_str = dll.to_string();
+                    rva = next_rva;
+                    idx += 1;
+                    if d[0] & 1 == 0 {
+                        warnings.push(format!("delay imports: VA-based descriptor unsupported ({ctx})"));
+                        continue;
+                    }
+                    let dll = match dll_name(f.slice_bytes(d[1]).ok()) {
+                        Ok(n) => n,
+                        Err(why) => {
+                            warnings.push(format!("delay imports: {why} ({ctx})"));
+                            continue;
+                        }
+                    };
+                    let functions = thunks(d[4], "delay imports", &dll, &mut warnings);
                     imports.push(Import {
-                        dll: dll_str.clone(),
+                        dll,
                         delay: true,
-                        functions: thunks(d[4], &dll_str, &mut warnings),
+                        functions,
                     });
-                }
-                if !terminated {
-                    warnings.push("delay imports: descriptor table not terminated within 4096 entries".to_owned());
                 }
             }
 
@@ -303,7 +357,7 @@ macro_rules! extract {
                             // each. Read every string ourselves through `read_bounded` instead.
                             // `by.index()` is avoided for the same reason and because pelite's
                             // forwarder check adds the directory RVA and size in u32 (overflows).
-                            let (dir_rva, dir_size) = dir(0);
+                            let (dir_rva, dir_size) = dir(DIR_EXPORT);
                             let in_dir = |rva: u32| {
                                 u64::from(rva) >= u64::from(dir_rva) && u64::from(rva) < u64::from(dir_rva) + u64::from(dir_size)
                             };
@@ -405,13 +459,48 @@ macro_rules! extract {
                     }
                 }
                 Err(pelite::Error::Null) => {}
+                Err(pelite::Error::Bounds) if dirs.len() <= DIR_EXPORT => {}
                 Err(e) => warnings.push(format!("exports: {e}")),
             }
 
             let mut relocation_count = 0;
             match f.base_relocs() {
-                Ok(r) => relocation_count = r.fold(0usize, |n, _rva, ty| n + usize::from(ty != 0)),
+                Ok(r) => {
+                    // Walk the blocks here instead of using pelite's iterator: it rounds
+                    // SizeOfBlock up to 4 with a wrapping add, so a SizeOfBlock of 0xFFFFFFFD..FF
+                    // makes it advance by 0 and yield the same block forever (a hang). It also
+                    // skips a malformed block (SizeOfBlock < 8, or running past the end of the
+                    // directory) without a word. Same advance rule, but every step moves forward,
+                    // and anything odd is reported.
+                    let data = r.image();
+                    let mut off = 0usize;
+                    let mut bad = Tally::default();
+                    while data.len() - off >= 8 {
+                        let left = data.len() - off;
+                        let word = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap_or_default());
+                        let (page, size) = (word(off), word(off + 4) as usize);
+                        // An all-zero header is the "no relocations" idiom (Wine's builtin stubs
+                        // carry a directory of exactly one), not damage.
+                        if (size < 8 || size > left) && (page, size) != (0, 0) {
+                            bad.hit(off);
+                        }
+                        let words = &data[off + 8..off + size.clamp(8, left)];
+                        relocation_count += words.chunks_exact(2).filter(|w| w[1] >> 4 != 0).count();
+                        off += size.max(8).next_multiple_of(4).min(left);
+                    }
+                    if bad.count > 0 {
+                        warnings.push(format!(
+                            "relocations: {} malformed blocks (SizeOfBlock under 8 or past the end of the directory), \
+                             first at directory offset {:#x}",
+                            bad.count, bad.first
+                        ));
+                    }
+                    if off < data.len() {
+                        warnings.push(format!("relocations: {} trailing bytes ignored", data.len() - off));
+                    }
+                }
                 Err(pelite::Error::Null) => {}
+                Err(pelite::Error::Bounds) if dirs.len() <= DIR_BASERELOC => {}
                 Err(e) => warnings.push(format!("relocations: {e}")),
             }
 
@@ -429,6 +518,7 @@ macro_rules! extract {
                     tls = Some(Tls { callback_count })
                 }
                 Err(pelite::Error::Null) => {}
+                Err(pelite::Error::Bounds) if dirs.len() <= DIR_TLS => {}
                 Err(e) => warnings.push(format!("tls: {e}")),
             }
 
