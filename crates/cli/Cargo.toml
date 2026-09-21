@@ -20,5 +20,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# `FakeBackend` for the unit tests of the front end (never part of a normal build).
+runtime-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
 zip.workspace = true

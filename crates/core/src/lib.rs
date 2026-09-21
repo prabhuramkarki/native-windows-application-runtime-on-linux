@@ -29,7 +29,10 @@ pub use install::{InstallError, InstallOpts, InstallOutcome, install};
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running};
 pub use meta::{BackendInfo, MetaError, Metadata};
 pub use proc::{HelperOutput, RunError};
-pub use run::{RunAppError, RunOptions, RunOutcome, Started, TargetKind, classify, exit_code, run, start};
+pub use run::{
+    ResolvedProgram, RunAppError, RunOptions, RunOutcome, Started, Target, TargetKind, classify, exit_code,
+    find_target, resolve_program, run, start,
+};
 pub use store::{AppEnv, ListEntry, Store, StoreError, StoreWarn, unique_id};
 pub use unzip::{NameError, ZipError};
 pub use winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};

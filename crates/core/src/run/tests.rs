@@ -645,3 +645,240 @@ fn an_install_failure_is_reported_and_leaves_no_app_and_runs_nothing() {
     assert!(f.commands().is_empty());
     assert!(f.app_dirs().is_empty(), "no residue: {:?}", f.app_dirs());
 }
+
+// ---------------------------------------------------------------- resolve_program
+
+#[test]
+fn resolve_program_returns_the_environment_metadata_program_and_directory() {
+    let f = fx("exit 0");
+    let env = f.app("app");
+    let id = AppId::parse("app").unwrap();
+    let p = resolve_program(&f.store, &id, "fake").unwrap();
+    assert_eq!(p.env.root(), env.root());
+    assert_eq!(p.metadata.name, "App");
+    let exe = env.drive_c().join("Program Files/app/app.exe");
+    assert_eq!(p.exe, exe);
+    assert_eq!(p.cwd, exe.parent().unwrap());
+    assert!(f.backend.calls().is_empty(), "resolving spawns and prepares nothing");
+    // The RESOLVED spelling, not the metadata's, comes back.
+    f.tamper(&env, |v| v["executable"] = "C:\\PROGRAM FILES\\APP\\APP.EXE".into());
+    assert_eq!(resolve_program(&f.store, &id, "fake").unwrap().exe, exe);
+}
+
+#[test]
+fn resolve_program_of_an_unknown_id_is_not_installed() {
+    let f = fx("exit 0");
+    let e = resolve_program(&f.store, &AppId::parse("nothing").unwrap(), "fake").unwrap_err();
+    assert!(matches!(e, RunAppError::NotInstalled { .. }), "{e:?}");
+    assert!(text(&e).contains("runtime list"), "{e}");
+}
+
+#[test]
+fn resolve_program_applies_the_known_value_checks() {
+    let f = fx("exit 0");
+    let env = f.app("app");
+    let id = AppId::parse("app").unwrap();
+    let e = resolve_program(&f.store, &id, "wine").unwrap_err();
+    assert!(matches!(e, RunAppError::BackendMismatch { .. }), "{e:?}");
+    f.tamper(&env, |v| v["environment"] = "evil".into());
+    let e = resolve_program(&f.store, &id, "fake").unwrap_err();
+    assert!(
+        matches!(
+            e,
+            RunAppError::BadMetadata {
+                field: "environment",
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn resolve_program_refuses_a_missing_or_irregular_program_and_hostile_executable_metadata() {
+    let id = AppId::parse("app").unwrap();
+    // On disk: gone, a directory, a symlink to a file outside, a symlinked parent directory.
+    type Tamper = fn(&Fx, &AppEnv);
+    let cases: [(&str, Tamper); 4] = [
+        ("missing", |_, env| {
+            fs::remove_file(env.drive_c().join("Program Files/app/app.exe")).unwrap();
+        }),
+        ("directory", |_, env| {
+            let p = env.drive_c().join("Program Files/app/app.exe");
+            fs::remove_file(&p).unwrap();
+            fs::create_dir(&p).unwrap();
+        }),
+        ("symlink to a file", |f, env| {
+            let p = env.drive_c().join("Program Files/app/app.exe");
+            fs::remove_file(&p).unwrap();
+            let outside = f.tmp.path().join("outside/real.exe");
+            fs::write(&outside, b"MZ").unwrap();
+            symlink(&outside, &p).unwrap();
+        }),
+        ("symlinked directory", |f, env| {
+            let d = env.drive_c().join("Program Files/app");
+            let outside = f.tmp.path().join("outside/app");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("app.exe"), b"MZ").unwrap();
+            fs::remove_dir_all(&d).unwrap();
+            symlink(&outside, &d).unwrap();
+        }),
+    ];
+    for (what, tamper) in cases {
+        let f = fx("exit 0");
+        let env = f.app("app");
+        tamper(&f, &env);
+        let e = resolve_program(&f.store, &id, "fake").unwrap_err();
+        assert!(matches!(e, RunAppError::ExecutableMissing { .. }), "{what}: {e:?}");
+    }
+    // In metadata.json (a file the Wine app itself could rewrite).
+    for exe in [
+        "C:\\..\\..\\outside\\real.exe",
+        "D:\\Program Files\\app\\app.exe",
+        "C:\\",
+        "",
+        "C:\\Program Files\\app\\",
+        "\\\\?\\unix\\etc\\passwd",
+        "/etc/passwd",
+        "C:\\Program Files\\app\\app.exe\x1b[31m",
+    ] {
+        let f = fx("exit 0");
+        let env = f.app("app");
+        fs::write(f.tmp.path().join("outside/real.exe"), b"MZ").unwrap();
+        f.tamper(&env, |v| v["executable"] = exe.into());
+        let e = resolve_program(&f.store, &id, "fake").expect_err(exe);
+        assert!(!text(&e).contains('\x1b'), "{exe:?}: unescaped text: {e}");
+    }
+}
+
+// ---------------------------------------------------------------- find_target
+
+#[test]
+fn find_target_classifies_without_a_backend_and_creates_nothing() {
+    let f = fx("exit 0");
+    let base = f.tmp.path().join("in");
+    let find = |t: &str| find_target(&f.store, t, &base);
+    assert!(matches!(find("hello"), Err(RunAppError::NotInstalled { .. })));
+    assert!(matches!(find(""), Err(RunAppError::NoSuchFile { .. })));
+    assert!(matches!(find("nothing.exe"), Err(RunAppError::NoSuchFile { .. })));
+    assert!(matches!(find("Hello World"), Err(RunAppError::NoSuchFile { .. })));
+    let e = find("Hello\x1b[31m").unwrap_err();
+    assert!(!text(&e).contains('\x1b'), "{e}");
+    f.app("app");
+    assert!(matches!(find("app"), Ok(Target::Installed(id)) if id.as_str() == "app"));
+    let p = f.input("hello64.exe", b"MZ");
+    assert!(matches!(find("hello64.exe"), Ok(Target::File(got)) if got == p));
+    // An installed id wins over a file of the same name; an id-shaped file that is not installed is a file.
+    f.input("app", b"MZ");
+    assert!(matches!(find("app"), Ok(Target::Installed(_))));
+    f.input("plain", b"MZ");
+    assert!(matches!(find("plain"), Ok(Target::File(_))));
+    assert!(f.backend.calls().is_empty());
+    assert_eq!(f.app_dirs(), ["app"], "nothing was created");
+}
+
+// ---------------------------------------------------------------- a failure after an install by path
+
+/// A backend whose `command` fails or describes a program that cannot be started.
+struct FailingBackend {
+    inner: FakeBackend,
+    unstartable: bool,
+}
+
+impl CompatBackend for FailingBackend {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn version(&self) -> Result<String, BackendError> {
+        self.inner.version()
+    }
+    fn prepare(&self, env: &AppEnv) -> Result<(), BackendError> {
+        self.inner.prepare(env)
+    }
+    fn command(
+        &self,
+        env: &AppEnv,
+        exe: &Path,
+        cwd: &Path,
+        args: &[OsString],
+        opts: &RunOpts,
+    ) -> Result<std::process::Command, BackendError> {
+        if self.unstartable {
+            return Ok(std::process::Command::new("/nonexistent/no-such-program"));
+        }
+        let _ = (env, exe, cwd, args, opts);
+        Err(BackendError::failed("fake command", b"configured to fail"))
+    }
+    fn stop(&self, env: &AppEnv) -> Result<(), BackendError> {
+        self.inner.stop(env)
+    }
+    fn dll_dirs(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+}
+
+#[test]
+fn a_command_or_spawn_failure_after_an_install_by_path_names_the_new_app() {
+    for unstartable in [false, true] {
+        let f = fx("exit 0");
+        let backend = FailingBackend {
+            inner: FakeBackend::new(),
+            unstartable,
+        };
+        f.input("hello64.exe", &fixture("hello64.exe"));
+        let base = f.tmp.path().join("in");
+        let terminal = || -> Box<dyn Write + Send> { Box::new(io::sink()) };
+        let env = Env {
+            base: &base,
+            terminal: &terminal,
+        };
+        let Err(e) = start_in(
+            &f.store,
+            &backend,
+            &f.launcher,
+            "hello64.exe",
+            &[],
+            &RunOptions::default(),
+            &env,
+        ) else {
+            panic!("expected a failure (unstartable={unstartable})")
+        };
+        let apps = f.app_dirs();
+        assert_eq!(apps.len(), 1, "the install stays: {apps:?}");
+        let msg = text(&e);
+        assert!(
+            msg.contains(&format!("installed as {}", apps[0])) && msg.contains(&format!("runtime remove {}", apps[0])),
+            "unstartable={unstartable}: {msg}"
+        );
+        assert!(matches!(e, RunAppError::AfterInstall { .. }), "{e:?}");
+    }
+}
+
+#[test]
+fn a_failure_for_an_app_that_was_already_installed_is_not_wrapped() {
+    let f = fx("exit 0");
+    f.app("app");
+    let backend = FailingBackend {
+        inner: FakeBackend::new(),
+        unstartable: false,
+    };
+    let base = f.tmp.path().join("in");
+    let terminal = || -> Box<dyn Write + Send> { Box::new(io::sink()) };
+    let env = Env {
+        base: &base,
+        terminal: &terminal,
+    };
+    let Err(e) = start_in(
+        &f.store,
+        &backend,
+        &f.launcher,
+        "app",
+        &[],
+        &RunOptions::default(),
+        &env,
+    ) else {
+        panic!("expected a failure")
+    };
+    assert!(matches!(e, RunAppError::Backend(_)), "{e:?}");
+    assert!(!text(&e).contains("installed as"), "{e}");
+}
