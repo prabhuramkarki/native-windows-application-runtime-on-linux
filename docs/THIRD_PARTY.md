@@ -10,6 +10,7 @@
 | thiserror | MIT OR Apache-2.0 | Error types | |
 | clap | MIT OR Apache-2.0 | CLI | |
 | tracing, tracing-subscriber | MIT | Structured logging | |
+| tempfile | MIT OR Apache-2.0 | Temporary directories in tests | Dev-dependency only (`runtime-core`); never linked into release binaries. |
 
 This table lists direct dependencies only. `cargo deny` (see `deny.toml`) governs the whole transitive set and its licence allow-list. For example `unicode-ident` (pulled in by the proc-macro crates) is `(MIT OR Apache-2.0) AND Unicode-3.0`, which is why `Unicode-3.0` is in `deny.toml`.
 
