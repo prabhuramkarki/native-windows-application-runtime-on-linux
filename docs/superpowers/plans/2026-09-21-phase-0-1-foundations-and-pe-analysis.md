@@ -2329,3 +2329,42 @@ git tag v0.0.1
 ## Next plan
 
 After the Phase 1 gate: write the Phase 2 plan (environments + `CompatBackend` + Wine backend). It reuses `tools/fixtures` (`hello64.exe` exits 7; `gui64.exe`) and `pe::analyze` for `doctor`'s import-vs-prefix check.
+
+---
+
+## Execution notes (added after the phase was implemented)
+
+**The code blocks in this plan are not what shipped for Tasks 5-8 and Task 10.** Review found the plan's versions unsafe against hostile input (`crates/pe` is a security boundary: it must never panic or abort, must bound its work, and must report what it could not read). The repository holds the hardened code, which supersedes:
+
+- **Tasks 5-8** (imports and delay imports, exports, relocations and TLS, version info and installers): the plan's `analyze.rs` blocks are replaced by hand-written walkers with per-table and whole-file budgets, bounded string reads (`read_bounded`, using `memchr`, at most 1025 bytes per string) and aggregated warnings.
+- **Task 10** (`runtime analyze`): the plan's raw `println!` of file-supplied strings is replaced by `safe()` sanitisation (control characters and bidi overrides escaped), a size cap, regular-file checks before and after `open`, and a single `BrokenPipe` path.
+- **Task 9b** was added (not in this plan): completion of the hostile-input work deferred from Tasks 5-9, and the `pe` mutation/corruption tests.
+- **`crates/pe/src/version.rs`** was added: our own bounded VS_VERSIONINFO parser. pelite is used only to locate the raw RT_VERSION bytes. The resource language is chosen as en-US (0x0409), then neutral (0), then the first entry.
+
+**pelite 0.10 hazards found, and where each is guarded**
+
+1. Its `int()` rejects the 4-byte-aligned import lookup tables GNU ld emits for PE32+: the thunk arrays are walked by hand with `derva_copy` (`analyze.rs`, the `thunks` closure).
+2. It checks alignment against the RVA, not the file offset, so a section whose raw pointer and RVA differ mod 8 yields misaligned references (UB): `check_layout` rejects such an image as `Malformed`; an unaligned input slice is copied to an 8-aligned buffer (`Aligned`).
+3. `VersionInfo` slices out of range on a crafted 10-byte resource and panics: replaced by `version::parse`.
+4. `resources()` dereferences a directory at a non-4-aligned RVA, which is a debug-build SIGABRT (a non-unwinding panic): guarded by the `res_rva % 4` check, reported as a warning.
+5. The base-relocation block iterator loops forever on `SizeOfBlock` 0xFFFFFFFD..0xFFFFFFFF (wrapping round-up): replaced by our own block walk that always advances at least 8 bytes.
+
+Related: pelite's `derva_c_str` scans to the NUL without a limit; all import, export and forwarder strings go through `read_bounded` instead.
+
+**`PeInfo.warnings` are free-form text.** Wording changes between versions (it did during this phase, by ruling). Consumers must not parse them; the structured fields are the contract. A warning means the field it concerns may be incomplete.
+
+**Changes after the final whole-branch review:** JSON `arch` and `subsystem` are always strings (`"other"` when unknown) with the raw numbers in `machine` and `subsystem_raw`; VERSIONINFO language selection; export tables declared but missing now warn; ordinal base is read as a u32; HIGHADJ relocation parameter words are not counted as fixups.
+
+**Deferred and accepted** (the controller's ledger under `.superpowers/sdd/` is not committed; this is its summary):
+
+- PE32 is not fuzzed by the structure-aware mutator (it only builds x64 images); PE32 has hostile-input tests but no mutation coverage.
+- The version parser is lossy on malformation: one over-long string, more than 256 entries or a malformed first table drops all version info (with a warning). Only the first `StringTable` of the chosen language is read.
+- DLL names are outside the 4 MiB retained-name budget (about 8 MiB worst case).
+- `safe()` does not escape LRM, RLM, ALM, U+2028, U+2029 or zero-width characters; clap's argument-error echo and `tracing` output are not routed through it. JSON output carries raw file strings (see the `--json` help).
+- Hang regressions (relocation loop) are caught only by a CI timeout, not a per-test watchdog; the bounded-read test is timing-based.
+- CLI: no "file too large" test and no broken-pipe test; the check after `open` cannot close a swap-to-FIFO race; the FIFO test's guard is created after `spawn`.
+- The `real_world` oracle depends on `file(1)` wording (`(native)`, `Intel i386`).
+- `check_layout` rejects hand-built images whose raw pointers Windows would round down.
+- Five commits carry a `Claude Haiku 4.5` co-author trailer; history was not rewritten.
+
+**Phase 1 exit checklist items NOT done** (they need things the implementation session did not have): the 10+ user-supplied real binaries (7-Zip or Notepad++ portable, a VC++ redistributable, a .NET app, Inno Setup and NSIS installers, an ARM64 DLL), and "CI green" (nothing was pushed to a remote, so `.github/workflows/ci.yml` has never run). `v0.0.1` was not tagged.
