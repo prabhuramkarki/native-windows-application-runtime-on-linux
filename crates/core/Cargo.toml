@@ -8,6 +8,11 @@ rust-version.workspace = true
 [lib]
 name = "rt_core"
 
+[features]
+# Compiles `fake::FakeBackend` (a test double) into the crate. Other crates enable it ONLY through a
+# dev-dependency, so it is never part of a default or release build of a dependent.
+testing = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
