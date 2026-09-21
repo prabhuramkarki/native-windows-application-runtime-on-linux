@@ -17,7 +17,26 @@ jobs:
       - run: tools/build-fixtures.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Plain `cargo test` skips the `#[ignore]`d real-Wine tests; the `wine-e2e` job runs them.
       - run: cargo test --workspace
+  # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
+  # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
+  # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on
+  # Linux only): expect to adjust the Wine package, its first-run time or timeouts after the first run.
+  wine-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      WINEDEBUG: "-all"
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tools/build-fixtures.sh
+      - run: cargo build
+      # Only the crates with real-Wine tests: `--workspace --ignored` would also run the runtime-pe oracle tests,
+      # which need RUNTIME_SAMPLES (a directory of real binaries) and fail without it.
+      - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
   deny:
     runs-on: ubuntu-latest
     steps:
