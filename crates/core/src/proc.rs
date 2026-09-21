@@ -10,8 +10,11 @@
 //! Consequences, by design: output a lingering grandchild writes after the direct child exited is dropped, and
 //! once the reader is gone such a grandchild gets `EPIPE`/`SIGPIPE` if it writes to the captured stream.
 //!
-//! [`run_with_timeout`] kills only the direct child (there is no process-group kill without `libc`); a daemon the
-//! child started keeps running. It never involves a shell.
+//! `run_with_timeout` (crate-private) kills only the direct child (there is no process-group kill without `libc`);
+//! a daemon the child started keeps running. It never involves a shell. It does NOT touch the environment: the
+//! only way for a backend to run a helper process is [`Launcher::run_helper`](crate::Launcher::run_helper), which
+//! finalises the command first (cleared environment + allowlist), so `wineboot` never sees host secrets.
+use crate::Detail;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -23,7 +26,7 @@ use std::time::{Duration, Instant};
 
 /// Reads are made in chunks of this size, so memory use does not depend on how much the child writes.
 pub const CHUNK: usize = 8 * 1024;
-/// [`run_with_timeout`] keeps at most this many bytes of the child's combined stdout+stderr.
+/// A helper run keeps at most this many bytes of the child's combined stdout+stderr.
 pub const MAX_CAPTURE: usize = 64 * 1024;
 /// How long the reader waits for data before it looks at the stop flag.
 const READ_TIMEOUT: Duration = Duration::from_millis(25);
@@ -39,8 +42,16 @@ pub enum RunError {
     Spawn(#[source] io::Error),
     #[error("cannot wait for process: {0}")]
     Wait(#[source] io::Error),
-    #[error("process did not finish within {0:?} and was killed")]
-    TimedOut(Duration),
+    /// `output` is what the child had written when it was killed (capped at 4 KiB; untrusted text).
+    #[error("process did not finish within {after:?} and was killed; output: {output}")]
+    TimedOut { after: Duration, output: Detail },
+}
+
+/// What a helper process produced: its exit status and its combined stdout+stderr (at most [`MAX_CAPTURE`] bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperOutput {
+    pub status: ExitStatus,
+    pub output: Vec<u8>,
 }
 
 /// The read end has a timeout; the write end goes to the child as an `OwnedFd`.
@@ -122,8 +133,9 @@ fn pump<T>(mut rd: UnixStream, mut state: T, stop: &AtomicBool, mut on_chunk: im
 
 /// Runs `cmd` (no shell, stdin closed) and waits at most `timeout`. Returns its exit status and its combined
 /// stdout+stderr, capped at [`MAX_CAPTURE`] bytes (the rest is read and discarded, so the child never blocks on
-/// a full pipe). On timeout the child is killed and reaped (no zombie) and `RunError::TimedOut` is returned.
-pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(ExitStatus, Vec<u8>), RunError> {
+/// a full pipe). On timeout the child is killed and reaped (no zombie) and `RunError::TimedOut` is returned,
+/// carrying the partial output. `cmd` is used as given (no environment finalisation: see the module docs).
+pub(crate) fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(ExitStatus, Vec<u8>), RunError> {
     let (rd, wr) = capture_pair().map_err(RunError::Capture)?;
     let wr2 = wr.try_clone().map_err(RunError::Capture)?;
     cmd.stdin(Stdio::null()).stdout(stdio(wr)).stderr(stdio(wr2));
@@ -156,8 +168,11 @@ pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(ExitStat
                     // Kill, then reap: a killed child that is never waited for stays a zombie.
                     let _ = child.kill();
                     let _ = child.wait();
-                    drain.finish();
-                    return Err(RunError::TimedOut(timeout));
+                    let partial = drain.finish();
+                    return Err(RunError::TimedOut {
+                        after: timeout,
+                        output: Detail::from_bytes(&partial),
+                    });
                 }
                 left.min(POLL)
             }
@@ -201,7 +216,7 @@ mod tests {
         let t0 = Instant::now();
         let err = run_with_timeout(sh(&script), Duration::from_millis(300)).unwrap_err();
         let took = t0.elapsed();
-        assert!(matches!(err, RunError::TimedOut(_)), "{err:?}");
+        assert!(matches!(err, RunError::TimedOut { .. }), "{err:?}");
         assert!(took < Duration::from_secs(2), "took {took:?}");
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         // A killed but unreaped child would still have a /proc entry (state Z).
@@ -231,5 +246,86 @@ mod tests {
     fn an_absurd_timeout_does_not_panic() {
         let (st, _) = run_with_timeout(sh("exit 0"), Duration::MAX).unwrap();
         assert!(st.success());
+    }
+
+    #[test]
+    fn the_timeout_error_carries_the_partial_output() {
+        let t0 = Instant::now();
+        let err = run_with_timeout(sh("echo hello; exec sleep 30"), Duration::from_secs(1)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(3), "took {:?}", t0.elapsed());
+        match err {
+            RunError::TimedOut { after, output } => {
+                assert_eq!(after, Duration::from_secs(1));
+                assert!(output.as_str().contains("hello"), "{output}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_timeout_output_is_capped_at_4_kib() {
+        let err = run_with_timeout(sh("head -c 100000 /dev/zero; exec sleep 30"), Duration::from_secs(1)).unwrap_err();
+        match err {
+            RunError::TimedOut { output, .. } => assert_eq!(output.as_str().len(), 4096),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const PROBE_ENV: &str = "RT_CORE_STDIN_PROBE";
+
+    /// The child half of `stdin_of_the_helper_is_closed`: does nothing unless that test started this process.
+    #[test]
+    fn stdin_probe_child_half() {
+        if std::env::var_os(PROBE_ENV).is_none() {
+            return;
+        }
+        // Here fd 0 is an open pipe nobody writes to. `cat` would block on it unless the helper's stdin is null.
+        let t0 = Instant::now();
+        let (st, out) = run_with_timeout(sh("cat"), Duration::from_secs(4)).expect("cat finished");
+        assert!(st.success());
+        assert!(out.is_empty(), "{out:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn stdin_of_the_helper_is_closed() {
+        // Re-run this test binary with an open, silent pipe as ITS stdin so that a helper which inherits stdin
+        // really blocks (the harness's own stdin may be /dev/null, which would hide the bug).
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "proc::tests::stdin_probe_child_half", "--test-threads=1"])
+            .env(PROBE_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Keep the write end open (`wait_with_output` would close it): no data, no EOF.
+        let _keep_open = child.stdin.take();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}");
+        assert!(
+            text.contains("test result: ok. 1 passed"),
+            "the probe did not run: {text}"
+        );
+    }
+
+    #[test]
+    fn the_reader_stops_after_the_post_exit_cap_even_if_the_writer_never_does() {
+        // The stop flag is set from the start, as after the child's exit; the writer offers 16 MiB.
+        let (rd, mut wr) = capture_pair().unwrap();
+        let stop = AtomicBool::new(true);
+        let writer = thread::spawn(move || {
+            let block = [b'x'; CHUNK];
+            let mut sent = 0usize;
+            while sent < 16 * 1024 * 1024 && io::Write::write_all(&mut wr, &block).is_ok() {
+                sent += CHUNK;
+            }
+            sent
+        });
+        let got = pump(rd, 0usize, &stop, |n, chunk| *n += chunk.len());
+        let sent = writer.join().unwrap();
+        assert!((MAX_AFTER_STOP..=MAX_AFTER_STOP + CHUNK).contains(&got), "read {got}");
+        assert!(sent < 16 * 1024 * 1024, "the writer was never cut off (sent {sent})");
     }
 }
