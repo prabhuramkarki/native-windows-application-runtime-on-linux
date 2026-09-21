@@ -1,6 +1,7 @@
 //! Header-based analysis of Windows binaries. Never trusts file extensions.
 mod analyze;
 mod detect;
+mod installer;
 mod model;
 
 pub use analyze::analyze;

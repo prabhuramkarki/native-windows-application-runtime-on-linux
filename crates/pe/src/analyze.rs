@@ -1,4 +1,4 @@
-use crate::{Error, FileKind, detect, model::*};
+use crate::{Error, FileKind, detect, installer, model::*};
 use pelite::{PeFile, Wrap};
 use std::collections::BTreeMap;
 
@@ -16,10 +16,11 @@ pub fn analyze(bytes: &[u8]) -> Result<PeInfo, Error> {
     };
     let file = PeFile::from_bytes(bytes).map_err(|e| Error::Malformed(e.to_string()))?;
     check_layout(&file)?;
-    let info = match file {
+    let mut info = match file {
         Wrap::T32(f) => info32(f),
         Wrap::T64(f) => info64(f),
     };
+    info.installer = installer::detect(bytes, &info);
     Ok(info)
 }
 
@@ -429,7 +430,31 @@ macro_rules! extract {
                 Err(e) => warnings.push(format!("tls: {e}")),
             }
 
-            let version = None;
+            let mut version = None;
+            match f.resources() {
+                Ok(res) => {
+                    if let Ok(vi) = res.version_info() {
+                        let mut strings = BTreeMap::new();
+                        if let Some(&lang) = vi.translation().first() {
+                            vi.strings(lang, |k, v| {
+                                strings.insert(k.to_owned(), v.to_owned());
+                            });
+                        }
+                        let file_version = strings.get("FileVersion").cloned().or_else(|| {
+                            vi.fixed().map(|x| {
+                                let v = x.dwFileVersion;
+                                format!("{}.{}.{}.{}", v.Major, v.Minor, v.Patch, v.Build)
+                            })
+                        });
+                        version = Some(VersionInfo {
+                            file_version,
+                            strings,
+                        });
+                    }
+                }
+                Err(pelite::Error::Null) => {}
+                Err(e) => warnings.push(format!("resources: {e}")),
+            }
 
             PeInfo {
                 format: $format,
