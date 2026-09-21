@@ -183,3 +183,25 @@ pub fn delay_data(base: u32) -> Vec<u8> {
         .cstr("CreateDXGIFactory")
         .0
 }
+
+/// Ordinal base 10; slot 0 named "Alpha", slot 1 named "Fwd" forwarding to ntdll, slot 2 unused.
+#[rustfmt::skip]
+pub fn exports_data(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(10).u32(3).u32(2).u32(base + 64).u32(base + 80).u32(base + 96)
+        .pad_to(40)
+        .cstr("mylib.dll")
+        .pad_to(64)
+        .u32(0x2000).u32(base + 112).u32(0)
+        .pad_to(80)
+        .u32(base + 144).u32(base + 152)
+        .pad_to(96)
+        .u16(0).u16(1)
+        .pad_to(112)
+        .cstr("NTDLL.RtlAllocateHeap")
+        .pad_to(144)
+        .cstr("Alpha")
+        .pad_to(152)
+        .cstr("Fwd")
+        .0
+}

@@ -1,5 +1,6 @@
 use crate::{Error, FileKind, detect, model::*};
 use pelite::{PeFile, Wrap};
+use std::collections::BTreeMap;
 
 pub fn analyze(bytes: &[u8]) -> Result<PeInfo, Error> {
     if detect(bytes) != FileKind::Pe {
@@ -238,7 +239,38 @@ macro_rules! extract {
                 }
             }
 
-            let exports = Vec::new();
+            let mut exports = Vec::new();
+            match f.exports() {
+                Ok(ex) => {
+                    let base = ex.ordinal_base() as u32;
+                    match ex.by() {
+                        Ok(by) => {
+                            let mut names = BTreeMap::new();
+                            for (name, idx) in by.iter_name_indices() {
+                                if let Ok(n) = name {
+                                    names.insert(idx, n.to_string());
+                                }
+                            }
+                            for idx in 0..by.functions().len().min(65_536) {
+                                let forwarder = match by.index(idx) {
+                                    Ok(pelite::$pe::exports::Export::Forward(fwd)) => Some(fwd.to_string()),
+                                    Ok(pelite::$pe::exports::Export::Symbol(&0)) => continue, // unused slot
+                                    Ok(_) => None,
+                                    Err(_) => continue,
+                                };
+                                exports.push(Export {
+                                    name: names.remove(&idx),
+                                    ordinal: base + idx as u32,
+                                    forwarder,
+                                });
+                            }
+                        }
+                        Err(e) => warnings.push(format!("exports: {e}")),
+                    }
+                }
+                Err(pelite::Error::Null) => {}
+                Err(e) => warnings.push(format!("exports: {e}")),
+            }
 
             let relocation_count = 0;
 
