@@ -188,3 +188,48 @@ fn mutated_resource_sections_never_panic() {
         pe::analyze(&img).expect("analyze");
     }
 }
+
+/// Two-language RT_VERSION resource: each language holds a version block naming its ProductName.
+fn product_name(langs: &[(u32, &str)]) -> Option<String> {
+    let blocks: Vec<Vec<u8>> = langs
+        .iter()
+        .map(|&(_, name)| version_info_block("1.0.0.0", name))
+        .collect();
+    let pairs: Vec<(u32, &[u8])> = langs
+        .iter()
+        .zip(&blocks)
+        .map(|(&(l, _), b)| (l, b.as_slice()))
+        .collect();
+    let base = Builder::rva(0);
+    let rsrc = rsrc_version_langs(base, &pairs);
+    let len = rsrc.len() as u32;
+    let i = analyze(&Builder::x64().section(".rsrc", DATA_R, rsrc).dir(2, base, len));
+    assert!(i.warnings.is_empty(), "{:?}", i.warnings);
+    i.version?.strings.get("ProductName").cloned()
+}
+
+#[test]
+fn en_us_wins_over_a_lower_language_id() {
+    // 0x0401 (Arabic) sorts first, as in Wine's multi-language builtins.
+    let got = product_name(&[(0x0401, "arabic"), (0x0409, "english"), (0x0804, "chinese")]);
+    assert_eq!(got.as_deref(), Some("english"));
+}
+
+#[test]
+fn neutral_language_wins_when_en_us_is_absent() {
+    // Neutral listed after another language, so "first entry" would pick the wrong one.
+    let got = product_name(&[(0x0401, "arabic"), (0, "neutral")]);
+    assert_eq!(got.as_deref(), Some("neutral"));
+}
+
+#[test]
+fn en_us_beats_neutral() {
+    let got = product_name(&[(0, "neutral"), (0x0409, "english")]);
+    assert_eq!(got.as_deref(), Some("english"));
+}
+
+#[test]
+fn first_language_is_used_when_neither_en_us_nor_neutral_exists() {
+    let got = product_name(&[(0x0407, "german"), (0x0401, "arabic")]);
+    assert_eq!(got.as_deref(), Some("german"));
+}

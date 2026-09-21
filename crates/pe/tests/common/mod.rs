@@ -378,15 +378,40 @@ pub fn tls_data_no_callbacks(base: u32) -> Vec<u8> {
 /// 0x409) whose single data entry holds `data` verbatim. `base` is the section's RVA. Wire it with
 /// `.dir(2, base, len)`, where `len` is the returned length.
 pub fn rsrc_version_section(base: u32, data: &[u8]) -> Vec<u8> {
+    rsrc_version_langs(base, &[(0x409, data)])
+}
+
+/// Like `rsrc_version_section`, with one language entry per `(language id, data)`, in the order
+/// given (real linkers sort ascending; tests may not).
+pub fn rsrc_version_langs(base: u32, langs: &[(u32, &[u8])]) -> Vec<u8> {
+    let n = langs.len() as u32;
     // IMAGE_RESOURCE_DIRECTORY: characteristics, timestamp, major, minor, named entries, id entries.
-    let dir = || Bytes::default().u32(0).u32(0).u16(0).u16(0).u16(0).u16(1);
-    let mut out = dir().u32(16).u32(0x8000_0000 | 24).0; // root: type 16 -> directory at 24
-    out.extend(dir().u32(1).u32(0x8000_0000 | 48).0); // id 1 -> directory at 48
-    out.extend(dir().u32(0x409).u32(72).0); // language 0x409 -> data entry at 72
+    let dir = |count: u16| Bytes::default().u32(0).u32(0).u16(0).u16(0).u16(0).u16(count);
+    let mut out = dir(1).u32(16).u32(0x8000_0000 | 24).0; // root: type 16 -> directory at 24
+    out.extend(dir(1).u32(1).u32(0x8000_0000 | 48).0); // id 1 -> directory at 48
+    let mut lang_dir = dir(langs.len() as u16);
+    let entries_at = 48 + 16 + 8 * n;
+    for (i, &(lang, _)) in langs.iter().enumerate() {
+        lang_dir = lang_dir.u32(lang).u32(entries_at + 16 * i as u32); // language -> data entry
+    }
+    out.extend(lang_dir.0);
     // IMAGE_RESOURCE_DATA_ENTRY: OffsetToData (an RVA), Size, CodePage, Reserved.
-    out.extend(Bytes::default().u32(base + 88).u32(data.len() as u32).u32(0).u32(0).0);
-    assert_eq!(out.len(), 88);
-    out.extend_from_slice(data);
+    let mut data_at = entries_at + 16 * n;
+    for &(_, data) in langs {
+        out.extend(
+            Bytes::default()
+                .u32(base + data_at)
+                .u32(data.len() as u32)
+                .u32(0)
+                .u32(0)
+                .0,
+        );
+        data_at += data.len() as u32;
+    }
+    assert_eq!(out.len() as u32, entries_at + 16 * n);
+    for &(_, data) in langs {
+        out.extend_from_slice(data);
+    }
     out
 }
 
