@@ -4,7 +4,7 @@ use std::os::unix::fs::{MetadataExt, symlink};
 
 struct Opened {
     _tmp: tempfile::TempDir,
-    archive: ZipArchive<File>,
+    archive: Archive,
     plan: Plan,
 }
 
@@ -494,13 +494,14 @@ fn zip64_end_records_are_read_for_the_entry_count() {
         let err = expect_err(&to_zip64(base.clone(), lie));
         assert!(matches!(err, ZipError::TooManyEntries { max: 20_000 }), "{lie}: {err}");
     }
-    // A sentinel without the zip64 record behind it is not a usable archive.
+    // A sentinel without the zip64 record behind it is refused by the strict pre-validation (this assertion said
+    // `Format(_)` when the end record was only read for its count).
     let mut broken = base;
     let end = broken.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
     for at in [end + 8, end + 10] {
         broken[at..at + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
     }
-    assert!(matches!(expect_err(&broken), ZipError::Format(_)));
+    assert!(matches!(expect_err(&broken), ZipError::Layout(Layout::Zip64)));
 }
 
 #[test]
@@ -690,6 +691,17 @@ fn read_capped_never_hands_out_more_than_declared_plus_one() {
 }
 
 #[test]
+fn crate_error_texts_are_cut_on_a_character_boundary() {
+    // 300 bytes of two-byte characters: a byte cut at 200 would be fine, one at 201 would split a character.
+    let e = zip::result::ZipError::InvalidArchive("\u{e9}".repeat(150).into());
+    let ZipError::Format(m) = format_err(&e) else { panic!() };
+    assert!(m.len() <= 200 && m.is_char_boundary(m.len()));
+    let e = zip::result::ZipError::InvalidArchive(format!("x{}", "\u{1f600}".repeat(60)).into());
+    let ZipError::Format(m) = format_err(&e) else { panic!() };
+    assert!(m.len() <= 200, "{}", m.len());
+}
+
+#[test]
 fn garbage_is_a_format_error_not_a_panic() {
     for bytes in [
         &b""[..],
@@ -704,5 +716,577 @@ fn garbage_is_a_format_error_not_a_panic() {
             "{:?}",
             &bytes[..bytes.len().min(8)]
         );
+    }
+}
+
+// ---------------------------------------------------------------- strict pre-validation (before the crate)
+
+mod prevalidate_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn pv_with(bytes: &[u8], limits: &Limits) -> Result<DirInfo, ZipError> {
+        prevalidate(&mut Cursor::new(bytes), bytes.len() as u64, limits)
+    }
+
+    fn pv(bytes: &[u8]) -> Result<DirInfo, ZipError> {
+        pv_with(bytes, &Limits::default())
+    }
+
+    /// The exact layout reason `prevalidate` refuses `bytes` for (the zip crate is never involved: this takes a
+    /// byte slice).
+    fn layout(bytes: &[u8]) -> Layout {
+        match pv(bytes) {
+            Err(ZipError::Layout(l)) => l,
+            other => panic!("expected a layout error, got {other:?}"),
+        }
+    }
+
+    /// `open` must give the same answer (and so never reaches the crate for these).
+    fn open_layout(bytes: &[u8]) -> Layout {
+        match expect_err(bytes) {
+            ZipError::Layout(l) => l,
+            other => panic!("expected a layout error from open, got {other}"),
+        }
+    }
+
+    fn base3() -> Vec<u8> {
+        raw_zip(&[
+            Raw::file("a.txt", b"aaa"),
+            Raw::file("b/c.txt", b"bbbb"),
+            Raw::file("d", b""),
+        ])
+    }
+
+    /// Offset of the `n`th central directory header.
+    fn header(zip: &[u8], n: usize) -> usize {
+        zip.windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == b"PK\x01\x02")
+            .nth(n)
+            .unwrap()
+            .0
+    }
+
+    fn decoy_eocd(entries: u16) -> Vec<u8> {
+        let mut d = b"PK\x05\x06\0\0\0\0".to_vec();
+        d.extend_from_slice(&entries.to_le_bytes());
+        d.extend_from_slice(&entries.to_le_bytes());
+        d.extend_from_slice(&[0u8; 10]);
+        d
+    }
+
+    #[test]
+    fn a_plain_archive_validates_and_reports_what_it_found() {
+        let zip = base3();
+        let info = pv(&zip).unwrap();
+        assert_eq!(info.entries, 3);
+        assert_eq!(info.cd_offset + info.cd_size, eocd_at(&zip) as u64);
+        assert_eq!(info.cd_offset as usize, header(&zip, 0));
+        assert_eq!(pv(&raw_zip(&[])).unwrap().entries, 0);
+    }
+
+    #[test]
+    fn entry_counts_that_disagree_on_disk_and_total_are_refused() {
+        for (disk, total) in [(3u16, 1u16), (1, 3), (0, 3), (3, 0)] {
+            let mut zip = base3();
+            let end = eocd_at(&zip);
+            put16(&mut zip, end + 8, disk);
+            put16(&mut zip, end + 10, total);
+            assert_eq!(layout(&zip), Layout::CountMismatch, "disk {disk} total {total}");
+            assert_eq!(open_layout(&zip), Layout::CountMismatch);
+        }
+    }
+
+    #[test]
+    fn disk_numbers_must_be_zero() {
+        for at in [4, 6] {
+            let mut zip = base3();
+            let end = eocd_at(&zip);
+            put16(&mut zip, end + at, 1);
+            assert_eq!(layout(&zip), Layout::MultiDisk, "offset {at}");
+        }
+    }
+
+    #[test]
+    fn a_decoy_end_record_inside_the_comment_is_ambiguous() {
+        let zip = with_comment(base3(), &decoy_eocd(1));
+        assert_eq!(layout(&zip), Layout::AmbiguousEnd);
+        assert_eq!(open_layout(&zip), Layout::AmbiguousEnd);
+        // The reviewer's shape: 60 000 real entries, a maximal comment with a decoy that says 1 entry.
+        let many: Vec<Raw> = (0..60_000).map(|i| Raw::file(&format!("f{i}"), b"")).collect();
+        let mut comment = decoy_eocd(1);
+        comment.resize(0xFFFF, 0);
+        let zip = with_comment(raw_zip(&many), &comment);
+        assert_eq!(layout(&zip), Layout::AmbiguousEnd);
+        assert_eq!(open_layout(&zip), Layout::AmbiguousEnd);
+    }
+
+    #[test]
+    fn two_end_records_in_the_tail_window_are_ambiguous() {
+        let zip = base3();
+        let end = eocd_at(&zip);
+        let twice = [zip.clone(), zip[end..].to_vec()].concat();
+        assert_eq!(layout(&twice), Layout::AmbiguousEnd);
+        // Also when the earlier signature is nowhere near a record (a bare signature in the window).
+        let mut sig_in_data = base3();
+        let at = header(&sig_in_data, 0) - 8;
+        sig_in_data[at..at + 4].copy_from_slice(b"PK\x05\x06");
+        assert_eq!(layout(&sig_in_data), Layout::AmbiguousEnd);
+    }
+
+    #[test]
+    fn the_end_record_must_end_exactly_at_the_end_of_the_file() {
+        let trailing = [base3(), b"garbage".to_vec()].concat();
+        assert_eq!(layout(&trailing), Layout::EndNotAtEof);
+        let mut short_comment = base3();
+        let end = eocd_at(&short_comment);
+        put16(&mut short_comment, end + 20, 10); // says 10, only 0 follow
+        assert_eq!(layout(&short_comment), Layout::EndNotAtEof);
+        let mut long_comment = with_comment(base3(), b"0123456789");
+        let end = eocd_at(&long_comment);
+        put16(&mut long_comment, end + 20, 3); // says 3, 10 follow
+        assert_eq!(layout(&long_comment), Layout::EndNotAtEof);
+        assert_eq!(open_layout(&trailing), Layout::EndNotAtEof);
+    }
+
+    #[test]
+    fn a_comment_is_fine_when_it_is_honest() {
+        for n in [1usize, 100, 0xFFFF] {
+            let zip = with_comment(base3(), &vec![b'c'; n]);
+            assert_eq!(pv(&zip).unwrap().entries, 3, "{n}-byte comment");
+            assert_eq!(open_default(&zip).unwrap().plan.files.len(), 3);
+        }
+        let with_local_sig = with_comment(base3(), b"PK\x03\x04 and PK\x01\x02 are not end records");
+        assert_eq!(pv(&with_local_sig).unwrap().entries, 3);
+    }
+
+    #[test]
+    fn a_zip64_sentinel_without_a_zip64_record_is_refused() {
+        for which in ["count", "size", "offset"] {
+            let mut zip = base3();
+            let end = eocd_at(&zip);
+            match which {
+                "count" => {
+                    put16(&mut zip, end + 8, 0xFFFF);
+                    put16(&mut zip, end + 10, 0xFFFF);
+                }
+                "size" => put32(&mut zip, end + 12, 0xFFFF_FFFF),
+                _ => put32(&mut zip, end + 16, 0xFFFF_FFFF),
+            }
+            assert_eq!(layout(&zip), Layout::Zip64, "{which}");
+        }
+    }
+
+    #[test]
+    fn a_small_honest_zip64_archive_is_accepted_whichever_field_carries_the_sentinel() {
+        for (count, size, offset) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let honest = base3();
+            let z = Z64 {
+                sentinel_count: count,
+                sentinel_size: size,
+                sentinel_offset: offset,
+                ..Z64::honest(&honest)
+            };
+            let zip = to_zip64_with(honest, &z);
+            let info = pv(&zip).unwrap();
+            assert_eq!(info.entries, 3, "sentinels {count} {size} {offset}");
+            let o =
+                open_default(&zip).unwrap_or_else(|e| panic!("open failed for sentinels {count} {size} {offset}: {e}"));
+            assert_eq!(o.plan.files.len(), 3);
+        }
+    }
+
+    #[test]
+    fn the_reviewers_zip64_memory_attack_shape_is_refused_by_its_count() {
+        // Classic count 3 and cd_offset = 0xFFFFFFFF, so the crate would go zip64 and trust a record that claims
+        // 30 million entries (and allocate for them). A few hundred bytes are enough to build it.
+        let honest = base3();
+        let z = Z64 {
+            entries_disk: 30_000_000,
+            total: 30_000_000,
+            sentinel_count: false,
+            sentinel_offset: true,
+            ..Z64::honest(&honest)
+        };
+        let zip = to_zip64_with(honest, &z);
+        assert!(zip.len() < 1000);
+        assert!(matches!(pv(&zip), Err(ZipError::TooManyEntries { max: 20_000 })));
+        assert!(matches!(expect_err(&zip), ZipError::TooManyEntries { max: 20_000 }));
+        // The same with a bogus (large) directory offset in the zip64 record, as in the 1.44 GB sparse-file probe:
+        // the crate only sizes its `Vec` for a count that does not exceed the directory offset.
+        let honest = base3();
+        let z = Z64 {
+            entries_disk: 30_000_000,
+            total: 30_000_000,
+            cd_offset: 40_000_000,
+            sentinel_count: false,
+            sentinel_offset: true,
+            ..Z64::honest(&honest)
+        };
+        let zip = to_zip64_with(honest, &z);
+        assert!(zip.len() < 1000);
+        assert!(matches!(pv(&zip), Err(ZipError::TooManyEntries { max: 20_000 })));
+        assert!(matches!(expect_err(&zip), ZipError::TooManyEntries { max: 20_000 }));
+    }
+
+    #[test]
+    fn the_zip64_allocation_attack_on_a_file_of_realistic_size_is_refused_before_the_crate_allocates() {
+        // The reviewer's probe (a ~1 GB sparse file, classic count 3, `cd_offset` = 0xFFFFFFFF, a zip64 record
+        // claiming millions of entries). The crate accepts such a record when the count does not exceed the directory
+        // offset and the record lies at least 46 x count bytes after it, and then does
+        // `Vec::with_capacity(count x ~232 bytes)`: 21 million entries are ~4.9 GB, an ABORT under
+        // `ulimit -v 4000000`. Only the file's tail is real; the rest is a hole.
+        const N: u64 = 21_000_000;
+        let record_at = 46 * N + N + 1000;
+        let honest = base3();
+        let end = eocd_at(&honest);
+        let z = Z64 {
+            entries_disk: N,
+            total: N,
+            cd_size: 0,
+            cd_offset: N,
+            locator_target: Some(record_at),
+            sentinel_count: false,
+            sentinel_offset: true,
+            ..Z64::honest(&honest)
+        };
+        let tail = to_zip64_with(honest, &z)[end..].to_vec();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("attack.zip");
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(record_at).unwrap();
+            f.seek(SeekFrom::End(0)).unwrap();
+            io::Write::write_all(&mut f, &tail).unwrap();
+        }
+        let err = match open(File::open(&path).unwrap(), &Limits::default()) {
+            Ok(_) => panic!("the attack archive was accepted"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ZipError::TooManyEntries { max: 20_000 }), "{err}");
+    }
+
+    #[test]
+    fn zip64_limits_and_consistency_are_enforced_on_the_64_bit_values() {
+        type Tweak = Box<dyn Fn(&mut Z64)>;
+        let cases: Vec<(&str, Tweak, Layout)> = vec![
+            ("disk", Box::new(|z| z.disk = 1), Layout::MultiDisk),
+            ("disk_cd", Box::new(|z| z.disk_cd = 2), Layout::MultiDisk),
+            ("locator disk", Box::new(|z| z.locator_disk = 1), Layout::MultiDisk),
+            (
+                "locator total disks",
+                Box::new(|z| z.locator_disks = 2),
+                Layout::MultiDisk,
+            ),
+            (
+                "entries_disk != total",
+                Box::new(|z| z.entries_disk = 2),
+                Layout::CountMismatch,
+            ),
+            ("cd_size", Box::new(|z| z.cd_size = 70 << 20), Layout::DirectoryTooLarge),
+            (
+                "cd_offset past the record",
+                Box::new(|z| z.cd_offset += 1),
+                Layout::DirectoryOutOfBounds,
+            ),
+            (
+                "cd_size past the record",
+                Box::new(|z| z.cd_size += 1),
+                Layout::DirectoryOutOfBounds,
+            ),
+            ("record size field", Box::new(|z| z.size_field = 45), Layout::Zip64),
+            (
+                "record size field too small",
+                Box::new(|z| z.size_field = 10),
+                Layout::Zip64,
+            ),
+            (
+                "locator points elsewhere",
+                Box::new(|z| z.locator_target = Some(0)),
+                Layout::Zip64,
+            ),
+            (
+                "locator points after itself",
+                Box::new(|z| z.locator_target = Some(1 << 40)),
+                Layout::Zip64,
+            ),
+        ];
+        for (what, tweak, want) in cases {
+            let honest = base3();
+            let mut z = Z64::honest(&honest);
+            tweak(&mut z);
+            let zip = to_zip64_with(honest, &z);
+            assert_eq!(layout(&zip), want, "{what}");
+        }
+        // A record whose signature is not `PK\x06\x06`, though its size and position are right.
+        let honest = base3();
+        let mut zip = to_zip64_with(honest.clone(), &Z64::honest(&honest));
+        let at = zip.windows(4).position(|w| w == b"PK\x06\x06").unwrap();
+        zip[at + 3] = 0x09;
+        assert_eq!(layout(&zip), Layout::Zip64);
+        // A zip64 record with more entries than the cap.
+        let honest = base3();
+        let z = Z64 {
+            entries_disk: 20_001,
+            total: 20_001,
+            ..Z64::honest(&honest)
+        };
+        assert!(matches!(
+            pv(&to_zip64_with(honest, &z)),
+            Err(ZipError::TooManyEntries { .. })
+        ));
+    }
+
+    #[test]
+    fn a_zip64_locator_the_end_record_does_not_point_to_is_ambiguous() {
+        let honest = base3();
+        let z = Z64 {
+            sentinel_count: false,
+            ..Z64::honest(&honest)
+        };
+        assert_eq!(layout(&to_zip64_with(honest, &z)), Layout::StrayZip64Locator);
+    }
+
+    #[test]
+    fn an_end_record_signature_hidden_in_the_directory_or_the_zip64_data_is_ambiguous() {
+        // In an entry name inside the central directory.
+        let zip = raw_zip(&[Raw::file("a.txt", b"1"), Raw::file("xPK\x05\x06y", b"2")]);
+        assert_eq!(layout(&zip), Layout::AmbiguousEnd);
+        assert_eq!(open_layout(&zip), Layout::AmbiguousEnd);
+        // In the zip64 extensible data sector (an honest size field, so only the signature is wrong).
+        let honest = base3();
+        let sector = b"....PK\x05\x06....".to_vec();
+        let z = Z64 {
+            size_field: 44 + sector.len() as u64,
+            extensible: sector,
+            ..Z64::honest(&honest)
+        };
+        assert_eq!(layout(&to_zip64_with(honest, &z)), Layout::AmbiguousEnd);
+        // Far from the end (outside the 64 KiB tail window) it is still found: a big sector, signature first.
+        let honest = base3();
+        let mut sector = vec![0u8; 65_535];
+        sector[..4].copy_from_slice(b"PK\x05\x06");
+        let z = Z64 {
+            size_field: 44 + sector.len() as u64,
+            extensible: sector,
+            ..Z64::honest(&honest)
+        };
+        assert_eq!(layout(&to_zip64_with(honest, &z)), Layout::AmbiguousEnd);
+        // The same for a poisoned name at the start of a big central directory.
+        let mut entries = vec![Raw::file("xPK\x05\x06y", b"")];
+        entries.extend((0..3000).map(|i| Raw::file(&format!("filler-{i:05}-{}", "z".repeat(40)), b"")));
+        let big = raw_zip(&entries);
+        assert!(
+            big.len() - header(&big, 0) > 70_000,
+            "the signature must lie outside the tail window"
+        );
+        assert_eq!(layout(&big), Layout::AmbiguousEnd);
+        // The same sector without the signature is fine.
+        let honest = base3();
+        let sector = b"....PK\x03\x04....".to_vec();
+        let z = Z64 {
+            size_field: 44 + sector.len() as u64,
+            extensible: sector,
+            ..Z64::honest(&honest)
+        };
+        assert_eq!(pv(&to_zip64_with(honest, &z)).unwrap().entries, 3);
+    }
+
+    #[test]
+    fn the_central_directory_size_is_capped_at_64_mib() {
+        let mut zip = base3();
+        let end = eocd_at(&zip);
+        put32(&mut zip, end + 12, (64 << 20) + 1);
+        assert_eq!(layout(&zip), Layout::DirectoryTooLarge);
+        assert_eq!(open_layout(&zip), Layout::DirectoryTooLarge);
+    }
+
+    #[test]
+    fn the_central_directory_must_lie_inside_the_archive_and_end_at_the_end_record() {
+        let mut past = base3();
+        let end = eocd_at(&past);
+        put32(&mut past, end + 16, end as u32); // cd_offset + cd_size > eocd_pos
+        assert_eq!(layout(&past), Layout::DirectoryOutOfBounds);
+        let mut huge = base3();
+        put32(&mut huge, end + 16, 0xFFFF_FFF0);
+        assert_eq!(layout(&huge), Layout::DirectoryOutOfBounds);
+        // Junk between the directory and the end record.
+        let mut gap = base3();
+        gap.splice(end..end, [7u8; 10]);
+        assert_eq!(layout(&gap), Layout::DirectoryGap);
+    }
+
+    #[test]
+    fn a_missing_or_wrong_central_header_signature_is_refused() {
+        let mut first = base3();
+        let at = header(&first, 0);
+        first[at + 2] = 9;
+        assert_eq!(layout(&first), Layout::PrependedData);
+        let mut second = base3();
+        let at = header(&second, 1);
+        second[at + 3] = 9;
+        assert_eq!(layout(&second), Layout::InconsistentDirectory);
+        assert_eq!(open_layout(&second), Layout::InconsistentDirectory);
+    }
+
+    #[test]
+    fn a_directory_walk_that_overruns_or_leaves_bytes_is_refused() {
+        // A name length that runs past the directory.
+        let mut overrun = base3();
+        let at = header(&overrun, 2);
+        put16(&mut overrun, at + 28, 3000);
+        assert_eq!(layout(&overrun), Layout::InconsistentDirectory);
+        // Extra and comment lengths count too.
+        for field in [30, 32] {
+            let mut z = base3();
+            let at = header(&z, 2);
+            put16(&mut z, at + field, 500);
+            assert_eq!(layout(&z), Layout::InconsistentDirectory, "field {field}");
+        }
+        // Fewer entries than headers: bytes are left over.
+        let mut fewer = base3();
+        let end = eocd_at(&fewer);
+        put16(&mut fewer, end + 8, 2);
+        put16(&mut fewer, end + 10, 2);
+        assert_eq!(layout(&fewer), Layout::InconsistentDirectory);
+        // More entries than headers: the walk runs out.
+        let mut more = base3();
+        put16(&mut more, end + 8, 5);
+        put16(&mut more, end + 10, 5);
+        assert_eq!(layout(&more), Layout::InconsistentDirectory);
+        // Even a directory of nothing but its declared size.
+        let mut empty_count = base3();
+        put16(&mut empty_count, end + 8, 0);
+        put16(&mut empty_count, end + 10, 0);
+        assert_eq!(layout(&empty_count), Layout::InconsistentDirectory);
+    }
+
+    #[test]
+    fn entry_names_are_bounded_per_entry_and_in_total() {
+        let long = raw_zip(&[Raw::file(&"n".repeat(4097), b"")]);
+        assert_eq!(layout(&long), Layout::NamesTooLong);
+        let at_cap = raw_zip(&[Raw::file(&"n".repeat(4096), b"")]);
+        assert_eq!(pv(&at_cap).unwrap().entries, 1);
+        // 4200 names of 4096 bytes: 17 MB, over the 16 MiB total.
+        let entries: Vec<Raw> = (0..4200)
+            .map(|i| Raw::file(&format!("{i:05}{}", "x".repeat(4091)), b""))
+            .collect();
+        assert_eq!(layout(&raw_zip(&entries)), Layout::NamesTooLong);
+    }
+
+    #[test]
+    fn prepended_data_is_not_supported() {
+        for junk in [&b"JUNK"[..], b"#!/bin/sh\nexit 0\n", &[0u8; 5000]] {
+            let zip = [junk, &base3()].concat();
+            assert_eq!(layout(&zip), Layout::PrependedData, "{} junk bytes", junk.len());
+            assert_eq!(open_layout(&zip), Layout::PrependedData);
+        }
+        let msg = ZipError::Layout(Layout::PrependedData).to_string();
+        assert!(msg.contains("data before the first entry"), "{msg}");
+    }
+
+    #[test]
+    fn the_entry_count_cap_holds_in_prevalidate() {
+        let many = |n: usize| raw_zip(&(0..n).map(|i| Raw::file(&format!("f{i}"), b"")).collect::<Vec<_>>());
+        assert_eq!(pv(&many(20_000)).unwrap().entries, 20_000);
+        assert!(matches!(
+            pv(&many(20_001)),
+            Err(ZipError::TooManyEntries { max: 20_000 })
+        ));
+        let tight = Limits {
+            max_entries: 2,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            pv_with(&base3(), &tight),
+            Err(ZipError::TooManyEntries { max: 2 })
+        ));
+    }
+
+    #[test]
+    fn not_a_zip_at_all_is_a_format_error() {
+        for bytes in [&b""[..], b"PK", &[0u8; 21], &[0u8; 100_000]] {
+            assert!(matches!(pv(bytes), Err(ZipError::Format(_))), "{} bytes", bytes.len());
+        }
+    }
+
+    #[test]
+    fn an_archive_written_by_the_zip_crate_is_accepted() {
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        w.add_directory("d/", o).unwrap();
+        for i in 0..50 {
+            w.start_file(format!("d/f{i}.txt"), o).unwrap();
+            io::Write::write_all(&mut w, format!("file {i}").as_bytes()).unwrap();
+        }
+        w.set_raw_comment(b"made by the zip crate".to_vec().into()).unwrap();
+        let bytes = w.finish().unwrap().into_inner();
+        assert_eq!(pv(&bytes).unwrap().entries, 51);
+        assert_eq!(open_default(&bytes).unwrap().plan.files.len(), 50);
+    }
+
+    #[test]
+    fn an_archive_written_by_the_zip_tool_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub/deeper")).unwrap();
+        fs::write(src.join("a.txt"), "alpha").unwrap();
+        fs::write(src.join("sub/b.bin"), vec![7u8; 100_000]).unwrap();
+        fs::write(src.join("sub/deeper/c.txt"), "gamma").unwrap();
+        let out = tmp.path().join("out.zip");
+        let status = std::process::Command::new("zip")
+            .args(["-q", "-r"])
+            .arg(&out)
+            .arg(".")
+            .current_dir(&src)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => panic!("zip failed: {s}"),
+            Err(e) => {
+                eprintln!("SKIPPED: the `zip` tool is not available ({e}); only the zip-crate archive was tested");
+                return;
+            }
+        }
+        let bytes = fs::read(&out).unwrap();
+        assert_eq!(pv(&bytes).unwrap().entries, 5, "3 files + 2 directories");
+        let mut o = open_default(&bytes).unwrap();
+        assert_eq!(o.plan.files.len(), 3);
+        let (_t, dest) = dest();
+        extract(&mut o.archive, &o.plan, &dest, &Limits::default()).unwrap();
+        assert_eq!(fs::read(dest.join("sub/b.bin")).unwrap(), vec![7u8; 100_000]);
+    }
+
+    #[test]
+    fn the_crate_cannot_fall_back_to_another_end_record_hidden_in_the_data() {
+        // Outer archive: a STORED nested zip (with its own end record, well before the tail window), padding, and
+        // an entry the crate refuses (AES method without its extra field). Without the mask the crate would fail on
+        // our record and walk back to the nested one; with it there is no other record to find.
+        let nested = raw_zip(&[Raw::file("x", b"1"), Raw::file("y", b"2")]);
+        let zip = raw_zip(&[
+            Raw::file("nested.zip", &nested),
+            Raw::file("pad.bin", &vec![0u8; 70_000]),
+            Raw::file("aes.bin", b"data").method(99),
+        ]);
+        assert_eq!(pv(&zip).unwrap().entries, 3, "prevalidate accepts the outer archive");
+        match expect_err(&zip) {
+            ZipError::Format(m) => assert!(m.contains("AES"), "{m}"),
+            other => panic!("expected the crate's own refusal of the AES entry, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn after_parsing_the_crate_must_have_used_exactly_the_validated_record() {
+        // The archive validates; the crate accepts it; its view matches ours.
+        let o = open_default(&base3()).unwrap();
+        assert_eq!(o.archive.len(), 3);
+        assert_eq!(o.archive.offset(), 0);
+        assert_eq!(o.archive.central_directory_start(), pv(&base3()).unwrap().cd_offset);
     }
 }

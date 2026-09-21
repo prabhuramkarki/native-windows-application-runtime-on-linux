@@ -629,6 +629,86 @@ fn invalid_metadata_is_caught_before_anything_is_created() {
     assert!(wrap.inner.calls().is_empty(), "prepare ran: {:?}", wrap.inner.calls());
 }
 
+/// A backend whose `prepare` panics after creating the prefix (as buggy zip or PE code would).
+fn panicking() -> Wrap {
+    Wrap {
+        after_prepare: Some(Box::new(|_: &AppEnv| panic!("boom in prepare"))),
+        ..Wrap::new()
+    }
+}
+
+#[test]
+fn a_panic_after_create_still_removes_the_environment() {
+    let f = fx();
+    let path = f.input("hello64.exe", &prog());
+    let wrap = panicking();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.run_with(&wrap, &path, &InstallOpts::default())
+    }));
+    assert!(caught.is_err(), "the panic must propagate to the caller");
+    f.assert_no_app_left("panic in prepare");
+    let id = AppId::parse("hello64").unwrap();
+    assert_eq!(
+        wrap.inner.calls(),
+        vec![Call::Prepare { app: id.clone() }, Call::Stop { app: id }],
+        "the backend is stopped before the directory goes"
+    );
+    assert_eq!(fs::read_to_string(f.tmp.path().join("canary")).unwrap(), "canary");
+}
+
+#[test]
+fn a_panic_with_a_backend_that_cannot_stop_leaves_the_tree_and_does_not_abort() {
+    let f = fx();
+    let wrap = Wrap {
+        stop_fails: true,
+        ..panicking()
+    };
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.run_with(&wrap, &f.input("hello64.exe", &prog()), &InstallOpts::default())
+    }));
+    assert!(caught.is_err());
+    assert!(
+        f.apps().join("hello64").is_dir(),
+        "not removed while a Wine process may run"
+    );
+}
+
+#[test]
+fn a_successful_install_does_not_trigger_the_unwind_cleanup() {
+    let f = fx();
+    let out = f.ok(&f.input("hello64.exe", &prog()), &InstallOpts::default());
+    assert!(f.store.read_metadata(&f.store.get(&out.id).unwrap()).is_ok());
+    assert_eq!(f.backend.calls(), vec![Call::Prepare { app: out.id }]);
+}
+
+#[test]
+fn every_retried_id_is_validated_before_its_create() {
+    let f = fx();
+    let path = f.input("hello64.exe", &prog());
+    let foreign = f.apps().join("hello64");
+    fs::create_dir_all(&foreign).unwrap();
+    let first = std::cell::Cell::new(true);
+    // The first (stale) answer collides; the second is a valid app id that is not a usable Windows directory name.
+    let pick = |_: &Store, base: &AppId| -> Result<AppId, StoreError> {
+        if first.replace(false) {
+            Ok(base.clone())
+        } else {
+            Ok(AppId::parse("con")?)
+        }
+    };
+    let err = install_with(
+        &f.store,
+        &f.backend,
+        &path,
+        &InstallOpts::default(),
+        &tunables(Limits::default(), &pick),
+    )
+    .unwrap_err();
+    assert!(matches!(err, InstallError::Path(_)), "{err}");
+    assert_eq!(tree(&f.apps()), ["hello64/"], "nothing was created for the rejected id");
+    assert!(f.backend.calls().is_empty());
+}
+
 #[test]
 fn a_backend_that_is_not_available_stops_the_install_before_anything_is_created() {
     let f = fx();
@@ -983,6 +1063,15 @@ fn among_several_exes_the_largest_gui_program_wins() {
     ]);
     let out = f.ok(&f.input("many.zip", &zip), &InstallOpts::default());
     assert_eq!(out.executable.to_string(), "C:\\Program Files\\many\\big.exe");
+    // Four candidates (text, DLL, driver, installer) were dropped: that is said once, with the first reason.
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0].starts_with("4 of the 7 .exe files"),
+        "{:?}",
+        out.warnings
+    );
+    assert!(out.warnings[0].contains("first reason"), "{:?}", out.warnings);
+    assert!(out.warnings[0].chars().count() < 250, "{:?}", out.warnings);
 }
 
 #[test]
@@ -1227,6 +1316,32 @@ fn hostile_archives_are_refused_before_anything_is_created() {
             ),
         ),
         ("not a zip", [&b"PK\x03\x04"[..], &[0u8; 100]].concat()),
+        (
+            "decoy end record",
+            with_comment(raw_zip(&base), &[b"PK\x05\x06".as_slice(), &[0u8; 18]].concat()),
+        ),
+        ("trailing garbage", [raw_zip(&base), b"junk".to_vec()].concat()),
+        (
+            "prepended data",
+            [b"PK\x03\x04 prefix".to_vec(), raw_zip(&base)].concat(),
+        ),
+        ("count mismatch", {
+            let mut z = raw_zip(&[base.clone(), vec![Raw::file("b.txt", b"b")]].concat());
+            let end = eocd_at(&z);
+            put16(&mut z, end + 8, 3);
+            z
+        }),
+        ("zip64 memory attack shape", {
+            let z = raw_zip(&base);
+            let attack = Z64 {
+                entries_disk: 30_000_000,
+                total: 30_000_000,
+                sentinel_count: false,
+                sentinel_offset: true,
+                ..Z64::honest(&z)
+            };
+            to_zip64_with(z, &attack)
+        }),
     ];
     for (what, bytes) in cases {
         let path = f.input("hostile.zip", &bytes);

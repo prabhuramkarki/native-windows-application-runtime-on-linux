@@ -3,9 +3,23 @@
 //!
 //! **Nothing in an archive is trusted**: names, sizes, modes, counts. The flow is
 //!
-//! 1. [`open`] reads the end-of-central-directory record itself (entry count, zip64 aware) and refuses more than
-//!    [`Limits::max_entries`] entries BEFORE the `zip` crate parses the central directory, then builds the plan
-//!    from the central directory alone (no entry data is read):
+//! 1. [`open`] first runs [`prevalidate`]: a STRICT check of the end record and of the whole central directory,
+//!    done by this module before the `zip` crate sees the file. It requires exactly one end-of-central-directory
+//!    signature in the last 64 KiB, a comment that ends at the end of the file, disk numbers 0, equal entry counts
+//!    for this disk and in total, at most [`Limits::max_entries`] entries, a directory of at most [`MAX_CD_BYTES`]
+//!    that ends exactly where the end record (or zip64 record) starts, a valid zip64 record and locator whenever
+//!    the crate would go zip64 (count, size or offset field saturated), and a central directory that walks: exactly
+//!    `count` headers, sane name lengths, bytes consumed equal to the stated size. Anything else is a
+//!    [`Layout`] error. So every number the crate later uses to size its allocations (its `Vec::with_capacity`
+//!    takes the entry count) has been checked against the file and bounded by us first.
+//!    The crate could still, in principle, fail on OUR record for its own reasons (a malformed extra field) and
+//!    then walk back to an earlier `PK\5\6` hidden in file data (say a stored nested zip). That is made
+//!    unreachable: the crate reads through `Guarded`, which shows zeros for every byte before the central
+//!    directory until `ZipArchive::new` has returned, and the directory, its zip64 extensible data and the tail
+//!    window are scanned for stray signatures by [`prevalidate`]. Afterwards the crate's entry count, archive
+//!    offset and directory start must equal ours. Limits: archives must start at byte 0 (no self-extracting
+//!    prefix), zip64 records must be adjacent to the locator, the directory must directly precede the end record.
+//!    Then the plan is built from the central directory alone (no entry data is read):
 //!    * every name is parsed with [`WinPath::parse`] as `C:\<name>` after stripping ONE trailing separator (a
 //!      directory marker). `\` is a separator (Windows semantics; a Linux name with a backslash becomes a nested
 //!      path). `..`, absolute, drive, UNC, `\\?\`, `:` (alternate streams), NUL/control characters, reserved device
@@ -32,13 +46,15 @@
 //! can write into the destination while it is being extracted could swap a directory for a symlink. `install`
 //! only extracts when no Wine process is running in the prefix (`CompatBackend::prepare` stops the server before
 //! returning), and Phase 5's sandbox is the real boundary.
-use crate::text::quote;
+use crate::text::{clean, quote};
 use crate::winpath::{WinPath, WinPathError};
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use zip::{CompressionMethod, ZipArchive};
 
 const GIB: u64 = 1 << 30;
@@ -94,11 +110,51 @@ pub enum NameError {
     Path(WinPathError),
 }
 
-/// Error texts embed entry names only through [`quote`] (escaped, at most 125 characters each).
+/// Why the end record or the central directory of an archive is refused before the `zip` crate sees it. Carries no
+/// untrusted text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Layout {
+    #[error("ambiguous end record: more than one end-of-central-directory signature in the last 64 KiB")]
+    AmbiguousEnd,
+    #[error("the end record does not end at the end of the file (trailing data, or a comment length that lies)")]
+    EndNotAtEof,
+    #[error("multi-disk archives are not supported")]
+    MultiDisk,
+    #[error("the end record states different entry counts for this disk and in total")]
+    CountMismatch,
+    #[error("the central directory is larger than 64 MiB")]
+    DirectoryTooLarge,
+    #[error("the central directory lies outside the archive")]
+    DirectoryOutOfBounds,
+    #[error("the central directory is not directly followed by the end record")]
+    DirectoryGap,
+    #[error("the zip64 end record or its locator is missing or inconsistent")]
+    Zip64,
+    #[error("a zip64 locator is present but the end record does not point to it: ambiguous")]
+    StrayZip64Locator,
+    #[error("unsupported archive layout: data before the first entry, or a damaged central directory start")]
+    PrependedData,
+    #[error("inconsistent central directory (entry headers do not add up to the stated size and count)")]
+    InconsistentDirectory,
+    #[error("entry names are too long (over 4096 bytes each or 16 MiB together)")]
+    NamesTooLong,
+}
+
+/// What [`prevalidate`] established about an archive, all bounded and consistent with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirInfo {
+    pub entries: u64,
+    pub cd_offset: u64,
+    pub cd_size: u64,
+}
+
+/// Error texts embed entry names only through `text::quote` (escaped, at most 125 characters each).
 #[derive(Debug, thiserror::Error)]
 pub enum ZipError {
     #[error("not a usable zip archive: {0}")]
     Format(String),
+    #[error("unusable zip archive: {0}")]
+    Layout(#[from] Layout),
     #[error("the archive has more than {max} entries")]
     TooManyEntries { max: usize },
     #[error("the archive would create more than {max} directories")]
@@ -150,9 +206,7 @@ pub enum ZipError {
 
 fn format_err(e: &zip::result::ZipError) -> ZipError {
     // The crate's messages are static or numeric; still clip them.
-    let mut m = e.to_string();
-    m.truncate(200);
-    ZipError::Format(m)
+    ZipError::Format(clean(&e.to_string(), 200))
 }
 
 /// Parses an entry name into validated components (`C:\` is prepended so [`WinPath`] does the work, see the module
@@ -211,56 +265,251 @@ fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
-/// The entry count of the archive as the end record states it, read from the last 64 KiB of the file (zip64 aware).
-fn declared_entries(file: &File) -> Result<u64, ZipError> {
-    let bad = |what: &str| ZipError::Format(what.to_owned());
-    let io_err = |e: io::Error| ZipError::Format(e.to_string());
-    let mut f = file;
-    let len = f.seek(SeekFrom::End(0)).map_err(io_err)?;
-    let n = len.min(22 + 65_535);
-    let mut tail = vec![0u8; n as usize];
-    f.seek(SeekFrom::Start(len - n)).map_err(io_err)?;
-    f.read_exact(&mut tail).map_err(io_err)?;
-    let sig = b"PK\x05\x06";
-    let pos = tail
-        .windows(4)
-        .rposition(|w| w == sig)
-        .filter(|&p| p + 22 <= tail.len())
-        .ok_or_else(|| bad("no end of central directory record (not a zip archive)"))?;
-    let total = u64::from(u16::from_le_bytes([tail[pos + 10], tail[pos + 11]]));
-    if total != 0xFFFF {
-        return Ok(total);
-    }
-    // zip64: the locator sits right before the end record and points at the zip64 end record.
-    let loc = pos.checked_sub(20).ok_or_else(|| bad("zip64 locator missing"))?;
-    if &tail[loc..loc + 4] != b"PK\x06\x07" {
-        return Err(bad("zip64 locator missing"));
-    }
-    let off = u64::from_le_bytes(tail[loc + 8..loc + 16].try_into().unwrap_or_default());
-    let mut rec = [0u8; 56];
-    f.seek(SeekFrom::Start(off)).map_err(io_err)?;
-    f.read_exact(&mut rec).map_err(io_err)?;
-    if &rec[..4] != b"PK\x06\x06" {
-        return Err(bad("zip64 end of central directory record missing"));
-    }
-    Ok(u64::from_le_bytes(rec[32..40].try_into().unwrap_or_default()))
+/// Largest central directory accepted, in bytes.
+pub const MAX_CD_BYTES: u64 = 64 << 20;
+/// Longest entry name accepted in the central directory, in bytes, and the most all names may total.
+const MAX_NAME_BYTES: usize = 4096;
+const MAX_NAMES_TOTAL: usize = 16 << 20;
+/// The end record is searched in this many bytes at the end of the file (a 22 byte record plus a 65535 byte comment).
+const TAIL_WINDOW: u64 = 22 + 65_535;
+/// Most bytes of zip64 "extensible data" between the zip64 end record and its locator.
+const MAX_ZIP64_EXTENSIBLE: u64 = 64 * 1024;
+const SIG_EOCD: &[u8; 4] = b"PK\x05\x06";
+const SIG_ZIP64_EOCD: &[u8; 4] = b"PK\x06\x06";
+const SIG_ZIP64_LOCATOR: &[u8; 4] = b"PK\x06\x07";
+const SIG_CENTRAL: &[u8; 4] = b"PK\x01\x02";
+
+fn read_at<R: Read + Seek>(r: &mut R, at: u64, len: usize) -> Result<Vec<u8>, ZipError> {
+    let io_err = |e: io::Error| ZipError::Format(clean(&e.to_string(), 200));
+    let mut buf = vec![0u8; len];
+    r.seek(SeekFrom::Start(at)).map_err(io_err)?;
+    r.read_exact(&mut buf).map_err(io_err)?;
+    Ok(buf)
 }
 
-/// Opens the archive and plans it (see the module docs). Reads no entry data.
-pub fn open(file: File, limits: &Limits) -> Result<(ZipArchive<File>, Plan), ZipError> {
-    let declared = declared_entries(&file)?;
-    if declared > limits.max_entries as u64 {
+fn le16(b: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([b[at], b[at + 1]]))
+}
+
+fn le32(b: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]))
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(a)
+}
+
+fn has_end_signature(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| w == SIG_EOCD)
+}
+
+/// Strictly validates an archive of `len` bytes BEFORE the `zip` crate is allowed to look at it, and returns the
+/// numbers the crate will later rely on, all bounded. The crate parses the whole central directory with a
+/// `Vec::with_capacity(count)` taken from whichever end record it settles on, so it must never be handed an
+/// archive whose count, sizes or record choice we have not checked ourselves.
+///
+/// * The end-of-central-directory record is found in the last 22 + 65535 bytes, must be the ONLY signature there,
+///   and its comment must end exactly at the end of the file. (The crate walks back over every `PK\5\6` and falls
+///   back to an earlier one when a candidate fails its own checks; see [`open`] for how that is made unreachable.)
+/// * disk numbers are 0, entries on this disk equal the total, the total is at most `max_entries`, the directory
+///   is at most [`MAX_CD_BYTES`] and ends exactly where the end record (or the zip64 end record) begins.
+/// * The crate goes zip64 when the count is `0xFFFF` OR the directory size OR offset is `0xFFFFFFFF`: then the
+///   zip64 locator must sit directly before the end record and a valid zip64 record must sit directly before the
+///   locator, and the same rules apply to its 64-bit values. A locator without such a sentinel is ambiguous.
+/// * The central directory is walked: exactly `count` headers starting with `PK\1\2`, names of at most 4096 bytes
+///   (16 MiB together), the variable-length fields staying inside the directory, and the bytes consumed equal to
+///   the stated size. Data before the first entry (self-extracting archives, prepended junk) makes the first
+///   signature miss and is refused: this reader supports archives that start at byte 0.
+pub fn prevalidate<R: Read + Seek>(r: &mut R, len: u64, limits: &Limits) -> Result<DirInfo, ZipError> {
+    let no_end = || ZipError::Format("no end of central directory record (not a zip archive)".to_owned());
+    if len < 22 {
+        return Err(no_end());
+    }
+    let window = len.min(TAIL_WINDOW);
+    let window_start = len - window;
+    let tail = read_at(r, window_start, window as usize)?;
+    let mut sigs = tail
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == SIG_EOCD)
+        .map(|(i, _)| i);
+    let at = sigs.next().ok_or_else(no_end)?;
+    if sigs.next().is_some() {
+        return Err(Layout::AmbiguousEnd.into());
+    }
+    let eocd_pos = window_start + at as u64;
+    if at + 22 > tail.len() || eocd_pos + 22 + le16(&tail, at + 20) != len {
+        return Err(Layout::EndNotAtEof.into());
+    }
+    let rec = &tail[at..at + 22];
+    if le16(rec, 4) != 0 || le16(rec, 6) != 0 {
+        return Err(Layout::MultiDisk.into());
+    }
+    if le16(rec, 8) != le16(rec, 10) {
+        return Err(Layout::CountMismatch.into());
+    }
+    let (count32, size32, offset32) = (le16(rec, 10), le32(rec, 12), le32(rec, 16));
+    let zip64 = count32 == 0xFFFF || size32 == 0xFFFF_FFFF || offset32 == 0xFFFF_FFFF;
+    let locator_at = eocd_pos.checked_sub(20);
+    let locator = match locator_at {
+        Some(p) => Some(read_at(r, p, 20)?),
+        None => None,
+    };
+    let has_locator = locator.as_ref().is_some_and(|l| &l[..4] == SIG_ZIP64_LOCATOR);
+    // Where the directory must end (the start of whatever follows it) and what is scanned for stray signatures.
+    let (entries, cd_size, cd_offset, dir_end, mut scan): (u64, u64, u64, u64, Vec<u8>) = if !zip64 {
+        if has_locator {
+            return Err(Layout::StrayZip64Locator.into());
+        }
+        (count32, size32, offset32, eocd_pos, Vec::new())
+    } else {
+        let (Some(locator), Some(locator_pos)) = (locator.filter(|_| has_locator), locator_at) else {
+            return Err(Layout::Zip64.into());
+        };
+        if le32(&locator, 4) != 0 || le32(&locator, 16) > 1 {
+            return Err(Layout::MultiDisk.into());
+        }
+        let z64_pos = le64(&locator, 8);
+        if z64_pos.checked_add(56).is_none_or(|end| end > locator_pos) {
+            return Err(Layout::Zip64.into());
+        }
+        let head = read_at(r, z64_pos, 56)?;
+        let size = le64(&head, 4);
+        // The record and its extensible data end exactly where the locator begins.
+        if &head[..4] != SIG_ZIP64_EOCD
+            || size < 44
+            || size - 44 > MAX_ZIP64_EXTENSIBLE
+            || z64_pos.checked_add(12).and_then(|p| p.checked_add(size)) != Some(locator_pos)
+        {
+            return Err(Layout::Zip64.into());
+        }
+        if le32(&head, 16) != 0 || le32(&head, 20) != 0 {
+            return Err(Layout::MultiDisk.into());
+        }
+        if le64(&head, 24) != le64(&head, 32) {
+            return Err(Layout::CountMismatch.into());
+        }
+        let sector = read_at(r, z64_pos + 56, (size - 44) as usize)?;
+        (le64(&head, 32), le64(&head, 40), le64(&head, 48), z64_pos, sector)
+    };
+    if entries > limits.max_entries as u64 {
         return Err(ZipError::TooManyEntries {
             max: limits.max_entries,
         });
     }
-    let mut archive = ZipArchive::new(file).map_err(|e| format_err(&e))?;
-    // `declared <= max_entries` here, so equality also bounds `archive.len()`.
-    if declared != archive.len() as u64 {
+    if cd_size > MAX_CD_BYTES {
+        return Err(Layout::DirectoryTooLarge.into());
+    }
+    if cd_offset.checked_add(cd_size).is_none_or(|end| end > dir_end) {
+        return Err(Layout::DirectoryOutOfBounds.into());
+    }
+    let cd = read_at(r, cd_offset, cd_size as usize)?;
+    let mut pos = 0usize;
+    let mut names_total = 0usize;
+    for i in 0..entries {
+        if pos + 46 > cd.len() || &cd[pos..pos + 4] != SIG_CENTRAL {
+            return Err(if i == 0 {
+                Layout::PrependedData
+            } else {
+                Layout::InconsistentDirectory
+            }
+            .into());
+        }
+        let (name, extra, comment) = (
+            le16(&cd, pos + 28) as usize,
+            le16(&cd, pos + 30) as usize,
+            le16(&cd, pos + 32) as usize,
+        );
+        names_total += name;
+        if name > MAX_NAME_BYTES || names_total > MAX_NAMES_TOTAL {
+            return Err(Layout::NamesTooLong.into());
+        }
+        pos += 46 + name + extra + comment;
+    }
+    if pos != cd.len() {
+        return Err(Layout::InconsistentDirectory.into());
+    }
+    if cd_offset + cd_size != dir_end {
+        return Err(Layout::DirectoryGap.into());
+    }
+    // No other end record may hide in anything the crate may read after the directory starts: not in the
+    // directory (names, extra fields, comments), not in the zip64 extensible data.
+    scan.extend_from_slice(&cd);
+    if has_end_signature(&scan) {
+        return Err(Layout::AmbiguousEnd.into());
+    }
+    Ok(DirInfo {
+        entries,
+        cd_offset,
+        cd_size,
+    })
+}
+
+/// The reader the `zip` crate parses the directory through. While `masked` is set every byte BEFORE the central
+/// directory reads as zero, so the crate's backward search for end records can only ever find the one we
+/// validated (any other `PK\5\6` in the file data is invisible). It is switched off once `ZipArchive::new`
+/// returns: entry data is read unmodified.
+pub struct Guarded {
+    file: File,
+    below: u64,
+    pos: u64,
+    masked: Arc<AtomicBool>,
+}
+
+impl Read for Guarded {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if self.masked.load(Ordering::Relaxed) && self.pos < self.below {
+            let zeros = usize::try_from(self.below - self.pos).unwrap_or(usize::MAX).min(n);
+            buf[..zeros].fill(0);
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Guarded {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.pos = self.file.seek(from)?;
+        Ok(self.pos)
+    }
+}
+
+/// The archive type of this module.
+pub type Archive = ZipArchive<Guarded>;
+
+/// Opens the archive and plans it (see the module docs). Reads no entry data.
+///
+/// The `zip` crate only ever sees an archive that [`prevalidate`] accepted, through a reader that hides every
+/// other end-record signature (`Guarded`), so it cannot settle on a different record than the validated one; as
+/// defence in depth the count, the offset and the directory start it ends up with must equal ours, and the number
+/// of distinct names must equal the stated count (the crate keeps only the LAST of two identical raw names).
+pub fn open(file: File, limits: &Limits) -> Result<(Archive, Plan), ZipError> {
+    let len = file
+        .metadata()
+        .map_err(|e| ZipError::Format(clean(&e.to_string(), 200)))?
+        .len();
+    let info = prevalidate(&mut &file, len, limits)?;
+    let masked = Arc::new(AtomicBool::new(true));
+    let guarded = Guarded {
+        file,
+        below: info.cd_offset,
+        pos: 0,
+        masked: masked.clone(),
+    };
+    let parsed = ZipArchive::new(guarded);
+    masked.store(false, Ordering::Relaxed);
+    let mut archive = parsed.map_err(|e| format_err(&e))?;
+    if info.entries != archive.len() as u64 {
         return Err(ZipError::DuplicateNames {
-            declared,
+            declared: info.entries,
             distinct: archive.len(),
         });
+    }
+    if archive.offset() != 0 || archive.central_directory_start() != info.cd_offset {
+        return Err(Layout::InconsistentDirectory.into());
     }
     let plan = plan(&mut archive, limits)?;
     Ok((archive, plan))
@@ -307,7 +556,7 @@ fn register(
     }
 }
 
-fn plan(archive: &mut ZipArchive<File>, limits: &Limits) -> Result<Plan, ZipError> {
+fn plan(archive: &mut Archive, limits: &Limits) -> Result<Plan, ZipError> {
     let mut names: HashMap<String, Seen> = HashMap::new();
     let mut files = Vec::new();
     let mut skipped = 0usize;
@@ -410,7 +659,7 @@ fn join(dest: &Path, components: &[String]) -> Result<PathBuf, io::Error> {
 
 /// Extracts the plan below `dest` (which must exist and be a directory the caller just made). Returns the number
 /// of bytes written. Nothing already present is overwritten: every file is created with `create_new`.
-pub fn extract(archive: &mut ZipArchive<File>, plan: &Plan, dest: &Path, limits: &Limits) -> Result<u64, ZipError> {
+pub fn extract(archive: &mut Archive, plan: &Plan, dest: &Path, limits: &Limits) -> Result<u64, ZipError> {
     let io_err = |name: &[String], source| ZipError::Io {
         name: quote(&name.join("\\")),
         source,
@@ -471,7 +720,7 @@ fn read_capped(src: impl Read, size: u64) -> io::Result<Vec<u8>> {
 /// Reads one entry into memory for analysis. `declared` is the (already capped) declared size; reading stops one
 /// byte past it. `budget` is what is left of [`Limits::max_analysis_bytes`].
 pub fn read_entry(
-    archive: &mut ZipArchive<File>,
+    archive: &mut Archive,
     file: &PlannedFile,
     budget: &mut u64,
     limits: &Limits,
