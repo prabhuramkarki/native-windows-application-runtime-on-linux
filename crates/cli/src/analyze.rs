@@ -2,7 +2,7 @@ use pe::{FileKind, PeInfo, Subsystem};
 use serde_json::json;
 use std::{fmt::Write, io, path::Path};
 
-const CAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+const CAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB; ponytail: mmap if throughput becomes critical
 
 pub(crate) fn safe(s: &str) -> String {
     s.chars()
@@ -18,13 +18,12 @@ pub(crate) fn safe(s: &str) -> String {
 
 pub fn run(file: &Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let file_str = file.to_string_lossy().to_string();
-    let file_handle = std::fs::File::open(file).map_err(|e| format!("{}: {e}", safe(&file_str)))?;
-    let metadata = file_handle
-        .metadata()
-        .map_err(|e| format!("{}: {e}", safe(&file_str)))?;
-    if !metadata.is_file() {
+    // Check file type before opening to avoid blocking on FIFOs
+    let stat = std::fs::metadata(file).map_err(|e| format!("{}: {e}", safe(&file_str)))?;
+    if !stat.is_file() {
         return Err(format!("{}: not a regular file", safe(&file_str)).into());
     }
+    let file_handle = std::fs::File::open(file).map_err(|e| format!("{}: {e}", safe(&file_str)))?;
     let mut bytes = Vec::new();
     use std::io::Read;
     (&file_handle)
@@ -154,20 +153,25 @@ mod tests {
 
     #[test]
     fn safe_escapes_bidi_overrides() {
-        // Left-to-right override
-        assert!(!safe("\u{202a}text").contains('\u{202a}'));
-        // Right-to-left override
-        assert!(!safe("\u{202b}text").contains('\u{202b}'));
-        // Pop directional formatting
-        assert!(!safe("\u{202c}text").contains('\u{202c}'));
-        // Left-to-right isolate
-        assert!(!safe("\u{2066}text").contains('\u{2066}'));
-        // Right-to-left isolate
-        assert!(!safe("\u{2067}text").contains('\u{2067}'));
-        // First strong isolate
-        assert!(!safe("\u{2068}text").contains('\u{2068}'));
-        // Pop directional isolate
-        assert!(!safe("\u{2069}text").contains('\u{2069}'));
+        // Cover range boundaries and all directions
+        for c in [
+            '\u{202a}', // LRE: Left-to-right embedding
+            '\u{202b}', // RLE: Right-to-left embedding
+            '\u{202c}', // PDF: Pop directional formatting
+            '\u{202d}', // LRO: Left-to-right override (classic RLO pair)
+            '\u{202e}', // RLO: Right-to-left override (classic RLO)
+            '\u{2066}', // LRI: Left-to-right isolate
+            '\u{2067}', // RLI: Right-to-left isolate (range edge)
+            '\u{2068}', // FSI: First strong isolate
+            '\u{2069}', // PDI: Pop directional isolate (range edge)
+        ] {
+            let s = format!("{}text", c);
+            assert!(
+                !safe(&s).contains(c),
+                "Bidi character U+{:04X} not escaped in safe()",
+                c as u32
+            );
+        }
     }
 
     #[test]
@@ -177,9 +181,10 @@ mod tests {
 
     #[test]
     fn render_sanitizes_all_strings() {
-        let hostile_string = "hostile\x1b]0;pwned\x07\n\r\u{9b}";
+        let hostile_string = "hostile\x1b]0;pwned\x07\n\r\u{9b}\u{202e}\u{2067}";
         let mut strings = BTreeMap::new();
         strings.insert("ProductName".to_string(), hostile_string.to_string());
+        strings.insert("FileDescription".to_string(), "Größe 日本語".to_string());
 
         let info = PeInfo {
             format: Format::Pe32Plus,
@@ -223,15 +228,36 @@ mod tests {
 
         let rendered = render(Path::new(hostile_string), &info);
 
-        // Ensure no dangerous characters in output
+        // Ensure no dangerous characters or bidi controls in output
         assert!(!rendered.contains('\x1b'), "ESC character found in output");
         assert!(!rendered.contains('\r'), "CR character found in output");
         assert!(!rendered.contains('\u{9b}'), "8-bit CSI found in output");
-        assert!(!rendered.contains('\u{202a}'), "bidi override found in output");
 
-        // Ensure no extra lines were injected
+        // Assert all bidi controls in range U+202A..U+202E / U+2066..U+2069 are escaped
+        for c in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert!(
+                !rendered.contains(c),
+                "Bidi character U+{:04X} found in output",
+                c as u32
+            );
+        }
+
+        // Ensure ordinary Unicode survives
+        assert!(
+            rendered.contains("Größe 日本語"),
+            "Unicode text was not preserved in output"
+        );
+
+        // Ensure no extra lines were injected (exact line count: File, Format, Protection,
+        // .NET, Version, ProductName, FileDescription, Installer, Sections, Imports,
+        // Import dll, Exports, warning = 13 lines)
         let line_count = rendered.lines().count();
-        // Expected: File, Format, Protection, .NET, Version, ProductName, Sections, Imports, Import dll, Exports, warning
-        assert!(line_count < 20, "Too many lines, possible injection: {}", line_count);
+        assert_eq!(
+            line_count, 13,
+            "Expected exactly 13 lines, got {}: {}",
+            line_count, rendered
+        );
     }
 }

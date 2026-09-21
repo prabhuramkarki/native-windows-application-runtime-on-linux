@@ -22,15 +22,11 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let mut builder = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUNTIME_LOG"))
-        .with_writer(std::io::stderr);
-    if std::io::stderr().is_terminal() {
-        builder = builder.with_ansi(true);
-    } else {
-        builder = builder.with_ansi(false);
-    }
-    builder.init();
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
     let result = match Cli::parse().cmd {
         Cmd::Analyze { file, json } => analyze::run(&file, json),
     };
