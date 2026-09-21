@@ -166,6 +166,46 @@ mod tests {
     }
 
     #[test]
+    fn render_names_unknown_arch_and_subsystem_with_their_raw_values() {
+        let mut info = sample_info();
+        info.arch = Arch::Other(0x01C4);
+        info.machine = 0x01C4;
+        info.subsystem = pe::Subsystem::Other(9);
+        info.subsystem_raw = 9;
+        let rendered = render(Path::new("x.exe"), &info);
+        assert!(
+            rendered.contains("Format:     Pe32Plus Other(452) Exe (Other(9))"),
+            "{rendered}"
+        );
+    }
+
+    fn sample_info() -> PeInfo {
+        PeInfo {
+            format: Format::Pe32Plus,
+            arch: Arch::X86_64,
+            machine: 0x8664,
+            kind: Kind::Exe,
+            subsystem: pe::Subsystem::Console,
+            subsystem_raw: 3,
+            image_base: 0x140000000,
+            entry_point_rva: 0x1000,
+            size_of_image: 0x10000,
+            aslr: true,
+            nx: true,
+            signed: false,
+            dotnet: false,
+            sections: vec![],
+            imports: vec![],
+            exports: vec![],
+            relocation_count: 0,
+            tls: None,
+            version: None,
+            installer: None,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
     fn render_sanitizes_all_strings() {
         let hostile_string = "hostile\x1b]0;pwned\x07\n\r\u{9b}\u{202e}\u{2067}";
         let mut strings = BTreeMap::new();
@@ -175,8 +215,10 @@ mod tests {
         let info = PeInfo {
             format: Format::Pe32Plus,
             arch: Arch::X86_64,
+            machine: 0x8664,
             kind: Kind::Exe,
             subsystem: pe::Subsystem::Console,
+            subsystem_raw: 3,
             image_base: 0x140000000,
             entry_point_rva: 0x1000,
             size_of_image: 0x10000,

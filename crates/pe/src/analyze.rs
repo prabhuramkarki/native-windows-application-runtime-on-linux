@@ -553,12 +553,14 @@ macro_rules! extract {
             PeInfo {
                 format: $format,
                 arch: Arch::from_machine(fh.Machine),
+                machine: fh.Machine,
                 kind: if fh.Characteristics & 0x2000 != 0 {
                     Kind::Dll
                 } else {
                     Kind::Exe
                 },
                 subsystem: Subsystem::from_raw(oh.Subsystem),
+                subsystem_raw: oh.Subsystem,
                 image_base: oh.ImageBase as u64,
                 entry_point_rva: oh.AddressOfEntryPoint,
                 size_of_image: oh.SizeOfImage,

@@ -284,6 +284,7 @@ dependencies = [
  "memchr",
  "pelite",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

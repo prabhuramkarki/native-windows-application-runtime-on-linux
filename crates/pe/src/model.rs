@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -8,8 +8,9 @@ pub enum Format {
     Pe32Plus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialises as a string: the snake_case variant name, or `"other"` for `Other(_)`. The raw
+/// number is in `PeInfo::machine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86,
     X86_64,
@@ -30,6 +31,18 @@ impl Arch {
     }
 }
 
+impl Serialize for Arch {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Arch::X86 => "x86",
+            Arch::X86_64 => "x86_64",
+            Arch::Arm64 => "arm64",
+            Arch::Arm64Ec => "arm64_ec",
+            Arch::Other(_) => "other",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
@@ -37,8 +50,9 @@ pub enum Kind {
     Dll,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialises as a string: the snake_case variant name, or `"other"` for `Other(_)`. The raw
+/// number is in `PeInfo::subsystem_raw`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subsystem {
     /// Kernel-mode drivers use this. Unsupported (master prompt §29).
     Native,
@@ -57,6 +71,18 @@ impl Subsystem {
             10 => Subsystem::Efi,
             other => Subsystem::Other(other),
         }
+    }
+}
+
+impl Serialize for Subsystem {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Subsystem::Native => "native",
+            Subsystem::Gui => "gui",
+            Subsystem::Console => "console",
+            Subsystem::Efi => "efi",
+            Subsystem::Other(_) => "other",
+        })
     }
 }
 
@@ -126,8 +152,12 @@ pub struct Installer {
 pub struct PeInfo {
     pub format: Format,
     pub arch: Arch,
+    /// COFF `Machine` field as written in the file (`arch` is derived from it).
+    pub machine: u16,
     pub kind: Kind,
     pub subsystem: Subsystem,
+    /// Optional-header `Subsystem` field as written in the file (`subsystem` is derived from it).
+    pub subsystem_raw: u16,
     pub image_base: u64,
     pub entry_point_rva: u32,
     pub size_of_image: u32,
