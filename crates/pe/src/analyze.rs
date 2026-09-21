@@ -415,9 +415,15 @@ macro_rules! extract {
             let mut tls = None;
             match f.tls() {
                 Ok(t) => {
-                    tls = Some(Tls {
-                        callback_count: t.callbacks().map(|c| c.len()).unwrap_or(0),
-                    })
+                    let callback_count = match t.callbacks() {
+                        Ok(c) => c.len(),
+                        Err(pelite::Error::Null) => 0, // no callback array
+                        Err(e) => {
+                            warnings.push(format!("tls callbacks: {e}"));
+                            0
+                        }
+                    };
+                    tls = Some(Tls { callback_count })
                 }
                 Err(pelite::Error::Null) => {}
                 Err(e) => warnings.push(format!("tls: {e}")),
