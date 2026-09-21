@@ -11,7 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 runtime-pe = { path = "../pe" }
+runtime-core = { path = "../core" }
+runtime-backend-wine = { path = "../backend-wine" }
 clap = { version = "4", features = ["derive"] }
+libc.workspace = true
 serde_json.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+zip.workspace = true
