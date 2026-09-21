@@ -6,7 +6,7 @@
 //! Order for `wine`: `$RUNTIME_WINE` (absolute; a bad value is an ERROR, never a silent fallback to another
 //! Wine), then `wine64`, then `wine` on `$PATH`. For `wineserver` (it is usually NOT on `PATH`): `$RUNTIME_WINESERVER`
 //! (absolute, same rule); when `$RUNTIME_WINE` is set, the `wineserver` next to it; `wineserver` on `PATH`; then a
-//! fixed list of well-known locations. `PATH` entries that
+//! fixed list of well-known locations (including `/usr/lib/wine/wineserver64`, the reported Ubuntu 24.04 name). `PATH` entries that
 //! are empty or relative are skipped (an empty entry means "the current directory": a planted `wine` there must
 //! never be picked up). An empty override variable counts as unset.
 //!
@@ -26,6 +26,8 @@ pub const WINESERVER_CANDIDATES: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/wine/wineserver",
     "/usr/lib64/wine/wineserver",
     "/usr/lib/wine/wineserver",
+    // Reported layout of Ubuntu 24.04's Wine 9 packages (not verified on a real 24.04).
+    "/usr/lib/wine/wineserver64",
     "/opt/wine-stable/bin/wineserver",
     "/opt/wine-staging/bin/wineserver",
     "/opt/wine-devel/bin/wineserver",
@@ -293,11 +295,29 @@ mod tests {
                 "/usr/lib/x86_64-linux-gnu/wine/wineserver",
                 "/usr/lib64/wine/wineserver",
                 "/usr/lib/wine/wineserver",
+                "/usr/lib/wine/wineserver64",
                 "/opt/wine-stable/bin/wineserver",
                 "/opt/wine-staging/bin/wineserver",
                 "/opt/wine-devel/bin/wineserver",
             ]
         );
+    }
+
+    #[test]
+    fn the_ubuntu_noble_wineserver64_layout_is_found() {
+        // Reported Wine 9 layout on Ubuntu 24.04: `wine64` on PATH, only `/usr/lib/wine/wineserver64`, no `wineserver` anywhere.
+        let h = Host::default()
+            .var("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .file("/usr/bin/wine64")
+            .file("/usr/lib/wine/wineserver64")
+            .dir("/usr/lib/wine/x86_64-windows");
+        let found = h.run().unwrap();
+        assert_eq!(found.wine, p("/usr/bin/wine64"));
+        assert_eq!(found.wineserver, p("/usr/lib/wine/wineserver64"));
+        assert_eq!(found.dll_dirs, vec![p("/usr/lib/wine/x86_64-windows")]);
+        // A plain `wineserver` in the same directory still wins over the `64` name.
+        let h = h.file("/usr/lib/wine/wineserver");
+        assert_eq!(h.run().unwrap().wineserver, p("/usr/lib/wine/wineserver"));
     }
 
     #[test]
