@@ -405,9 +405,23 @@ macro_rules! extract {
                 Err(e) => warnings.push(format!("exports: {e}")),
             }
 
-            let relocation_count = 0;
+            let mut relocation_count = 0;
+            match f.base_relocs() {
+                Ok(r) => relocation_count = r.fold(0usize, |n, _rva, ty| n + usize::from(ty != 0)),
+                Err(pelite::Error::Null) => {}
+                Err(e) => warnings.push(format!("relocations: {e}")),
+            }
 
-            let tls = None;
+            let mut tls = None;
+            match f.tls() {
+                Ok(t) => {
+                    tls = Some(Tls {
+                        callback_count: t.callbacks().map(|c| c.len()).unwrap_or(0),
+                    })
+                }
+                Err(pelite::Error::Null) => {}
+                Err(e) => warnings.push(format!("tls: {e}")),
+            }
 
             let version = None;
 

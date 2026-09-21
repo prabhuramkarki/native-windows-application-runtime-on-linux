@@ -255,3 +255,20 @@ pub fn exports_raw(base: u32, ordinal_base: u32, funcs: &[u32], names: &[(u32, u
     out.extend_from_slice(tail);
     out
 }
+
+/// One block covering page 0x1000: two DIR64 fixups plus one ABSOLUTE padding entry.
+#[rustfmt::skip]
+pub fn reloc_data() -> Vec<u8> {
+    Bytes::default().u32(0x1000).u32(16).u16(0xA010).u16(0xA018).u16(0x0000).u16(0x0000).0
+}
+
+#[rustfmt::skip]
+pub fn tls_data(base: u32) -> Vec<u8> {
+    let image_base = 0x1_4000_0000u64;
+    let va = |off: u32| image_base + u64::from(base + off);
+    Bytes::default()
+        .u64(va(48)).u64(va(56)).u64(va(56)).u64(va(64)).u32(0).u32(0)
+        .pad_to(64)
+        .u64(image_base + 0x1000).u64(image_base + 0x1010).u64(0)
+        .0
+}
