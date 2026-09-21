@@ -312,3 +312,50 @@ pub fn rsrc_version_section(base: u32, data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(data);
     out
 }
+
+pub fn words(w: &[u16]) -> Vec<u8> {
+    w.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+pub fn utf16z(s: &str) -> Vec<u8> {
+    s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
+}
+
+/// One VS_VERSIONINFO-style block; wLength is filled in.
+pub fn block(key: &str, w_type: u16, value_len: u16, value: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
+    let pad4 = |b: &mut Vec<u8>| b.resize(b.len().next_multiple_of(4), 0);
+    let mut b = vec![0, 0];
+    b.extend(value_len.to_le_bytes());
+    b.extend(w_type.to_le_bytes());
+    b.extend(utf16z(key));
+    pad4(&mut b);
+    b.extend(value);
+    for c in children {
+        pad4(&mut b);
+        b.extend(c);
+    }
+    let len = b.len() as u16;
+    b[..2].copy_from_slice(&len.to_le_bytes());
+    b
+}
+
+pub fn string(k: &str, v: &str) -> Vec<u8> {
+    let val = utf16z(v);
+    block(k, 1, (val.len() / 2) as u16, &val, &[])
+}
+
+/// A well-formed VS_VERSIONINFO: fixed file info plus StringFileInfo/040904B0 holding
+/// FileVersion and ProductName.
+pub fn version_info_block(file_version: &str, product: &str) -> Vec<u8> {
+    let mut fixed = vec![0u8; 52];
+    fixed[..4].copy_from_slice(&0xFEEF_04BDu32.to_le_bytes());
+    let table = block(
+        "040904B0",
+        1,
+        0,
+        &[],
+        &[string("FileVersion", file_version), string("ProductName", product)],
+    );
+    let sfi = block("StringFileInfo", 1, 0, &[], &[table]);
+    block("VS_VERSION_INFO", 0, 52, &fixed, &[sfi])
+}

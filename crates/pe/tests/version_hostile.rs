@@ -11,37 +11,6 @@ fn image(data: &[u8]) -> Builder {
     Builder::x64().section(".rsrc", DATA_R, rsrc).dir(2, base, len)
 }
 
-fn words(w: &[u16]) -> Vec<u8> {
-    w.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
-fn utf16z(s: &str) -> Vec<u8> {
-    s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect()
-}
-
-/// One VS_VERSIONINFO-style block; wLength is filled in.
-fn block(key: &str, w_type: u16, value_len: u16, value: &[u8], children: &[Vec<u8>]) -> Vec<u8> {
-    let pad4 = |b: &mut Vec<u8>| b.resize(b.len().next_multiple_of(4), 0);
-    let mut b = vec![0, 0];
-    b.extend(value_len.to_le_bytes());
-    b.extend(w_type.to_le_bytes());
-    b.extend(utf16z(key));
-    pad4(&mut b);
-    b.extend(value);
-    for c in children {
-        pad4(&mut b);
-        b.extend(c);
-    }
-    let len = b.len() as u16;
-    b[..2].copy_from_slice(&len.to_le_bytes());
-    b
-}
-
-fn string(k: &str, v: &str) -> Vec<u8> {
-    let val = utf16z(v);
-    block(k, 1, (val.len() / 2) as u16, &val, &[])
-}
-
 #[test]
 fn well_formed_version_resource_is_read_through_the_directory() {
     let mut fixed = vec![0u8; 52];
