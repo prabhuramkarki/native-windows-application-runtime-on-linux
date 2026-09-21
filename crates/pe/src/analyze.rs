@@ -90,21 +90,63 @@ macro_rules! extract {
                 })
                 .collect();
 
-            // Walk an import thunk array by hand. pelite's `int()` demands aligned tables and
-            // rejects the 4-byte-aligned ones GNU ld emits for PE32+.
-            let thunks = |mut rva: u32| {
+            // Walk import thunk arrays by hand. pelite's `int()` demands aligned tables and
+            // rejects the 4-byte-aligned ones GNU ld emits for PE32+. Shared budget prevents
+            // resource exhaustion (hostile files with unbounded thunk tables).
+            let mut budget = 200_000usize;
+            let mut thunks = |mut rva: u32, dll: &str, warnings: &mut Vec<String>| {
                 let mut functions = Vec::new();
+                if rva == 0 {
+                    warnings.push(format!("imports: {dll} zero table RVA"));
+                    return functions;
+                }
                 for _ in 0..65_536 {
-                    let Ok(v) = f.derva_copy::<$word>(rva) else { break };
+                    if budget == 0 {
+                        warnings.push(format!(
+                            "imports: {dll} budget exhausted at {} functions",
+                            functions.len()
+                        ));
+                        break;
+                    }
+                    let Ok(v) = f.derva_copy::<$word>(rva) else {
+                        warnings.push(format!("imports: {dll} truncated table at offset {:#x}", rva));
+                        break;
+                    };
                     if v == 0 {
                         break;
                     }
                     if v & $ord_flag != 0 {
                         functions.push(ImportedFn::Ordinal((v & 0xFFFF) as u16));
-                    } else if let Ok(n) = f.derva_c_str((v as u32).wrapping_add(2)) {
-                        functions.push(ImportedFn::Name(n.to_string()));
+                        budget -= 1;
+                    } else {
+                        let name_rva = (v as u32).checked_add(2).unwrap_or(0);
+                        if name_rva == 0 {
+                            warnings.push(format!("imports: {dll} thunk value overflows u32 ({:#x})", v));
+                            continue;
+                        }
+                        match f.derva_c_str(name_rva) {
+                            Ok(n) => {
+                                if n.len() > 1024 {
+                                    warnings.push(format!("imports: {dll} name too long ({} bytes)", n.len()));
+                                    continue;
+                                }
+                                functions.push(ImportedFn::Name(n.to_string()));
+                                budget -= 1;
+                            }
+                            Err(_) => {
+                                warnings.push(format!(
+                                    "imports: {dll} unreadable function name at {:#x}",
+                                    name_rva
+                                ));
+                            }
+                        }
                     }
-                    rva = rva.wrapping_add(std::mem::size_of::<$word>() as u32);
+                    let word_size = std::mem::size_of::<$word>() as u32;
+                    let Some(next_rva) = rva.checked_add(word_size) else {
+                        warnings.push(format!("imports: {dll} RVA overflow"));
+                        break;
+                    };
+                    rva = next_rva;
                 }
                 functions
             };
@@ -112,11 +154,18 @@ macro_rules! extract {
             let mut imports = Vec::new();
             match f.imports() {
                 Ok(list) => {
+                    let mut desc_count = 0;
                     for desc in list {
+                        if desc_count >= 4096 {
+                            warnings.push("imports: descriptor limit (4096) exceeded".to_owned());
+                            break;
+                        }
+                        desc_count += 1;
                         let Ok(dll) = desc.dll_name() else {
                             warnings.push("imports: unreadable DLL name".to_owned());
                             continue;
                         };
+                        let dll_str = dll.to_string();
                         let d = desc.image();
                         // Fall back to the IAT when the lookup table is absent (old linkers).
                         let table = if d.OriginalFirstThunk != 0 {
@@ -125,9 +174,9 @@ macro_rules! extract {
                             d.FirstThunk
                         };
                         imports.push(Import {
-                            dll: dll.to_string(),
+                            dll: dll_str.clone(),
                             delay: false,
-                            functions: thunks(table),
+                            functions: thunks(table, &dll_str, &mut warnings),
                         });
                     }
                 }
@@ -138,7 +187,12 @@ macro_rules! extract {
             // pelite has no delay-import support: walk IMAGE_DELAYLOAD_DESCRIPTOR (8 x u32) by hand.
             if dir(DIR_DELAY_IMPORT).0 != 0 {
                 let mut rva = dir(DIR_DELAY_IMPORT).0;
+                let mut delay_count = 0;
                 for _ in 0..4096 {
+                    if delay_count >= 4096 {
+                        warnings.push("delay imports: descriptor limit (4096) exceeded".to_owned());
+                        break;
+                    }
                     let Ok(d) = f.derva_copy::<[u32; 8]>(rva) else {
                         warnings.push("delay imports: truncated descriptor".to_owned());
                         break;
@@ -146,7 +200,13 @@ macro_rules! extract {
                     if d[1] == 0 {
                         break;
                     }
-                    rva = rva.wrapping_add(32);
+                    delay_count += 1;
+                    let next_rva = rva.checked_add(32).unwrap_or(0);
+                    if next_rva == 0 {
+                        warnings.push("delay imports: RVA overflow".to_owned());
+                        break;
+                    }
+                    rva = next_rva;
                     if d[0] & 1 == 0 {
                         warnings.push("delay imports: VA-based descriptor unsupported".to_owned());
                         continue;
@@ -155,10 +215,11 @@ macro_rules! extract {
                         warnings.push("delay imports: unreadable DLL name".to_owned());
                         continue;
                     };
+                    let dll_str = dll.to_string();
                     imports.push(Import {
-                        dll: dll.to_string(),
+                        dll: dll_str.clone(),
                         delay: true,
-                        functions: thunks(d[4]),
+                        functions: thunks(d[4], &dll_str, &mut warnings),
                     });
                 }
             }
