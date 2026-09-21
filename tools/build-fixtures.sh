@@ -11,6 +11,7 @@ for arch in x86_64 i686; do
   flags="-O1 -Wall -Wl,--dynamicbase -Wl,--nxcompat"
   "$rc" -i tools/fixtures/hello.rc -O coff -o "$out/hello$tag.res.o"
   "$cc" $flags -o "$out/hello$tag.exe" tools/fixtures/hello.c "$out/hello$tag.res.o"
+  "$cc" $flags -o "$out/fs$tag.exe" tools/fixtures/fs.c
   "$cc" $flags -mwindows -o "$out/gui$tag.exe" tools/fixtures/gui.c
   "$cc" $flags -shared -o "$out/exports$tag.dll" tools/fixtures/exports.c
   rm -f "$out/hello$tag.res.o"
