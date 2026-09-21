@@ -1,0 +1,17 @@
+[package]
+name = "runtime-backend-wine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "backend_wine"
+
+[dependencies]
+runtime-core = { path = "../core" }
+thiserror.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
