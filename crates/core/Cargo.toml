@@ -14,9 +14,13 @@ name = "rt_core"
 testing = []
 
 [dependencies]
+runtime-pe = { path = "../pe" }
+flate2.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

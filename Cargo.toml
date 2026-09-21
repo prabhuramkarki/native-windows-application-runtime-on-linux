@@ -14,3 +14,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tempfile = "3"
+libc = "0.2"
+# Only stored + deflate: no bzip2/zstd/lzma/aes/zopfli and no `time`. zip's own `deflate` feature selects
+# zlib-rs (licence `Zlib`, not in deny.toml), so the pure-Rust miniz_oxide backend (MIT OR Zlib OR Apache-2.0) is
+# chosen explicitly through the direct `flate2` dependency (runtime-core enables feature `rust_backend`).
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Zip tests inflate/deflate hundreds of MiB; unoptimised miniz_oxide would take minutes.
+[profile.dev.package.miniz_oxide]
+opt-level = 3

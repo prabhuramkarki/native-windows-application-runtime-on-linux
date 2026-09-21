@@ -10,8 +10,9 @@
 //! refuse to read.
 //!
 //! `executable` is the canonical text of a [`WinPath`]. The rules are `WinPath::parse` succeeds, the drive is
-//! `C` (the only drive [`crate::resolve_under`] maps) and there is at least one component. Callers re-parse it
-//! before use; the text is never turned into a host path by concatenation.
+//! `C` (the only drive [`crate::resolve_under`] maps), there is at least one component and the text equals
+//! `WinPath::to_string` (so `c:/a.exe` is refused on read and on write). Callers re-parse it before use; the text
+//! is never turned into a host path by concatenation. Build values with [`Metadata::new`].
 use crate::{AppId, WinPath, WinPathError};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -52,6 +53,8 @@ pub enum MetaError {
     ExecutableDrive,
     #[error("executable names the drive root, not a file")]
     ExecutableIsRoot,
+    #[error("executable must be in canonical form (`C:\\dir\\file.exe`: uppercase drive, backslashes, no `.` parts)")]
+    NonCanonicalExecutable,
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }
@@ -120,9 +123,43 @@ fn read_capped(r: impl Read) -> Result<Vec<u8>, MetaError> {
     Ok(bytes)
 }
 
+/// Opens `path` read-only with `O_NONBLOCK`: opening a FIFO (with no writer) then returns at once instead of
+/// blocking forever, and the caller's fstat rejects it. For a regular file the flag changes nothing.
+pub(crate) fn open_nonblocking(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Metadata {
+    /// Builds metadata for a freshly installed app: schema version, `environment` `"default"` and `created` (now)
+    /// are filled in; `executable` is stored as the canonical text of `executable`. Not validated: call
+    /// [`Metadata::validate`] (write does it too) before anything is created on disk.
+    pub fn new(
+        id: AppId,
+        name: String,
+        version: Option<String>,
+        architecture: &str,
+        executable: &WinPath,
+        backend: BackendInfo,
+        subsystem: &str,
+    ) -> Metadata {
+        Metadata {
+            schema_version: SCHEMA_VERSION,
+            id,
+            name,
+            version,
+            architecture: architecture.to_owned(),
+            executable: executable.to_string(),
+            environment: "default".to_owned(),
+            backend,
+            subsystem: subsystem.to_owned(),
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), MetaError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(MetaError::SchemaVersion(self.schema_version.into()));
@@ -142,6 +179,11 @@ impl Metadata {
         }
         if exe.components().is_empty() {
             return Err(MetaError::ExecutableIsRoot);
+        }
+        // Canonical text only: what is stored is exactly what `WinPath::to_string` writes, so two spellings of
+        // one path can never coexist and a reader never has to normalise.
+        if exe.to_string() != self.executable {
+            return Err(MetaError::NonCanonicalExecutable);
         }
         cap("environment", &self.environment, MAX_FIELD_LEN)?;
         cap("backend.id", &self.backend.id, MAX_FIELD_LEN)?;
@@ -169,17 +211,24 @@ impl Metadata {
         if !before.file_type().is_file() {
             return Err(MetaError::NotRegular);
         }
-        let file = File::open(path)?;
-        // The path could have been swapped for a symlink between the lstat and the open: the handle we hold must
-        // be the very file we checked. (A swap to a FIFO in that window could still block the open; only the
-        // owner of the directory can do that, and it is a hang, not a bypass.)
-        let after = file.metadata()?;
-        if !after.file_type().is_file() || (after.dev(), after.ino()) != (before.dev(), before.ino()) {
-            return Err(MetaError::NotRegular);
-        }
-        Metadata::parse(&read_capped(file)?)
+        read_checked(path, &before)
     }
+}
 
+/// Opens `path` (see [`open_nonblocking`]), requires the handle to be the very regular file `before` described,
+/// and parses it.
+fn read_checked(path: &Path, before: &fs::Metadata) -> Result<Metadata, MetaError> {
+    let file = open_nonblocking(path)?;
+    // The path could have been swapped for a symlink or a FIFO between the lstat and the open: the handle we hold
+    // must be the very file we checked. `O_NONBLOCK` keeps the open of a swapped-in FIFO from blocking.
+    let after = file.metadata()?;
+    if !after.file_type().is_file() || (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+        return Err(MetaError::NotRegular);
+    }
+    Metadata::parse(&read_capped(file)?)
+}
+
+impl Metadata {
     /// Validates, then writes atomically: a `0600` temp file in the same directory (`O_EXCL`), `sync_all`,
     /// rename over `path`, best-effort directory fsync. The temp file is removed on every failure.
     pub fn write_atomic(&self, path: &Path) -> Result<(), MetaError> {
@@ -250,6 +299,7 @@ pub(crate) fn sample(id: &str) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{mkfifo, within_10s};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn json(m: &Metadata) -> String {
@@ -637,5 +687,96 @@ mod tests {
             read_capped(io::repeat(b'x').take(MAX_FILE_BYTES)).unwrap().len(),
             MAX_FILE_BYTES as usize
         );
+    }
+
+    // ---------------------------------------------------------------- Task 6: constructor, canonical exe, FIFO
+
+    #[test]
+    fn new_fills_the_fixed_fields_and_stores_canonical_text() {
+        let exe = WinPath::parse("c:/Program Files/App/app.exe").unwrap();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let m = Metadata::new(
+            AppId::parse("app").unwrap(),
+            "App".into(),
+            Some("1.0".into()),
+            "x86_64",
+            &exe,
+            BackendInfo {
+                id: "fake".into(),
+                version: "1".into(),
+            },
+            "gui",
+        );
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
+        assert_eq!(m.environment, "default");
+        assert_eq!(
+            m.executable, "C:\\Program Files\\App\\app.exe",
+            "canonical text, not the input spelling"
+        );
+        assert!(
+            m.created >= before && m.created > 1_600_000_000,
+            "created = {}",
+            m.created
+        );
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn non_canonical_executable_text_is_rejected_on_write_and_read() {
+        // Each of these parses as a WinPath but is not spelled the way `WinPath::to_string` writes it.
+        for e in [
+            "c:/a.exe",
+            "c:\\a.exe",
+            "C:/a.exe",
+            "C:\\a\\.\\b.exe",
+            "C:\\a/b.exe",
+            "C:\\a\\b.exe\\.",
+        ] {
+            let mut m = sample("app");
+            m.executable = e.into();
+            assert!(
+                matches!(m.validate(), Err(MetaError::NonCanonicalExecutable)),
+                "validate {e:?}"
+            );
+            let err = Metadata::parse(&with("executable", Some(e.into()))).unwrap_err();
+            assert!(matches!(err, MetaError::NonCanonicalExecutable), "read {e:?}: {err:?}");
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("metadata.json");
+            assert!(m.write_atomic(&path).is_err(), "wrote {e:?}");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn a_fifo_swapped_in_after_the_lstat_cannot_hang_the_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regular = tmp.path().join("regular.json");
+        sample("app").write_atomic(&regular).unwrap();
+        let fifo = tmp.path().join("metadata.json");
+        mkfifo(&fifo);
+        // What `read` would have seen at lstat time, then the path is a FIFO when it is opened.
+        let before = fs::symlink_metadata(&regular).unwrap();
+        let err = within_10s(move || read_checked(&fifo, &before)).unwrap_err();
+        assert!(matches!(err, MetaError::NotRegular), "{err:?}");
+    }
+
+    #[test]
+    fn open_nonblocking_returns_at_once_on_a_fifo_without_a_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("f");
+        mkfifo(&fifo);
+        let file = within_10s(move || open_nonblocking(&fifo)).unwrap();
+        assert!(!file.metadata().unwrap().file_type().is_file());
+    }
+
+    #[test]
+    fn read_of_a_planted_fifo_is_not_regular_not_a_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("metadata.json");
+        mkfifo(&fifo);
+        let err = within_10s(move || Metadata::read(&fifo)).unwrap_err();
+        assert!(matches!(err, MetaError::NotRegular), "{err:?}");
     }
 }
