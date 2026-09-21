@@ -57,6 +57,7 @@ impl Aligned {
 }
 
 const DIR_SECURITY: usize = 4;
+const DIR_DELAY_IMPORT: usize = 13;
 const DIR_CLR: usize = 14;
 
 // pelite's pe32 and pe64 modules expose identical APIs behind different traits, so the
@@ -65,6 +66,7 @@ macro_rules! extract {
     ($fn_name:ident, $pe:ident, $format:expr, $word:ty, $ord_flag:expr) => {
         fn $fn_name(f: pelite::$pe::PeFile<'_>) -> PeInfo {
             use pelite::$pe::Pe;
+            let mut warnings = Vec::new();
             let fh = f.file_header();
             let oh = f.optional_header();
             let dirs = f.data_directory();
@@ -88,7 +90,78 @@ macro_rules! extract {
                 })
                 .collect();
 
-            let imports = Vec::new();
+            // Walk an import thunk array by hand. pelite's `int()` demands aligned tables and
+            // rejects the 4-byte-aligned ones GNU ld emits for PE32+.
+            let thunks = |mut rva: u32| {
+                let mut functions = Vec::new();
+                for _ in 0..65_536 {
+                    let Ok(v) = f.derva_copy::<$word>(rva) else { break };
+                    if v == 0 {
+                        break;
+                    }
+                    if v & $ord_flag != 0 {
+                        functions.push(ImportedFn::Ordinal((v & 0xFFFF) as u16));
+                    } else if let Ok(n) = f.derva_c_str((v as u32).wrapping_add(2)) {
+                        functions.push(ImportedFn::Name(n.to_string()));
+                    }
+                    rva = rva.wrapping_add(std::mem::size_of::<$word>() as u32);
+                }
+                functions
+            };
+
+            let mut imports = Vec::new();
+            match f.imports() {
+                Ok(list) => {
+                    for desc in list {
+                        let Ok(dll) = desc.dll_name() else {
+                            warnings.push("imports: unreadable DLL name".to_owned());
+                            continue;
+                        };
+                        let d = desc.image();
+                        // Fall back to the IAT when the lookup table is absent (old linkers).
+                        let table = if d.OriginalFirstThunk != 0 {
+                            d.OriginalFirstThunk
+                        } else {
+                            d.FirstThunk
+                        };
+                        imports.push(Import {
+                            dll: dll.to_string(),
+                            delay: false,
+                            functions: thunks(table),
+                        });
+                    }
+                }
+                Err(pelite::Error::Null) => {}
+                Err(e) => warnings.push(format!("imports: {e}")),
+            }
+
+            // pelite has no delay-import support: walk IMAGE_DELAYLOAD_DESCRIPTOR (8 x u32) by hand.
+            if dir(DIR_DELAY_IMPORT).0 != 0 {
+                let mut rva = dir(DIR_DELAY_IMPORT).0;
+                for _ in 0..4096 {
+                    let Ok(d) = f.derva_copy::<[u32; 8]>(rva) else {
+                        warnings.push("delay imports: truncated descriptor".to_owned());
+                        break;
+                    };
+                    if d[1] == 0 {
+                        break;
+                    }
+                    rva = rva.wrapping_add(32);
+                    if d[0] & 1 == 0 {
+                        warnings.push("delay imports: VA-based descriptor unsupported".to_owned());
+                        continue;
+                    }
+                    let Ok(dll) = f.derva_c_str(d[1]) else {
+                        warnings.push("delay imports: unreadable DLL name".to_owned());
+                        continue;
+                    };
+                    imports.push(Import {
+                        dll: dll.to_string(),
+                        delay: true,
+                        functions: thunks(d[4]),
+                    });
+                }
+            }
 
             let exports = Vec::new();
 
@@ -121,7 +194,7 @@ macro_rules! extract {
                 tls,
                 version,
                 installer: None,
-                warnings: Vec::new(),
+                warnings,
             }
         }
     };
