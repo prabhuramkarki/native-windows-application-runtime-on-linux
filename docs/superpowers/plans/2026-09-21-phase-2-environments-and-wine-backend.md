@@ -166,3 +166,65 @@ CLI (`crates/cli`): subcommands `install <file> [--name N] [--exe PATH]`, `run <
 ## Self-review against the roadmap
 
 Covered: AppEnv + metadata.json + layout (T3), CompatBackend + Launcher + sandbox seam (T4), WineBackend with `Z:` removal and more (T5), install portable/zip (T6), run/list/remove/logs (T7), basic doctor (T8), `--debug` (T4/T7), Windows path semantics as a pure module (T2), isolation test (T9). Deferred by design: installers/MSI (Phase 3), template prefixes, dependencies/graphics (Phase 4), sandbox (Phase 5), `prefix`/`config`/`shell`/`repair`/`update`/`system-info` commands (later; `repair` is referenced by an error hint only, so print "not implemented yet" there, never a fake fix).
+
+---
+
+## Execution notes (added after the phase was implemented)
+
+The plan was spec-level; the repository is the truth. What differs from, or was added to, the plan:
+
+**Backend seam and process plumbing**
+
+- The trait that shipped is `CompatBackend { id, version, prepare, command, stop, dll_dirs }`. A backend only *describes* a `Command` (`command` sets its variables with `.env()`, never calls `env_clear()` and never spawns). `Launcher::{finalize, spawn, run_helper, wrap}` is the single place a command is finalised (cleared environment, host allowlist, then the backend's variables again so they win, then the sandbox hook `wrap`, an identity in Phase 2) and started. Helpers (`wineboot`, `wineserver -k`, `wine --version`) must go through `Launcher::run_helper` (deadline, capped output, stdin closed); that rule is enforced by documentation only, because `finalize` and `wrap` are `pub`.
+- `Launcher::spawn` returns a `Running` (log path, `kill`, `try_wait`, `wait`, `wait_report`); the run service wraps it in `Started` (app id, `Option<InstallOutcome>`) so a front end can start, ignore SIGINT, then wait. Stderr goes to a fresh `logs/run-<secs>-<nanos>-<pid>.log` (`O_EXCL`, 0600, at most 20 kept); `LogSink::LogOnly` hands the file to the child, `LogSink::Tee` copies to the file and a terminal writer with a thread that `wait` joins. stdout and stdin are inherited.
+- The tee and the helper capture read from a **socket pair, not a pipe**: `wineboot` leaves a `wineserver` daemon that inherits the child's stderr and lives seconds or longer, so a pipe reader would only see EOF when the daemon exits and "join the reader when the child exits" would hang. A `UnixStream` pair gives a read timeout with std only; the price is that what a lingering grandchild writes afterwards is dropped (and it gets `EPIPE`; on Wine 10.0 the server survives that, tripwire e2e `e2e_debug_run_survives_a_lingering_wineserver`).
+- `prepare` order as shipped: `precheck -> ensure_app_home -> wineboot -u -> ALWAYS wineserver -k -> harden`. The plan said harden, then stop. Measured: `wineserver -k` blocks until the server is gone and the registry files are written by then, and stopping first means no Wine process races the hardening; a failed `wineboot` is also followed by `wineserver -k`, and a failing stop is merged into the error (a server may still be running).
+
+**`HOME` redirect (not in the plan; added after Task 9's review)**
+
+- Wine derives `WINEHOMEDIR`, the shell folders and its caches from `HOME`, so passing the host `HOME` handed the real home path to every app. The backend now sets `HOME=<app>/runtime/home` (0700, created by `prepare`, must be a real directory: `command()` refuses otherwise) for `wineboot`, the program and `wineserver -k`. Fixed: Wine creates no links to the real home in a fresh prefix (checked on Wine 10.0). Cost: everything looked up under the real home is gone (fonts, `~/.drirc`, `~/.asoundrc`, cursor themes, `xdg-open` handlers, `~/.config/vulkan` and `~/.local/share/vulkan`, `~/.cache/wine`; caches are per app and start cold); listed in `docs/SECURITY.md`. It does not hide the home: `WINEHOMEDIR` still shows the host path of `runtime/home` and `\\?\unix\home` is reachable.
+- The redirect also hides `~/.Xauthority` from X clients that rely on it when `XAUTHORITY` is unset (`startx`, `ssh -X`, `xdm`). Final fix wave: `Launcher::with_host_env` passes `<host HOME>/.Xauthority` as `XAUTHORITY` (path only) when `DISPLAY` is kept, `XAUTHORITY` is unset or empty, the host `HOME` is absolute and the file is a regular file by `symlink_metadata`; a host `XAUTHORITY` is never overridden. Unit-tested (and through a real child via `/usr/bin/env`), not tried against a real X server.
+- `doctor <app>` checks `runtime/home` with the backend's own `check_app_home`, so an app prepared before the redirect fails in `doctor` as it does in `run` ("reinstall it").
+
+**Zip installs**
+
+- `unzip::open` runs a strict `prevalidate` on the end record and the whole central directory before the `zip` crate sees the file, then reads through `Guarded`, which shows zeros for every byte before the central directory until `ZipArchive::new` returns (the crate walks back over `PK\5\6` signatures; that path is unreachable). The plan is built from the central directory alone; `extract` then creates exactly that plan (`create_new`, 0755/0644, never through a link).
+- Refused on purpose (documented in `docs/SECURITY.md`): self-extracting archives (data before the first entry), signature records, a stored nested zip in the last 64 KiB, zip64 records not adjacent to the locator, encrypted entries and methods other than stored/deflate, and anything beyond the limits. Symlink, device, FIFO and socket entries are skipped with one warning, not refused.
+- `Limits::default()`: 20 000 entries, 20 000 directories (`max_dirs`, separate from the entry cap), 4 GiB total and per entry, ratio 1000 above a 1 MiB floor, 512 MiB per candidate program read for analysis, 64 candidates, 4 GiB analysed in total; the central directory is capped at 64 MiB (`MAX_CD_BYTES`).
+
+**Hardening and the prefix**
+
+- Hardening covers the whole `drive_c` (every symlink that resolves outside it is replaced by an empty real directory or removed), not only the folders the spike named. Hard caps: 12 directory levels and 200 000 entries; beyond them the operation is an error, never a partial job. `audit_prefix` is the read-only twin (used by `doctor`) and `precheck` runs before `wineboot`. `HardenError` travels inside `BackendError::Io`; callers use `harden_cause` before treating an `Io` error generically.
+
+**Targets, `run`, `doctor`**
+
+- Ruling 1 (target classification): a string containing `/` or ending in `.exe`/`.zip` (any case) is a path; anything else is an app id; an installed id wins over a file of the same name; an existing file is installed first, then run. `find_target` runs before Wine discovery, so "no such app" is reported without Wine. `resolve_program` (metadata known-values checks, executable resolved under `drive_c`, regular file) is shared by `run` and `doctor`.
+- `doctor` design: a `Listing` (names, `truncated`, `errors`) / `ListError` model so an unreadable or capped directory yields ONE "incomplete listing" warning instead of false "DLL not found" lines; DLL names are compared with ASCII-only case folding; the 32-bit and 64-bit DLL directories are merged (a DLL present for only the other bitness can read as available); API-set names (`api-ms-win-*`) are counted but not verified by design (Wine ships no stubs); read-only, it starts nothing but `wine --version`.
+- Discovery order: `wine` = `$RUNTIME_WINE`, then `wine64`, then `wine` on `PATH`; `wineserver` = `$RUNTIME_WINESERVER`, then the sibling of `$RUNTIME_WINE`, then `PATH`, then `/usr/lib/x86_64-linux-gnu/wine`, `/usr/lib64/wine`, `/usr/lib/wine` (`wineserver`), `/usr/lib/wine/wineserver64` (the reported Ubuntu 24.04 Wine 9 layout: not verified on a real 24.04) and `/opt/wine-{stable,staging,devel}/bin`. A bad override is an error, never a fallback.
+- Exit codes: the program's status `& 0xff` (as a shell truncates), 128+N for a signal N. The CLI ignores SIGINT only from right after the spawn (the terminal also sends it to the program) and restores the previous disposition afterwards.
+
+**Security statement, compared with the roadmap**
+
+- "An app cannot read `~`" is NOT claimed: `\\?\unix\...` reaches the whole host (verified on Wine 10.0), Phase 2 is no sandbox. `analyze --json` is NOT escaped for C1/bidi characters (`list --json` and `doctor --json` are). The program's stdout and stdin are the terminal's own, so it can write escape sequences on every run.
+
+**Verification record**
+
+- Wine 10.0 only. Final gate on the last code commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace` (684 passed, 0 failed, 7 ignored), `cargo doc --workspace --no-deps`, `cargo deny check`; real-Wine e2e `cargo test -p runtime-cli -p runtime-backend-wine -- --ignored --test-threads=1`: 5 of 5 (2 backend, 3 CLI), no `wineserver` left afterwards.
+- The CI job `wine-e2e` has never run on a real runner (it is `continue-on-error`; Ubuntu's Wine 9 has no new WoW64, so the 32-bit steps skip there).
+- Manual gates NOT done: the `gui64.exe` window under Wayland (never run by any test), 7-Zip and Notepad++ portable, user-supplied apps. Nothing is tagged and `phase-0-1` is not merged.
+
+**Ready for Phase 3 (open items)**
+
+- `BackendError::Refused` for security refusals (they are `Io` today); a per-app `flock` for commands that write while an app may run; O_DIRECTORY on remaining directory opens; log rotation by size (one log has no cap); `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` now that `libc` is a dependency; the single terminal-sanitiser table (done in the final wave: `rt_core::is_format`, used by the CLI); consider `WINEDEBUG=err+all` as the non-debug default so `logs` has more to show (the plan chose `-all`: Wine's own diagnostics are off unless `--debug`, so a log holds only what the program writes to stderr, and `logs` says when the newest log is empty); `eprintln!` on a closed stderr panics (as in `analyze`); the data directory's ancestors are not forced to 0700.
+
+**Deferred and accepted minors** (the controller's ledger under `.superpowers/sdd/` is not committed; this is its summary)
+
+- Backend: `is_executable_file` accepts any exec bit (`access(X_OK)` would be exact); `wineserver -k` exit code 1 is treated as "no server", which is ambiguous; `wineboot` on a re-prepared prefix runs before hardening and could follow links planted by an earlier run; kept links may have outside hops and a `d:` alias can dangle after hardening.
+- Names: comparisons use `str::to_lowercase` (Wine folds to upper case), no NFC/NFD normalisation, no NTFS `$UpCase`; DLL-dir de-duplication is by string, not by real directory.
+- Process plumbing: a panicking tee thread reads as "no write failure"; a sub-second timeout prints "0 s"; a timed-out helper's output is its head, not its tail; the pump test relies on a 25 ms read timeout under heavy load; `Running::kill` kills only the direct child.
+- Store and metadata: no locking (last writer wins); `Metadata::parse` is public without a size cap (`read` caps); free-text fields are capped but not content-checked (consumers must escape); `create` leaves a partial directory on a later `mkdir` failure (`remove` cleans up); stale temp files are not collected; a relative `XDG_DATA_HOME` is an error (stricter than the XDG spec).
+- Zip: an input file that its writer swaps during install is out of scope; the drop-guard cleanup's `catch_unwind` is untested; the 5 GiB and 1.5 GB sparse tests need a sparse file system; the lying-deflate test cannot tell its two guards apart.
+- `run` and `install`: run-by-path creates a new app per invocation (`some-2`, ...); Ctrl-C during `install` or `run <file>` can leave a partial app; `--debug` tees the child's raw stderr to the terminal; clap's `-- -x` tip is misleading; the app name is re-read from metadata after an install.
+- `doctor`: reads a whole PE (4 GiB ceiling, same as `install`); the prefix's `system32` listing follows symlinks (names only, capped); one CLI line (`app_dir: Some(HostFs.list(..))`) is not mutation-tested.
+- e2e: the backend e2e's stop steps are masked by Wine's ~3 s idle-out (the CLI rig covers `remove`); the `Documents` check assumes Wine 10's layout; the rig is hermetic for the data directory and Wine variables, not for the rest of the host environment.
+- Data directory spelling: a `.` or `..` component in `RUNTIME_DATA_DIR`, `XDG_DATA_HOME` or `HOME` is an error (`dirs`, `Store::new`), as in hardening (final wave); before that it failed late, at install.
