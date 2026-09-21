@@ -24,6 +24,14 @@ pub fn run(file: &Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>>
         return Err(format!("{}: not a regular file", safe(&file_str)).into());
     }
     let file_handle = std::fs::File::open(file).map_err(|e| format!("{}: {e}", safe(&file_str)))?;
+    // Re-check the opened handle: the path may have been swapped for a FIFO/device since the stat above.
+    if !file_handle
+        .metadata()
+        .map_err(|e| format!("{}: {e}", safe(&file_str)))?
+        .is_file()
+    {
+        return Err(format!("{}: not a regular file", safe(&file_str)).into());
+    }
     let mut bytes = Vec::new();
     use std::io::Read;
     (&file_handle)
@@ -41,44 +49,22 @@ pub fn run(file: &Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>>
         FileKind::Msi | FileKind::Zip => None,
     };
 
-    let stdout = std::io::stdout();
-    use std::io::Write;
-    let mut stdout_locked = stdout.lock();
-
-    if as_json {
-        let json_out = serde_json::to_string_pretty(&json!({ "kind": kind, "pe": info }))?;
-        if let Err(e) = writeln!(stdout_locked, "{}", json_out) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(Box::new(e));
-        }
+    let text = if as_json {
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({ "kind": kind, "pe": info }))?
+        )
+    } else if let Some(i) = &info {
+        render(file, i)
     } else {
-        match &info {
-            Some(i) => {
-                let rendered = render(file, i);
-                if let Err(e) = write!(stdout_locked, "{}", rendered) {
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        return Ok(());
-                    }
-                    return Err(Box::new(e));
-                }
-            }
-            None => {
-                if let Err(e) = writeln!(
-                    stdout_locked,
-                    "{}: {kind:?} package (not analysed further yet)",
-                    safe(&file_str)
-                ) {
-                    if e.kind() == io::ErrorKind::BrokenPipe {
-                        return Ok(());
-                    }
-                    return Err(Box::new(e));
-                }
-            }
-        }
+        format!("{}: {kind:?} package (not analysed further yet)\n", safe(&file_str))
+    };
+    // A closed pipe (e.g. `| head`) is the reader's choice, not an error.
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(text.as_bytes()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn render(file: &Path, i: &PeInfo) -> String {
