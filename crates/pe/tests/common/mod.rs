@@ -206,7 +206,7 @@ pub fn exports_data(base: u32) -> Vec<u8> {
         .0
 }
 
-/// Ordinal-only export: slot 0 unnamed, ordinal base 5.
+/// Ordinal-only export: slot 0 unnamed with symbol RVA 0x2000 outside export dir, ordinal base 5.
 #[rustfmt::skip]
 pub fn exports_ordinal_only_data(base: u32) -> Vec<u8> {
     Bytes::default()
@@ -214,7 +214,7 @@ pub fn exports_ordinal_only_data(base: u32) -> Vec<u8> {
         .pad_to(40)
         .cstr("mylib.dll")
         .pad_to(64)
-        .u32(0x1000).u32(base + 96).u32(0)
+        .u32(0x2000)  // symbol RVA outside export dir
         .pad_to(80)
         .u16(0)
         .pad_to(96)
@@ -259,4 +259,64 @@ pub fn exports_oob_name_idx_data(base: u32) -> Vec<u8> {
         .pad_to(144)
         .cstr("OutOfBounds")
         .0
+}
+
+/// Unreadable forwarder: slot RVA inside export dir claim but outside mapped section.
+#[rustfmt::skip]
+pub fn exports_unreadable_forwarder_data(base: u32) -> Vec<u8> {
+    // Claim export dir extends to base+500, but actual section ends at base+96
+    // Slot 0 has forwarder RVA = base + 400 (inside claimed dir, outside actual section)
+    Bytes::default()
+        .u32(0).u32(0).u16(0).u16(0).u32(base + 40).u32(1).u32(1).u32(0).u32(base + 64).u32(0).u32(base + 80)
+        .pad_to(40)
+        .cstr("mylib.dll")
+        .pad_to(64)
+        .u32(base + 400)  // forwarder RVA inside claimed dir, outside actual mapped data
+        .pad_to(80)
+        .u16(0)
+        .pad_to(96)
+        .0
+}
+
+/// Budget test: 5000 functions with shared 1000-byte name each => >4MiB total.
+#[rustfmt::skip]
+pub fn exports_budget_test_data(base: u32) -> Vec<u8> {
+    const NUM_FUNCS: u32 = 5000;
+    const NUM_NAMES: u32 = 5000;
+    const SHARED_NAME_LEN: usize = 1000;
+
+    // Shared name is 1000 bytes (under per-string cap)
+    let shared_name = "n".repeat(SHARED_NAME_LEN);
+    let mut b = Bytes::default();
+
+    // Export directory header
+    let funcs_tbl_rva = base + 40;
+    let names_tbl_rva = base + 40 + NUM_FUNCS * 4; // after function RVAs
+    let ordinals_tbl_rva = base + 40 + NUM_FUNCS * 4 + NUM_NAMES * 4; // after name RVAs
+    let name_str_rva = base + 40 + NUM_FUNCS * 4 + NUM_NAMES * 4 + NUM_NAMES * 2; // after ordinals
+
+    b = b.u32(0).u32(0).u16(0).u16(0).u32(base + 40 - 36).u32(1); // name at base+4, ordinal base 1
+    b = b.u32(NUM_FUNCS).u32(NUM_NAMES).u32(funcs_tbl_rva).u32(names_tbl_rva).u32(ordinals_tbl_rva);
+    b = b.pad_to(40_usize);
+
+    // Function RVAs: all are 0x2000 (symbol outside export dir)
+    for _ in 0..NUM_FUNCS {
+        b = b.u32(0x2000);
+    }
+
+    // Name RVAs: all point to the same shared string
+    for _ in 0..NUM_NAMES {
+        b = b.u32(name_str_rva);
+    }
+
+    // Ordinals: sequential (0..NUM_NAMES)
+    for i in 0..NUM_NAMES {
+        b = b.u16((i & 0xFFFF) as u16);
+    }
+
+    // Shared name string (1000 bytes + NUL)
+    b.0.extend_from_slice(shared_name.as_bytes());
+    b.0.push(0);
+
+    b.0
 }
