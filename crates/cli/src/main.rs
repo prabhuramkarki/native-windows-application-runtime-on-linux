@@ -1,7 +1,7 @@
 mod analyze;
 
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, process::ExitCode};
+use std::{io::IsTerminal, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(name = "runtime", version, about = "Run Windows applications on Linux")]
@@ -22,17 +22,23 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
+    let mut builder = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUNTIME_LOG"))
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+    if std::io::stderr().is_terminal() {
+        builder = builder.with_ansi(true);
+    } else {
+        builder = builder.with_ansi(false);
+    }
+    builder.init();
     let result = match Cli::parse().cmd {
         Cmd::Analyze { file, json } => analyze::run(&file, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            let safe_err = analyze::safe(&e.to_string());
+            eprintln!("error: {}", safe_err);
             ExitCode::FAILURE
         }
     }

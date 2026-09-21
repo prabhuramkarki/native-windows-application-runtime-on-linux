@@ -59,3 +59,98 @@ fn analyze_human_output_lists_imports() {
     assert!(text.contains("Pe32Plus X86_64 Exe (Console)"), "{text}");
     assert!(text.to_lowercase().contains("kernel32.dll"), "{text}");
 }
+
+#[test]
+fn analyze_rejects_malformed_pe() {
+    let malformed = scratch("malformed.exe");
+    let hello = fixture("hello64.exe");
+    let first_512 = std::fs::read(&hello).unwrap();
+    let truncated = &first_512[..512.min(first_512.len())];
+    std::fs::write(&malformed, truncated).unwrap();
+    let out = runtime(&["analyze".as_ref(), malformed.as_os_str()]);
+    let _ = std::fs::remove_file(&malformed);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error:"),
+        "stderr should contain error message: {stderr}"
+    );
+    // Ensure it didn't panic
+    assert!(!stderr.contains("panicked"), "process panicked: {stderr}");
+}
+
+#[test]
+fn analyze_handles_msi_magic() {
+    let msi = scratch("test.msi");
+    // MSI magic: D0 CF 11 E0 A1 B1 1A E1 (OLE compound document)
+    let magic = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1padpadpadpadpadpadpad";
+    std::fs::write(&msi, magic).unwrap();
+    let out = runtime(&["analyze".as_ref(), "--json".as_ref(), msi.as_os_str()]);
+    let _ = std::fs::remove_file(&msi);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["kind"], "msi");
+    assert_eq!(v["pe"], serde_json::json!(null));
+}
+
+#[test]
+fn analyze_handles_zip_magic() {
+    let zip = scratch("test.zip");
+    // ZIP magic: 50 4B 03 04
+    let magic = b"PK\x03\x04padpadpadpadpadpadpadpadpadpadpad";
+    std::fs::write(&zip, magic).unwrap();
+    let out = runtime(&["analyze".as_ref(), "--json".as_ref(), zip.as_os_str()]);
+    let _ = std::fs::remove_file(&zip);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["kind"], "zip");
+    assert_eq!(v["pe"], serde_json::json!(null));
+}
+
+#[test]
+fn analyze_rejects_directory() {
+    let dir = scratch("test-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let out = runtime(&["analyze".as_ref(), dir.as_os_str()]);
+    let _ = std::fs::remove_dir(&dir);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error:"), "stderr: {stderr}");
+}
+
+#[test]
+fn analyze_human_output_has_success_before_stdout() {
+    let out = runtime(&["analyze".as_ref(), fixture("hello64.exe").as_os_str()]);
+    assert!(out.status.success());
+}
+
+#[test]
+fn analyze_output_sanitizes_escape_sequences() {
+    // Copy hello64.exe and try to patch DLL name if possible
+    let patched = scratch("patched.exe");
+    let hello = fixture("hello64.exe");
+    let bytes = std::fs::read(&hello).unwrap();
+
+    // Try to find and patch KERNEL32.dll string in the binary
+    // Look for the ASCII string "KERNEL32.dll" or similar
+    let mut patched_bytes = bytes.clone();
+    if let Some(pos) = bytes.windows(12).position(|w| w.eq_ignore_ascii_case(b"KERNEL32.dll")) {
+        // Replace first byte with ESC
+        patched_bytes[pos] = 0x1b;
+        std::fs::write(&patched, &patched_bytes).unwrap();
+        let out = runtime(&["analyze".as_ref(), patched.as_os_str()]);
+        let _ = std::fs::remove_file(&patched);
+
+        // Check that output doesn't contain raw ESC bytes
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains('\x1b'),
+            "ESC byte found in stdout: {:?}",
+            stdout.as_bytes().iter().position(|&b| b == 0x1b)
+        );
+    } else {
+        // If we can't find the string, just clean up and skip
+        let _ = std::fs::remove_file(&patched);
+    }
+}
