@@ -22,23 +22,35 @@ const MAX_BLOCKS: usize = 4096;
 const FIXED_SIGNATURE: u32 = 0xFEEF_04BD;
 const FIXED_SIZE: usize = 52;
 
-/// The raw RT_VERSION bytes: resource id 1 if present, else the first id, first language.
-/// `FindError::NotFound` means the image has no version resource. The structure of the bytes is
-/// not looked at.
+/// Language ids tried in order before falling back to the first entry: en-US, then neutral.
+const PREFERRED_LANGS: [u16; 2] = [0x0409, 0];
+
+/// The raw RT_VERSION bytes: resource id 1 if present, else the first id. Multi-language binaries
+/// carry one resource per language (Wine's kernel32.dll has 37), and the directory lists them by
+/// ascending id, so "first" would be Arabic (0x0401). Pick en-US (0x0409), then the neutral
+/// language (0), then the first entry. Any other error, such as a corrupt preferred entry, is
+/// returned rather than skipped. `FindError::NotFound` means the image has no version resource.
+/// The structure of the bytes is not looked at.
 pub(crate) fn find<'a>(res: &Resources<'a>) -> Result<&'a [u8], FindError> {
     let ids = res.root()?.get_dir(Name::VERSION)?;
     let langs = match ids.get_dir(Name::Id(1)) {
         Err(FindError::NotFound) => ids.first_dir()?,
         other => other?,
     };
+    for lang in PREFERRED_LANGS {
+        match langs.get_data(Name::Id(lang.into())) {
+            Err(FindError::NotFound) => {}
+            found => return Ok(found?.bytes()?),
+        }
+    }
     Ok(langs.first_data()?.bytes()?)
 }
 
 /// Parses a VS_VERSIONINFO resource. Err says why it is malformed, or empty.
 ///
-/// Only the first `StringTable` is read (Windows itself picks by language; the first table is
-/// the resource's primary one). `VarFileInfo` is ignored. An over-long key or string, more than
-/// 1024 units or 256 entries, is an Err: nothing is truncated silently.
+/// Only the first `StringTable` is read; `find` has already chosen the language resource, and a
+/// resource normally carries one table for its language. `VarFileInfo` is ignored. An over-long
+/// key or string, more than 1024 units or 256 entries, is an Err: nothing is truncated silently.
 pub(crate) fn parse(bytes: &[u8]) -> Result<VersionInfo, String> {
     let budget = Cell::new(MAX_BLOCKS);
     let root = read_block(bytes)?;
