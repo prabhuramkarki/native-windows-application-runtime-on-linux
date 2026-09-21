@@ -243,95 +243,126 @@ macro_rules! extract {
             match f.exports() {
                 Ok(ex) => {
                     let base = ex.ordinal_base() as u32;
+                    // Note: pelite's Ordinal is u16; bases above 0xFFFF silently truncate. No panic, wrong ordinals.
                     match ex.by() {
                         Ok(by) => {
                             const MAX_STRING_LEN: usize = 1024;
                             const BYTES_BUDGET: usize = 4 * 1024 * 1024; // ~4 MiB
                             let mut names = BTreeMap::new();
+                            let mut bytes_used = 0usize;
+                            let mut budget_exhausted = false;
+                            let funcs_len = by.functions().len().min(65_536);
+                            let mut oob_names = 0;
+                            let mut first_oob_idx = None;
                             let mut bad_names = 0;
                             let mut first_bad_name_idx = None;
-                            let mut bytes_used = 0usize;
-                            let funcs_len = by.functions().len().min(65_536);
-                            // Collect names, skipping those out-of-bounds or over the byte budget
-                            for (name, idx) in by.iter_name_indices() {
-                                if idx >= funcs_len {
-                                    continue; // skip name-table entries for non-existent function slots
+
+                            // Collect names using pelite's pre-parsed strings (already NUL-scanned)
+                            // Track budget for these strings
+                            for (name, name_idx) in by.iter_name_indices() {
+                                if (name_idx as usize) >= funcs_len {
+                                    oob_names += 1;
+                                    if first_oob_idx.is_none() {
+                                        first_oob_idx = Some(name_idx as usize);
+                                    }
+                                    continue;
                                 }
                                 match name {
                                     Ok(n) => {
                                         if n.len() > MAX_STRING_LEN {
                                             bad_names += 1;
                                             if first_bad_name_idx.is_none() {
-                                                first_bad_name_idx = Some(idx);
+                                                first_bad_name_idx = Some(name_idx as usize);
                                             }
                                         } else if bytes_used.checked_add(n.len()).unwrap_or(BYTES_BUDGET + 1)
                                             <= BYTES_BUDGET
                                         {
                                             bytes_used += n.len();
-                                            names.insert(idx, n.to_string());
+                                            names.insert(name_idx as usize, n.to_string());
                                         } else {
-                                            warnings.push(format!(
-                                                "exports: name budget exceeded; total bytes {} >= ~{}",
-                                                bytes_used, BYTES_BUDGET
-                                            ));
-                                            break;
+                                            budget_exhausted = true;
                                         }
                                     }
                                     Err(_) => {
                                         bad_names += 1;
                                         if first_bad_name_idx.is_none() {
-                                            first_bad_name_idx = Some(idx);
+                                            first_bad_name_idx = Some(name_idx as usize);
                                         }
                                     }
                                 }
                             }
+                            if oob_names > 0 {
+                                warnings.push(format!(
+                                    "exports: {} name entries out of range (first at index {})",
+                                    oob_names,
+                                    first_oob_idx.unwrap_or(0)
+                                ));
+                            }
                             if bad_names > 0 {
                                 warnings.push(format!(
-                                    "exports: {} names unreadable/too-long (first at index {})",
+                                    "exports: {} names unreadable (first at index {})",
                                     bad_names,
                                     first_bad_name_idx.unwrap_or(0)
                                 ));
                             }
+
                             // Walk function table
-                            let mut bad_forwards = 0;
-                            let mut first_bad_fwd_idx = None;
+                            let func_rvas = by.functions();
+                            let mut unreadable_entries = 0;
+                            let mut first_unreadable_idx = None;
                             for idx in 0..funcs_len {
-                                let forwarder = match by.index(idx) {
-                                    Ok(pelite::$pe::exports::Export::Forward(fwd)) => {
-                                        if fwd.len() > MAX_STRING_LEN {
-                                            bad_forwards += 1;
-                                            if first_bad_fwd_idx.is_none() {
-                                                first_bad_fwd_idx = Some(idx);
+                                let mut forwarder = None;
+                                let mut is_unused = false;
+
+                                // Check RVA directly first
+                                if idx < func_rvas.len() && func_rvas[idx] == 0 {
+                                    is_unused = true;
+                                } else {
+                                    match by.index(idx) {
+                                        Ok(pelite::$pe::exports::Export::Forward(fwd_str)) => {
+                                            // Forwarder string from pelite; apply length cap and budget
+                                            if fwd_str.len() > MAX_STRING_LEN {
+                                                // Too long; drop the forwarder
+                                            } else if bytes_used.checked_add(fwd_str.len()).unwrap_or(BYTES_BUDGET + 1)
+                                                <= BYTES_BUDGET
+                                            {
+                                                bytes_used += fwd_str.len();
+                                                forwarder = Some(fwd_str.to_string());
+                                            } else {
+                                                budget_exhausted = true;
                                             }
-                                            None
-                                        } else if bytes_used.checked_add(fwd.len()).unwrap_or(BYTES_BUDGET + 1)
-                                            <= BYTES_BUDGET
-                                        {
-                                            bytes_used += fwd.len();
-                                            Some(fwd.to_string())
-                                        } else {
-                                            warnings.push(format!(
-                                                "exports: forwarder budget exceeded at slot {}; total bytes {} >= ~{}",
-                                                idx, bytes_used, BYTES_BUDGET
-                                            ));
-                                            break;
+                                        }
+                                        Ok(_) => {
+                                            // Regular symbol or Symbol variant
+                                        }
+                                        Err(_) => {
+                                            unreadable_entries += 1;
+                                            if first_unreadable_idx.is_none() {
+                                                first_unreadable_idx = Some(idx);
+                                            }
                                         }
                                     }
-                                    Ok(pelite::$pe::exports::Export::Symbol(&0)) => continue, // unused slot
-                                    Ok(_) => None,
-                                    Err(_) => continue, // skip unreadable entries without warning
-                                };
-                                exports.push(Export {
-                                    name: names.remove(&idx),
-                                    ordinal: base.saturating_add(idx as u32),
-                                    forwarder,
-                                });
+                                }
+
+                                if !is_unused {
+                                    exports.push(Export {
+                                        name: names.remove(&idx),
+                                        ordinal: base.saturating_add(idx as u32),
+                                        forwarder,
+                                    });
+                                }
                             }
-                            if bad_forwards > 0 {
+                            if unreadable_entries > 0 {
                                 warnings.push(format!(
-                                    "exports: {} forwarders too-long (first at index {})",
-                                    bad_forwards,
-                                    first_bad_fwd_idx.unwrap_or(0)
+                                    "exports: {} entries unreadable (first at index {})",
+                                    unreadable_entries,
+                                    first_unreadable_idx.unwrap_or(0)
+                                ));
+                            }
+                            if budget_exhausted {
+                                warnings.push(format!(
+                                    "exports: string budget (~{} bytes) exhausted at {} bytes",
+                                    BYTES_BUDGET, bytes_used
                                 ));
                             }
                         }
