@@ -146,3 +146,7 @@ impl Bytes {
         self
     }
 }
+
+pub fn analyze(b: &Builder) -> pe::PeInfo {
+    pe::analyze(&b.build()).expect("analyze")
+}
