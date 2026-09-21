@@ -14,6 +14,9 @@ pub struct Builder {
     pub sections: Vec<(&'static str, u32, Vec<u8>)>,
     /// (data directory index, rva, size)
     pub dirs: Vec<(usize, u32, u32)>,
+    /// NumberOfRvaAndSizes as written to the header (default 16). Entries in `dirs` at or above
+    /// this index are still written to the (always 16-entry) table area but the parser ignores them.
+    pub num_dirs: u32,
     pub overlay: Vec<u8>,
 }
 
@@ -26,6 +29,7 @@ impl Builder {
             subsystem: 3,
             sections: vec![],
             dirs: vec![],
+            num_dirs: 16,
             overlay: vec![],
         }
     }
@@ -85,7 +89,7 @@ impl Builder {
         } else {
             (oh + 92, oh + 96)
         };
-        put32(&mut out, num_dirs, 16);
+        put32(&mut out, num_dirs, self.num_dirs);
         for &(i, rva, size) in &self.dirs {
             put32(&mut out, dirs + i * 8, rva);
             put32(&mut out, dirs + i * 8 + 4, size);
@@ -166,6 +170,57 @@ pub fn imports_data(base: u32) -> Vec<u8> {
         .u16(0)
         .cstr("ExitProcess")
         .0
+}
+
+/// PE32 (u32 thunk) twin of `imports_data`: kernel32.dll importing ExitProcess by name, then ordinal 5.
+#[rustfmt::skip]
+pub fn imports_data32(base: u32) -> Vec<u8> {
+    Bytes::default()
+        .u32(base + 68).u32(0).u32(0).u32(base + 48).u32(base + 68) // descriptor: OFT, ts, fwd, name, FT
+        .pad_to(48)
+        .cstr("kernel32.dll")
+        .pad_to(68)
+        .u32(base + 96) // by name
+        .u32(0x8000_0005) // by ordinal 5
+        .u32(0)
+        .pad_to(96)
+        .u16(0)
+        .cstr("ExitProcess")
+        .0
+}
+
+/// Import directory at offset 0 built from raw descriptors `(OriginalFirstThunk, Name, FirstThunk)`,
+/// followed by a null descriptor, then `tail` at `imports_tail_off`. Descriptor `i` sits at RVA
+/// `base + 20 * i`. Nothing is validated.
+pub fn imports_raw(descs: &[(u32, u32, u32)], tail: &[u8]) -> Vec<u8> {
+    let mut b = Bytes::default();
+    for &(oft, name, ft) in descs {
+        b = b.u32(oft).u32(0).u32(0).u32(name).u32(ft);
+    }
+    let mut out = b.pad_to(20 * (descs.len() + 1)).pad_to(imports_tail_off(descs.len())).0;
+    out.extend_from_slice(tail);
+    out
+}
+
+pub fn imports_tail_off(n_descs: usize) -> usize {
+    (20 * (n_descs + 1)).next_multiple_of(8)
+}
+
+/// Delay-import directory at offset 0 from raw 8-word descriptors, followed by a null descriptor,
+/// then `tail` at `delay_tail_off`. Descriptor `i` sits at RVA `base + 32 * i`. Word order:
+/// attributes, DllNameRVA, module handle, IAT, INT, ...
+pub fn delay_raw(descs: &[[u32; 8]], tail: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for d in descs {
+        out.extend(d.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    out.resize(delay_tail_off(descs.len()), 0); // zero padding includes the null descriptor
+    out.extend_from_slice(tail);
+    out
+}
+
+pub fn delay_tail_off(n_descs: usize) -> usize {
+    (32 * (n_descs + 1)).next_multiple_of(8)
 }
 
 #[rustfmt::skip]
@@ -260,6 +315,28 @@ pub fn exports_raw(base: u32, ordinal_base: u32, funcs: &[u32], names: &[(u32, u
 #[rustfmt::skip]
 pub fn reloc_data() -> Vec<u8> {
     Bytes::default().u32(0x1000).u32(16).u16(0xA010).u16(0xA018).u16(0x0000).u16(0x0000).0
+}
+
+/// PE32 relocation block: `page`, SizeOfBlock as given (not derived), then the type/offset words.
+pub fn reloc_block(page: u32, size_of_block: u32, words: &[u16]) -> Vec<u8> {
+    let mut b = Bytes::default().u32(page).u32(size_of_block);
+    for &w in words {
+        b = b.u16(w);
+    }
+    b.0
+}
+
+/// PE32 (x86) TLS directory, image base 0x40_0000, with two callbacks (VAs 0x40_1000 and 0x40_1010)
+/// and a zero terminator.
+#[rustfmt::skip]
+pub fn tls_data32(base: u32) -> Vec<u8> {
+    let image_base = 0x40_0000u32;
+    let va = |off: u32| image_base + base + off;
+    Bytes::default()
+        .u32(va(32)).u32(va(40)).u32(va(40)).u32(va(48)).u32(0).u32(0)
+        .pad_to(48)
+        .u32(image_base + 0x1000).u32(image_base + 0x1010).u32(0)
+        .0
 }
 
 #[rustfmt::skip]
