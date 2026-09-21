@@ -57,6 +57,55 @@ impl Aligned {
     }
 }
 
+// Export string limits. A forwarder or name is read through at most MAX_STRING_LEN + 1 bytes;
+// all kept strings together may not exceed BYTES_BUDGET; each table is read up to
+// MAX_EXPORT_ENTRIES entries.
+const MAX_STRING_LEN: usize = 1024;
+const BYTES_BUDGET: usize = 4 * 1024 * 1024;
+const MAX_EXPORT_ENTRIES: usize = 65_536;
+
+enum Str {
+    Ok(String),
+    /// Longer than MAX_STRING_LEN.
+    TooLong,
+    /// Mapped data ended before a NUL.
+    Unterminated,
+    /// RVA not inside any section.
+    Unreadable,
+}
+
+/// Reads a NUL-terminated string from `bytes` (everything from the string's RVA to the end of its
+/// section) touching at most MAX_STRING_LEN + 1 bytes, however long the data is.
+fn read_bounded(bytes: &[u8]) -> Str {
+    let window = &bytes[..bytes.len().min(MAX_STRING_LEN + 1)];
+    match memchr::memchr(0, window) {
+        Some(n) => Str::Ok(String::from_utf8_lossy(&window[..n]).into_owned()),
+        None if window.len() > MAX_STRING_LEN => Str::TooLong,
+        None => Str::Unterminated,
+    }
+}
+
+/// Counts one kind of problem and remembers where it first happened, for one aggregate warning.
+#[derive(Default)]
+struct Tally {
+    count: usize,
+    first: usize,
+}
+
+impl Tally {
+    fn hit(&mut self, at: usize) {
+        if self.count == 0 {
+            self.first = at;
+        }
+        self.count += 1;
+    }
+    fn warn(&self, warnings: &mut Vec<String>, what: &str, at: &str) {
+        if self.count > 0 {
+            warnings.push(format!("exports: {} {what} (first at {at} {})", self.count, self.first));
+        }
+    }
+}
+
 const DIR_SECURITY: usize = 4;
 const DIR_DELAY_IMPORT: usize = 13;
 const DIR_CLR: usize = 14;
@@ -246,123 +295,106 @@ macro_rules! extract {
                     // Note: pelite's Ordinal is u16; bases above 0xFFFF silently truncate. No panic, wrong ordinals.
                     match ex.by() {
                         Ok(by) => {
-                            const MAX_STRING_LEN: usize = 1024;
-                            const BYTES_BUDGET: usize = 4 * 1024 * 1024; // ~4 MiB
-                            let mut names = BTreeMap::new();
+                            // pelite's `&str`/`Forward` accessors scan to the NUL with no limit, so
+                            // many entries pointing at one huge unterminated string cost a full scan
+                            // each. Read every string ourselves through `read_bounded` instead.
+                            // `by.index()` is avoided for the same reason and because pelite's
+                            // forwarder check adds the directory RVA and size in u32 (overflows).
+                            let (dir_rva, dir_size) = dir(0);
+                            let in_dir = |rva: u32| {
+                                u64::from(rva) >= u64::from(dir_rva) && u64::from(rva) < u64::from(dir_rva) + u64::from(dir_size)
+                            };
+                            let read = |rva: u32| f.slice_bytes(rva).map_or(Str::Unreadable, read_bounded);
                             let mut bytes_used = 0usize;
                             let mut budget_exhausted = false;
-                            let funcs_len = by.functions().len().min(65_536);
-                            let mut oob_names = 0;
-                            let mut first_oob_idx = None;
-                            let mut bad_names = 0;
-                            let mut first_bad_name_idx = None;
+                            // Charges `len` against the shared budget; false (and flagged) if it does not fit.
+                            let mut charge = |len: usize| {
+                                if bytes_used + len <= BYTES_BUDGET {
+                                    bytes_used += len;
+                                    true
+                                } else {
+                                    budget_exhausted = true;
+                                    false
+                                }
+                            };
+                            let funcs = by.functions();
+                            let funcs_len = funcs.len().min(MAX_EXPORT_ENTRIES);
+                            let name_rvas = by.names();
+                            let name_len = name_rvas.len().min(MAX_EXPORT_ENTRIES);
+                            if name_rvas.len() > name_len {
+                                warnings.push(format!(
+                                    "exports: name table has {} entries, only the first {MAX_EXPORT_ENTRIES} were read",
+                                    name_rvas.len()
+                                ));
+                            }
+                            if funcs.len() > funcs_len {
+                                warnings.push(format!(
+                                    "exports: function table has {} entries, only the first {MAX_EXPORT_ENTRIES} were read",
+                                    funcs.len()
+                                ));
+                            }
 
-                            // Collect names using pelite's pre-parsed strings (already NUL-scanned)
-                            // Track budget for these strings
-                            for (name, name_idx) in by.iter_name_indices() {
-                                if (name_idx as usize) >= funcs_len {
-                                    oob_names += 1;
-                                    if first_oob_idx.is_none() {
-                                        first_oob_idx = Some(name_idx as usize);
-                                    }
+                            let mut names = BTreeMap::new();
+                            let (mut oob, mut name_long, mut name_open, mut name_bad) =
+                                (Tally::default(), Tally::default(), Tally::default(), Tally::default());
+                            let name_idx = by.name_indices();
+                            for (hint, (&rva, &idx)) in name_rvas.iter().zip(name_idx).take(name_len).enumerate() {
+                                let idx = usize::from(idx);
+                                if idx >= funcs_len {
+                                    oob.hit(idx);
                                     continue;
                                 }
-                                match name {
-                                    Ok(n) => {
-                                        if n.len() > MAX_STRING_LEN {
-                                            bad_names += 1;
-                                            if first_bad_name_idx.is_none() {
-                                                first_bad_name_idx = Some(name_idx as usize);
-                                            }
-                                        } else if bytes_used.checked_add(n.len()).unwrap_or(BYTES_BUDGET + 1)
-                                            <= BYTES_BUDGET
-                                        {
-                                            bytes_used += n.len();
-                                            names.insert(name_idx as usize, n.to_string());
-                                        } else {
-                                            budget_exhausted = true;
+                                match read(rva) {
+                                    Str::Ok(n) => {
+                                        if charge(n.len()) {
+                                            names.insert(idx, n);
                                         }
                                     }
-                                    Err(_) => {
-                                        bad_names += 1;
-                                        if first_bad_name_idx.is_none() {
-                                            first_bad_name_idx = Some(name_idx as usize);
-                                        }
-                                    }
+                                    Str::TooLong => name_long.hit(hint),
+                                    Str::Unterminated => name_open.hit(hint),
+                                    Str::Unreadable => name_bad.hit(hint),
                                 }
                             }
-                            if oob_names > 0 {
-                                warnings.push(format!(
-                                    "exports: {} name entries out of range (first at index {})",
-                                    oob_names,
-                                    first_oob_idx.unwrap_or(0)
-                                ));
-                            }
-                            if bad_names > 0 {
-                                warnings.push(format!(
-                                    "exports: {} names unreadable (first at index {})",
-                                    bad_names,
-                                    first_bad_name_idx.unwrap_or(0)
-                                ));
-                            }
+                            oob.warn(&mut warnings, "name entries out of range", "index");
+                            name_long.warn(&mut warnings, "names too long", "name entry");
+                            name_open.warn(&mut warnings, "names unterminated", "name entry");
+                            name_bad.warn(&mut warnings, "names unreadable", "name entry");
 
-                            // Walk function table
-                            let func_rvas = by.functions();
-                            let mut unreadable_entries = 0;
-                            let mut first_unreadable_idx = None;
-                            for idx in 0..funcs_len {
+                            let (mut fwd_long, mut fwd_open, mut fwd_bad) =
+                                (Tally::default(), Tally::default(), Tally::default());
+                            for (idx, &rva) in funcs.iter().enumerate().take(funcs_len) {
+                                if rva == 0 {
+                                    continue; // unused slot
+                                }
                                 let mut forwarder = None;
-                                let mut is_unused = false;
-
-                                // Check RVA directly first
-                                if idx < func_rvas.len() && func_rvas[idx] == 0 {
-                                    is_unused = true;
-                                } else {
-                                    match by.index(idx) {
-                                        Ok(pelite::$pe::exports::Export::Forward(fwd_str)) => {
-                                            // Forwarder string from pelite; apply length cap and budget
-                                            if fwd_str.len() > MAX_STRING_LEN {
-                                                // Too long; drop the forwarder
-                                            } else if bytes_used.checked_add(fwd_str.len()).unwrap_or(BYTES_BUDGET + 1)
-                                                <= BYTES_BUDGET
-                                            {
-                                                bytes_used += fwd_str.len();
-                                                forwarder = Some(fwd_str.to_string());
-                                            } else {
-                                                budget_exhausted = true;
+                                // An RVA inside the export directory is a forwarder string.
+                                // A forwarder that cannot be read keeps its export (ordinal and name are
+                                // still real) with `forwarder: None`; the aggregate warning below is what
+                                // records that it was a forwarder.
+                                if in_dir(rva) {
+                                    match read(rva) {
+                                        Str::Ok(s) => {
+                                            if charge(s.len()) {
+                                                forwarder = Some(s);
                                             }
                                         }
-                                        Ok(_) => {
-                                            // Regular symbol or Symbol variant
-                                        }
-                                        Err(_) => {
-                                            unreadable_entries += 1;
-                                            if first_unreadable_idx.is_none() {
-                                                first_unreadable_idx = Some(idx);
-                                            }
-                                        }
+                                        Str::TooLong => fwd_long.hit(idx),
+                                        Str::Unterminated => fwd_open.hit(idx),
+                                        Str::Unreadable => fwd_bad.hit(idx),
                                     }
                                 }
-
-                                if !is_unused {
-                                    exports.push(Export {
-                                        name: names.remove(&idx),
-                                        ordinal: base.saturating_add(idx as u32),
-                                        forwarder,
-                                    });
-                                }
+                                exports.push(Export {
+                                    name: names.remove(&idx),
+                                    ordinal: base.saturating_add(idx as u32),
+                                    forwarder,
+                                });
                             }
-                            if unreadable_entries > 0 {
-                                warnings.push(format!(
-                                    "exports: {} entries unreadable (first at index {})",
-                                    unreadable_entries,
-                                    first_unreadable_idx.unwrap_or(0)
-                                ));
-                            }
+                            fwd_long.warn(&mut warnings, "forwarders too long", "index");
+                            fwd_open.warn(&mut warnings, "forwarders unterminated", "index");
+                            fwd_bad.warn(&mut warnings, "forwarders unreadable", "index");
                             if budget_exhausted {
                                 warnings.push(format!(
-                                    "exports: string budget (~{} bytes) exhausted at {} bytes",
-                                    BYTES_BUDGET, bytes_used
+                                    "exports: string budget (~{BYTES_BUDGET} bytes) exhausted at {bytes_used} bytes"
                                 ));
                             }
                         }
