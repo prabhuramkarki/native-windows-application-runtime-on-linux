@@ -7,12 +7,15 @@
 //! [`rt_core::Launcher::wrap`] via [`InstallerSandbox::for_launcher`], the ONE existing spawn point, so a caller
 //! keeps using `Launcher::spawn`/`run_helper` rather than a second `Command::spawn` path.
 //!
-//! **The profile** (bound, in this order, everything else invisible): the app's own `prefix` (which contains
-//! `drive_c`), read-write, at the same path; [`RO_BINDS`] read-only (a fixed, documented set — not the real
-//! Wine binary's dependency closure, see the constant's docs); a fresh, private `/tmp`; a fresh `/proc` and
-//! `/dev`; an empty scratch directory standing in for `$HOME` (never the real one — see [`home_path`]); a fresh
-//! PID/UTS/IPC namespace; the network namespace unshared unless [`SandboxOpts::allow_network`]; `--die-with-parent`;
-//! never `--dev-bind`. `docs/SECURITY.md` has the honest "what this does NOT stop" list.
+//! **The profile** (everything not listed here is invisible): the app's own `prefix` (which contains
+//! `drive_c`), read-write, at the same path; [`RO_BINDS`] plus [`SandboxOpts::extra_ro_binds`] read-only (a
+//! fixed, documented set — not the real Wine binary's dependency closure, see [`RO_BINDS`]'s docs); a fresh,
+//! private `/tmp`; a fresh `/proc` and `/dev`; an empty scratch directory standing in for `$HOME` (never the
+//! real one — see [`home_path`]); a fresh PID/UTS/IPC namespace; a new session (`--new-session`, detaches the
+//! real controlling terminal); the network namespace unshared unless [`SandboxOpts::allow_network`];
+//! `--die-with-parent`; never `--dev-bind`. `docs/SECURITY.md` has the honest "what this does NOT stop" list.
+//! The prefix bind and the `$HOME` tmpfs are ordered relative to each other at runtime (never a fixed order):
+//! see [`InstallerSandbox::wrap`]'s own comment on why.
 //!
 //! [`InstallerSandbox::wrap`] is a pure argv-builder: given the already-finalized [`Command`] (final program,
 //! args, env and cwd — see `rt_core::launch`'s module docs), it returns a NEW `Command` that runs `bwrap` with
@@ -31,6 +34,14 @@ use std::sync::Arc;
 /// documented set is what the plan asks for and what a system Wine package normally needs (its own binaries and
 /// libraries, plus the distro's `/etc/alternatives` symlinks such as `/usr/bin/wine` -> `/etc/alternatives/wine`).
 /// A directory that does not exist on this distro is silently skipped (`--ro-bind-try`), never an error.
+///
+/// ponytail: this only covers a Wine install rooted under one of these four paths (true for a distro package).
+/// WineHQ's own official packages commonly install to `/opt/wine-stable/...`, outside all of them; a Wine there
+/// would fail to `execvp` inside the sandbox. Fixing that generally means walking the discovered Wine binary's
+/// own install root/dependency closure, which is out of THIS task's scope (the plan's own wording reads as
+/// "this fixed set is enough" for now) — Task 6, which actually knows the discovered Wine path
+/// (`backend_wine::discover::Found`), should pass its install root through [`SandboxOpts::extra_ro_binds`]
+/// when it is outside this fixed set, rather than this crate growing a second binary-discovery mechanism.
 pub const RO_BINDS: [&str; 4] = ["/usr", "/lib", "/lib64", "/etc/alternatives"];
 
 /// The path used as `$HOME` inside the sandbox when the wrapped command's own finalized env has none. Nothing
@@ -39,12 +50,16 @@ pub const RO_BINDS: [&str; 4] = ["/usr", "/lib", "/lib64", "/etc/alternatives"];
 const FALLBACK_HOME: &str = "/home/sandbox";
 
 /// Per-run choices [`InstallerSandbox::wrap`] does not hard-code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SandboxOpts {
     /// `false` (the default): the network namespace is unshared, so the sandboxed process has no network at
     /// all (not even loopback to the host). Installers that need to phone home for a redistributable are out
     /// of scope for Phase 3 (its target is offline-only installers); set this once Phase 4 needs it.
     pub allow_network: bool,
+    /// Extra paths bound read-only besides [`RO_BINDS`] (`--ro-bind-try`, so a missing one is skipped, not an
+    /// error). For a Wine install outside the fixed set (see [`RO_BINDS`]'s docs), e.g. a WineHQ package under
+    /// `/opt/wine-stable`.
+    pub extra_ro_binds: Vec<PathBuf>,
 }
 
 /// A `bwrap`-backed sandbox for one installer helper invocation. Cheap to clone (`bwrap` is a `PathBuf`).
@@ -71,6 +86,11 @@ impl InstallerSandbox {
 
         let mut out = Command::new(&self.bwrap);
         out.arg("--die-with-parent");
+        // Detaches the sandboxed process from the real controlling terminal (a new session/process group), so
+        // it cannot use TIOCSTI-style terminal escapes to inject input back into the host's tty. Fine for a
+        // non-interactive installer helper (this profile's only target, see the module docs); this is why
+        // `Launcher::spawn`'s interactive-console-program path is not something this sandbox is meant for.
+        out.arg("--new-session");
         out.arg("--unshare-pid");
         out.arg("--unshare-uts");
         out.arg("--unshare-ipc");
@@ -83,8 +103,24 @@ impl InstallerSandbox {
         for dir in RO_BINDS {
             out.arg("--ro-bind-try").arg(dir).arg(dir);
         }
-        out.arg("--bind").arg(&prefix).arg(&prefix);
-        out.arg("--tmpfs").arg(&home);
+        for dir in &opts.extra_ro_binds {
+            out.arg("--ro-bind-try").arg(dir).arg(dir);
+        }
+        // Order matters: a LATER bwrap mount wins over an EARLIER one at the same or a nested path (verified
+        // against real bwrap 0.11.1). `home` is normally unrelated to `prefix` (`backend_wine::app_home` makes
+        // it a sibling), but if a caller ever hands `wrap` a `HOME` that is `prefix` itself or an ancestor
+        // directory of it, mounting the empty `$HOME` tmpfs AFTER the prefix bind would silently swallow the
+        // whole prefix (this was a real, reproduced bug: the two binds were previously always emitted in the
+        // same fixed order). So: whichever of the two is the ancestor-or-equal is mounted FIRST, and the
+        // more specific one (or, in a plain tie, the prefix bind, since containment of the app's own data
+        // matters more than a cosmetic empty `$HOME`) is mounted LAST, so it is what is actually visible.
+        if prefix.starts_with(&home) {
+            out.arg("--tmpfs").arg(&home);
+            out.arg("--bind").arg(&prefix).arg(&prefix);
+        } else {
+            out.arg("--bind").arg(&prefix).arg(&prefix);
+            out.arg("--tmpfs").arg(&home);
+        }
         out.arg("--");
         out.arg(cmd.get_program());
         out.args(cmd.get_args());

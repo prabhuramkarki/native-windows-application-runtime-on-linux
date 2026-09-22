@@ -139,12 +139,23 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   real filesystem is bound: no `Downloads`, no other app's data, no arbitrary host path.
 - `/usr`, `/lib`, `/lib64`, `/etc/alternatives` are bound read-only (a fixed, documented set a system Wine
   package needs to run at all — not a walk of its actual shared-library dependency closure, and not everything
-  under `/`; a distro without one of these directories just does not get it, `--ro-bind-try`).
+  under `/`; a distro without one of these directories just does not get it, `--ro-bind-try`), plus any extra
+  read-only paths the caller passes (`SandboxOpts::extra_ro_binds`, also `--ro-bind-try`) — for a Wine install
+  outside the fixed set, e.g. a WineHQ package under `/opt/wine-stable`. Nothing walks the fixed set today, so a
+  Wine there needs Task 6 to add its install root explicitly.
 - `$HOME` is never the real one: an empty `tmpfs` stands in for whatever the finalized command's own `HOME` is
   (real bwrap test: the directory exists and is empty, a canary file placed at the real `$HOME` cannot be read).
+  The prefix bind and this `$HOME` tmpfs are ordered relative to each other at runtime, never a fixed argv
+  order: a later bwrap mount wins over an earlier one at the same or a nested path, so if `$HOME` were ever the
+  prefix itself or a directory above it, mounting it in a fixed order could silently swallow the whole prefix
+  (reproduced against real bwrap, then fixed and regression-tested: `when_home_is_an_ancestor_of_the_prefix_*`,
+  `real_sandbox_prefix_is_not_shadowed_when_home_is_an_ancestor_of_it`).
 - A private, empty `/tmp` (`tmpfs`), a fresh `/proc` and a fresh `/dev` (never `--dev-bind`, which would hand
   over the host's real device nodes).
-- A fresh PID, UTS and IPC namespace.
+- A fresh PID, UTS and IPC namespace, and a new session (`--new-session`), which detaches the sandboxed process
+  from the real controlling terminal so it cannot use `TIOCSTI`-style terminal escapes to inject input back into
+  the host's tty (most current kernels already disable legacy `TIOCSTI` injection by default, so this is
+  defence in depth, not the only thing standing between a hostile installer and your terminal).
 - The network namespace is unshared (`--unshare-net`) unless the caller sets `allow_network` — Phase 3's own
   target is offline-only installers; an installer that needs to fetch a redistributable is Phase 4's problem.
   Real bwrap test: a loopback TCP connect to a listener on the host succeeds only when `allow_network` is set (a
@@ -153,9 +164,9 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
 - `--die-with-parent`: a sandboxed helper cannot outlive the runtime process that started it.
 
 **What this narrows.** An installer running under it cannot read or write anything on the host outside its own
-app directory (verified: a write attempt outside the prefix fails and leaves nothing on the real filesystem),
-cannot see the real user's home, other apps' data or arbitrary host paths, and (by default) has no network at
-all, not even loopback to the host.
+app directory and the fixed read-only system paths listed above (needed to run Wine itself; verified: a write
+attempt outside the prefix fails and leaves nothing on the real filesystem), cannot see the real user's home,
+other apps' data or any other host path, and (by default) has no network at all, not even loopback to the host.
 
 **What this does NOT stop** — read this before trusting it as "the app is contained":
 - **Same uid, no user namespace remapping.** The sandboxed process runs as the same Linux user as everything
