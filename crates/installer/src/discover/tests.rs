@@ -27,6 +27,82 @@ fn no_size(_: &str) -> Option<u64> {
     None
 }
 
+// --- laziness: `read` (the full-bytes closure) must never be called once a higher tier already
+// settles the winner ------------------------------------------------------------------------
+
+#[test]
+fn read_is_never_called_when_a_shortcut_alone_already_settles_the_winner() {
+    let d = diff(
+        &[
+            "Program Files/App/app.exe",
+            "Program Files/App/helper1.exe",
+            "Program Files/App/helper2.exe",
+        ],
+        vec![],
+    );
+    let shortcuts = [lnk_to(r"C:\Program Files\App\app.exe")];
+    let read_calls = std::cell::Cell::new(0usize);
+    let read = |_: &str| {
+        read_calls.set(read_calls.get() + 1);
+        None
+    };
+    let result = rank(&d, &shortcuts, read, no_size);
+    assert!(matches!(result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"));
+    assert_eq!(
+        read_calls.get(),
+        0,
+        "tier (1) alone already settled it: read must not be called"
+    );
+}
+
+#[test]
+fn read_is_never_called_when_an_uninstall_entry_alone_already_settles_the_winner() {
+    let d = diff(
+        &["Program Files/App/app.exe", "Program Files/App/helper.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: None,
+            icon_path: Some(r"C:\Program Files\App\app.exe".into()),
+        }],
+    );
+    let read_calls = std::cell::Cell::new(0usize);
+    let read = |_: &str| {
+        read_calls.set(read_calls.get() + 1);
+        None
+    };
+    let result = rank(&d, &[], read, no_size);
+    assert!(matches!(result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"));
+    assert_eq!(
+        read_calls.get(),
+        0,
+        "tier (2) alone already settled it: read must not be called"
+    );
+}
+
+#[test]
+fn read_is_called_only_for_candidates_still_tied_after_lnk_and_uninstall() {
+    // Three candidates: two tied at the top (no lnk, no uninstall match) and one loser (neither).
+    // Only the two tied ones may ever be passed to `read`.
+    let d = diff(
+        &["P/tied_a.exe", "P/tied_b.exe"],
+        vec![UninstallEntry {
+            display_name: Some("Something Else".into()),
+            uninstall_string: None,
+            icon_path: Some(r"C:\P\not_a_candidate.exe".into()),
+        }],
+    );
+    let seen = std::cell::RefCell::new(Vec::new());
+    let read = |p: &str| {
+        seen.borrow_mut().push(p.to_string());
+        None
+    };
+    let result = rank(&d, &[], read, no_size);
+    let mut seen = seen.into_inner();
+    seen.sort();
+    assert_eq!(seen, ["P/tied_a.exe", "P/tied_b.exe"]);
+    assert!(matches!(result, RankResult::NeedsManualChoice(_)));
+}
+
 #[test]
 fn unambiguous_winner_via_start_menu_shortcut() {
     let d = diff(&["Program Files/App/app.exe", "Program Files/App/helper.exe"], vec![]);

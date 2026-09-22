@@ -3,23 +3,28 @@
 //!
 //! **Never guesses on a genuine tie.** Scoring is strict priority order, exactly as the plan
 //! states: (1) named by a Start Menu `.lnk`'s target > (2) named in a new `Uninstall` registry
-//! entry > (3) GUI subsystem (per `pe::analyze`) > (4) largest file size. Candidates are compared
-//! lexicographically on that 4-tuple; [`rank`] returns [`RankResult::Winner`] only when exactly
-//! one candidate reaches the highest tuple value. Anything else — several candidates tied at the
-//! top, or no candidates at all — is [`RankResult::NeedsManualChoice`], never a silent pick (an
-//! empty diff and a genuine tie share this one variant rather than a separate `NoCandidates`: both
-//! mean the same thing to a caller, "I cannot tell you, ask the user or take `--exe`", and keeping
-//! one variant is less code for the same information — the `Vec` being empty already says which
-//! case it was).
+//! entry > (3) GUI subsystem (per `pe::analyze`) > (4) largest file size. This is applied in two
+//! narrowing stages rather than one flat 4-tuple comparison (see [`rank`]'s laziness note just
+//! below for why): first every candidate is narrowed to the top `(has_lnk, has_uninstall)` pair,
+//! then — only if more than one candidate remains — narrowed again to the top `(is_gui,
+//! file_size)` pair among THOSE. Either stage narrowing to exactly one candidate is a
+//! [`RankResult::Winner`]; anything else — several candidates still tied after both stages, or no
+//! candidates at all — is [`RankResult::NeedsManualChoice`], never a silent pick (an empty diff and
+//! a genuine tie share this one variant rather than a separate `NoCandidates`: both mean the same
+//! thing to a caller, "I cannot tell you, ask the user or take `--exe`", and keeping one variant is
+//! less code for the same information — the `Vec` being empty already says which case it was).
 //!
 //! **Byte access is injected, not read directly** (Phase 2's `doctor`/`FsProbe` style), so ranking
 //! is unit-testable without real files on disk: `read` fetches a candidate's whole bytes (used
 //! only for the GUI-subsystem check, `pe::analyze`), `size` fetches just its size (used for the
 //! file-size tie-break) — kept as two separate closures rather than one, so a caller ranking many
-//! large candidates is never forced to read a whole file just to compare sizes; only the winning
-//! tier's candidates end up read at all, and only for the subsystem check. Both take the exact
-//! `InstallDiff::new_files` path string; a real caller's closures join it onto the app's actual
-//! `drive_c` themselves.
+//! large candidates is never forced to read a whole file just to compare sizes. `read` is also
+//! evaluated LAZILY, one tier at a time: the (1) `.lnk` and (2) Uninstall-entry signals need no
+//! I/O at all, so they are computed for every candidate first; `read`/`pe::analyze` (3) is then
+//! called ONLY for the candidates still tied after (1) and (2) — an installer naming its own
+//! executable in a `.lnk` or an Uninstall entry, among 50 other `.exe`s it also wrote, costs zero
+//! calls to `read` for any of them, not 50. Both closures take the exact `InstallDiff::new_files`
+//! path string; a real caller's closures join it onto the app's actual `drive_c` themselves.
 //!
 //! **Candidates** are the entries of `InstallDiff::new_files` whose extension is `.exe`
 //! (case-insensitive) — the only kind of file this ranking is ever asked to choose among (a
@@ -54,11 +59,6 @@ pub enum RankResult {
     Winner(Candidate),
     NeedsManualChoice(Vec<Candidate>),
 }
-
-/// The exact, lossless tie-break order: compared as a tuple, greatest wins. `file_size` carries
-/// its real magnitude (unlike `Candidate::score`'s single bit for it), so two candidates of
-/// different sizes are never mistaken for a tie.
-type RankKey = (bool, bool, bool, u64);
 
 fn is_exe(path: &str) -> bool {
     path.rsplit('.')
@@ -100,8 +100,30 @@ fn uninstall_haystacks(diff: &InstallDiff) -> Vec<(Option<String>, String)> {
         .collect()
 }
 
+/// A candidate after the no-I/O tiers (1)/(2) have been scored, before (3)/(4) are even looked at.
+struct Partial {
+    path: String,
+    has_lnk: bool,
+    has_uninstall: bool,
+    uninstall_name: Option<String>,
+}
+
+fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
+    let bits = (u32::from(p.has_lnk) << 3)
+        | (u32::from(p.has_uninstall) << 2)
+        | (u32::from(is_gui) << 1)
+        | u32::from(file_size > 0);
+    Candidate {
+        path: p.path,
+        name: p.uninstall_name,
+        icon: None,
+        score: bits,
+    }
+}
+
 /// Ranks the `.exe` candidates in `diff.new_files`. See the module doc for the priority order, the
-/// injected `read`/`size` closures, and exactly what counts as a candidate.
+/// injected `read`/`size` closures (and exactly when `read` is and is not called), and exactly
+/// what counts as a candidate.
 pub fn rank(
     diff: &InstallDiff,
     shortcuts: &[ShellLink],
@@ -111,43 +133,76 @@ pub fn rank(
     let lnk_targets = lnk_targets(shortcuts);
     let uninstall = uninstall_haystacks(diff);
 
-    let mut scored: Vec<(Candidate, RankKey)> = diff
+    // Tiers (1) and (2): no I/O, computed for every candidate.
+    let mut partials: Vec<Partial> = diff
         .new_files
         .iter()
         .filter(|p| is_exe(p))
         .map(|path| {
             let lower = path.to_lowercase();
-            let has_lnk = lnk_targets.contains(&lower);
             let uninstall_match = uninstall.iter().find(|(_, haystack)| haystack.contains(&lower));
-            let has_uninstall = uninstall_match.is_some();
-            let is_gui = read(path)
-                .and_then(|bytes| pe::analyze(&bytes).ok())
-                .is_some_and(|info| info.subsystem == pe::Subsystem::Gui);
-            let file_size = size(path).unwrap_or(0);
-
-            let bits = (u32::from(has_lnk) << 3)
-                | (u32::from(has_uninstall) << 2)
-                | (u32::from(is_gui) << 1)
-                | u32::from(file_size > 0);
-            let candidate = Candidate {
+            Partial {
                 path: path.clone(),
-                name: uninstall_match.and_then(|(name, _)| name.clone()),
-                icon: None,
-                score: bits,
-            };
-            (candidate, (has_lnk, has_uninstall, is_gui, file_size))
+                has_lnk: lnk_targets.contains(&lower),
+                has_uninstall: uninstall_match.is_some(),
+                uninstall_name: uninstall_match.and_then(|(name, _)| name.clone()),
+            }
         })
         .collect();
 
-    let Some(&(_, top)) = scored.iter().max_by_key(|(_, key)| *key) else {
+    if partials.is_empty() {
         return RankResult::NeedsManualChoice(Vec::new());
-    };
-    scored.retain(|(_, key)| *key == top);
-    let mut winners: Vec<Candidate> = scored.into_iter().map(|(c, _)| c).collect();
+    }
+    let top_pair = partials
+        .iter()
+        .map(|p| (p.has_lnk, p.has_uninstall))
+        .max()
+        .expect("partials is non-empty");
+    partials.retain(|p| (p.has_lnk, p.has_uninstall) == top_pair);
+
+    // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never
+    // called for it, or for any candidate it already beat. `size` is still fetched (a stat, not a
+    // full read) so `Candidate.score`'s size bit stays accurate even in this early-exit path.
+    if partials.len() == 1 {
+        let winner = partials.pop().expect("len checked");
+        let file_size = size(&winner.path).unwrap_or(0);
+        return RankResult::Winner(to_candidate(winner, false, file_size));
+    }
+
+    // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never
+    // called for it, or for any candidate it already beat. `size` is still fetched (a stat, not a
+    // full read) so `Candidate.score`'s size bit stays accurate even in this early-exit path.
+    // Tier (3): only the candidates still tied after (1)/(2) are ever read.
+    let scored: Vec<(Partial, bool, u64)> = partials
+        .into_iter()
+        .map(|p| {
+            let is_gui = read(&p.path)
+                .and_then(|bytes| pe::analyze(&bytes).ok())
+                .is_some_and(|info| info.subsystem == pe::Subsystem::Gui);
+            let file_size = size(&p.path).unwrap_or(0);
+            (p, is_gui, file_size)
+        })
+        .collect();
+
+    let top_key: (bool, u64) = scored
+        .iter()
+        .map(|(_, gui, sz)| (*gui, *sz))
+        .max()
+        .expect("scored is non-empty");
+    let mut winners: Vec<(Partial, bool, u64)> = scored
+        .into_iter()
+        .filter(|(_, gui, sz)| (*gui, *sz) == top_key)
+        .collect();
     if winners.len() == 1 {
-        RankResult::Winner(winners.pop().expect("len checked"))
+        let (p, gui, sz) = winners.pop().expect("len checked");
+        RankResult::Winner(to_candidate(p, gui, sz))
     } else {
-        RankResult::NeedsManualChoice(winners)
+        RankResult::NeedsManualChoice(
+            winners
+                .into_iter()
+                .map(|(p, gui, sz)| to_candidate(p, gui, sz))
+                .collect(),
+        )
     }
 }
 
