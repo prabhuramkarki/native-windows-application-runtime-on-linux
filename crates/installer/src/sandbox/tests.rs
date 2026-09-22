@@ -36,6 +36,13 @@ fn finalized(program: &str) -> Command {
     c
 }
 
+fn network_opts(allow_network: bool) -> SandboxOpts {
+    SandboxOpts {
+        allow_network,
+        ..Default::default()
+    }
+}
+
 // ------------------------------------------------------------------------------ argv-builder (no bwrap run)
 
 #[test]
@@ -47,13 +54,14 @@ fn the_exact_argv_for_a_typical_command() {
     cmd.env("WINEPREFIX", env.prefix());
     cmd.current_dir(env.drive_c());
 
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts { allow_network: false });
+    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(false));
 
     assert_eq!(out.get_program(), "/usr/bin/bwrap");
     let prefix = env.prefix();
     let home = env.root().join("runtime/home");
     let want: Vec<OsString> = [
         "--die-with-parent",
+        "--new-session",
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
@@ -105,10 +113,41 @@ fn allow_network_true_omits_unshare_net_and_false_includes_it() {
     let (_tmp, env) = fx();
     for (allow, expect_present) in [(false, true), (true, false)] {
         let cmd = finalized("/bin/true");
-        let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts { allow_network: allow });
+        let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow));
         let has_flag = out.get_args().any(|a| a == OsStr::new("--unshare-net"));
         assert_eq!(has_flag, expect_present, "allow_network={allow}");
     }
+}
+
+#[test]
+fn new_session_is_always_present() {
+    let (_tmp, env) = fx();
+    let cmd = finalized("/bin/true");
+    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    assert!(out.get_args().any(|a| a == OsStr::new("--new-session")));
+}
+
+#[test]
+fn extra_ro_binds_are_emitted_after_the_fixed_set_with_ro_bind_try() {
+    let (_tmp, env) = fx();
+    let cmd = finalized("/bin/true");
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![PathBuf::from("/opt/wine-stable")],
+        ..Default::default()
+    };
+    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &opts);
+    let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let extra = args
+        .windows(3)
+        .position(|w| w == ["--ro-bind-try", "/opt/wine-stable", "/opt/wine-stable"])
+        .unwrap_or_else(|| panic!("extra RO bind not found: {args:?}"));
+    let last_fixed = args
+        .windows(3)
+        .position(|w| w == ["--ro-bind-try", "/etc/alternatives", "/etc/alternatives"])
+        .unwrap();
+    let prefix_bind = args.iter().position(|a| a == "--bind").unwrap();
+    assert!(extra > last_fixed, "{args:?}");
+    assert!(extra < prefix_bind, "{args:?}");
 }
 
 #[test]
@@ -199,6 +238,63 @@ fn with_no_current_dir_set_the_wrapped_command_also_sets_none() {
     assert_eq!(out.get_current_dir(), None);
 }
 
+#[test]
+fn when_home_is_an_ancestor_of_the_prefix_the_home_tmpfs_is_mounted_first() {
+    // Regression test for a real, reproduced bug: if the two binds were always emitted in a fixed order (prefix
+    // bind, then $HOME tmpfs), and a caller's HOME happened to be `prefix` itself or a directory above it, the
+    // later, broader tmpfs mount would silently swallow the earlier, narrower prefix bind (verified against
+    // real bwrap 0.11.1 before writing this test).
+    let (_tmp, env) = fx();
+    let ancestor = env.root(); // a strict ancestor of env.prefix() == env.root().join("prefix")
+    let mut cmd = finalized("/bin/true");
+    cmd.env("HOME", ancestor);
+    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let tmpfs_home = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == ancestor.to_str().unwrap())
+        .unwrap_or_else(|| panic!("{args:?}"));
+    let prefix_bind = args.iter().position(|a| a == "--bind").unwrap();
+    assert!(
+        tmpfs_home < prefix_bind,
+        "tmpfs(home) must precede bind(prefix): {args:?}"
+    );
+}
+
+#[test]
+fn when_home_equals_the_prefix_exactly_the_prefix_bind_still_wins() {
+    let (_tmp, env) = fx();
+    let mut cmd = finalized("/bin/true");
+    cmd.env("HOME", env.prefix());
+    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    let tmpfs_home = args
+        .windows(2)
+        .position(|w| w[0] == "--tmpfs" && w[1] == env.prefix().to_str().unwrap())
+        .unwrap();
+    let prefix_bind = args.iter().position(|a| a == "--bind").unwrap();
+    assert!(tmpfs_home < prefix_bind, "{args:?}");
+}
+
+#[test]
+fn real_sandbox_prefix_is_not_shadowed_when_home_is_an_ancestor_of_it() {
+    // The end-to-end version of the two ordering tests above, against real bwrap: even in the previously-buggy
+    // configuration (HOME set to a directory above the prefix), the prefix's own real content stays visible
+    // and writable.
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = fx();
+    fs::write(env.prefix().join("f.txt"), "prefix-data").unwrap();
+
+    let launcher = sandboxed_launcher(&bwrap, &env, SandboxOpts::default());
+    let mut cmd = Command::new("/usr/bin/sh");
+    cmd.arg("-c").arg(format!("cat {}/f.txt", env.prefix().display()));
+    cmd.env("HOME", env.root()); // a strict ancestor of env.prefix()
+    let out = launcher.run_helper(cmd, Duration::from_secs(10)).unwrap();
+
+    assert!(out.status.success(), "{:?}", out.output);
+    assert_eq!(String::from_utf8_lossy(&out.output), "prefix-data");
+}
+
 // ------------------------------------------------------------------------------ bwrap discovery (no filesystem)
 
 #[test]
@@ -224,10 +320,22 @@ fn find_bwrap_is_none_without_a_match_or_without_path() {
 // ------------------------------------------------------------------------------ real bwrap execution
 
 /// `Some(path)` if a real `bwrap` is on `$PATH`; otherwise prints why the real-sandbox tests are skipped
-/// (loudly, per the plan: never a silent `#[ignore]`).
+/// (loudly, per the plan: never a silent `#[ignore]`) and returns `None` so the caller does an early `return`
+/// (the test then still reports as passed — `cargo test` has no "skipped" outcome for a plain `#[test]`).
+///
+/// `cargo test` swallows the stderr of a passing test, so on a machine without `bwrap` the "loud" skip above is
+/// actually invisible, and these tests report green while testing nothing. Setting `RUNTIME_REQUIRE_BWRAP=1`
+/// (same `RUNTIME_*` naming as `RUNTIME_WINE`/`RUNTIME_DATA_DIR` elsewhere in this codebase) turns that into a
+/// hard failure instead, so CI can opt into "these tests MUST really run"; local dev machines that may lack
+/// `bwrap` keep today's default (unset: skip and pass).
 fn require_real_bwrap() -> Option<PathBuf> {
     match find_bwrap_on_path() {
         Some(p) => Some(p),
+        None if std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty()) => {
+            panic!(
+                "bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set: the real-sandbox tests must run for real"
+            );
+        }
         None => {
             eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox tests need bubblewrap installed");
             None
@@ -344,7 +452,7 @@ fn real_sandbox_network_is_unshared_by_default_and_shared_when_allowed() {
     // metacharacter risk (the host/port are literal, not interpolated from untrusted input).
     let probe = format!(r#"exec 3<>/dev/tcp/127.0.0.1/{port} && echo CONNECTED || echo FAILED"#);
 
-    let denied = sandboxed_launcher(&bwrap, &env, SandboxOpts { allow_network: false });
+    let denied = sandboxed_launcher(&bwrap, &env, network_opts(false));
     let mut cmd = Command::new("/usr/bin/bash");
     cmd.arg("-c").arg(&probe);
     let out = denied.run_helper(cmd, Duration::from_secs(10)).unwrap();
@@ -354,7 +462,7 @@ fn real_sandbox_network_is_unshared_by_default_and_shared_when_allowed() {
         out.output
     );
 
-    let allowed = sandboxed_launcher(&bwrap, &env, SandboxOpts { allow_network: true });
+    let allowed = sandboxed_launcher(&bwrap, &env, network_opts(true));
     let mut cmd = Command::new("/usr/bin/bash");
     cmd.arg("-c").arg(&probe);
     let out = allowed.run_helper(cmd, Duration::from_secs(10)).unwrap();
