@@ -124,12 +124,73 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
   and HTML-embedding programs fail until Phase 4 provides a dependency mechanism. `doctor` warns about .NET.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
 
+## Installer sandbox (Phase 3 Task 5)
+
+`rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
+through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
+not to Wine app runs in general**: a plain `runtime run` still has none of this (the "What Phase 2 does NOT do"
+list above is still the truth for it) until a later phase attaches a sandbox to every app's `Launcher`, not
+just the installer's. It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
+`Sandbox` trait a `Launcher` can optionally carry, rather than a hard-coded identity function), so a sandboxed
+run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::spawn` path.
+
+**The profile**, verified against a real `bwrap` (bubblewrap 0.11.1) in `crates/installer/src/sandbox/tests.rs`:
+- The app's own `prefix` (which contains `drive_c`) is bound read-write, at the same path. Nothing else on the
+  real filesystem is bound: no `Downloads`, no other app's data, no arbitrary host path.
+- `/usr`, `/lib`, `/lib64`, `/etc/alternatives` are bound read-only (a fixed, documented set a system Wine
+  package needs to run at all — not a walk of its actual shared-library dependency closure, and not everything
+  under `/`; a distro without one of these directories just does not get it, `--ro-bind-try`).
+- `$HOME` is never the real one: an empty `tmpfs` stands in for whatever the finalized command's own `HOME` is
+  (real bwrap test: the directory exists and is empty, a canary file placed at the real `$HOME` cannot be read).
+- A private, empty `/tmp` (`tmpfs`), a fresh `/proc` and a fresh `/dev` (never `--dev-bind`, which would hand
+  over the host's real device nodes).
+- A fresh PID, UTS and IPC namespace.
+- The network namespace is unshared (`--unshare-net`) unless the caller sets `allow_network` — Phase 3's own
+  target is offline-only installers; an installer that needs to fetch a redistributable is Phase 4's problem.
+  Real bwrap test: a loopback TCP connect to a listener on the host succeeds only when `allow_network` is set (a
+  DNS-based probe was deliberately not used — this sandbox does not bind `/etc/resolv.conf` or
+  `/etc/nsswitch.conf` either, so name resolution would fail for a reason unrelated to the network namespace).
+- `--die-with-parent`: a sandboxed helper cannot outlive the runtime process that started it.
+
+**What this narrows.** An installer running under it cannot read or write anything on the host outside its own
+app directory (verified: a write attempt outside the prefix fails and leaves nothing on the real filesystem),
+cannot see the real user's home, other apps' data or arbitrary host paths, and (by default) has no network at
+all, not even loopback to the host.
+
+**What this does NOT stop** — read this before trusting it as "the app is contained":
+- **Same uid, no user namespace remapping.** The sandboxed process runs as the same Linux user as everything
+  else; anything that same uid can reach OUTSIDE the mount namespace bwrap builds (signals to other processes of
+  that uid, `/proc/<pid>` of a process outside the fresh PID namespace it cannot even see, System V IPC objects
+  outside the fresh IPC namespace, D-Bus/X11/PulseAudio sockets if a caller ever passed those environment
+  variables through) is still reachable exactly as any other process of that user would reach it. This profile
+  does not pass `DISPLAY`/`PULSE_SERVER`/D-Bus variables itself, but it does not strip them either if they were
+  already on the finalized command's env — Task 6 must not put them there for a headless installer.
+- **No seccomp filter, no Landlock, no capability drop, no resource limits (cgroups, rlimits).** A sandboxed
+  process still has every syscall a normal process has inside its namespaces; a kernel exploit or a namespace
+  escape is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
+  whatever privilege unprivileged user namespaces (or its setuid bit) give it on this machine.
+- **What is bound read-only is still a real, current copy of `/usr` et al.** and could itself contain something
+  exploitable already on the host; this profile does not vet, pin or checksum it.
+- **The app's own prefix is fully read-write**, on purpose (installers write there) — a malicious installer can
+  still plant anything it wants inside its own prefix, corrupt its own registry hives, or write a `.lnk`/`.exe`
+  that a LATER, unsandboxed `runtime run` of that same app would execute. The sandbox boundary is the real
+  filesystem outside the app, not "this installer cannot do anything bad to this app".
+- **No output/resource caps of its own.** `run_helper`'s own timeout and capped-output rules still apply (they
+  are `Launcher`'s, not the sandbox's), but the sandbox adds no additional CPU, memory or disk-space limit; a
+  hostile installer can still fill disk inside its own prefix or spin the CPU until the helper's timeout fires.
+- **TOCTOU on the bound paths.** Same caveat as the rest of this document: nothing here uses `openat2` path
+  confinement: what is real at the moment `bwrap` sets up its mounts is what gets bound.
+- **Not yet wired into any real installer run.** Task 5 only builds and tests the sandbox and the `Launcher`
+  seam; nothing in `runtime install`/`run` calls it yet (that is Task 6). Until then this section describes
+  what the primitive does when used, not something the CLI already does.
+
 ## Roadmap
 
-Phase 5 adds the actual boundary: run Wine inside bubblewrap (mount and PID namespaces, a private filesystem
-view without the host), Landlock rules as a second layer where bubblewrap is unavailable, and a seccomp filter,
-with the network and device access decided per app. The `Launcher::wrap` hook in `rt_core` is the seam
-prepared for it (an identity function today). Until then, this document is the truth and the README says the
+Phase 5 adds the actual boundary for ordinary app runs, not just installer helpers: run Wine itself inside
+bubblewrap (mount and PID namespaces, a private filesystem view without the host), Landlock rules as a second
+layer where bubblewrap is unavailable, and a seccomp filter, with the network and device access decided per
+app. The `Launcher::wrap` hook in `rt_core` — now a `Sandbox` trait a `Launcher` can carry, per the installer
+sandbox above — is the seam prepared for it. Until then, this document is the truth and the README says the
 same.
 
 ## Reporting

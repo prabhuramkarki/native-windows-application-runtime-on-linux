@@ -27,7 +27,7 @@ pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
 pub use fake::{Call, FakeBackend};
 pub use id::{AppId, IdError};
 pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, install, read_input};
-pub use launch::{Finished, LaunchError, Launcher, LogSink, Running};
+pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{BackendInfo, MetaError, Metadata};
 pub use proc::{HelperOutput, RunError};
 pub use run::{

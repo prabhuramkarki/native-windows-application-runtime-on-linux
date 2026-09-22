@@ -7,10 +7,12 @@ mod discover;
 mod family;
 mod lnk;
 mod reg;
+mod sandbox;
 mod snapshot;
 
 pub use discover::{Candidate, RankResult, rank};
 pub use family::{InstallerFamily, PlanError, Program, RunPlan, SilentFlags, plan, silent_flags};
 pub use lnk::{LnkError, ShellLink};
 pub use reg::{RegError, RegKey, RegValue, WineReg};
+pub use sandbox::{InstallerSandbox, RO_BINDS, SandboxOpts, find_bwrap, find_bwrap_on_path};
 pub use snapshot::{InstallDiff, Snapshot, UninstallEntry};
