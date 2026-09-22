@@ -415,6 +415,128 @@ pub fn rsrc_version_langs(base: u32, langs: &[(u32, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// A general three-level PE resource section (Type -> ID -> Language), built from raw `(type_id,
+/// id, lang_id, data)` tuples grouped automatically by type then by id. `rsrc_version_langs`
+/// above only ever builds one type (RT_VERSION); this is the same shape generalised to several
+/// types/ids at once, which Task 3's RT_GROUP_ICON + RT_ICON tests need together in one section.
+/// `base` is the section's RVA (wire with `.dir(2, base, len)`).
+pub fn rsrc_multi(base: u32, entries: &[(u16, u16, u16, &[u8])]) -> Vec<u8> {
+    let mut types: Vec<u16> = Vec::new();
+    for &(t, _, _, _) in entries {
+        if !types.contains(&t) {
+            types.push(t);
+        }
+    }
+    let ids_of = |t: u16| -> Vec<u16> {
+        let mut v = Vec::new();
+        for &(et, id, _, _) in entries {
+            if et == t && !v.contains(&id) {
+                v.push(id);
+            }
+        }
+        v
+    };
+    let langs_of = |t: u16, id: u16| -> Vec<(u16, &[u8])> {
+        entries
+            .iter()
+            .filter(|&&(et, eid, _, _)| et == t && eid == id)
+            .map(|&(_, _, l, d)| (l, d))
+            .collect()
+    };
+    let dir_hdr = |count: u16| Bytes::default().u32(0).u32(0).u16(0).u16(0).u16(0).u16(count);
+
+    let root_size = 16 + 8 * types.len();
+    let mut off = root_size;
+    let mut type_dir_off = Vec::new();
+    for &t in &types {
+        type_dir_off.push(off);
+        off += 16 + 8 * ids_of(t).len();
+    }
+    let mut id_dir_off: Vec<Vec<usize>> = Vec::new();
+    for &t in &types {
+        let mut per_id = Vec::new();
+        for &id in &ids_of(t) {
+            per_id.push(off);
+            off += 16 + 8 * langs_of(t, id).len();
+        }
+        id_dir_off.push(per_id);
+    }
+    // `off` here (before the data-entry array itself is laid out) is where the last directory
+    // level ends: the checkpoint the emission loops below are asserted against.
+    let dirs_end = off;
+    let mut data_entry_off: Vec<Vec<Vec<usize>>> = Vec::new();
+    for &t in &types {
+        let mut per_id = Vec::new();
+        for &id in &ids_of(t) {
+            let mut per_lang = Vec::new();
+            for _ in &langs_of(t, id) {
+                per_lang.push(off);
+                off += 16;
+            }
+            per_id.push(per_lang);
+        }
+        data_entry_off.push(per_id);
+    }
+    let data_start = off; // where the raw resource bytes begin, after every IMAGE_RESOURCE_DATA_ENTRY
+
+    let mut out = dir_hdr(types.len() as u16).0;
+    for (ti, &t) in types.iter().enumerate() {
+        out.extend(
+            Bytes::default()
+                .u32(u32::from(t))
+                .u32(0x8000_0000 | type_dir_off[ti] as u32)
+                .0,
+        );
+    }
+    for (ti, &t) in types.iter().enumerate() {
+        let ids = ids_of(t);
+        out.extend(dir_hdr(ids.len() as u16).0);
+        for (ii, &id) in ids.iter().enumerate() {
+            out.extend(
+                Bytes::default()
+                    .u32(u32::from(id))
+                    .u32(0x8000_0000 | id_dir_off[ti][ii] as u32)
+                    .0,
+            );
+        }
+    }
+    for (ti, &t) in types.iter().enumerate() {
+        for (ii, &id) in ids_of(t).iter().enumerate() {
+            let langs = langs_of(t, id);
+            out.extend(dir_hdr(langs.len() as u16).0);
+            for (li, &(lang, _)) in langs.iter().enumerate() {
+                out.extend(
+                    Bytes::default()
+                        .u32(u32::from(lang))
+                        .u32(data_entry_off[ti][ii][li] as u32)
+                        .0,
+                );
+            }
+        }
+    }
+    assert_eq!(out.len(), dirs_end, "directory layout arithmetic is self-consistent");
+    let mut running = data_start as u32;
+    let mut all_data = Vec::new();
+    for &t in &types {
+        for &id in &ids_of(t) {
+            for &(_, data) in &langs_of(t, id) {
+                out.extend(
+                    Bytes::default()
+                        .u32(base + running)
+                        .u32(data.len() as u32)
+                        .u32(0)
+                        .u32(0)
+                        .0,
+                );
+                all_data.extend_from_slice(data);
+                running += data.len() as u32;
+            }
+        }
+    }
+    out.extend(all_data);
+    out
+}
+
 pub fn words(w: &[u16]) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }

@@ -36,7 +36,7 @@ pub fn analyze(bytes: &[u8]) -> Result<PeInfo, Error> {
 /// pelite checks alignment against the RVA, not the real file offset. If a section's raw
 /// pointer and RVA disagree mod 8, it would return misaligned references (UB) for tables in
 /// that section. Real linkers never produce this; corrupted or hostile files do.
-fn check_layout(file: &PeFile<'_>) -> Result<(), Error> {
+pub(crate) fn check_layout(file: &PeFile<'_>) -> Result<(), Error> {
     let bad = file
         .section_headers()
         .iter()
@@ -49,19 +49,22 @@ fn check_layout(file: &PeFile<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-struct Aligned {
+/// An 8-byte-aligned owned copy of a byte slice, for handing to pelite (which dereferences straight
+/// into the buffer it is given). `pub(crate)`: also used by `icon`, which needs the same alignment
+/// dance around its own call into `Resources`.
+pub(crate) struct Aligned {
     words: Vec<u64>,
     len: usize,
 }
 
 impl Aligned {
-    fn new(src: &[u8]) -> Self {
+    pub(crate) fn new(src: &[u8]) -> Self {
         let mut words = vec![0u64; src.len().div_ceil(8)];
         // SAFETY: `words` owns at least `src.len()` initialised bytes; u8 has no alignment needs.
         unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), src.len()) }.copy_from_slice(src);
         Self { words, len: src.len() }
     }
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         // SAFETY: same buffer as above, shared borrow.
         unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
     }
