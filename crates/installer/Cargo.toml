@@ -9,5 +9,9 @@ rust-version.workspace = true
 name = "rt_installer"
 
 [dependencies]
+runtime-core = { path = "../core" }
 runtime-pe = { path = "../pe" }
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

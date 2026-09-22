@@ -413,7 +413,9 @@ dependencies = [
 name = "runtime-installer"
 version = "0.0.1"
 dependencies = [
+ "runtime-core",
  "runtime-pe",
+ "tempfile",
  "thiserror",
 ]
 

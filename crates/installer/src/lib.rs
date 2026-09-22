@@ -4,5 +4,9 @@
 //! should pass to run an installer, silent or not; it never runs anything itself.
 
 mod family;
+mod reg;
+mod snapshot;
 
 pub use family::{InstallerFamily, PlanError, Program, RunPlan, SilentFlags, plan, silent_flags};
+pub use reg::{RegError, RegKey, RegValue, WineReg};
+pub use snapshot::{InstallDiff, Snapshot, UninstallEntry};
