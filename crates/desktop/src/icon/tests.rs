@@ -22,7 +22,7 @@ fn hello64_icon_is_returned_unchanged_at_every_requested_size() {
     // bytes back, unchanged (PNG passthrough, no re-encoding).
     let entries = pe::find_group_icon(&pe_bytes).unwrap().unwrap();
     let raw = pe::icon_bytes(&pe_bytes, entries[0].id).unwrap().unwrap();
-    assert!(raw.starts_with(PNG_MAGIC));
+    assert!(raw.starts_with(PNG_SIGNATURE));
     for (size, png) in &result {
         assert_eq!(png, &raw, "size {size}");
     }
@@ -297,11 +297,58 @@ fn decodes_a_24bpp_dib_using_the_and_mask_for_alpha() {
     assert_eq!(&rgba[4..8], &[40, 50, 60, 0]);
 }
 
+fn fake_png(width: u32, height: u32) -> Vec<u8> {
+    let mut b = PNG_SIGNATURE.to_vec();
+    b.extend_from_slice(&13u32.to_be_bytes()); // IHDR chunk length (not inspected, only the type/dims are)
+    b.extend_from_slice(b"IHDR");
+    b.extend_from_slice(&width.to_be_bytes());
+    b.extend_from_slice(&height.to_be_bytes());
+    b.extend_from_slice(b"whatever follows is never inspected here");
+    b
+}
+
 #[test]
-fn png_magic_is_passed_through_unchanged() {
-    let mut fake_png = PNG_MAGIC.to_vec();
-    fake_png.extend_from_slice(b"whatever follows is never inspected here");
-    assert_eq!(to_png(&fake_png), Some(fake_png.clone()));
+fn well_formed_png_with_valid_dimensions_is_passed_through_unchanged() {
+    let png = fake_png(32, 32);
+    assert_eq!(to_png(&png), Some(png.clone()));
+}
+
+/// The decompression-bomb guard this finding asked for: a PNG's own byte size says nothing about
+/// the pixel buffer a real decoder would need for the dimensions it declares, so a PNG-in-ICO
+/// entry claiming an absurd width/height must be rejected before being passed through, exactly
+/// like an oversized DIB is rejected before being decoded.
+#[test]
+fn png_declaring_oversized_dimensions_is_rejected_not_passed_through() {
+    for (w, h) in [(100_000u32, 32u32), (32, 100_000), (300, 300)] {
+        let png = fake_png(w, h);
+        assert_eq!(to_png(&png), None, "w={w} h={h}");
+    }
+}
+
+#[test]
+fn png_with_zero_width_or_height_is_rejected() {
+    assert_eq!(to_png(&fake_png(0, 32)), None);
+    assert_eq!(to_png(&fake_png(32, 0)), None);
+}
+
+#[test]
+fn png_signature_whose_first_chunk_is_not_ihdr_is_rejected() {
+    let mut b = PNG_SIGNATURE.to_vec();
+    b.extend_from_slice(&13u32.to_be_bytes());
+    b.extend_from_slice(b"IDAT"); // not the mandatory first chunk
+    b.extend_from_slice(&32u32.to_be_bytes());
+    b.extend_from_slice(&32u32.to_be_bytes());
+    assert_eq!(to_png(&b), None);
+}
+
+#[test]
+fn truncated_png_header_is_rejected_not_a_panic() {
+    let full = fake_png(32, 32);
+    for n in 0..24 {
+        let r = std::panic::catch_unwind(|| to_png(&full[..n]));
+        assert!(r.is_ok(), "panicked at prefix {n}");
+        assert_eq!(r.unwrap(), None, "prefix {n} is not a complete IHDR");
+    }
 }
 
 /// 300x300 is over hicolor's 256 maximum, but this DIB carries every byte a real 300x300 32bpp

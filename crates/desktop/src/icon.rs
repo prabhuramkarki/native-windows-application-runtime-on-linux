@@ -20,10 +20,17 @@
 //! **Decoding.** An ICO "image" entry is either a raw PNG stream (common for a 256x256 entry, and
 //! in practice for smaller ones too — real encoders vary) or an uncompressed DIB (a
 //! `BITMAPINFOHEADER` followed by XOR color data and a 1bpp AND transparency mask, with NO
-//! `BITMAPFILEHEADER`, per the ICO format). PNG is detected by its magic bytes and passed through
-//! byte-for-byte, never re-encoded. A DIB is decoded and re-encoded as PNG with the `png` crate
-//! (MIT OR Apache-2.0; not hand-rolled, per the project's own stance on vetted format crates —
-//! see `docs/THIRD_PARTY.md`).
+//! `BITMAPFILEHEADER`, per the ICO format). A PNG stream is verified by its full 8-byte signature
+//! (not just the first 4 magic bytes) and its mandatory first chunk's declared `IHDR`
+//! width/height (read directly at their fixed offsets — no PNG-decoding dependency is pulled in
+//! just for this bounds check, matching Phase 1's `unzip`/`version.rs` precedent of validating a
+//! format's own header fields before trusting anything past them) capped the same as a DIB's; a
+//! PNG declaring an oversized width/height is a possible decompression bomb (its actual byte size
+//! says nothing about the pixel buffer a later, real decoder would need to allocate) and is
+//! rejected for that reason, not decoded, not passed through. A PNG that passes both checks is
+//! passed through byte-for-byte, never re-encoded. A DIB is decoded and re-encoded as PNG with the
+//! `png` crate (MIT OR Apache-2.0; not hand-rolled, per the project's own stance on vetted format
+//! crates — see `docs/THIRD_PARTY.md`).
 //!
 //! ponytail: only 24bpp and 32bpp uncompressed (`BI_RGB`) DIBs are decoded — real icon resources
 //! built by any current toolchain are one of these two (or already PNG); older 1/4/8bpp palette
@@ -37,17 +44,21 @@
 //! already far under the stated 16 MiB single-icon allocation ceiling, so this one check enforces
 //! both. Every subsequent slice access is a checked `.get(..)`, never raw indexing, so a `biSize`,
 //! row stride or mask offset that does not fit the actual bytes present is an `Err` for that size,
-//! never a panic or an out-of-bounds read.
+//! never a panic or an out-of-bounds read. The same 256x256 cap applies to a PNG-in-ICO entry's
+//! own declared `IHDR` dimensions, checked before the bytes are accepted at all (see `to_png`).
 use std::io::Cursor;
 
-/// hicolor's own maximum edge length; also this module's cap on a DIB's declared dimensions.
+/// hicolor's own maximum edge length; also this module's cap on a DIB's or PNG's declared
+/// dimensions.
 const MAX_EDGE: u32 = 256;
 /// Never allocate more than this for one icon's decoded RGBA buffer. 256x256x4 = 262 144 bytes,
 /// comfortably under this; the check exists so the *reason* a huge declared size is rejected is
 /// documented and tested independently of the 256-edge cap happening to imply it.
 const MAX_ALLOC_BYTES: usize = 16 * 1024 * 1024;
 
-const PNG_MAGIC: &[u8] = b"\x89PNG";
+/// The complete PNG signature ([PNG] 5.2): the first 8 bytes of every valid PNG stream. `to_png`
+/// requires all 8 (not just the leading `\x89PNG` magic) before it will even look at `IHDR`.
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 /// Why the WHOLE call failed (see the module doc for what does, and does not, reach this — most
 /// failures instead just leave one requested size absent from the result).
@@ -96,19 +107,43 @@ pub fn extract_icon_png(pe_bytes: &[u8], sizes: &[u32]) -> Result<Vec<(u32, Vec<
     Ok(out)
 }
 
-/// Returns `raw` unchanged if it is already a PNG stream, otherwise decodes it as an ICO DIB entry
-/// and re-encodes as PNG. `None`: unusable (truncated, hostile dimensions, or an unsupported bit
-/// depth) — never a panic.
+/// Returns `raw` unchanged if it is a PNG stream whose own declared dimensions fit the hicolor cap,
+/// otherwise decodes it as an ICO DIB entry and re-encodes as PNG. `None`: unusable (not a real PNG
+/// signature, a PNG declaring oversized dimensions, truncated/hostile DIB dimensions, or an
+/// unsupported bit depth) — never a panic.
 fn to_png(raw: &[u8]) -> Option<Vec<u8>> {
-    if raw.starts_with(PNG_MAGIC) {
-        return Some(raw.to_vec());
+    if raw.starts_with(PNG_SIGNATURE) {
+        return png_dimensions_in_bounds(raw).then(|| raw.to_vec());
     }
     let (width, height, rgba) = decode_dib(raw)?;
     encode_png(width, height, &rgba)
 }
 
+/// Checks a PNG stream's own declared width/height (its mandatory first chunk, `IHDR`: 4-byte
+/// length, 4-byte type `"IHDR"`, then width and height as 4-byte big-endian integers — [PNG]
+/// 11.2.2) against [`MAX_EDGE`), entirely by reading fixed offsets, no PNG-decoding dependency.
+/// This is the decompression-bomb guard: a PNG's own byte size says nothing about the pixel buffer
+/// a later, real decoder would need to allocate for the dimensions it declares, so those
+/// dimensions are read and bounded here BEFORE the bytes are ever accepted as "just pass this
+/// through" — the same "check the format's own header before trusting anything past it" discipline
+/// as Phase 1's `unzip`/`version.rs`. `false` for anything that does not look like a well-formed
+/// `IHDR` at all (not just an oversized one): a PNG this module cannot even confirm the size of is
+/// treated the same as one that is too big, never passed through on faith.
+fn png_dimensions_in_bounds(raw: &[u8]) -> bool {
+    if raw.get(12..16) != Some(b"IHDR") {
+        return false;
+    }
+    let (Some(width), Some(height)) = (u32_be_at(raw, 16), u32_be_at(raw, 20)) else {
+        return false;
+    };
+    width > 0 && height > 0 && width <= MAX_EDGE && height <= MAX_EDGE
+}
+
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+fn u32_be_at(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 fn i32_at(b: &[u8], at: usize) -> Option<i32> {
     u32_at(b, at).map(|v| v as i32)
