@@ -410,6 +410,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-installer"
+version = "0.0.1"
+dependencies = [
+ "runtime-pe",
+ "thiserror",
+]
+
+[[package]]
 name = "runtime-pe"
 version = "0.0.1"
 dependencies = [
