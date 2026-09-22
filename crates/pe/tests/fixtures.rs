@@ -2,12 +2,15 @@
 use pe::{Arch, Format, ImportedFn, Kind, Subsystem};
 use std::path::PathBuf;
 
-fn load(name: &str) -> pe::PeInfo {
+fn bytes(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/build")
         .join(name);
-    let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("missing fixture {name}: run tools/build-fixtures.sh"));
-    pe::analyze(&bytes).expect("analyze fixture")
+    std::fs::read(&path).unwrap_or_else(|_| panic!("missing fixture {name}: run tools/build-fixtures.sh"))
+}
+
+fn load(name: &str) -> pe::PeInfo {
+    pe::analyze(&bytes(name)).expect("analyze fixture")
 }
 
 #[test]
@@ -54,6 +57,28 @@ fn hello32_is_pe32_x86() {
 #[test]
 fn gui64_uses_the_gui_subsystem() {
     assert_eq!(load("gui64.exe").subsystem, Subsystem::Gui);
+}
+
+/// `tools/fixtures/hello.rc` declares `IDI_ICON1 ICON "icon.ico"` (Task 3: added so
+/// `rt_desktop::icon`'s extraction has a real PE icon resource to test against, alongside its own
+/// synthetic fixtures). `tools/fixtures/icon.ico` is a Pillow-generated 32x32 icon, which Pillow
+/// happens to encode as a PNG stream (not a classic DIB) even at this size — real ICO files can
+/// carry either, and `windres` accepts both.
+#[test]
+fn hello64_carries_the_icon_resource_added_for_task_3() {
+    let bytes = bytes("hello64.exe");
+    let entries = pe::find_group_icon(&bytes).unwrap().expect("group icon resource");
+    assert_eq!(entries.len(), 1);
+    let e = entries[0];
+    assert_eq!((e.width, e.height), (32, 32));
+    let data = pe::icon_bytes(&bytes, e.id)
+        .unwrap()
+        .expect("icon data for the group's own id");
+    assert!(
+        data.starts_with(b"\x89PNG"),
+        "expected a PNG-in-ICO entry, got {:?}",
+        &data[..data.len().min(8)]
+    );
 }
 
 #[test]
