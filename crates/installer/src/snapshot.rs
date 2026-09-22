@@ -59,6 +59,12 @@ pub struct InstallDiff {
     /// `(full key path, value names)`: for a key that is new entirely, every one of its value names (the
     /// default value's name is `""`, same as [`WineReg`]); for a key that already existed, only the value names
     /// that are new. A key or value present before but removed after is NEVER reported here.
+    ///
+    /// **This detects new value NAMES only, never changed content.** A value whose name existed in `before` and
+    /// still exists in `after`, but whose content changed (a repair/upgrade overwriting an existing
+    /// `DisplayVersion`, for example), is NOT reported here at all — `diff()` only compares which names are
+    /// present in each key, never what the existing names' values equal. A caller that needs to detect a
+    /// changed-in-place value must compare `before`'s and `after`'s [`WineReg`] directly, name by name.
     pub new_registry_keys: Vec<(String, Vec<String>)>,
     /// Every `...\Software\Microsoft\Windows\CurrentVersion\Uninstall\<subkey>` key present after but not
     /// before, under either hive.
@@ -118,7 +124,10 @@ impl Snapshot {
         }
     }
 
-    /// What is in `after` but not in `before`. See [`InstallDiff`] for exactly what counts as "new".
+    /// What is in `after` but not in `before`. See [`InstallDiff`] for exactly what counts as "new". Registry
+    /// changes are detected by NAME presence only: a value name that existed in both `before` and `after` is
+    /// never reported here even if its content differs between the two — see
+    /// [`InstallDiff::new_registry_keys`]'s doc comment for exactly what that means for repair/upgrade installs.
     pub fn diff(before: &Snapshot, after: &Snapshot) -> InstallDiff {
         let before_files: HashSet<&str> = before.files.iter().map(String::as_str).collect();
         let new_files = after
@@ -146,6 +155,9 @@ impl Snapshot {
                     }
                 }
                 Some(before_key) => {
+                    // Name presence only: a name in both `before_key` and `key` is excluded here even if its
+                    // value changed (see `InstallDiff::new_registry_keys`'s doc comment) — this is not a value
+                    // equality diff.
                     let added: Vec<String> = key
                         .values
                         .keys()
