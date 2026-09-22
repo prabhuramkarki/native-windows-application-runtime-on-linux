@@ -1,0 +1,13 @@
+[package]
+name = "runtime-installer"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rt_installer"
+
+[dependencies]
+runtime-pe = { path = "../pe" }
+thiserror.workspace = true
