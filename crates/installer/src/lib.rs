@@ -3,11 +3,13 @@
 //! Pure logic only: no file I/O, no subprocess spawning. [`plan`] decides which flags a caller
 //! should pass to run an installer, silent or not; it never runs anything itself.
 
+mod discover;
 mod family;
 mod lnk;
 mod reg;
 mod snapshot;
 
+pub use discover::{Candidate, RankResult, rank};
 pub use family::{InstallerFamily, PlanError, Program, RunPlan, SilentFlags, plan, silent_flags};
 pub use lnk::{LnkError, ShellLink};
 pub use reg::{RegError, RegKey, RegValue, WineReg};
