@@ -7,6 +7,10 @@
 //!                           + sandbox hook (`wrap`)
 //! ```
 //!
+//! **Sandbox hook.** [`Launcher::wrap`] is identity unless a [`Sandbox`] was attached with
+//! [`Launcher::with_sandbox`], in which case it delegates to it. `rt_installer`'s `InstallerSandbox` is the
+//! first (Phase 3 Task 5, installer helpers only); a later phase may attach one to every app run.
+//!
 //! **Environment.** `Command::env_clear()` also forgets variables set earlier with `.env()`, so `finalize`
 //! first snapshots what the backend set, clears, applies the allowlisted host variables and only then re-applies
 //! the snapshot: backend variables always win over a host variable of the same name (a host `WINEPREFIX` can
@@ -71,11 +75,21 @@ impl LogSink {
     }
 }
 
-/// See the module docs. Cheap to clone (the filtered host environment is shared), so a backend can own one.
+/// A sandbox hook attachable to a [`Launcher`] (see [`Launcher::with_sandbox`]). Called by [`Launcher::wrap`] on
+/// the fully-finalized command (final argv, env and cwd already set): a real implementation rebuilds the
+/// program and args (e.g. `bwrap <profile> -- <program> <args>`) and carries the env/cwd over unchanged.
+pub trait Sandbox: Send + Sync {
+    fn wrap(&self, cmd: Command) -> Command;
+}
+
+/// See the module docs. Cheap to clone (the filtered host environment and the sandbox are shared), so a backend
+/// can own one.
 #[derive(Clone)]
 pub struct Launcher {
     /// The host variables a child may inherit (already filtered by [`allowed_env`]).
     host: Arc<Vec<(OsString, OsString)>>,
+    /// See [`Sandbox`]. `None` (the default): [`Launcher::wrap`] is identity.
+    sandbox: Option<Arc<dyn Sandbox>>,
 }
 
 impl Default for Launcher {
@@ -108,13 +122,26 @@ impl Launcher {
         if let Some(path) = xauth {
             kept.push((OsString::from("XAUTHORITY"), path.into_os_string()));
         }
-        Launcher { host: Arc::new(kept) }
+        Launcher {
+            host: Arc::new(kept),
+            sandbox: None,
+        }
     }
 
-    /// The sandbox hook. Identity in Phase 2 (Phase 5 wraps the command here); it runs last, on the finished
-    /// command, so a sandbox sees the final environment.
+    /// Attaches a sandbox hook (see [`Sandbox`]); a builder call, so a backend can do
+    /// `Launcher::new().with_sandbox(...)`. Replaces any sandbox attached earlier.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Launcher {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// The sandbox hook: identity unless a [`Sandbox`] is attached ([`Launcher::with_sandbox`]); it runs last, on
+    /// the finished command, so a sandbox sees the final environment.
     pub fn wrap(&self, cmd: Command) -> Command {
-        cmd
+        match &self.sandbox {
+            Some(sandbox) => sandbox.wrap(cmd),
+            None => cmd,
+        }
     }
 
     /// Applies the environment rules (module docs) and the sandbox hook. `spawn` and `run_helper` use it.
@@ -601,6 +628,55 @@ mod tests {
         assert_eq!(f.get_program(), "/bin/echo");
         assert_eq!(f.get_args().collect::<Vec<_>>(), ["x"]);
         assert_eq!(f.get_current_dir(), Some(Path::new("/tmp")));
+    }
+
+    struct PrefixSandbox;
+    impl Sandbox for PrefixSandbox {
+        fn wrap(&self, cmd: Command) -> Command {
+            let mut wrapped = Command::new("/usr/bin/env");
+            wrapped.arg("--").arg(cmd.get_program()).args(cmd.get_args());
+            for (k, v) in cmd.get_envs() {
+                match v {
+                    Some(v) => {
+                        wrapped.env(k, v);
+                    }
+                    None => {
+                        wrapped.env_remove(k);
+                    }
+                }
+            }
+            wrapped
+        }
+    }
+
+    #[test]
+    fn wrap_delegates_to_an_attached_sandbox_and_is_identity_without_one() {
+        let mut c = Command::new("/bin/echo");
+        c.arg("hi").env("K", "v");
+        let plain = Launcher::with_host_env(Vec::<(&str, &str)>::new()).wrap(c);
+        assert_eq!(plain.get_program(), "/bin/echo");
+
+        let mut c = Command::new("/bin/echo");
+        c.arg("hi").env("K", "v");
+        let sandboxed = Launcher::with_host_env(Vec::<(&str, &str)>::new())
+            .with_sandbox(Arc::new(PrefixSandbox))
+            .wrap(c);
+        assert_eq!(sandboxed.get_program(), "/usr/bin/env");
+        assert_eq!(sandboxed.get_args().collect::<Vec<_>>(), ["--", "/bin/echo", "hi"]);
+        assert_eq!(envs(&sandboxed)["K"], some("v"));
+    }
+
+    #[test]
+    fn finalize_applies_the_sandbox_after_the_env_rules() {
+        // The sandbox sees the FINAL env (host allowlist + backend vars), not the raw backend command.
+        let l = Launcher::with_host_env([("PATH", "/usr/bin")]).with_sandbox(Arc::new(PrefixSandbox));
+        let mut c = Command::new("/bin/true");
+        c.env("WINEPREFIX", "/apps/t/prefix");
+        let out = l.finalize(c);
+        assert_eq!(out.get_program(), "/usr/bin/env");
+        assert_eq!(out.get_args().collect::<Vec<_>>(), ["--", "/bin/true"]);
+        assert_eq!(envs(&out)["WINEPREFIX"], some("/apps/t/prefix"));
+        assert_eq!(envs(&out)["PATH"], some("/usr/bin"));
     }
 
     // ------------------------------------------------------------------------------ real spawns
