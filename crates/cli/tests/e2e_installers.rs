@@ -3,7 +3,7 @@
 //! `wixl`/`makensis` (`tools/build-fixtures.sh`): the Task 6/7 installer pipeline (`.msi`/`.exe`
 //! silent install, `.desktop`/icon generation, `runtime uninstall`), Phase 3 Task 8.
 //!
-//! **`#[ignore]`d**: they need Wine, `bwrap` on `$PATH`, and `hello.msi`/`hello-nsis.exe`
+//! **`#[ignore]`d**: they need Wine, `bwrap` on `$PATH`, and `hello.msi`/`hello-nsis.exe`/`hello-nsis-noshortcut.exe`
 //! (`tools/build-fixtures.sh`, which itself needs `msitools`/`wixl`/`nsis`). Run them with
 //!
 //! ```text
@@ -32,7 +32,8 @@
 //! `hello64.exe` a console one). After C1, tier (2) would have matched `UninstallString` (which names
 //! `uninstall.exe`); discovery now drops any `.exe` an `UninstallString` names from the candidate pool
 //! and matches tier (2) against `DisplayIcon` only (unit-tested in `rt_installer::discover`). This test
-//! still passes via tier (1); it does not by itself exercise the no-`.lnk` path. `--exe` is still covered by
+//! still passes via tier (1); `e2e_nsis_without_a_shortcut_auto_discovers_the_app_not_the_uninstaller`
+//! covers the no-`.lnk` path with `hello-nsis-noshortcut.exe`. `--exe` is still covered by
 //! `rt_installer`'s own `exe_override_skips_discovery_and_installs_the_named_file`.
 mod support;
 
@@ -190,6 +191,51 @@ fn e2e_nsis_silent_install_desktop_entry_run_and_uninstall() {
     );
     assert!(!icon_path.exists(), "the icon must be removed by uninstall");
 
+    rig.finish();
+}
+
+/// The no-`.lnk` discovery path, for real: `hello-nsis-noshortcut.exe` is `hello-nsis.exe` minus its Start
+/// Menu shortcut, so tier (1) cannot fire. The candidates are `hello64.exe` and `uninstall.exe` (which the
+/// Uninstall key's `UninstallString` names and whose basename is an uninstaller's): discovery must exclude
+/// the latter and record `hello64.exe`, with the registry-derived metadata present.
+#[test]
+#[ignore = "needs Wine, bwrap and nsis-built fixtures; run with --ignored --test-threads=1"]
+fn e2e_nsis_without_a_shortcut_auto_discovers_the_app_not_the_uninstaller() {
+    let rig = Rig::new();
+    let xdg = rig.xdg_data_home();
+    let xdg_env = [("XDG_DATA_HOME", xdg.to_str().unwrap())];
+
+    let nsis = fixture("hello-nsis-noshortcut.exe");
+    let ran = rig.rt_env(&["install", nsis.to_str().unwrap(), "--silent"], &xdg_env);
+    ran.expect_ok();
+    let id = installed_id(&ran);
+
+    let drive_c = rig.drive_c(&id);
+    assert!(drive_c.join("Program Files/RuntimeFixtureNsis/uninstall.exe").is_file());
+    assert!(
+        !drive_c
+            .join("ProgramData/Microsoft/Windows/Start Menu/Programs/RuntimeFixtureNsis")
+            .exists(),
+        "this fixture must not create a Start Menu shortcut"
+    );
+    assert!(
+        ran.out()
+            .contains(r"Executable: C:\Program Files\RuntimeFixtureNsis\hello64.exe"),
+        "auto-discovery picked the wrong executable: {}",
+        ran.report()
+    );
+
+    let inst = installer_metadata(&rig, &id);
+    assert_eq!(inst["productName"], "Runtime Fixture NSIS", "{inst}");
+    assert_eq!(
+        inst["uninstallCommand"], r"C:\Program Files\RuntimeFixtureNsis\uninstall.exe",
+        "{inst}"
+    );
+
+    let ran = rig.rt(&["run", &id]);
+    assert!(ran.out().contains(HELLO), "hello64 stdout: {}", ran.report());
+
+    rig.rt_env(&["uninstall", &id], &xdg_env).expect_ok();
     rig.finish();
 }
 
