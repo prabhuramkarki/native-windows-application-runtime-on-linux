@@ -87,6 +87,42 @@ fn split_command_line_handles_quoted_and_bare_programs() {
     );
 }
 
+/// Never panics, and never reads past the end of the string, on any byte sequence a hostile installer could
+/// have written into `UninstallString` (control characters, NUL, a lone quote, only whitespace, absurdly long
+/// input, non-ASCII, an unterminated quote at every position).
+#[test]
+fn split_command_line_never_panics_on_hostile_input() {
+    let cases: Vec<String> = vec![
+        "\0".repeat(10),
+        "\"".repeat(5000),
+        " ".repeat(100_000),
+        "a\"b\"c\"d".to_string(),
+        "\u{202e}\u{200b}\"C:\\a\u{1b}[31m\\b.exe\" /S\u{7}".to_string(),
+        "\u{e9}".repeat(10_000),
+        "\"".to_string() + &"x".repeat(1_000_000),
+    ];
+    for c in cases {
+        let tokens = split_command_line(&c);
+        assert!(tokens.iter().all(|t| t.len() <= c.len()), "a token grew past the input");
+    }
+    // A fuzz over a small hostile alphabet: only that the call returns, ever, for any shape.
+    let alphabet: Vec<char> = " \"\\/\0\n\t\u{1b}aZ.exe~".chars().collect();
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..2000 {
+        let len = (next() % 50) as usize;
+        let s: String = (0..len)
+            .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+            .collect();
+        let _ = split_command_line(&s);
+    }
+}
+
 // ---------------------------------------------------------------- no recorded uninstaller: a documented limit
 
 #[test]
