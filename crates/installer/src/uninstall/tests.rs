@@ -1,0 +1,193 @@
+use super::*;
+use crate::sandbox::find_bwrap_on_path;
+use rt_core::{AppId, FakeBackend, Store};
+use std::fs;
+
+fn env_with_msiexec() -> (tempfile::TempDir, AppEnv) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::new(tmp.path().join("apps")).unwrap();
+    let env = store.create(&AppId::parse("t").unwrap()).unwrap();
+    let backend = FakeBackend::new();
+    backend.prepare(&env).unwrap();
+    let msiexec = env.drive_c().join("windows/system32/msiexec.exe");
+    fs::create_dir_all(msiexec.parent().unwrap()).unwrap();
+    fs::write(&msiexec, b"MZ").unwrap();
+    (tmp, env)
+}
+
+fn md_with_uninstall(env: &AppEnv, command: Option<&str>) -> Metadata {
+    let exe = WinPath::parse("C:\\Program Files\\t\\t.exe").unwrap();
+    let mut md = Metadata::new(
+        env.id().clone(),
+        "T".into(),
+        None,
+        "x86_64",
+        &exe,
+        rt_core::BackendInfo {
+            id: "fake".into(),
+            version: "1".into(),
+        },
+        "gui",
+    );
+    md.installer = Some(rt_core::InstallerMeta {
+        family: "msi".into(),
+        product_name: Some("T".into()),
+        uninstall_command: command.map(str::to_owned),
+    });
+    md
+}
+
+fn require_real_bwrap() -> Option<std::path::PathBuf> {
+    let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
+    match find_bwrap_on_path() {
+        Some(p) => Some(p),
+        None if require => panic!("bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set"),
+        None => {
+            eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox uninstall tests need bubblewrap installed");
+            None
+        }
+    }
+}
+
+fn launcher() -> Launcher {
+    Launcher::with_host_env([("PATH", "/usr/bin:/bin")])
+}
+
+/// `FakeBackend::command` hardcodes `/bin/sh`; `InstallerSandbox::RO_BINDS` does not include `/bin` (see the
+/// identical comment in `crate::pipeline::tests`). `extra_ro_binds` (Ruling 3) is the fix; unlike
+/// `crate::pipeline`, `uninstall` takes `SandboxOpts` from its caller rather than building it from
+/// `backend.dll_dirs()` itself, so a real-run test must build it explicitly with [`opts_for`].
+fn fake_backend(script: &str) -> FakeBackend {
+    FakeBackend::with_script(script).with_dll_dirs(vec![std::path::PathBuf::from("/bin")])
+}
+
+fn opts_for(backend: &FakeBackend) -> SandboxOpts {
+    SandboxOpts {
+        extra_ro_binds: backend.dll_dirs(),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------- split_command_line
+
+#[test]
+fn split_command_line_handles_quoted_and_bare_programs() {
+    assert_eq!(split_command_line("MsiExec.exe /X{GUID}"), ["MsiExec.exe", "/X{GUID}"]);
+    assert_eq!(
+        split_command_line("\"C:\\Program Files\\App\\uninstall.exe\" /S"),
+        ["C:\\Program Files\\App\\uninstall.exe", "/S"]
+    );
+    assert_eq!(split_command_line("   "), Vec::<String>::new());
+    assert_eq!(split_command_line(""), Vec::<String>::new());
+    assert_eq!(split_command_line("\"unterminated"), ["unterminated"]);
+    assert_eq!(split_command_line("solo.exe"), ["solo.exe"]);
+    assert_eq!(
+        split_command_line("  \"C:\\a b\\c.exe\"   --flag  val  "),
+        ["C:\\a b\\c.exe", "--flag", "val"]
+    );
+}
+
+// ---------------------------------------------------------------- no recorded uninstaller: a documented limit
+
+#[test]
+fn no_uninstall_command_recorded_is_none_with_no_warnings() {
+    let (_tmp, env) = env_with_msiexec();
+    let backend = FakeBackend::new();
+    // A portable-exe-shaped app: no `installer` field at all (schema v1, or never went through this pipeline).
+    let exe = WinPath::parse("C:\\Program Files\\t\\t.exe").unwrap();
+    let portable = Metadata::new(
+        env.id().clone(),
+        "T".into(),
+        None,
+        "x86_64",
+        &exe,
+        rt_core::BackendInfo {
+            id: "fake".into(),
+            version: "1".into(),
+        },
+        "gui",
+    );
+    assert_eq!(portable.installer, None);
+    let outcome = uninstall(&backend, &launcher(), &env, &portable, SandboxOpts::default());
+    assert_eq!(outcome, UninstallOutcome::default());
+    assert_eq!(outcome.uninstaller_succeeded, None);
+    assert!(outcome.warnings.is_empty());
+
+    // Same result when `installer` is present but carries no uninstall command (an installer that registered
+    // none, e.g. `hello.msi` has no such row in its own `Property` table).
+    let with_family_no_command = md_with_uninstall(&env, None);
+    let outcome = uninstall(
+        &backend,
+        &launcher(),
+        &env,
+        &with_family_no_command,
+        SandboxOpts::default(),
+    );
+    assert_eq!(outcome, UninstallOutcome::default());
+}
+
+// ---------------------------------------------------------------- resolving the recorded command
+
+#[test]
+fn an_unresolvable_uninstall_command_is_a_warning_not_a_panic() {
+    let (_tmp, env) = env_with_msiexec();
+    let backend = FakeBackend::new();
+    for bad in ["", "   ", "D:\\outside\\uninstall.exe", "not-even-a-windows-path"] {
+        let md = md_with_uninstall(&env, Some(bad));
+        let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+        assert_eq!(outcome.uninstaller_succeeded, Some(false), "{bad:?}: {outcome:?}");
+        assert_eq!(outcome.warnings.len(), 1, "{bad:?}: {outcome:?}");
+    }
+}
+
+#[test]
+fn a_command_naming_a_missing_program_is_a_warning_not_a_panic() {
+    let (_tmp, env) = env_with_msiexec();
+    let backend = FakeBackend::new();
+    let md = md_with_uninstall(&env, Some("C:\\Program Files\\t\\does-not-exist.exe"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    assert_eq!(outcome.uninstaller_succeeded, Some(false));
+    assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
+}
+
+// ---------------------------------------------------------------- real runs (need a real bwrap)
+
+#[test]
+fn a_real_msiexec_uninstall_command_runs_sandboxed_and_reports_success() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let backend = fake_backend("exit 0");
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    assert_eq!(outcome.uninstaller_succeeded, Some(true), "{outcome:?}");
+    assert!(outcome.warnings.is_empty(), "{outcome:?}");
+}
+
+#[test]
+fn a_real_exe_uninstall_command_that_fails_reports_failure_not_a_panic() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let uninstaller = env.drive_c().join("Program Files/t");
+    fs::create_dir_all(&uninstaller).unwrap();
+    fs::write(uninstaller.join("uninstall.exe"), b"MZ").unwrap();
+    let backend = fake_backend("exit 7");
+    let md = md_with_uninstall(&env, Some("\"C:\\Program Files\\t\\uninstall.exe\" /S"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
+    assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
+    assert!(outcome.warnings[0].contains("exited with"), "{outcome:?}");
+    assert!(outcome.warnings[0].contains('7'), "{outcome:?}");
+}
+
+#[test]
+fn missing_bwrap_is_a_warning_not_a_panic() {
+    // Cannot force a real absence of bwrap portably (find_bwrap_on_path reads the real $PATH), but a program
+    // this pipeline can never resolve (outside drive_c) exercises the same "never a panic, always a warning"
+    // contract as a missing bwrap would, without needing to mutate global process state.
+    let (_tmp, env) = env_with_msiexec();
+    let backend = FakeBackend::new();
+    let md = md_with_uninstall(&env, Some("C:\\Windows\\..\\..\\etc\\passwd"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    assert_eq!(outcome.uninstaller_succeeded, Some(false));
+    assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
+}
