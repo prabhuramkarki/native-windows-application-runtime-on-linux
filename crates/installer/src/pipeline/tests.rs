@@ -495,3 +495,61 @@ fn a_backend_command_failure_cleans_up_the_environment() {
     );
     f.assert_no_app_left();
 }
+
+// ------------------------------------------------------------- I3: host-side discovery reads never follow/hang
+
+/// A hostile installer leaves only a FIFO (no writer: a plain `fs::read` would block forever) and a symlink to a
+/// host file as its "new" `.exe`/`.lnk` files. Discovery must refuse both: no hang, no candidate, and the
+/// symlink's target is never read (`read_bounded_regular_file` sees a symlink, not the host file).
+#[test]
+fn discovery_refuses_a_planted_fifo_and_symlink_without_hanging_or_following() {
+    use std::os::unix::ffi::OsStrExt;
+    let f = fx();
+    let env = f.store.create(&AppId::parse("t").unwrap()).unwrap();
+    let app = env.drive_c().join("App");
+    fs::create_dir_all(&app).unwrap();
+    for name in ["fifo.exe", "fifo.lnk"] {
+        let c = std::ffi::CString::new(app.join(name).as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+    let host = f.tmp.path().join("canary");
+    std::os::unix::fs::symlink(&host, app.join("link.exe")).unwrap();
+    std::os::unix::fs::symlink(&host, app.join("link.lnk")).unwrap();
+    let diff = InstallDiff {
+        new_files: ["App/fifo.exe", "App/fifo.lnk", "App/link.exe", "App/link.lnk"]
+            .map(String::from)
+            .to_vec(),
+        ..Default::default()
+    };
+
+    // Everything runs on a worker thread so a regression fails at the deadline instead of hanging the suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let d = diff.clone();
+    let e = env.clone();
+    std::thread::spawn(move || {
+        let reads: Vec<_> = d
+            .new_files
+            .iter()
+            .map(|p| read_bounded_regular_file(&e.drive_c().join(p)))
+            .collect();
+        tx.send((
+            reads,
+            load_shortcuts(&e, &d).len(),
+            discover_winner(&e, &d, None).map(|x| match x {
+                Discovery::Winner(p) => Some(p),
+                Discovery::NeedsChoice(_) => None,
+            }),
+        ))
+        .unwrap()
+    });
+    let (reads, shortcuts, winner) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("discovery hung on a planted FIFO");
+    assert!(reads.iter().all(Option::is_none), "{reads:?}");
+    assert_eq!(shortcuts, 0);
+    assert!(
+        !matches!(winner, Ok(Some(_))),
+        "a FIFO/symlink must never win: {winner:?}"
+    );
+}

@@ -180,6 +180,43 @@ fn uninstall_entries_come_only_from_brand_new_uninstall_subkeys() {
     );
 }
 
+/// I1: a real 64-bit Wine prefix's Wow6432Node mirror (where a 32-bit installer's Uninstall entry actually
+/// lands, confirmed for real against `hello-nsis.exe`) must be captured exactly like the non-Wow path, not
+/// silently dropped.
+#[test]
+fn a_wow6432node_uninstall_subkey_is_captured_like_the_regular_one() {
+    let before = reg(&[]);
+    let after = reg(&[(
+        r"HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RuntimeFixtureNsis",
+        key(&[
+            ("DisplayName", RegValue::Str("Runtime Fixture NSIS".into())),
+            (
+                "UninstallString",
+                RegValue::Str(r"C:\Program Files\RuntimeFixtureNsis\uninstall.exe".into()),
+            ),
+        ]),
+    )]);
+    let diff = Snapshot::diff(
+        &Snapshot {
+            registry: before,
+            ..Default::default()
+        },
+        &Snapshot {
+            registry: after,
+            ..Default::default()
+        },
+    );
+    assert_eq!(diff.uninstall_entries.len(), 1, "{:?}", diff.uninstall_entries);
+    assert_eq!(
+        diff.uninstall_entries[0].display_name.as_deref(),
+        Some("Runtime Fixture NSIS")
+    );
+    assert_eq!(
+        diff.uninstall_entries[0].uninstall_string.as_deref(),
+        Some(r"C:\Program Files\RuntimeFixtureNsis\uninstall.exe")
+    );
+}
+
 #[test]
 fn an_uninstall_subkey_that_already_existed_is_not_reported_as_a_new_entry() {
     let existing = reg(&[(

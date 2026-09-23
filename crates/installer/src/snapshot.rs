@@ -84,12 +84,22 @@ pub struct UninstallEntry {
 /// `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\{GUID}`.
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
 
-/// `true` when `path` is a direct child of `HKLM\`/`HKCU\` + [`UNINSTALL_KEY`] (the Wow6432Node mirror some real
-/// prefixes also have is out of scope: it is not the `Uninstall` key the shell reads).
+/// The 32-bit registry view's mirror of [`UNINSTALL_KEY`] on a 64-bit prefix. `backend_wine` only ever creates
+/// `WINEARCH=win64` prefixes (see `backend_wine::wine_command`), and a 32-bit installer running under one — which
+/// NSIS, Inno Setup and InstallShield installers, and this project's own 32-bit `hello.msi` fixture, overwhelmingly
+/// are — writes its `Uninstall` entry HERE, not under [`UNINSTALL_KEY`] directly: confirmed for real,
+/// `hello-nsis.exe`'s own Uninstall key lands at exactly
+/// `HKLM\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\RuntimeFixtureNsis`. This is not an
+/// edge case to skip: real Windows' "Programs and Features" reads both locations, merged, and so must this.
+const UNINSTALL_KEY_WOW6432: &str = r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
+
+/// `true` when `path` is a direct child of `HKLM\`/`HKCU\` + [`UNINSTALL_KEY`] or its 32-bit mirror
+/// [`UNINSTALL_KEY_WOW6432`] (see its own docs for why both are read).
 fn is_uninstall_subkey(path: &str) -> bool {
     for hive in ["HKLM\\", "HKCU\\"] {
-        if let Some(rest) = path.strip_prefix(hive) {
-            let prefix = format!("{UNINSTALL_KEY}\\");
+        let Some(rest) = path.strip_prefix(hive) else { continue };
+        for key in [UNINSTALL_KEY, UNINSTALL_KEY_WOW6432] {
+            let prefix = format!("{key}\\");
             if let Some(name) = rest.strip_prefix(prefix.as_str())
                 && !name.is_empty()
                 && !name.contains('\\')
