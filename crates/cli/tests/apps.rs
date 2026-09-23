@@ -582,6 +582,20 @@ fn install_of_a_msi_without_wine_says_what_to_do() {
 }
 
 #[test]
+fn install_of_an_installer_without_silent_warns_about_no_display_in_the_sandbox() {
+    let r = rig();
+    let p = r.input("hello.msi", &fs::read(fixture("hello.msi")).unwrap());
+    let err = assert_fails(&r.rt(&["install".as_ref(), p.as_os_str()]));
+    assert!(err.contains("no display access"), "{err}");
+    assert!(err.contains("--silent"), "{err}");
+
+    // The same install with --silent does not get the warning (it explicitly asked to skip the GUI).
+    let p2 = r.input("hello2.msi", &fs::read(fixture("hello.msi")).unwrap());
+    let err2 = assert_fails(&r.rt(&["install".as_ref(), p2.as_os_str(), "--silent".as_ref()]));
+    assert!(!err2.contains("no display access"), "{err2}");
+}
+
+#[test]
 fn install_of_an_unrecognised_file_still_uses_the_old_pipeline() {
     // Not installer-shaped (no MSI magic, no installer marker): falls through to the unchanged
     // `rt_core::install`, which reports its own `Unknown` error, not the installer pipeline's.

@@ -10,7 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      # `bubblewrap` is required (not merely nice-to-have): the installer-sandbox tests in `runtime-installer`
+      # (`crate::sandbox`, `crate::pipeline`, `crate::uninstall`) gate on `bwrap` being on `$PATH` and otherwise
+      # skip loudly rather than failing, so without this and RUNTIME_REQUIRE_BWRAP below, CI could go green while
+      # never actually running them.
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 bubblewrap
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -18,7 +22,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Plain `cargo test` skips the `#[ignore]`d real-Wine tests; the `wine-e2e` job runs them.
+      # RUNTIME_REQUIRE_BWRAP=1 turns a missing `bwrap` into a hard test failure instead of the default
+      # loud-skip-and-pass, so the real-sandbox tests above are guaranteed to actually execute here.
       - run: cargo test --workspace
+        env:
+          RUNTIME_REQUIRE_BWRAP: "1"
   # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
   # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
   # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on

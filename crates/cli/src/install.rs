@@ -6,7 +6,14 @@
 //! the file's real CONTENT (never its extension, matching every other detection in this project) and routes:
 //! installer-shaped input goes to [`rt_installer::install_via_installer`]; everything else (a portable exe, a
 //! zip archive) keeps going through the unchanged `rt_core::install`, which still refuses MSI/installer input
-//! as a backstop should this peek and its own detection ever disagree.
+//! as a backstop should this peek and its own detection ever disagree. The peek itself goes through
+//! `rt_core::read_input` (the same `metadata`-then-`O_NONBLOCK`-open, fstat-cap-before-bulk-read discipline
+//! `rt_installer::pipeline`'s own reader uses) rather than a hand-rolled `fs::read`, so a file swapped for a
+//! FIFO between the two separate syscalls a naive peek would need cannot block this process forever.
+//!
+//! **No display in the sandbox by default.** `InstallerSandbox` (Task 5) binds no X11/Wayland socket, so an
+//! installer run WITHOUT `--silent` (the default: "show its own GUI") likely cannot render a window at all; see
+//! the warning `run` prints for that case, and `rt_installer::pipeline`'s own module docs for the full story.
 use crate::safe::{safe, warn};
 use crate::{CmdError, SANDBOX_NOTE};
 use rt_core::{AppId, InstallOpts, InstallOutcome, Store};
@@ -31,6 +38,12 @@ pub fn run(
     if peek_looks_like_installer(file) {
         if name.is_some() {
             warn("--name is not used for .msi/.exe installers (the app's own name is used instead); ignored");
+        }
+        if !silent {
+            warn(
+                "the installer runs in an isolated sandbox with no display access; if it hangs waiting for a \
+                 window, retry with --silent",
+            );
         }
         let opts = InstallerOpts {
             silent,
@@ -62,17 +75,20 @@ pub fn run(
     Ok(0)
 }
 
-/// A bounded peek at `file`'s real content to decide dispatch (see the module docs). Any problem reading it here
-/// (missing, huge, unreadable) is left for whichever pipeline actually runs to explain with its own proper
-/// error; this just answers "installer-shaped or not", defaulting to "not" when it cannot tell.
+/// A bounded, TOCTOU-safe peek at `file`'s real content to decide dispatch (see the module docs): reuses
+/// `rt_core::read_input`, never a hand-rolled `fs::metadata` + `fs::read` pair (a file swapped for a FIFO
+/// between two separate syscalls like that would block this process forever; `read_input` does its
+/// `metadata`-then-`O_NONBLOCK`-open-then-cap-checked-read all in one place for exactly this reason). Any
+/// problem reading it here (missing, huge, unreadable, a directory, ...) is left for whichever pipeline actually
+/// runs to explain with its own proper error; this just answers "installer-shaped or not", defaulting to "not"
+/// when it cannot tell. An MSI is recognised from `read_input`'s own `InstallError::Msi` (it refuses to hand
+/// back MSI bytes at all, by design: Phase 2 never installs one), so no separate read is needed for that case.
 fn peek_looks_like_installer(file: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(file) else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() > rt_installer::INPUT_CAP {
-        return false;
+    match rt_core::read_input(file) {
+        Ok(rt_core::Input::Pe(bytes)) => rt_installer::looks_like_installer(&bytes),
+        Err(rt_core::InstallError::Msi) => true,
+        _ => false,
     }
-    std::fs::read(file).is_ok_and(|bytes| rt_installer::looks_like_installer(&bytes))
 }
 
 fn print_installed(store: &Store, id: &AppId, executable: &str, warnings: &[String]) -> Result<(), CmdError> {

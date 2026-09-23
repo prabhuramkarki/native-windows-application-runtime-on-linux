@@ -187,6 +187,63 @@ exit 5
     assert_ne!(id, id2);
 }
 
+/// Regression test for the Critical fix-round-1 finding: with a prefix shaped like a REAL Wine one (a
+/// pre-existing, all-lowercase `drive_c/windows/temp` — `FakeBackend::prepare` alone never creates one, which is
+/// exactly why every other test in this file was blind to the bug), `place_installer_file`'s `join_new` reuses
+/// the real lowercase `windows`/`temp` components verbatim, so the installer actually lands at
+/// `windows/temp/rt-installer/hello-nsis.exe` on disk — NOT `Windows/Temp/rt-installer/hello-nsis.exe`, the
+/// spelling a naive string-based exclusion (what this pipeline used to do) would have compared against. The
+/// fix removes that comparison entirely (the installer is placed before the "before" snapshot, so it is never a
+/// diff candidate to begin with, regardless of casing); this test proves the REAL app still wins discovery
+/// against this realistic filesystem shape, not the installer's own staged copy.
+///
+/// Mutation-check (reasoned, not executed): the previous code compared `diff.new_files` entries against
+/// `installer_winpath.components().join("/")`, i.e. the literal string `"Windows/Temp/rt-installer/hello-nsis.exe"`
+/// (the WinPath text as requested). Against this test's realistic fixture the installer's REAL on-disk path is
+/// `"windows/temp/rt-installer/hello-nsis.exe"` (lowercase `windows`/`temp`, reused from the pre-created
+/// directory) — the two strings never compare equal, so that old filter would have let the installer itself
+/// through as a candidate. Since the installer copy is a real GUI PE roughly the same size as (or larger than)
+/// the "app" this test plants, the installer would have won `discover::rank` outright and this test's
+/// `executable` assertion below would have failed with the installer's own staged path instead.
+#[test]
+fn real_hello_nsis_installs_correctly_against_a_prefix_shaped_like_a_real_one() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let script = r#"
+set -e
+dest_dir="$WINEPREFIX/drive_c/Program Files/HelloNsis"
+mkdir -p "$dest_dir"
+cp "$0" "$dest_dir/hello.exe"
+exit 0
+"#;
+    let wrap = Wrap {
+        precreate_windows_temp: true,
+        ..Wrap::new(fake_backend(script))
+    };
+    let outcome = install_via_installer(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap();
+    let InstallOutcome::Installed { id, executable, .. } = outcome else {
+        panic!("expected Installed, got {outcome:?}");
+    };
+    assert_eq!(
+        executable.to_string(),
+        "C:\\Program Files\\HelloNsis\\hello.exe",
+        "the real app must win, not the installer's own staged copy"
+    );
+    let env = f.store.get(&id).unwrap();
+    // The fixture really is realistic: `windows/temp` pre-existed (lowercase), proving this test actually
+    // exercises the case-reuse path `join_new` takes on a real Wine prefix, not the "component missing, create
+    // verbatim" path every other test in this file exercises.
+    assert!(env.drive_c().join("windows/temp").is_dir());
+    // Finding 3: the staged installer copy is deleted once the install has succeeded — it must not permanently
+    // double the app's disk footprint. (It would have landed at `windows/temp/rt-installer/hello-nsis.exe`,
+    // reusing the pre-existing lowercase directories; that whole `rt-installer` staging directory is now gone.)
+    assert!(
+        !env.drive_c().join("windows/temp/rt-installer").exists(),
+        "the staged installer copy must be deleted after a successful install"
+    );
+}
+
 // ---------------------------------------------------------------- nothing created before Store::create
 
 #[test]
@@ -285,6 +342,14 @@ struct Wrap {
     inner: FakeBackend,
     version_fails: bool,
     command_fails: bool,
+    /// Mimics a REAL Wine prefix's pre-existing `drive_c/windows/temp` (Windows always has one, and a real
+    /// `wineboot -u` creates it too; `FakeBackend::prepare` does not). This is exactly the shape that made the
+    /// original (fixed) staged-installer-exclusion bug reproducible: with a real, pre-existing, all-lowercase
+    /// `windows/temp` directory, `join_new`'s case-insensitive component matching reuses it verbatim, so the
+    /// installer actually lands at `windows/temp/rt-installer/<name>` — a different string, in a different case,
+    /// than a hand-written `Windows\Temp\...` comparison would ever match. See
+    /// `real_hello_nsis_installs_correctly_against_a_prefix_shaped_like_a_real_one`.
+    precreate_windows_temp: bool,
 }
 
 impl Wrap {
@@ -293,6 +358,7 @@ impl Wrap {
             inner,
             version_fails: false,
             command_fails: false,
+            precreate_windows_temp: false,
         }
     }
 }
@@ -308,7 +374,14 @@ impl CompatBackend for Wrap {
         self.inner.version()
     }
     fn prepare(&self, env: &AppEnv) -> Result<(), BackendError> {
-        self.inner.prepare(env)
+        self.inner.prepare(env)?;
+        if self.precreate_windows_temp {
+            fs::create_dir_all(env.drive_c().join("windows/temp")).map_err(|source| BackendError::Io {
+                what: "test fixture: windows/temp",
+                source,
+            })?;
+        }
+        Ok(())
     }
     fn command(
         &self,
