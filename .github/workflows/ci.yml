@@ -44,12 +44,26 @@ jobs:
       WINEDEBUG: "-all"
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
+      # Task 8's real-Wine installer e2e tests (`e2e_installers.rs`) need `nsis` (makensis) and `wixl`
+      # (a SEPARATE apt package from `msitools` on this system's split, confirmed by this session's own
+      # install history and by `tools/build-fixtures.sh`'s own error hint: "sudo apt install msitools
+      # wixl") to build `hello.msi`/`hello-nsis.exe`, `bubblewrap` for the installer sandbox
+      # (`rt_installer::sandbox`), and `desktop-file-utils` (`desktop-file-validate`) for the
+      # `.desktop`-entry checks, matching the `test` job's already-established convention.
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64 nsis msitools wixl bubblewrap desktop-file-utils
       - uses: dtolnay/rust-toolchain@stable
       - run: tools/build-fixtures.sh
       # Only the crates with real-Wine tests: `--workspace --ignored` would also run the runtime-pe oracle tests,
-      # which need RUNTIME_SAMPLES (a directory of real binaries) and fail without it.
+      # which need RUNTIME_SAMPLES (a directory of real binaries) and fail without it. `-p runtime-cli` already
+      # picks up every `#[ignore]`d test under `crates/cli/tests/`, `e2e_installers.rs` included, the same way it
+      # already picks up `e2e_wine.rs`'s: there is no per-file allowlist, `cargo test -p <crate>` runs every
+      # integration-test binary of that crate. RUNTIME_REQUIRE_BWRAP/RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE match
+      # the `test` job's own convention (Tasks 6/7's fix rounds), so a runner missing either tool fails loudly
+      # instead of the installer-pipeline/`.desktop` tests silently skip-and-passing.
       - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1 --nocapture
+        env:
+          RUNTIME_REQUIRE_BWRAP: "1"
+          RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
   deny:
     runs-on: ubuntu-latest
     steps:
