@@ -277,3 +277,100 @@ fn sanity_gui_pe_bytes_is_actually_gui() {
     let info = pe::analyze(&gui_pe_bytes()).expect("analyze");
     assert_eq!(info.subsystem, pe::Subsystem::Gui);
 }
+
+// --- the uninstaller an `UninstallString` names is never auto-picked --------------------------
+
+fn nsis_entry(icon: Option<&str>) -> UninstallEntry {
+    UninstallEntry {
+        display_name: Some("My App".into()),
+        uninstall_string: Some(r#""C:\Program Files\App\uninstall.exe""#.into()),
+        icon_path: icon.map(Into::into),
+    }
+}
+
+#[test]
+fn uninstall_string_never_makes_the_uninstaller_win_nsis_shape() {
+    // No `.lnk`; the uninstaller is bigger, so the size tier alone would also pick it if it were
+    // still a candidate. It must not win by tier (2) or by any lower tier.
+    let d = diff(
+        &["Program Files/App/app.exe", "Program Files/App/uninstall.exe"],
+        vec![nsis_entry(None)],
+    );
+    let size = |p: &str| match p {
+        "Program Files/App/uninstall.exe" => Some(1_000_000),
+        _ => Some(10),
+    };
+    let result = rank(&d, &[], no_bytes, size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn display_icon_naming_the_uninstaller_does_not_rescue_it() {
+    // NSIS scripts often set `DisplayIcon` to `uninstall.exe,0` too.
+    let d = diff(
+        &["Program Files/App/app.exe", "Program Files/App/uninstall.exe"],
+        vec![nsis_entry(Some(r"C:\Program Files\App\uninstall.exe,0"))],
+    );
+    let result = rank(&d, &[], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_start_menu_uninstall_shortcut_does_not_rescue_the_uninstaller() {
+    // NSIS/Inno commonly add an "Uninstall My App" Start Menu shortcut next to the app's own.
+    let d = diff(
+        &["Program Files/App/app.exe", "Program Files/App/uninstall.exe"],
+        vec![nsis_entry(None)],
+    );
+    let shortcuts = [
+        lnk_to(r"C:\Program Files\App\app.exe"),
+        lnk_to(r"C:\Program Files\App\uninstall.exe"),
+    ];
+    let size = |p: &str| (p == "Program Files/App/uninstall.exe").then_some(1_000_000);
+    let result = rank(&d, &shortcuts, no_bytes, size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn inno_shape_display_icon_names_the_app_and_unins000_never_wins() {
+    let d = diff(
+        &[
+            "Program Files/App/app.exe",
+            "Program Files/App/helper.exe",
+            "Program Files/App/unins000.exe",
+        ],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r#""C:\Program Files\App\unins000.exe""#.into()),
+            icon_path: Some(r"C:\Program Files\App\app.exe".into()),
+        }],
+    );
+    let size = |p: &str| (p == "Program Files/App/unins000.exe").then_some(1_000_000);
+    let result = rank(&d, &[], no_bytes, size);
+    let RankResult::Winner(c) = result else {
+        panic!("expected a winner: {result:?}");
+    };
+    assert_eq!(c.path, "Program Files/App/app.exe");
+    assert_eq!(c.name.as_deref(), Some("My App"));
+    assert_eq!(c.score & 0b0100, 0b0100, "won by tier (2), DisplayIcon");
+}
+
+#[test]
+fn an_uninstaller_that_is_the_only_new_exe_is_a_manual_choice_not_a_winner() {
+    let d = diff(&["Program Files/App/uninstall.exe"], vec![nsis_entry(None)]);
+    let result = rank(&d, &[], no_bytes, no_size);
+    let RankResult::NeedsManualChoice(candidates) = result else {
+        panic!("expected a manual choice: {result:?}");
+    };
+    let paths: Vec<_> = candidates.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(paths, ["Program Files/App/uninstall.exe"]);
+}

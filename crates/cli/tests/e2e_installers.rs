@@ -16,7 +16,8 @@
 //! file passes as `XDG_DATA_HOME`, so `.desktop`/icon writes never touch the real user's directories.
 //!
 //! **Registry-derived outcomes are asserted, not just files.** Both install tests check that
-//! `metadata.json`'s `installer.productName`/`installer.uninstallCommand` were recorded, and the MSI test
+//! `metadata.json`'s `installer.uninstallCommand` was recorded (the NSIS test also checks
+//! `productName`, which for NSIS comes from the Uninstall key's `DisplayName`), and the MSI test
 //! checks that `runtime uninstall` really ran the recorded uninstaller. Until the Phase 3 final review's C1
 //! fix, `bwrap --unshare-pid` killed `wineserver` the instant the installer exited, before it flushed the
 //! registry to disk: the registry diff was always empty, no `uninstallCommand` was ever recorded, and
@@ -24,11 +25,14 @@
 //! passed. `CompatBackend::settle` (`wineserver -w` inside the same sandboxed process tree) fixed it.
 //!
 //! **The NSIS test uses auto-discovery (no `--exe`).** `hello-nsis.exe` installs both `hello64.exe` and
-//! its own `uninstall.exe` side by side. Discovery used to mis-pick `uninstall.exe`, for two reasons now
-//! both fixed: `rt_installer::lnk` did not read a real Wine shortcut's `LinkTargetIDList` (Task 9 fixed
-//! that, so tier (1) now finds `hello64.exe` via the Start Menu shortcut), and — with the C1 empty
-//! registry diff — tier (2) never fired, so the pick fell through to tier (3)'s GUI-subsystem heuristic
-//! (`uninstall.exe` is a GUI PE, `hello64.exe` a console one). `--exe` is still covered by
+//! its own `uninstall.exe` side by side. Discovery used to mis-pick `uninstall.exe`: `rt_installer::lnk`
+//! did not read a real Wine shortcut's `LinkTargetIDList` (Task 9 fixed that, so tier (1) now finds
+//! `hello64.exe` via the Start Menu shortcut), and — with the C1 empty registry diff — tier (2) never
+//! fired, so the pick fell through to tier (3)'s GUI-subsystem heuristic (`uninstall.exe` is a GUI PE,
+//! `hello64.exe` a console one). After C1, tier (2) would have matched `UninstallString` (which names
+//! `uninstall.exe`); discovery now drops any `.exe` an `UninstallString` names from the candidate pool
+//! and matches tier (2) against `DisplayIcon` only (unit-tested in `rt_installer::discover`). This test
+//! still passes via tier (1); it does not by itself exercise the no-`.lnk` path. `--exe` is still covered by
 //! `rt_installer`'s own `exe_override_skips_discovery_and_installs_the_named_file`.
 mod support;
 
@@ -85,7 +89,9 @@ fn e2e_msi_silent_install_desktop_entry_run_and_uninstall() {
     let exe = rig.drive_c(&id).join("Program Files (x86)/RuntimeFixture/hello64.exe");
     assert!(exe.is_file(), "hello64.exe missing under drive_c: {}", exe.display());
 
-    // Registry-derived (C1): msiexec's Uninstall key (Wow6432Node, REG_EXPAND_SZ) reached disk and was read.
+    // `productName` comes from the MSI Property table first (not the registry); the load-bearing
+    // registry-derived (C1) check is `uninstallCommand`: msiexec's Uninstall key (Wow6432Node,
+    // REG_EXPAND_SZ) reached disk and was read.
     let inst = installer_metadata(&rig, &id);
     assert_eq!(inst["productName"], "Runtime Fixture MSI", "{inst}");
     let uninstall = inst["uninstallCommand"]
