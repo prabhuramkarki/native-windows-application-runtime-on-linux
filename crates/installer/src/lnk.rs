@@ -21,13 +21,17 @@
 //! it exists only to resolve a target that is not found where the link says it is, which is out
 //! of scope here). `LinkTargetIDList`, if present, is skipped by its declared size for the
 //! purposes of locating the next structure, but — since real Wine-created shortcuts turn out to
-//! encode their target *only* here, with `RELATIVE_PATH` StringData absent — its `SHITEMID` item
-//! sequence is also walked as a fallback: when `RELATIVE_PATH` is absent (or present but
-//! unparseable), a best-effort absolute path is reconstructed from the list's drive/folder/file
-//! items (see [`id_list_path`]) and fed through [`WinPath::parse`] exactly like the StringData
-//! fields. `RELATIVE_PATH` StringData, when present and parseable, always wins; this is purely a
-//! fallback for when it is not. No other shell-namespace item shapes (e.g. CLSID-rooted special
-//! folders) are resolved — those are skipped as unrecognized, not walked into. Then whichever of
+//! encode their target *only* here, with the `HAS_RELATIVE_PATH` flag bit itself unset — its
+//! `SHITEMID` item sequence is also walked as a fallback: when the `HAS_RELATIVE_PATH` flag bit is
+//! unset (so there is no `RELATIVE_PATH` StringData to read at all), a best-effort absolute path
+//! is reconstructed from the list's drive/folder/file items (see [`id_list_path`]) and fed through
+//! [`WinPath::parse`] exactly like the StringData fields. This fallback deliberately does *not*
+//! fire when `HAS_RELATIVE_PATH` is set but the string just failed to parse (e.g. a genuinely
+//! relative string like `.\Target.exe`) — that keeps the already-shipped "unparseable
+//! `RELATIVE_PATH` -> `None` + a warning" behavior exactly as it was, rather than silently
+//! superseding it with an IDList-derived guess. No other shell-namespace item shapes (e.g.
+//! CLSID-rooted special folders) are resolved — those are skipped as unrecognized, not walked
+//! into. Then whichever of
 //! the `NAME_STRING` / `RELATIVE_PATH` / `WORKING_DIR` / `COMMAND_LINE_ARGUMENTS` /
 //! `ICON_LOCATION` StringData records `LinkFlags` says are present, in that fixed order, keeping
 //! only the three this module exposes. `ExtraData` (anything after the last StringData) is never
@@ -75,9 +79,12 @@ const IS_UNICODE: u32 = 0x80;
 pub struct ShellLink {
     /// The `RELATIVE_PATH` StringData, if present AND it parsed as a [`WinPath`] (see the module
     /// doc: a genuinely relative string is common and expected here, and leaves this `None`).
-    /// When `RELATIVE_PATH` is absent or unparseable, falls back to a best-effort absolute path
-    /// reconstructed from `LinkTargetIDList`'s items, if that IDList is present and yields one
-    /// (see [`id_list_path`]) — the common case for real Wine-created shortcuts.
+    /// When the `HAS_RELATIVE_PATH` flag bit itself is unset (no `RELATIVE_PATH` StringData at
+    /// all), falls back to a best-effort absolute path reconstructed from `LinkTargetIDList`'s
+    /// items, if that IDList is present and yields one (see [`id_list_path`]) — the common case
+    /// for real Wine-created shortcuts. Does not fall back when `RELATIVE_PATH` is present but
+    /// merely failed to parse; that case stays `None` exactly as it did before this fallback
+    /// existed.
     pub relative_path: Option<WinPath>,
     /// The `ICON_LOCATION` StringData path, paired with the header's `IconIndex`. `None` when
     /// `ICON_LOCATION` is absent or its path did not parse as a [`WinPath`]; the index alone,
@@ -171,10 +178,14 @@ impl ShellLink {
         let working_dir = parse_field(working_dir_str, "WorkingDir");
         let icon_location = parse_field(icon_location_str, "IconLocation").map(|p| (p, icon_index));
 
-        // Fallback: RELATIVE_PATH absent (or present but unparseable) is exactly the case real
-        // Wine-created shortcuts hit — their target lives only in LinkTargetIDList. Never
-        // overrides a RELATIVE_PATH that already parsed.
-        if relative_path.is_none()
+        // Fallback: fires only when the HAS_RELATIVE_PATH flag bit itself is unset — the real
+        // case Wine-created shortcuts hit, where the target lives only in LinkTargetIDList. Never
+        // fires when HAS_RELATIVE_PATH is set but the string just failed to parse (e.g. a
+        // genuinely relative string like `.\hello.exe`): that keeps Task 3's already-shipped
+        // "unparseable RelativePath -> None + a warning" behavior exactly as it was, rather than
+        // silently superseding it with an IDList-derived guess for an untested edge case.
+        if flags & HAS_RELATIVE_PATH == 0
+            && relative_path.is_none()
             && let Some((start, end)) = id_list_region
             && let Some(assembled) = id_list_path(bytes, start, end)
         {
