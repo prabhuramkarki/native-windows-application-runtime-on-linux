@@ -282,9 +282,10 @@ through both together. Three things surfaced that were not previously visible:
   (`uninstall*`, `uninst*`, `unins<digits>`, `remove*`, case-insensitive) — always, whatever names it, so a
   file named `uninstall.exe`/`unins000.exe` never wins — or (b) an `UninstallString` names it and there is no
   positive evidence it is the app: no normal Start Menu `.lnk` targets it, and no `DisplayIcon` names it
-  other than in an entry whose `UninstallString` names it too. A `.lnk` is not normal when its own name
-  contains an uninstall word (`uninst`, `remove`, `deinstall`, `entfern`, `désinstall`, `desinstal`); such
-  shortcuts count for nothing (not tier (1), not evidence). So an app whose `UninstallString` is its own main
+  other than in an entry whose `UninstallString` names it too. A `.lnk` is not normal when a word of its own name
+  (split on non-alphanumeric characters) is the whole word `remove` or starts with `uninst`, `deinstall`,
+  `entfern`, `désinstall` or `desinstal` ("Uninstall My App", "Remove My App"; not "Watermark Remover" or
+  "MyAppUninstall"); such shortcuts count for nothing (not tier (1), not evidence). So an app whose `UninstallString` is its own main
   exe (`app.exe /uninstall`) is still auto-picked when a normal shortcut names it. An exclusion is
   *doubtful* when the exe was dropped by (b) alone, or by (a) despite positive evidence (a real app named
   `Remove Background.exe`); then, if the surviving winner has no tier (1)/(2) signal of its own, discovery
@@ -298,10 +299,14 @@ through both together. Three things surfaced that were not previously visible:
   `DisplayName`/`UninstallString` gets recorded is decided the same structural way: the only entry, else the
   one whose `DisplayIcon` names the winner, else the one whose `UninstallString` program is in the winner's
   directory; with several entries and no tie, nothing is recorded from the registry and the install warns
-  (never a bundled redistributable's name and `MsiExec` command). Known limits (all end in a manual choice,
-  a wrong recorded name at worst, or `--exe`): the filename rule has false positives (an app really named
-  `Remove*.exe`/`Uninst*.exe` is excluded; with evidence that becomes a manual choice, but if its only
-  shortcut is itself named `Remove …` there is no evidence and another exe can win); and the path parser
+  (so with several entries a bundled redistributable's name and `MsiExec` command are never picked; but a
+  single entry is recorded unconditionally, so if the redistributable's is the ONLY `Uninstall` entry, its
+  name and command are what get recorded). Manual-choice lists are sorted by path. Known limits (mostly a
+  manual choice, a wrong recorded name, or `--exe`, but the first one can silently pick the wrong exe): the
+  filename rule has false positives (an app really named `Remove*.exe`/`Uninst*.exe` is excluded; with
+  evidence that becomes a manual choice, but if its only shortcut is itself named `Remove …` there is no
+  evidence and another exe can win silently); Squirrel installers, MSI cached icons and the recorded-entry
+  directory match have further gaps (listed in the Phase 3 plan's open items); and the path parser
   does not normalise doubled separators (`C:\App\\app.exe`) or 8.3 short names (`C:\PROGRA~1\...`), so such
   registry values match nothing.
 

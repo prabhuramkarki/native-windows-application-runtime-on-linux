@@ -473,6 +473,74 @@ fn an_uninstall_named_shortcut_is_not_evidence_and_gives_no_tier_one() {
     }
 }
 
+#[test]
+fn a_shortcut_merely_containing_remove_in_a_longer_word_keeps_tier_one() {
+    // "Remover"/"Removal" are app names, not the uninstall word: the shortcut is tier-(1) evidence.
+    for lnk in [
+        "Start Menu/Watermark Remover.lnk",
+        "Start Menu/PDF Password Remover.lnk",
+        "Start Menu/Removal Tool.lnk",
+    ] {
+        let d = diff(&["App/app.exe", "App/other.exe"], vec![]);
+        let shortcuts = [named_lnk_to(lnk, r"C:\App\other.exe")];
+        let size = |p: &str| (p == "App/app.exe").then_some(1_000_000);
+        let result = rank(&d, &shortcuts, no_bytes, size);
+        assert!(
+            matches!(&result, RankResult::Winner(c) if c.path == "App/other.exe" && c.score & 0b1000 != 0),
+            "{lnk}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn uninstall_shortcut_word_matching_is_by_word() {
+    for yes in [
+        "Uninstall MyApp.lnk",
+        "Remove My App.lnk",
+        "Uninstall.lnk",
+        "Uninst.lnk",
+        "My App - Uninstaller.lnk",
+        "Deinstallieren X.lnk",
+        "P/Désinstaller My App.lnk",
+    ] {
+        assert!(is_uninstall_shortcut(yes), "{yes}");
+    }
+    for no in [
+        "Watermark Remover.lnk",
+        "Removal Tool.lnk",
+        "My App.lnk",
+        "MyAppUninstall.lnk",
+        "",
+        "ÿ\u{0}💥/.lnk",
+    ] {
+        assert!(!is_uninstall_shortcut(no), "{no}");
+    }
+}
+
+#[test]
+fn manual_choice_lists_are_sorted_by_path_whatever_the_input_order() {
+    let files = ["App/zeta.exe", "App/alpha.exe", "App/Mid.exe"];
+    let sorted = |r: RankResult| match r {
+        RankResult::NeedsManualChoice(v) => v.into_iter().map(|c| c.path).collect::<Vec<_>>(),
+        other => panic!("expected a manual choice: {other:?}"),
+    };
+    let want = ["App/Mid.exe", "App/alpha.exe", "App/zeta.exe"];
+    assert_eq!(sorted(rank(&diff(&files, vec![]), &[], no_bytes, no_size)), want);
+    let mut rev = files;
+    rev.reverse();
+    assert_eq!(sorted(rank(&diff(&rev, vec![]), &[], no_bytes, no_size)), want);
+    // The doubtful-exclusion path (survivor + excluded exe appended) is sorted too.
+    let d = diff(
+        &["App/zz.exe", "App/app.exe"],
+        vec![UninstallEntry {
+            display_name: None,
+            uninstall_string: Some(r"C:\App\app.exe /uninstall".into()),
+            icon_path: None,
+        }],
+    );
+    assert_eq!(sorted(rank(&d, &[], no_bytes, no_size)), ["App/app.exe", "App/zz.exe"]);
+}
+
 fn manual_paths(result: &RankResult) -> Vec<&str> {
     let RankResult::NeedsManualChoice(candidates) = result else {
         panic!("expected a manual choice: {result:?}");
