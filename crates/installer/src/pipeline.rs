@@ -39,8 +39,10 @@
 //! is fuzzed panic-free (see their own module docs), so the panic risk this pipeline actually carries is much
 //! lower than Phase 2's zip/PE path; add the same drop-guard back if a real panic here is ever observed.
 //!
-//! **Ruling 1 (deferred).** `.desktop` generation (Task 7) does not exist yet: this pipeline stops at writing
-//! `Metadata`. See the `TODO(Task 7)` marker below.
+//! **Desktop integration (Task 7).** After `Metadata` is written, this pipeline writes a `.desktop` launcher
+//! (`rt_desktop::entry::write`) and registers the `.exe`/`.msi` MIME association (`rt_desktop::mime::register`).
+//! Both run only after the app itself is already fully installed and runnable; either failing becomes a warning
+//! on the returned `InstallOutcome`, never an install failure (see `run_after_create`'s own comment there).
 use crate::InstallerFamily;
 use crate::discover::{Candidate, RankResult, rank};
 use crate::family::{self, PlanError, Program};
@@ -73,8 +75,6 @@ const INSTALLER_STAGING_DIR: &str = "C:\\Windows\\Temp\\rt-installer";
 /// wine wineboot -u` on Wine 10.0/Ubuntu creates exactly this file). See Ruling 2 in the task brief. Also used
 /// by `crate::uninstall` (an `UninstallString` of `MsiExec.exe /X{GUID}` needs the same resolution).
 pub(crate) const MSIEXEC_RELATIVE: &str = "windows/system32/msiexec.exe";
-/// Icon sizes requested from `rt_desktop::icon::extract_icon_png` (hicolor's own sizes).
-const ICON_SIZES: [u32; 5] = [16, 32, 48, 128, 256];
 
 /// What the caller asked for. `silent`/`allow_network` default OFF ("default = show installer GUI", matching
 /// the task brief and this project's stance that Phase 3's target is offline-only installers).
@@ -554,27 +554,6 @@ fn arch_and_subsystem(pe_info: Option<&pe::PeInfo>) -> (&'static str, &'static s
     }
 }
 
-/// Extracts and best-effort caches the winning executable's icon as PNGs under `env.root()/icons/<size>.png`.
-/// There is no `.desktop` writer yet to hand these to directly (Ruling 1): they are cached here for Task 7 to
-/// pick up once it exists. Failure here (extraction or a single file write) never fails the install: an icon is
-/// cosmetic, never load-bearing.
-fn store_icons(env: &AppEnv, icons: &[(u32, Vec<u8>)]) {
-    if icons.is_empty() {
-        return;
-    }
-    let dir = env.root().join("icons");
-    if DirBuilder::new().recursive(true).mode(0o700).create(&dir).is_err() && !dir.is_dir() {
-        return;
-    }
-    for (size, bytes) in icons {
-        let path = dir.join(format!("{size}.png"));
-        // `create_new`: never overwrite, never follow a symlink. One icon failing must not touch the others.
-        if let Ok(mut f) = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
-            let _ = f.write_all(bytes);
-        }
-    }
-}
-
 // ---------------------------------------------------------------- orchestration after Store::create
 
 #[allow(clippy::too_many_arguments)]
@@ -627,11 +606,12 @@ fn run_after_create(
     let pe_info = winner_bytes.as_deref().and_then(|b| pe::analyze(b).ok());
     let (architecture, subsystem) = arch_and_subsystem(pe_info.as_ref());
 
-    if let Some(winner_bytes) = &winner_bytes
-        && let Ok(icons) = rt_desktop::icon::extract_icon_png(winner_bytes, &ICON_SIZES)
-    {
-        store_icons(env, &icons);
-    }
+    // Hoisted (Task 7's Ruling 4) so it is still in scope below, at the `.desktop`/icon-writing call site: the
+    // bytes are handed to `rt_desktop::entry::write` directly, never re-read off disk.
+    let icons: Vec<(u32, Vec<u8>)> = winner_bytes
+        .as_deref()
+        .and_then(|b| rt_desktop::icon::extract_icon_png(b, &rt_desktop::entry::HICOLOR_SIZES).ok())
+        .unwrap_or_default();
 
     let uninstall_entry = choose_uninstall_entry(&diff, &winner_path);
     let product_name = resolved_product_name(analyzed, uninstall_entry);
@@ -663,7 +643,22 @@ fn run_after_create(
     md.validate()?;
     store.write_metadata(env, &md)?;
 
-    // TODO(Task 7): generate .desktop entry here once rt_desktop::entry exists.
+    // Desktop integration (Task 7): the app is already fully installed and runnable via `runtime run <id>` at
+    // this point, exactly like the icon extraction above — a `.desktop` entry or MIME association failing here
+    // is cosmetic desktop-shell integration, never a reason to fail an otherwise-successful install (the same
+    // stance `store_icons` used to document for icon extraction). Both failures become warnings instead.
+    if let Err(e) = rt_desktop::entry::write(env, &md, &icons) {
+        warnings.push(format!(
+            "could not create the desktop menu entry: {}",
+            clean(&e.to_string(), MAX_FIELD_LEN)
+        ));
+    }
+    if let Err(e) = rt_desktop::mime::register() {
+        warnings.push(format!(
+            "could not register the .exe/.msi file association: {}",
+            clean(&e.to_string(), MAX_FIELD_LEN)
+        ));
+    }
 
     Ok(InstallOutcome::Installed {
         id: env.id().clone(),
