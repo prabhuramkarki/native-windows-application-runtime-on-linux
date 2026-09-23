@@ -155,7 +155,7 @@ fn a_portable_exe_installs_end_to_end() {
     assert_eq!(md.architecture, "x86_64");
     assert_eq!(md.executable, "C:\\Program Files\\runtime-fixture\\hello64.exe");
     assert_eq!(md.environment, "default");
-    assert_eq!(md.schema_version, 1);
+    assert_eq!(md.schema_version, 2);
     assert_eq!(md.backend.id, "fake");
     assert_eq!(md.backend.version, "fake-1.0");
     assert_eq!(md.subsystem, "console");
