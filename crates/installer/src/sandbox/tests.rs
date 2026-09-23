@@ -219,6 +219,25 @@ fn an_explicit_env_removal_on_the_wrapped_command_is_kept() {
     assert_eq!(e.get("GONE").cloned().flatten(), None);
 }
 
+/// I4: display/audio/D-Bus session variables never reach the sandbox, with or without network.
+#[test]
+fn display_audio_and_dbus_variables_are_never_replayed_into_the_sandbox() {
+    let (_tmp, env) = fx();
+    for allow_network in [false, true] {
+        let mut cmd = finalized("/bin/true");
+        for k in SANDBOX_ENV_DENYLIST {
+            cmd.env(k, "host-value");
+        }
+        cmd.env("LANG", "C.UTF-8");
+        let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow_network));
+        let e = envs(&out);
+        for k in SANDBOX_ENV_DENYLIST {
+            assert!(!e.contains_key(k), "{k} leaked (allow_network={allow_network})");
+        }
+        assert_eq!(e["LANG"], some("C.UTF-8"));
+    }
+}
+
 #[test]
 fn wrap_never_touches_the_current_processs_real_environment() {
     // A brand new `Command::new` otherwise inherits this process's real env (cargo's CARGO_* vars, ...); wrap()
