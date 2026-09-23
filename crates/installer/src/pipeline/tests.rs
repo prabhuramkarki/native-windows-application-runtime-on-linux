@@ -555,3 +555,188 @@ fn discovery_refuses_a_planted_fifo_and_symlink_without_hanging_or_following() {
         "a FIFO/symlink must never win: {winner:?}"
     );
 }
+
+// ------------------------------------------------------------- which Uninstall entry gets recorded
+
+fn entry(name: &str, uninstall: Option<&str>, icon: Option<&str>) -> UninstallEntry {
+    UninstallEntry {
+        display_name: Some(name.into()),
+        uninstall_string: uninstall.map(Into::into),
+        icon_path: icon.map(Into::into),
+    }
+}
+
+fn entries_diff(entries: Vec<UninstallEntry>) -> InstallDiff {
+    InstallDiff {
+        uninstall_entries: entries,
+        ..Default::default()
+    }
+}
+
+fn chosen_name(entries: Vec<UninstallEntry>, winner: &str) -> Option<String> {
+    let d = entries_diff(entries);
+    choose_uninstall_entry(&d, winner).and_then(|e| e.display_name.clone())
+}
+
+fn vc_redist() -> UninstallEntry {
+    entry(
+        "Microsoft Visual C++ 2015-2022 Redistributable (x64)",
+        Some("MsiExec.exe /X{0000-VC}"),
+        Some(r"C:\ProgramData\Package Cache\{0000-VC}\VC_redist.x64.exe,0"),
+    )
+}
+
+#[test]
+fn choose_uninstall_entry_ties_the_app_entry_by_display_icon_or_same_directory() {
+    const WINNER: &str = "Program Files/App/app.exe";
+    // The redistributable comes FIRST, so a `first()` fallback would record it.
+    let by_icon = vec![
+        vc_redist(),
+        entry("My App", None, Some(r#""C:\Program Files\App\APP.exe",0"#)),
+    ];
+    let by_dir = vec![
+        vc_redist(),
+        entry("My App", Some(r#""C:\Program Files\App\uninstall.exe" /S"#), None),
+    ];
+    assert_eq!(chosen_name(by_icon, WINNER).as_deref(), Some("My App"));
+    assert_eq!(chosen_name(by_dir, WINNER).as_deref(), Some("My App"));
+}
+
+#[test]
+fn choose_uninstall_entry_records_nothing_when_several_entries_tie_to_nothing() {
+    let entries = vec![
+        vc_redist(),
+        // A subdirectory of the winner's directory is not "the same directory".
+        entry("Other", Some(r"C:\Program Files\App\Sub\uninstall.exe /S"), None),
+    ];
+    assert_eq!(chosen_name(entries, "Program Files/App/app.exe"), None);
+}
+
+#[test]
+fn choose_uninstall_entry_keeps_a_single_entry() {
+    let entries = vec![entry("Only", Some("MsiExec.exe /I{GUID}"), None)];
+    assert_eq!(
+        chosen_name(entries, "Program Files/App/app.exe").as_deref(),
+        Some("Only")
+    );
+    assert_eq!(chosen_name(Vec::new(), "Program Files/App/app.exe"), None);
+}
+
+#[test]
+fn choose_uninstall_entry_never_matches_by_substring() {
+    // `c:/myapp/app.exe` CONTAINS `app/app.exe`: the old substring match wrongly tied these to App/app.exe.
+    let entries = vec![
+        entry(
+            "Mine",
+            Some(r#""C:\MyApp\app.exe" /uninstall"#),
+            Some(r"C:\MyApp\app.exe,0"),
+        ),
+        entry("Else", Some(r"C:\Else\x.exe"), None),
+    ];
+    assert_eq!(chosen_name(entries, "App/app.exe"), None);
+}
+
+#[test]
+fn choose_uninstall_entry_never_panics_on_hostile_strings() {
+    let hostile = [
+        String::new(),
+        "\"".repeat(5000),
+        ".exe".repeat(10_000),
+        "\u{e9}.exe\u{e9}".repeat(1000),
+        "C:\\\u{130}.EXE,0".to_owned(),
+        "C:\\".to_owned() + &"a\\".repeat(100_000) + "x.exe",
+    ];
+    for s in &hostile {
+        let entries = vec![entry("a", Some(s), Some(s)), entry("b", Some(s), None)];
+        for winner in ["", "/", "a.exe", "\u{130}/\u{e9}.exe", s.as_str()] {
+            let _ = chosen_name(entries.clone(), winner);
+        }
+    }
+}
+
+/// The pipeline-level shape of an `hello.exe /uninstall` app with no shortcut and no other `DisplayIcon`: its
+/// exclusion is doubtful, so the one other exe must NOT win by elimination; nothing is installed. Needs `bwrap`.
+#[test]
+fn a_doubtful_exclusion_makes_the_pipeline_ask_instead_of_picking_the_helper() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let script = r#"
+set -e
+dest_dir="$WINEPREFIX/drive_c/Program Files/HelloNsis"
+mkdir -p "$dest_dir"
+cp "$0" "$dest_dir/hello.exe"
+printf 'helper' > "$dest_dir/helper.exe"
+cat > "$WINEPREFIX/system.reg" <<'REG'
+WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\Machine
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{TESTGUID}] 1700000000
+#time=1
+"DisplayName"="Hello Nsis"
+"UninstallString"="\"C:\\Program Files\\HelloNsis\\hello.exe\" /uninstall"
+REG
+exit 0
+"#;
+    let backend = fake_backend(script);
+    let outcome =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let InstallOutcome::NeedsChoice(candidates) = outcome else {
+        panic!("expected NeedsChoice, got {outcome:?}");
+    };
+    let mut paths: Vec<_> = candidates.iter().map(|c| c.path.clone()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        [
+            "Program Files/HelloNsis/hello.exe",
+            "Program Files/HelloNsis/helper.exe"
+        ]
+    );
+    f.assert_no_app_left();
+}
+
+/// Two Uninstall entries, neither tied to the installed exe: nothing from the registry is recorded (the
+/// provisional name stays) and a warning says why. Needs `bwrap`.
+#[test]
+fn several_unrelated_uninstall_entries_record_nothing_and_warn() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let script = r#"
+set -e
+dest_dir="$WINEPREFIX/drive_c/Program Files/HelloNsis"
+mkdir -p "$dest_dir"
+cp "$0" "$dest_dir/hello.exe"
+cat > "$WINEPREFIX/system.reg" <<'REG'
+WINE REGISTRY Version 2
+;; All keys relative to REGISTRY\\Machine
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{VCREDIST}] 1700000000
+#time=1
+"DisplayName"="Microsoft Visual C++ Redistributable"
+"UninstallString"="MsiExec.exe /X{VCREDIST}"
+
+[Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{OTHER}] 1700000000
+#time=1
+"DisplayName"="Other Tool"
+"UninstallString"="C:\\Other\\uninstall.exe /S"
+REG
+exit 0
+"#;
+    let backend = fake_backend(script);
+    let outcome =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let InstallOutcome::Installed { id, warnings, .. } = outcome else {
+        panic!("expected Installed, got {outcome:?}");
+    };
+    assert!(
+        warnings.iter().any(|w| w.contains("none could be tied")),
+        "{warnings:?}"
+    );
+    let md = f.store.read_metadata(&f.store.get(&id).unwrap()).unwrap();
+    assert_eq!(md.name, "hello-nsis", "the provisional name, not a redistributable's");
+    let installer = md.installer.expect("installer field");
+    assert_eq!(installer.product_name, None);
+    assert_eq!(installer.uninstall_command, None);
+}
