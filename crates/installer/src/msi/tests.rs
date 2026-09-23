@@ -370,13 +370,36 @@ fn a_cyclic_directory_chain_is_rejected_not_an_infinite_loop() {
 
 #[test]
 fn a_cyclic_minifat_chain_is_rejected_not_an_infinite_loop() {
-    let (mut bytes, _) = build_msi(&[("ProductName", "A"), ("ProductCode", "B")], true);
-    // minifat[2] (the Property stream's own mini-sector) pointed at itself instead of EOC.
-    let minifat_off = HEADER_LEN + SECTOR * 3;
+    let (mut bytes, property_len_off) = build_msi(&[("ProductName", "A"), ("ProductCode", "B")], true);
+    // Declare the Property stream far longer than one mini-sector (64 bytes) — long enough that
+    // honestly satisfying it via mini-FAT accumulation would take more hops than the mini-FAT's
+    // own 128 entries could ever supply (hop_budget = minifat.len() + 1 = 129, i.e. at most
+    // 129 * 64 = 8256 bytes of real progress before the hop-budget guard must fire). This means
+    // if the guard below is removed, `out.len() < declared` stays true well past hop 129, so ONLY
+    // the hop-budget guard — not the unrelated "stream data is shorter than its declared size"
+    // check — can plausibly stop the loop. Comfortably under `MAX_STREAM_BYTES` (16 MiB).
+    put_u64(&mut bytes, property_len_off, 20_000);
+    // 20 000 is over the real `mini_stream_cutoff` (4096), which would otherwise reclassify this
+    // stream as a *regular*-FAT stream (routed through `read_chain`, not `read_minichain`, missing
+    // the mini-FAT cycle entirely). Raise the header's cutoff so the classification still picks
+    // the mini-chain path despite the inflated declared length.
+    put_u32(&mut bytes, 56, 1_000_000);
+    // minifat[2] (the Property stream's own, and only, mini-sector) pointed at itself instead of
+    // EOC. Layout is `header ++ fat ++ dir ++ minifat ++ ministream` (each one 512-byte SECTOR),
+    // so the mini-FAT sector is the *third* region after the header, at file offset
+    // `HEADER_LEN + SECTOR * 2` — NOT `* 3`, which lands in the mini stream instead and silently
+    // corrupts `_StringPool`'s data rather than exercising the mini-FAT cycle guard at all (a
+    // prior version of this test had exactly that off-by-one and passed for the wrong reason).
+    let minifat_off = HEADER_LEN + SECTOR * 2;
     put_u32(&mut bytes, minifat_off + 8, 2);
     let started = Instant::now();
     let err = MsiInfo::read(&bytes).unwrap_err();
-    assert!(matches!(err, MsiError::Malformed(_)), "{err:?}");
+    // Specific enough to fail if some other guard (e.g. the length check) caught this instead of
+    // the mini-FAT hop-budget guard actually being reached.
+    assert_eq!(
+        err,
+        MsiError::Malformed("mini-FAT chain longer than the mini-FAT itself (a cycle?)".to_string())
+    );
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "took {:?}",
@@ -483,22 +506,46 @@ fn a_self_looping_difat_sector_is_rejected_not_an_infinite_loop() {
 }
 
 // --- mutation checks (guards temporarily removed by hand, see the task report for the exact
-// names and what was observed) ---
-// - `truncated_before_the_header_ends_is_a_clean_error` fails if the `bytes.len() < HEADER_LEN`
-//   check in `CfbHeader::parse` is removed (it then panics on the header slice).
-// - `bad_magic_is_rejected` fails if the magic-number check is removed.
-// - `fat_sector_count_larger_than_the_file_is_rejected_without_reading_huge_data` fails (times
-//   out or panics trying to allocate/slice) if `build_fat`'s upfront
-//   `declared_bytes > bytes.len()` check is removed.
-// - `declared_stream_size_over_the_bound_is_rejected_before_any_chain_is_walked` fails if the
-//   `declared_len > max_bytes` check at the top of `read_chain`/`read_minichain` is removed.
+// names and what was observed; below is what actually happened when each guard was removed, not
+// a guess — several turned out to be backed up by a second, independent guard, and the notes say
+// so rather than overclaiming) ---
+// - `truncated_before_the_header_ends_is_a_clean_error` fails (panics, out-of-range slice) if the
+//   `bytes.len() < HEADER_LEN` check in `CfbHeader::parse` is removed. Uniquely load-bearing: no
+//   other guard runs before this one.
+// - `bad_magic_is_rejected` fails (returns `Ok` with the real product facts) if the magic-number
+//   check is removed. Uniquely load-bearing: nothing else inspects those 8 bytes.
+// - `fat_sector_count_larger_than_the_file_is_rejected_without_reading_huge_data` does NOT fail if
+//   `build_fat`'s upfront `declared_bytes > bytes.len()` check alone is removed: for this test's
+//   value, the later `locations.len() < num_fat_sectors` check ("DIFAT chain did not yield enough
+//   FAT sector locations") catches the same mismatch, so the two are defense-in-depth for this
+//   scenario. Only removing *both* would reach the unguarded `Vec::with_capacity` call.
+// - `declared_stream_size_over_the_bound_is_rejected_before_any_chain_is_walked` does NOT fail if
+//   the `declared_len > max_bytes` check alone is removed: the real/synthetic files this test uses
+//   are far too small to ever back up the huge declared length, so `read_chain`/`read_minichain`'s
+//   later `out.len() < declared` check ("stream data is shorter than its declared size") catches
+//   it instead. The upfront check is what matters for a file large enough to actually supply that
+//   many bytes within the overall `MAX_MSI_BYTES` budget — not exercised by this test.
 // - `stream_shorter_than_its_declared_size_is_an_error_not_a_silent_truncation` fails (returns Ok
-//   with a truncated value instead of Err) if the `out.len() < declared` check is removed.
-// - `a_cyclic_directory_chain_is_rejected_not_an_infinite_loop` and
-//   `a_cyclic_minifat_chain_is_rejected_not_an_infinite_loop` hang (never return) if the
-//   `hops >= hop_budget` checks are removed.
+//   with a truncated/empty value) if the `out.len() < declared` check is removed. Uniquely
+//   load-bearing for this scenario.
+// - `a_cyclic_directory_chain_is_rejected_not_an_infinite_loop` does NOT fail (and does not hang)
+//   if `read_directory_bytes`'s `hops >= hop_budget` check alone is removed: its `out.len() as u64
+//   >= max_bytes` (the `MAX_DIR_ENTRIES` cap) still stops the cycle, just after more iterations.
+//   Confirmed by removing the hop check and watching the test still pass.
+// - `a_cyclic_minifat_chain_is_rejected_not_an_infinite_loop` (the Property stream's declared size
+//   deliberately set past what `hop_budget * 64` bytes of honest mini-FAT accumulation could ever
+//   reach — see the test's own comment) DOES fail if `read_minichain`'s `hops >= hop_budget` check
+//   is removed: the loop does not hang (bounded by `declared`), but it silently returns `Ok` with
+//   313 repeated copies of one mini-sector's bytes decoded as garbage `Property` rows, instead of
+//   the expected cycle error. This is the one hop-budget check in `read_chain`/`read_minichain`
+//   this suite actually pins, by construction (declared length far exceeds what the mini-FAT could
+//   legitimately supply, so the length bound cannot fire first).
 // - `a_110th_fat_sector_is_reached_through_one_difat_sector` fails if the DIFAT-sector-chain walk
 //   in `build_fat` is removed or broken (falls back to only the 109 inline entries).
+// - `a_self_looping_difat_sector_is_rejected_not_an_infinite_loop` HANGS (confirmed: had to be
+//   killed with an external `timeout`, no output) if `MAX_DIFAT_HOPS` is removed. This is the one
+//   hop budget in this module with no independent backstop: a DIFAT sector can legally contribute
+//   zero new FAT sector locations (every entry `FREE_SECTOR`), so nothing else bounds that loop.
 // - `mutated_hello_msi_never_panics` is the blanket check: any single guard's removal that turns
 //   a clean error into a panic on some byte pattern is expected to be caught by this test too.
 
