@@ -163,6 +163,22 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   DNS-based probe was deliberately not used — this sandbox does not bind `/etc/resolv.conf` or
   `/etc/nsswitch.conf` either, so name resolution would fail for a reason unrelated to the network namespace).
 - `--die-with-parent`: a sandboxed helper cannot outlive the runtime process that started it.
+- **No display, audio or D-Bus, regardless of `--network`.** `InstallerSandbox::wrap` never replays
+  `SANDBOX_ENV_DENYLIST` (`DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `XDG_SESSION_TYPE`,
+  `DBUS_SESSION_BUS_ADDRESS`, `PULSE_SERVER`) into the sandbox, even though the ordinary launcher allowlist
+  passes them to unsandboxed runs. This matters with `--network`: the host network namespace is then shared, so
+  the host's abstract X11 socket is reachable (verified in the Phase 3 final review), and before this fix
+  `DISPLAY`/`XAUTHORITY` were passed straight through — only X auth-cookie binding stood between a `--network`
+  installer and the host session. No socket is bound either (`/tmp` is a fresh tmpfs, `$XDG_RUNTIME_DIR` is not
+  bound), so a program that guesses `DISPLAY=:0` on its own can still try the abstract socket under
+  `--network`; it would need the (unbound) X authority cookie to get in.
+- **Wine's registry flush happens inside the sandbox.** `--unshare-pid` makes `bwrap` tear down the PID namespace
+  the instant its direct child exits, killing `wineserver` before it writes `system.reg`/`user.reg`. Every
+  installer/uninstaller command is therefore wrapped by `CompatBackend::settle` (Wine:
+  `/bin/sh -c '<fixed script>' sh <wineserver> <program> <args...>`, which runs the program, then
+  `wineserver -w`, then exits with the program's own status). The script text is a constant; every path and
+  argument arrives as argv, never interpolated. Residual risk: if `wineserver -w` never returns (a Wine process
+  left holding the prefix), the install waits with no internal timeout, the same as the installer run itself.
 
 **What this narrows.** An installer running under it cannot read or write anything on the host outside its own
 app directory and the fixed read-only system paths listed above (needed to run Wine itself; verified: a write
@@ -173,10 +189,9 @@ other apps' data or any other host path, and (by default) has no network at all,
 - **Same uid, no user namespace remapping.** The sandboxed process runs as the same Linux user as everything
   else; anything that same uid can reach OUTSIDE the mount namespace bwrap builds (signals to other processes of
   that uid, `/proc/<pid>` of a process outside the fresh PID namespace it cannot even see, System V IPC objects
-  outside the fresh IPC namespace, D-Bus/X11/PulseAudio sockets if a caller ever passed those environment
-  variables through) is still reachable exactly as any other process of that user would reach it. This profile
-  does not pass `DISPLAY`/`PULSE_SERVER`/D-Bus variables itself, but it does not strip them either if they were
-  already on the finalized command's env — Task 6 must not put them there for a headless installer.
+  outside the fresh IPC namespace, and — only with `--network` — the host's abstract-namespace sockets) is still
+  reachable exactly as any other process of that user would reach it. The display/audio/D-Bus variables that
+  would point at those sockets are stripped (see above), which is not the same as the sockets being unreachable.
 - **No seccomp filter, no Landlock, no capability drop, no resource limits (cgroups, rlimits).** A sandboxed
   process still has every syscall a normal process has inside its namespaces; a kernel exploit or a namespace
   escape is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
@@ -248,15 +263,14 @@ through both together. Three things surfaced that were not previously visible:
   running `runtime install` without `--silent` on an installer that manages to render (e.g. if a display
   socket were ever added to this sandbox in a later phase, or one with a dialog sequence that blocks
   differently than NSIS's) has no such external bound today.
-- **A separate, non-sandbox finding from the same real end-to-end testing: `.lnk`-based executable
-  discovery (`rt_installer::discover::rank`'s tier (1)) does not fire for a real Wine-created Start Menu
-  shortcut**, because such a shortcut carries its target only in `LinkTargetIDList`, which
-  `rt_installer::lnk` deliberately never parses (documented scope limit since Task 3). For
-  `hello-nsis.exe`, whose installer also registers a separate `uninstall.exe` in the `Uninstall` registry
-  key, this means tier (2) uniquely — and wrongly — picks `uninstall.exe` as the app's own executable.
-  This is a ranking/parsing gap, not a sandbox one; see this task's report and the plan's Execution notes
-  for the full story. `crates/cli/tests/e2e_installers.rs`'s NSIS test uses `--exe` to name the real
-  executable directly rather than rely on discovery, until this is fixed.
+- **(Fixed in Task 9 and the final review.) `.lnk`-based executable discovery did not fire for a real
+  Wine-created Start Menu shortcut**, because such a shortcut carries its target only in
+  `LinkTargetIDList`, which `rt_installer::lnk` did not parse then; Task 9 added that fallback. Auto-discovery
+  for `hello-nsis.exe` wrongly picked its `uninstall.exe`. Task 8 blamed tier (2) (the `Uninstall` registry
+  entry), but the final review found the registry diff was always empty (the `wineserver` teardown bug above),
+  so the wrong pick really came from tier (3), the GUI-subsystem heuristic. Both causes are fixed: a real
+  auto-discovered `hello-nsis.exe --silent` install now records `hello64.exe`, and
+  `crates/cli/tests/e2e_installers.rs`'s NSIS test runs without `--exe` and asserts that.
 
 ## Roadmap
 
