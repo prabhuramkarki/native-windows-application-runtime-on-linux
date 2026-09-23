@@ -551,6 +551,64 @@ fn install_without_wine_is_an_error_that_says_what_to_do() {
 }
 
 #[test]
+fn install_of_a_real_msi_is_routed_to_the_installer_pipeline_and_fails_cleanly_without_msiexec() {
+    // Dispatch is by content, not extension: the fake `wineboot` (like a real one, minus creating
+    // `windows/system32/msiexec.exe`) still runs for real, proving the file was routed to the new installer
+    // pipeline (Task 6), not rejected outright the way Phase 2's `rt_core::install` alone would reject an MSI.
+    let r = rig();
+    let p = r.input("hello.msi", &fs::read(fixture("hello.msi")).unwrap());
+    let o = r.rt(&["install".as_ref(), p.as_os_str()]);
+    let err = assert_fails(&o);
+    assert!(err.contains("msiexec.exe"), "{err}");
+    assert_tame(&err, "stderr");
+    assert_eq!(s(&o.stdout), "", "nothing on stdout for a failed install");
+    assert!(r.app_dirs().is_empty(), "the half-built environment must be cleaned up");
+    // `wineboot` really ran (real WineBackend.prepare, not a stub) and the backend was stopped afterwards.
+    assert!(r.calls().iter().any(|c| c == "wine wineboot"), "{:?}", r.calls());
+    assert!(
+        r.calls().iter().any(|c| c.starts_with("wineserver -k")),
+        "{:?}",
+        r.calls()
+    );
+}
+
+#[test]
+fn install_of_a_msi_without_wine_says_what_to_do() {
+    let r = rig().no_wine();
+    let p = r.input("hello.msi", &fs::read(fixture("hello.msi")).unwrap());
+    let err = assert_fails(&r.rt(&["install".as_ref(), p.as_os_str()]));
+    assert!(err.contains("RUNTIME_WINE"), "{err}");
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn install_of_an_unrecognised_file_still_uses_the_old_pipeline() {
+    // Not installer-shaped (no MSI magic, no installer marker): falls through to the unchanged
+    // `rt_core::install`, which reports its own `Unknown` error, not the installer pipeline's.
+    let r = rig();
+    let p = r.input("notes.txt", b"just some text");
+    let err = assert_fails(&r.rt(&["install".as_ref(), p.as_os_str()]));
+    assert!(err.contains("not recognised") || err.contains("unrecognised"), "{err}");
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn silent_and_network_are_ignored_with_a_warning_for_a_non_installer() {
+    let r = rig();
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let o = r.rt(&[
+        "install".as_ref(),
+        p.as_os_str(),
+        "--silent".as_ref(),
+        "--network".as_ref(),
+    ]);
+    assert_ok(&o);
+    let err = s(&o.stderr);
+    assert!(err.contains("warning: ") && err.contains("--silent"), "{err}");
+    assert_tame(&err, "stderr");
+}
+
+#[test]
 fn a_failing_backend_setup_leaves_no_app() {
     let r = rig();
     script(&r.bin.join("wine"), "echo 'boom \u{1b}[31m' >&2; exit 9");
@@ -917,6 +975,58 @@ fn remove_still_removes_when_stopping_the_backend_fails() {
     assert_ok(&o);
     let err = s(&o.stderr);
     assert!(err.contains("warning: ") && err.contains("wineserver -k"), "{err}");
+    assert_tame(&err, "stderr");
+    assert!(r.app_dirs().is_empty());
+}
+
+// ================================================================ uninstall
+
+#[test]
+fn uninstall_of_a_missing_app_is_an_error_and_needs_no_wine() {
+    let r = rig().no_wine();
+    let err = assert_fails(&r.rt(&["uninstall", "nothing"]));
+    assert!(err.contains("nothing") && err.contains("runtime list"), "{err}");
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn uninstall_rejects_a_path_not_an_id_and_touches_nothing() {
+    let r = rig();
+    r.plant("victim", "V");
+    for arg in ["../victim", "/abs", ".", "", "victim/"] {
+        let o = r.cmd().arg("uninstall").arg("--").arg(arg).output().unwrap();
+        let err = assert_fails(&o);
+        assert!(err.contains("not a valid app id"), "{arg:?}: {err}");
+    }
+    assert_eq!(r.app_dirs(), ["victim"]);
+    assert!(r.calls().is_empty());
+}
+
+#[test]
+fn uninstall_of_a_portable_exe_app_falls_back_to_plain_removal_a_documented_limit() {
+    // A portable-exe install has no `installer` field at all: no uninstall command exists to run, so
+    // `uninstall` behaves exactly like `remove` for it.
+    let r = rig();
+    let id = r.install();
+    let before = r.calls().len();
+    let o = r.rt(&["uninstall", &id]);
+    assert_ok(&o);
+    assert!(s(&o.stdout).contains(&format!("Uninstalled {id}")), "{}", s(&o.stdout));
+    assert!(r.app_dirs().is_empty());
+    // Only the backend stop, no attempt to run a nonexistent uninstall command.
+    let calls = &r.calls()[before..];
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].starts_with("wineserver -k"), "{calls:?}");
+}
+
+#[test]
+fn uninstall_without_wine_warns_and_still_removes() {
+    let r = rig().no_wine();
+    r.plant("app", "A");
+    let o = r.rt(&["uninstall", "app"]);
+    assert_ok(&o);
+    let err = s(&o.stderr);
+    assert!(err.contains("warning: ") && err.contains("Wine"), "{err}");
     assert_tame(&err, "stderr");
     assert!(r.app_dirs().is_empty());
 }

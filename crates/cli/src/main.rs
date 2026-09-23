@@ -6,6 +6,7 @@ mod logs;
 mod remove;
 mod run;
 mod safe;
+mod uninstall;
 
 use clap::{Parser, Subcommand};
 use rt_core::{Launcher, Store};
@@ -35,15 +36,26 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Install a portable .exe or a .zip archive into its own environment (needs Wine)
+    /// Install a portable .exe, a .zip archive, or a .msi/.exe installer into its own environment (needs Wine).
+    /// Which one a file is is decided by its content, never its extension.
     Install {
         file: PathBuf,
-        /// Display name (the app id is derived from it); default: the program's product name or file name
+        /// Display name (the app id is derived from it); default: the program's product name or file name.
+        /// Not used for a .msi/.exe installer: its own name is used instead.
         #[arg(long)]
         name: Option<String>,
-        /// For an archive: the program, as a path inside the archive (e.g. `bin/app.exe`)
+        /// For an archive: the program, as a path inside the archive (e.g. `bin/app.exe`). For a .msi/.exe
+        /// installer: the app's own executable, as a path inside the installed prefix (e.g.
+        /// `Program Files\App\app.exe`), skipping automatic discovery entirely.
         #[arg(long)]
         exe: Option<String>,
+        /// Installer only: run it non-interactively with its standard silent-install flags (default: show its
+        /// own GUI)
+        #[arg(long)]
+        silent: bool,
+        /// Installer only: allow it network access while it runs (default: no network at all, not even loopback)
+        #[arg(long)]
+        network: bool,
     },
     /// Run an installed app, or install a .exe/.zip file first and run it (needs Wine).
     /// The exit code is the program's (128+N when it was killed by signal N).
@@ -78,6 +90,10 @@ enum Cmd {
     },
     /// Stop an app's Wine processes and delete the app and its environment (takes an app id, never a path)
     Remove { app: String },
+    /// Run an app's recorded installer uninstall command (if any), then delete the app and its environment
+    /// regardless (takes an app id, never a path). An app with no recorded uninstaller (a portable-exe install,
+    /// or one made before this existed) just has its environment removed, same as `runtime remove`.
+    Uninstall { app: String },
     /// Show the newest log of an app (its last run's stderr)
     Logs {
         app: String,
@@ -123,11 +139,18 @@ fn main() -> ExitCode {
     };
     let result = match cli.cmd {
         Cmd::Analyze { file, json } => analyze::run(&file, json).map(|()| 0),
-        Cmd::Install { file, name, exe } => install::run(&file, name, exe).map(|()| 0),
+        Cmd::Install {
+            file,
+            name,
+            exe,
+            silent,
+            network,
+        } => install::run(&file, name, exe, silent, network),
         Cmd::Run { target, debug, args } => run::run(&target, &args, debug),
         Cmd::Doctor { target, json } => doctor::run(target.as_deref(), json),
         Cmd::List { json } => list::run(json).map(|()| 0),
         Cmd::Remove { app } => remove::run(&app).map(|()| 0),
+        Cmd::Uninstall { app } => uninstall::run(&app).map(|()| 0),
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
     };
     match result {
