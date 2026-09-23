@@ -473,14 +473,17 @@ fn read_bounded_regular_file(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// `.lnk` files among `diff.new_files`, read and parsed (a file that fails to parse is silently excluded, same
-/// as `rank`'s own "no candidate" handling: this is best-effort signal, not a hard requirement).
-fn load_shortcuts(env: &AppEnv, diff: &InstallDiff) -> Vec<ShellLink> {
+/// as `rank`'s own "no candidate" handling: this is best-effort signal, not a hard requirement). Each is paired
+/// with its own `new_files` path: `rank` reads the `.lnk`'s file name to skip "Uninstall" shortcuts.
+fn load_shortcuts(env: &AppEnv, diff: &InstallDiff) -> Vec<(String, ShellLink)> {
     let drive_c = env.drive_c();
     diff.new_files
         .iter()
         .filter(|p| p.to_lowercase().ends_with(".lnk"))
-        .filter_map(|p| read_bounded_regular_file(&drive_c.join(p)))
-        .filter_map(|bytes| ShellLink::parse(&bytes).ok())
+        .filter_map(|p| {
+            let link = ShellLink::parse(&read_bounded_regular_file(&drive_c.join(p))?).ok()?;
+            Some((p.clone(), link))
+        })
         .collect()
 }
 

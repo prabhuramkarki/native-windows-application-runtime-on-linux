@@ -274,14 +274,23 @@ through both together. Three things surfaced that were not previously visible:
   so the wrong pick really came from tier (3), the GUI-subsystem heuristic. Once that teardown bug was fixed
   and registry writes survived, tier (2) itself became a hazard: it matched candidates against
   `UninstallString`, which for NSIS/Inno names the uninstaller, so with no matching `.lnk` the uninstaller
-  would have won tier (2) outright. Now: tier (2) matches only `DisplayIcon`, and any `.exe` an
-  `UninstallString` names is dropped from the candidate pool entirely (no tier, including a Start Menu
-  "Uninstall" shortcut or a `DisplayIcon` of `uninstall.exe,0`, can pick it); if it was the only new `.exe`,
-  discovery asks for a manual choice instead. Unit-tested in `rt_installer::discover`. A real
-  auto-discovered `hello-nsis.exe --silent` install records `hello64.exe` (via tier (1), the Start Menu
-  shortcut), and `crates/cli/tests/e2e_installers.rs`'s NSIS test runs without `--exe` and asserts that.
-  Known ceiling: an app whose `UninstallString` is its own main exe (`app.exe /uninstall`) is never
-  auto-picked either; it needs a `.lnk`/lower-tier win among the other exes, a manual choice, or `--exe`.
+  would have won tier (2) outright. Now: tier (2) matches only `DisplayIcon`, and every path is matched
+  structurally, never by substring: each `DisplayIcon`/`UninstallString` is reduced to the one `C:` executable
+  path it names (quoted or not, spaces, trailing arguments, a `,index` suffix; `%VAR%` paths match nothing) and
+  compared component-wise, case-insensitively, with the candidate's drive_c-relative path. A candidate is
+  dropped from the pool before any tier is scored when (a) its basename looks like an uninstaller
+  (`uninstall*`, `uninst*`, `unins<digits>`, `remove*`, case-insensitive) — always, whatever names it, so a
+  file named `uninstall.exe`/`unins000.exe` never wins — or (b) an `UninstallString` names it and there is no
+  positive evidence it is the app: no Start Menu `.lnk` whose own name lacks "uninstall" targets it, and no
+  `DisplayIcon` names it other than in an entry whose `UninstallString` names it too. So an app whose
+  `UninstallString` is its own main exe (`app.exe /uninstall`) is still auto-picked when a normal shortcut
+  names it. "Uninstall …" shortcuts count for nothing (not tier (1), not evidence). If the exclusion leaves
+  no candidate, discovery asks for a manual choice. Unit-tested in `rt_installer::discover`. For real:
+  `hello-nsis.exe --silent` records `hello64.exe` via tier (1) (its Start Menu shortcut), and
+  `hello-nsis-noshortcut.exe --silent` (no shortcut) records `hello64.exe` with `uninstall.exe` excluded;
+  both run without `--exe` in `crates/cli/tests/e2e_installers.rs`. Remaining limit: an `app.exe /uninstall`
+  app with no normal shortcut and no other entry's `DisplayIcon` naming it is excluded, so discovery falls
+  to the other new exes' lower tiers or a manual choice; `--exe` overrides.
 
 ## Roadmap
 
