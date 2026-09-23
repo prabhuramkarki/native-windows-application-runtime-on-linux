@@ -419,6 +419,7 @@ dependencies = [
  "libc",
  "runtime-backend-wine",
  "runtime-core",
+ "runtime-desktop",
  "runtime-installer",
  "runtime-pe",
  "serde_json",
@@ -448,7 +449,9 @@ name = "runtime-desktop"
 version = "0.0.1"
 dependencies = [
  "png",
+ "runtime-core",
  "runtime-pe",
+ "tempfile",
  "thiserror",
 ]
 

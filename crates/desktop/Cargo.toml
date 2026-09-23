@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "rt_desktop"
 
 [dependencies]
+runtime-core = { path = "../core" }
 runtime-pe = { path = "../pe" }
 png = "0.18"
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
