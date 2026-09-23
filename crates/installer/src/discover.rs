@@ -118,21 +118,31 @@ fn looks_like_uninstaller(path: &str) -> bool {
             .is_some_and(|d| d.chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Words that make a shortcut's own file name an "Uninstall" shortcut: the uninstaller-name family
-/// ([`looks_like_uninstaller`]) plus common localized forms (German `Deinstallieren`/`Entfernen`,
-/// French `Désinstaller`, Spanish/Portuguese `Desinstalar`).
+/// Word stems that make a shortcut's own file name an "Uninstall" shortcut: the uninstaller-name
+/// family ([`looks_like_uninstaller`]) plus common localized forms (German `Deinstallieren`/`Entfernen`,
+/// French `Désinstaller`, Spanish/Portuguese `Desinstalar`). `remove` must be a whole word (so
+/// "Watermark Remover" / "Removal Tool" are not uninstall shortcuts); the others match a word's start.
 const UNINSTALL_WORDS: [&str; 6] = ["uninst", "remove", "deinstall", "entfern", "désinstall", "desinstal"];
 
-/// Keys of the `.lnk` targets that count as the app's own shortcuts: every shortcut except one
-/// whose own file name contains an [`UNINSTALL_WORDS`] word (NSIS/Inno's "Uninstall My App.lnk",
-/// which points at the uninstaller or at `app.exe /uninstall` and is evidence of nothing).
+/// True when a word of the shortcut's file name (split on non-alphanumeric chars, lowercased) is an
+/// [`UNINSTALL_WORDS`] word: "Uninstall My App.lnk", "Remove My App.lnk", "My App-Uninst.lnk" yes;
+/// "Watermark Remover.lnk", "MyAppUninstall.lnk" no.
+fn is_uninstall_shortcut(lnk_path: &str) -> bool {
+    let name = lnk_path.rsplit('/').next().unwrap_or(lnk_path).to_lowercase();
+    name.split(|c: char| !c.is_alphanumeric()).any(|t| {
+        UNINSTALL_WORDS
+            .iter()
+            .any(|w| t == *w || (*w != "remove" && t.starts_with(w)))
+    })
+}
+
+/// Keys of the `.lnk` targets that count as the app's own shortcuts: every shortcut except an
+/// "Uninstall" one ([`is_uninstall_shortcut`]: NSIS/Inno's "Uninstall My App.lnk", which points at
+/// the uninstaller or at `app.exe /uninstall` and is evidence of nothing).
 fn lnk_targets(shortcuts: &[(String, ShellLink)]) -> Vec<String> {
     shortcuts
         .iter()
-        .filter(|(lnk_path, _)| {
-            let name = lnk_path.rsplit('/').next().unwrap_or(lnk_path).to_lowercase();
-            !UNINSTALL_WORDS.iter().any(|w| name.contains(w))
-        })
+        .filter(|(lnk_path, _)| !is_uninstall_shortcut(lnk_path))
         .filter_map(|(_, s)| key(s.relative_path.as_ref()?))
         .collect()
 }
@@ -172,6 +182,12 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
     }
 }
 
+/// A manual choice, its list sorted by path so the order never depends on `read_dir`.
+fn manual(mut list: Vec<Candidate>) -> RankResult {
+    list.sort_by(|a, b| a.path.cmp(&b.path));
+    RankResult::NeedsManualChoice(list)
+}
+
 /// Ranks the `.exe` candidates in `diff.new_files`. See the module doc for the priority order, the
 /// injected `read`/`size` closures (and exactly when `read` is and is not called), and exactly
 /// what counts as a candidate.
@@ -185,7 +201,7 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
 ///   `uninst*`, `unins<digits>`, `remove*`) — always, whatever else names it; OR
 /// - (b) an Uninstall entry's `UninstallString` names it (the parsed program, [`exe_in`]) AND there
 ///   is no positive evidence it is the app. Positive evidence = a Start Menu `.lnk` targets it whose
-///   own name is not an "Uninstall" one ([`UNINSTALL_WORDS`]), or an entry's `DisplayIcon` names it
+///   own name is not an "Uninstall" one ([`is_uninstall_shortcut`]), or an entry's `DisplayIcon` names it
 ///   while that same entry's `UninstallString` does not (NSIS commonly sets both to its
 ///   uninstaller, so that pair is evidence of nothing).
 ///
@@ -201,6 +217,8 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
 /// bundled `helper.exe`/`vcredist.exe` would win silently by elimination. An uninstaller-named
 /// file with no evidence (NSIS's `uninstall.exe`, Inno's `unins000.exe`) is a confident exclusion
 /// and never triggers this: the one real app left still auto-picks.
+///
+/// Every [`RankResult::NeedsManualChoice`] list is sorted by path (deterministic across runs).
 pub fn rank(
     diff: &InstallDiff,
     shortcuts: &[(String, ShellLink)],
@@ -233,7 +251,7 @@ pub fn rank(
         }
     }
     if candidates.is_empty() {
-        return RankResult::NeedsManualChoice(excluded.iter().map(|(p, _)| excluded_candidate(p)).collect());
+        return manual(excluded.iter().map(|(p, _)| excluded_candidate(p)).collect());
     }
     let doubtful: Vec<Candidate> = excluded
         .iter()
@@ -274,7 +292,7 @@ pub fn rank(
             RankResult::NeedsManualChoice(v) => v,
         };
         list.extend(doubtful);
-        RankResult::NeedsManualChoice(list)
+        manual(list)
     };
 
     // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never
@@ -311,7 +329,7 @@ pub fn rank(
         let (p, gui, sz) = winners.pop().expect("len checked");
         RankResult::Winner(to_candidate(p, gui, sz))
     } else {
-        RankResult::NeedsManualChoice(
+        manual(
             winners
                 .into_iter()
                 .map(|(p, gui, sz)| to_candidate(p, gui, sz))
