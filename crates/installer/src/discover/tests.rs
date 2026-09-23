@@ -452,19 +452,41 @@ fn a_display_icon_equal_to_its_own_uninstall_string_is_not_evidence() {
 
 #[test]
 fn an_uninstall_named_shortcut_is_not_evidence_and_gives_no_tier_one() {
-    // "Uninstall My App.lnk" -> `app.exe /uninstall`: not a reason to keep or boost it.
-    let d = diff(&["App/app.exe", "App/other.exe"], vec![]);
-    let shortcuts = [named_lnk_to("Start Menu/Uninstall My App.lnk", r"C:\App\other.exe")];
-    let size = |p: &str| (p == "App/app.exe").then_some(1_000_000);
-    let result = rank(&d, &shortcuts, no_bytes, size);
-    assert!(
-        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe" && c.score & 0b1000 == 0),
-        "{result:?}"
-    );
+    // An "Uninstall"-family shortcut (any language) targeting other.exe gives it no tier (1), so the
+    // bigger app.exe wins on size instead.
+    for lnk in [
+        "Start Menu/Uninstall My App.lnk",
+        "Start Menu/Remove My App.lnk",
+        "Start Menu/My App deinstallieren.lnk",
+        "Start Menu/My App entfernen.lnk",
+        "Start Menu/Désinstaller My App.lnk",
+        "Start Menu/Desinstalar My App.lnk",
+    ] {
+        let d = diff(&["App/app.exe", "App/other.exe"], vec![]);
+        let shortcuts = [named_lnk_to(lnk, r"C:\App\other.exe")];
+        let size = |p: &str| (p == "App/app.exe").then_some(1_000_000);
+        let result = rank(&d, &shortcuts, no_bytes, size);
+        assert!(
+            matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe" && c.score & 0b1000 == 0),
+            "{lnk}: {result:?}"
+        );
+    }
+}
+
+fn manual_paths(result: &RankResult) -> Vec<&str> {
+    let RankResult::NeedsManualChoice(candidates) = result else {
+        panic!("expected a manual choice: {result:?}");
+    };
+    let mut paths: Vec<_> = candidates.iter().map(|c| c.path.as_str()).collect();
+    paths.sort_unstable();
+    paths
 }
 
 #[test]
-fn an_uninstaller_named_file_never_wins_even_with_a_shortcut_and_display_icon() {
+fn an_uninstaller_named_file_with_evidence_is_a_manual_choice_never_a_silent_pick() {
+    // The file is uninstaller-NAMED, so it never wins; but a normal shortcut and a DisplayIcon point at
+    // it (it may be a real app called "Remove Background.exe"), and helper.exe has no signal of its
+    // own: picking helper.exe by elimination would be a guess.
     for name in ["uninstall.exe", "unins000.exe", "Uninst.exe", "REMOVE.EXE", "unins.exe"] {
         let path = format!("App/{name}");
         let d = diff(
@@ -478,11 +500,94 @@ fn an_uninstaller_named_file_never_wins_even_with_a_shortcut_and_display_icon() 
         let shortcuts = [lnk_to(&format!(r"C:\App\{name}"))];
         let size = |p: &str| (p == path).then_some(1_000_000);
         let result = rank(&d, &shortcuts, no_bytes, size);
-        assert!(
-            matches!(&result, RankResult::Winner(c) if c.path == "App/helper.exe"),
-            "{name}: {result:?}"
+        let mut want = vec![path.as_str(), "App/helper.exe"];
+        want.sort_unstable();
+        assert_eq!(manual_paths(&result), want, "{name}");
+    }
+}
+
+#[test]
+fn a_remove_named_app_with_a_shortcut_or_display_icon_is_a_manual_choice() {
+    // Case (a): a real app named like an uninstaller, evidenced by a normal shortcut OR (separately)
+    // by a DisplayIcon in an entry whose UninstallString names a different exe.
+    let files = ["App/Remove Background.exe", "App/helper.exe", "App/unins000.exe"];
+    let by_lnk = rank(
+        &diff(&files, vec![]),
+        &[lnk_to(r"C:\App\Remove Background.exe")],
+        no_bytes,
+        no_size,
+    );
+    let by_icon = rank(
+        &diff(
+            &files,
+            vec![UninstallEntry {
+                display_name: Some("Remove Background".into()),
+                uninstall_string: Some(r#""C:\App\unins000.exe""#.into()),
+                icon_path: Some(r"C:\App\Remove Background.exe,0".into()),
+            }],
+        ),
+        &[],
+        no_bytes,
+        no_size,
+    );
+    for result in [by_lnk, by_icon] {
+        assert_eq!(
+            manual_paths(&result),
+            ["App/Remove Background.exe", "App/helper.exe"],
+            "unins000.exe (named only, no evidence) is not offered"
         );
     }
+}
+
+#[test]
+fn an_app_excluded_by_its_own_uninstall_string_without_evidence_is_a_manual_choice() {
+    // Case (b): `app.exe /uninstall` with no shortcut and a DisplayIcon only in its own entry is
+    // excluded; vcredist.exe must not win silently by elimination.
+    let d = diff(
+        &["App/app.exe", "App/vcredist_x64.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r#""C:\App\app.exe" /uninstall"#.into()),
+            icon_path: Some(r"C:\App\app.exe,0".into()),
+        }],
+    );
+    let size = |p: &str| (p == "App/vcredist_x64.exe").then_some(1_000_000);
+    assert_eq!(
+        manual_paths(&rank(&d, &[], no_bytes, size)),
+        ["App/app.exe", "App/vcredist_x64.exe"]
+    );
+}
+
+#[test]
+fn a_doubtful_exclusion_still_auto_picks_a_winner_with_its_own_shortcut() {
+    // Same doubtful `app.exe /uninstall` exclusion as above, but main.exe has a normal shortcut:
+    // tier (1) is positive evidence, so it wins outright.
+    let d = diff(
+        &["App/app.exe", "App/main.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r#""C:\App\app.exe" /uninstall"#.into()),
+            icon_path: None,
+        }],
+    );
+    let result = rank(&d, &[lnk_to(r"C:\App\main.exe")], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/main.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_pure_uninstaller_by_name_only_leaves_the_one_real_app_auto_picked() {
+    // No registry entry, no shortcut: unins000.exe is excluded by name alone (a confident
+    // exclusion), so the only other exe wins without a manual choice.
+    let d = diff(&["App/app.exe", "App/unins000.exe"], vec![]);
+    let size = |p: &str| (p == "App/unins000.exe").then_some(1_000_000);
+    let result = rank(&d, &[], no_bytes, size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe"),
+        "{result:?}"
+    );
 }
 
 // --- structured (not substring) path matching ---------------------------------------------------
@@ -508,7 +613,9 @@ fn exe_in_extracts_the_program_path() {
 }
 
 #[test]
-fn a_candidate_merely_containing_the_uninstallers_name_is_not_excluded() {
+fn a_file_merely_containing_uninstall_mid_name_is_neither_excluded_nor_confused_with_the_uninstaller() {
+    // `my-uninstall-helper.exe` does not START with an uninstaller word and is not what the
+    // UninstallString names (`uninstall.exe`, excluded by name): it stays a candidate and wins.
     let d = diff(
         &["App/my-uninstall-helper.exe", "App/uninstall.exe"],
         vec![UninstallEntry {
@@ -535,9 +642,14 @@ fn an_uninstall_string_path_ending_in_a_candidates_path_does_not_exclude_it() {
             icon_path: None,
         }],
     );
-    let result = rank(&d, &[], no_bytes, no_size);
+    // MyApp/app.exe's exclusion is doubtful (rule (b) alone), so this is a manual choice; the point is
+    // that App/app.exe was RANKED (a survivor: its size bit is set), not excluded (score 0).
+    let result = rank(&d, &[], no_bytes, |_| Some(10));
+    let RankResult::NeedsManualChoice(candidates) = &result else {
+        panic!("expected a manual choice: {result:?}");
+    };
     assert!(
-        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe"),
+        candidates.iter().any(|c| c.path == "App/app.exe" && c.score & 1 == 1),
         "{result:?}"
     );
 }

@@ -90,7 +90,7 @@ fn key(p: &WinPath) -> Option<String> {
 /// `uninstall.exe`, `MsiExec.exe /X{...}`, not an absolute `C:` path) is `None`: it names nothing
 /// this ranking can match. Never panics: the `.exe` search runs on an ASCII-lowercased copy, whose
 /// byte offsets equal the original's, and `.` is ASCII, so every slice is on a char boundary.
-fn exe_in(value: &str) -> Option<String> {
+pub(crate) fn exe_in(value: &str) -> Option<String> {
     let value = value.trim();
     let program = if value.starts_with('"') {
         split_command_line(value).into_iter().next()?
@@ -118,15 +118,20 @@ fn looks_like_uninstaller(path: &str) -> bool {
             .is_some_and(|d| d.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// Words that make a shortcut's own file name an "Uninstall" shortcut: the uninstaller-name family
+/// ([`looks_like_uninstaller`]) plus common localized forms (German `Deinstallieren`/`Entfernen`,
+/// French `Désinstaller`, Spanish/Portuguese `Desinstalar`).
+const UNINSTALL_WORDS: [&str; 6] = ["uninst", "remove", "deinstall", "entfern", "désinstall", "desinstal"];
+
 /// Keys of the `.lnk` targets that count as the app's own shortcuts: every shortcut except one
-/// whose own file name contains "uninstall" (NSIS/Inno's "Uninstall My App.lnk", which points at
-/// the uninstaller or at `app.exe /uninstall` and is evidence of nothing).
+/// whose own file name contains an [`UNINSTALL_WORDS`] word (NSIS/Inno's "Uninstall My App.lnk",
+/// which points at the uninstaller or at `app.exe /uninstall` and is evidence of nothing).
 fn lnk_targets(shortcuts: &[(String, ShellLink)]) -> Vec<String> {
     shortcuts
         .iter()
         .filter(|(lnk_path, _)| {
-            let name = lnk_path.rsplit('/').next().unwrap_or(lnk_path);
-            !name.to_lowercase().contains("uninstall")
+            let name = lnk_path.rsplit('/').next().unwrap_or(lnk_path).to_lowercase();
+            !UNINSTALL_WORDS.iter().any(|w| name.contains(w))
         })
         .filter_map(|(_, s)| key(s.relative_path.as_ref()?))
         .collect()
@@ -176,19 +181,26 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
 ///
 /// **Uninstallers are never auto-picked.** Before any tier is scored, a candidate is removed from
 /// the pool when EITHER
-/// - its basename looks like an uninstaller ([`looks_like_uninstaller`]: `uninstall*`, `uninst*`,
-///   `unins<digits>`, `remove*`) — always, whatever else names it; OR
-/// - an Uninstall entry's `UninstallString` names it (the parsed program, [`exe_in`]) AND there is
-///   no positive evidence it is the app: no non-"Uninstall" Start Menu `.lnk` targets it, and no
-///   entry's `DisplayIcon` names it unless that same entry's `UninstallString` names it too (NSIS
-///   commonly sets both to its uninstaller, so that pair is evidence of nothing).
+/// - (a) its basename looks like an uninstaller ([`looks_like_uninstaller`]: `uninstall*`,
+///   `uninst*`, `unins<digits>`, `remove*`) — always, whatever else names it; OR
+/// - (b) an Uninstall entry's `UninstallString` names it (the parsed program, [`exe_in`]) AND there
+///   is no positive evidence it is the app. Positive evidence = a Start Menu `.lnk` targets it whose
+///   own name is not an "Uninstall" one ([`UNINSTALL_WORDS`]), or an entry's `DisplayIcon` names it
+///   while that same entry's `UninstallString` does not (NSIS commonly sets both to its
+///   uninstaller, so that pair is evidence of nothing).
 ///
 /// So an app whose `UninstallString` is its own main exe (`app.exe /uninstall`) stays eligible
 /// when a normal shortcut, or another entry's `DisplayIcon`, names it. If the exclusion leaves no
-/// candidates, the result is [`RankResult::NeedsManualChoice`] listing the excluded exe(s): a
-/// genuine ambiguity the user resolves (or `--exe`), never a silent pick. Remaining limit: an
-/// `app.exe /uninstall` app with no such evidence (no shortcut, `DisplayIcon` only in its own
-/// entry) is excluded and falls to the other exes' lower tiers, or to a manual choice.
+/// candidates, the result is [`RankResult::NeedsManualChoice`] listing the excluded exe(s).
+///
+/// **Doubtful exclusions.** An exclusion is doubtful when the exe was dropped by (b) alone (not
+/// uninstaller-named: maybe `app.exe /uninstall` with no evidence), or by (a) despite positive
+/// evidence (maybe a real app called `Remove Background.exe`). When any exclusion is doubtful and
+/// the surviving winner has no tier (1)/(2) signal of its own, the result is
+/// [`RankResult::NeedsManualChoice`] listing the survivor(s) plus the doubtful exes: otherwise a
+/// bundled `helper.exe`/`vcredist.exe` would win silently by elimination. An uninstaller-named
+/// file with no evidence (NSIS's `uninstall.exe`, Inno's `unins000.exe`) is a confident exclusion
+/// and never triggers this: the one real app left still auto-picks.
 pub fn rank(
     diff: &InstallDiff,
     shortcuts: &[(String, ShellLink)],
@@ -197,28 +209,37 @@ pub fn rank(
 ) -> RankResult {
     let lnk_targets = lnk_targets(shortcuts);
     let entries = entries(diff);
+    let excluded_candidate = |path: &String| Candidate {
+        path: path.clone(),
+        name: None,
+        icon: None,
+        score: 0,
+    };
 
-    let (uninstaller_paths, candidates): (Vec<&String>, Vec<&String>) =
-        diff.new_files.iter().filter(|p| is_exe(p)).partition(|p| {
-            let lower = p.to_lowercase();
-            let is = |k: &Option<String>| k.as_deref() == Some(lower.as_str());
-            let named = entries.iter().any(|(_, _, u)| is(u));
-            let evidence = lnk_targets.contains(&lower) || entries.iter().any(|(_, icon, u)| is(icon) && !is(u));
-            looks_like_uninstaller(&lower) || (named && !evidence)
-        });
-    if candidates.is_empty() {
-        return RankResult::NeedsManualChoice(
-            uninstaller_paths
-                .into_iter()
-                .map(|path| Candidate {
-                    path: path.clone(),
-                    name: None,
-                    icon: None,
-                    score: 0,
-                })
-                .collect(),
-        );
+    // `excluded` pairs each dropped exe with whether dropping it is doubtful (see "Doubtful
+    // exclusions" in this function's doc).
+    let mut candidates = Vec::new();
+    let mut excluded = Vec::new();
+    for p in diff.new_files.iter().filter(|p| is_exe(p)) {
+        let lower = p.to_lowercase();
+        let is = |k: &Option<String>| k.as_deref() == Some(lower.as_str());
+        let named = entries.iter().any(|(_, _, u)| is(u));
+        let evidence = lnk_targets.contains(&lower) || entries.iter().any(|(_, icon, u)| is(icon) && !is(u));
+        let by_name = looks_like_uninstaller(&lower);
+        if by_name || (named && !evidence) {
+            excluded.push((p, evidence || !by_name));
+        } else {
+            candidates.push(p);
+        }
     }
+    if candidates.is_empty() {
+        return RankResult::NeedsManualChoice(excluded.iter().map(|(p, _)| excluded_candidate(p)).collect());
+    }
+    let doubtful: Vec<Candidate> = excluded
+        .iter()
+        .filter(|(_, d)| *d)
+        .map(|(p, _)| excluded_candidate(p))
+        .collect();
 
     // Tiers (1) and (2): no I/O, computed for every candidate.
     let mut partials: Vec<Partial> = candidates
@@ -243,6 +264,18 @@ pub fn rank(
         .max()
         .unwrap_or_default();
     partials.retain(|p| (p.has_lnk, p.has_uninstall) == top_pair);
+    // Doubtful exclusions + a winner with no tier (1)/(2) signal = too uncertain to auto-pick.
+    let settle = |result: RankResult| {
+        if top_pair != (false, false) || doubtful.is_empty() {
+            return result;
+        }
+        let mut list = match result {
+            RankResult::Winner(c) => vec![c],
+            RankResult::NeedsManualChoice(v) => v,
+        };
+        list.extend(doubtful);
+        RankResult::NeedsManualChoice(list)
+    };
 
     // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never
     // called for it, or for any candidate it already beat. `size` is still fetched (a stat, not a
@@ -250,7 +283,7 @@ pub fn rank(
     if partials.len() == 1 {
         let winner = partials.pop().expect("len checked");
         let file_size = size(&winner.path).unwrap_or(0);
-        return RankResult::Winner(to_candidate(winner, false, file_size));
+        return settle(RankResult::Winner(to_candidate(winner, false, file_size)));
     }
 
     // Tier (3): only the candidates still tied after (1)/(2) are ever read.
@@ -274,7 +307,7 @@ pub fn rank(
         .into_iter()
         .filter(|(_, gui, sz)| (*gui, *sz) == top_key)
         .collect();
-    if winners.len() == 1 {
+    settle(if winners.len() == 1 {
         let (p, gui, sz) = winners.pop().expect("len checked");
         RankResult::Winner(to_candidate(p, gui, sz))
     } else {
@@ -284,7 +317,7 @@ pub fn rank(
                 .map(|(p, gui, sz)| to_candidate(p, gui, sz))
                 .collect(),
         )
-    }
+    })
 }
 
 #[cfg(test)]
