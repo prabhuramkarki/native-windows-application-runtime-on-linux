@@ -13,8 +13,10 @@ jobs:
       # `bubblewrap` is required (not merely nice-to-have): the installer-sandbox tests in `runtime-installer`
       # (`crate::sandbox`, `crate::pipeline`, `crate::uninstall`) gate on `bwrap` being on `$PATH` and otherwise
       # skip loudly rather than failing, so without this and RUNTIME_REQUIRE_BWRAP below, CI could go green while
-      # never actually running them.
-      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 bubblewrap
+      # never actually running them. `desktop-file-utils` (provides `desktop-file-validate`) is required for the
+      # same reason: `runtime-desktop`'s `.desktop`-writer tests gate on it and RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE
+      # below, the identical convention.
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 bubblewrap desktop-file-utils
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,6 +29,7 @@ jobs:
       - run: cargo test --workspace
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
+          RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
   # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
   # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
   # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on

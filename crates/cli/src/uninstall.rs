@@ -59,10 +59,9 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
         )),
     }
     // Best-effort, same stance as the desktop entry's own creation (`installer::pipeline`): a `.desktop`/icon
-    // removal failure is desktop-shell cosmetics, never a reason to leave the app's environment in place.
-    if let Err(e) = rt_desktop::entry::remove(&id) {
-        warn(&format!("could not remove this app's desktop menu entry: {e}"));
-    }
+    // removal failure is desktop-shell cosmetics, never a reason to leave the app's environment in place. Shared
+    // with `remove::run` (`crate::remove_desktop_entry`) so both removal commands stay in sync.
+    crate::remove_desktop_entry(&id);
     store.remove(&id)?;
     crate::emit(&format!("Uninstalled {}\n", safe(id.as_str())))
 }
