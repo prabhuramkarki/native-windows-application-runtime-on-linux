@@ -44,7 +44,7 @@
 //! Both run only after the app itself is already fully installed and runnable; either failing becomes a warning
 //! on the returned `InstallOutcome`, never an install failure (see `run_after_create`'s own comment there).
 use crate::InstallerFamily;
-use crate::discover::{Candidate, RankResult, rank};
+use crate::discover::{Candidate, RankResult, exe_in, rank};
 use crate::family::{self, PlanError, Program};
 use crate::lnk::ShellLink;
 use crate::msi::{MsiError, MsiInfo};
@@ -532,24 +532,30 @@ fn resolve_exe_override(env: &AppEnv, raw: &str) -> Result<String, InstallerErro
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// The `Uninstall` entry that best matches `winner_path`: the only one when there is at most one (the common
-/// case: one installer, one Uninstall registration), else the one whose `UninstallString`/`DisplayIcon` mentions
-/// the winner's path, else the first one found (never a hard failure: an uninstall command is a nice-to-have,
-/// not required for the install itself to succeed).
+/// The `Uninstall` entry whose `DisplayName`/`UninstallString` get recorded for `winner_path`: the only one when
+/// there is exactly one (the common case: one installer, one Uninstall registration); else the one whose
+/// `DisplayIcon` names the winner; else the one whose `UninstallString` program sits in the winner's own
+/// directory. Paths are compared structurally ([`exe_in`]: parsed program path, component-wise, case-insensitive),
+/// never by substring. `None` when several entries exist and none ties to the winner (e.g. the app plus a bundled
+/// VC++ redistributable): the caller then records nothing from the registry and warns, rather than recording an
+/// unrelated product's name and uninstall command.
 fn choose_uninstall_entry<'a>(diff: &'a InstallDiff, winner_path: &str) -> Option<&'a UninstallEntry> {
-    if diff.uninstall_entries.len() <= 1 {
-        return diff.uninstall_entries.first();
+    let entries = &diff.uninstall_entries;
+    if let [only] = entries.as_slice() {
+        return Some(only);
     }
-    let needle = winner_path.to_lowercase();
-    diff.uninstall_entries
+    let winner = winner_path.to_lowercase();
+    let dir = |p: &str| p.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
+    let winner_dir = dir(&winner);
+    let exe = |v: &Option<String>| v.as_deref().and_then(exe_in);
+    entries
         .iter()
-        .find(|e| {
-            [e.uninstall_string.as_deref(), e.icon_path.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|s| s.replace('\\', "/").to_lowercase().contains(&needle))
+        .find(|e| exe(&e.icon_path).as_deref() == Some(winner.as_str()))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| exe(&e.uninstall_string).is_some_and(|u| dir(&u) == winner_dir))
         })
-        .or_else(|| diff.uninstall_entries.first())
 }
 
 /// The app's real product name, if one could be determined: an MSI's own `ProductName` first (known and
@@ -643,6 +649,13 @@ fn run_after_create(
         .unwrap_or_default();
 
     let uninstall_entry = choose_uninstall_entry(&diff, &winner_path);
+    if uninstall_entry.is_none() && diff.uninstall_entries.len() > 1 {
+        warnings.push(format!(
+            "{} Uninstall registry entries were found and none could be tied to the installed executable; no \
+             uninstall command or product name was recorded from the registry",
+            diff.uninstall_entries.len()
+        ));
+    }
     let product_name = resolved_product_name(analyzed, uninstall_entry);
     let uninstall_command = uninstall_entry
         .and_then(|e| e.uninstall_string.as_deref())
