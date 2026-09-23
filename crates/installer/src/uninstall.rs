@@ -79,6 +79,9 @@ fn run_uninstall_command(
             return false;
         }
     };
+    // Same reasoning as `pipeline::run_installer_process`: `settle` before the sandbox sees the command, so a
+    // lingering `wineserver` is waited for inside the same PID-namespace process tree, not after it is dead.
+    let cmd = backend.settle(cmd);
     let running = match sandboxed.spawn(cmd, env, LogSink::LogOnly) {
         Ok(r) => r,
         Err(e) => {

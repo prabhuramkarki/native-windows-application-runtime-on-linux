@@ -40,6 +40,20 @@ fn parses_string_dword_and_default_values() {
     assert_eq!(key.values[""], RegValue::Default("default text".into()));
 }
 
+/// Real line from a Wine 10.0 prefix after `hello.msi` installed (REG_EXPAND_SZ written as `str(2):`).
+#[test]
+fn str2_expand_sz_values_parse_as_strings() {
+    let mut input = String::new();
+    input.push_str("[Software\\\\Wow6432Node\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\{X}] 1\n");
+    input.push_str("\"UninstallString\"=str(2):\"MsiExec.exe /I{X}\"\n");
+    input.push_str("\"Path\"=str(2):\"%SystemRoot%\\\\a\"\n");
+    let reg = parse_ok(&input);
+    assert_eq!(reg.warnings, Vec::<String>::new());
+    let key = &reg.keys["Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{X}"];
+    assert_eq!(key.values["UninstallString"], RegValue::Str("MsiExec.exe /I{X}".into()));
+    assert_eq!(key.values["Path"], RegValue::Str("%SystemRoot%\\a".into()));
+}
+
 #[test]
 fn escaped_backslash_quote_cr_and_lf_decode_like_real_wine_does() {
     // Real sample from a live Wine 10.0 prefix's system.reg (this exact shape, minus the surrounding key):

@@ -432,6 +432,10 @@ fn run_installer_process(
         .with_sandbox(InstallerSandbox::new(bwrap).for_launcher(env.clone(), sandbox_opts));
 
     let cmd = backend.command(env, &exe_unix, &drive_c, &args, &RunOpts::default())?;
+    // Wrapped BEFORE the sandbox sees it (`CompatBackend::settle`'s own docs): a `--unshare-pid` sandbox kills a
+    // lingering `wineserver` the instant its direct child exits, so the wait for it has to happen inside the
+    // same process tree, not as a follow-up call after `spawn`/`wait` returns.
+    let cmd = backend.settle(cmd);
     let running = sandboxed.spawn(cmd, env, LogSink::LogOnly)?;
     let status = running
         .wait()
