@@ -993,6 +993,45 @@ fn remove_still_removes_when_stopping_the_backend_fails() {
     assert!(r.app_dirs().is_empty());
 }
 
+/// Plants a fake `.desktop` entry + hicolor icon for `id` under a fresh scratch `XDG_DATA_HOME` (never the real
+/// one — `Rig::cmd()` normally `env_clear()`s it away entirely; this is added back on top, on the returned
+/// `Command`, for exactly the one call that needs it), plus an unrelated survivor `.desktop` file in the same
+/// directory. Returns `(xdg_dir, desktop_path, icon_path, survivor_path)`.
+fn plant_desktop_entry(r: &Rig, id: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let xdg = r.root.join("xdg");
+    let apps_dir = xdg.join("applications");
+    let icon_dir = xdg.join("icons/hicolor/48x48/apps");
+    fs::create_dir_all(&apps_dir).unwrap();
+    fs::create_dir_all(&icon_dir).unwrap();
+    let desktop_path = apps_dir.join(format!("runtime-{id}.desktop"));
+    let icon_path = icon_dir.join(format!("runtime-{id}.png"));
+    fs::write(
+        &desktop_path,
+        format!("[Desktop Entry]\nType=Application\nName=Desktop App\nExec=runtime run {id}\n"),
+    )
+    .unwrap();
+    fs::write(&icon_path, b"not a real png, contents do not matter for this test").unwrap();
+    let survivor_path = apps_dir.join("runtime-other.desktop");
+    fs::write(&survivor_path, "survivor").unwrap();
+    (xdg, desktop_path, icon_path, survivor_path)
+}
+
+#[test]
+fn remove_also_deletes_this_apps_desktop_entry_and_icon() {
+    let r = rig();
+    let id = "desktop-app";
+    r.plant(id, "Desktop App");
+    let (xdg, desktop_path, icon_path, survivor_path) = plant_desktop_entry(&r, id);
+
+    let mut cmd = r.cmd();
+    let o = cmd.env("XDG_DATA_HOME", &xdg).arg("remove").arg(id).output().unwrap();
+    assert_ok(&o);
+
+    assert!(!desktop_path.exists(), "the .desktop entry must be removed by `remove`");
+    assert!(!icon_path.exists(), "the icon must be removed by `remove`");
+    assert!(survivor_path.exists(), "an unrelated .desktop file must survive");
+}
+
 // ================================================================ uninstall
 
 #[test]
@@ -1031,6 +1070,30 @@ fn uninstall_of_a_portable_exe_app_falls_back_to_plain_removal_a_documented_limi
     let calls = &r.calls()[before..];
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].starts_with("wineserver -k"), "{calls:?}");
+}
+
+#[test]
+fn uninstall_also_deletes_this_apps_desktop_entry_and_icon() {
+    let r = rig();
+    let id = "desktop-app";
+    r.plant(id, "Desktop App");
+    let (xdg, desktop_path, icon_path, survivor_path) = plant_desktop_entry(&r, id);
+
+    let mut cmd = r.cmd();
+    let o = cmd
+        .env("XDG_DATA_HOME", &xdg)
+        .arg("uninstall")
+        .arg(id)
+        .output()
+        .unwrap();
+    assert_ok(&o);
+
+    assert!(
+        !desktop_path.exists(),
+        "the .desktop entry must be removed by `uninstall`"
+    );
+    assert!(!icon_path.exists(), "the icon must be removed by `uninstall`");
+    assert!(survivor_path.exists(), "an unrelated .desktop file must survive");
 }
 
 #[test]

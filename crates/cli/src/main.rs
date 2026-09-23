@@ -113,6 +113,16 @@ pub(crate) fn backend(launcher: &Launcher) -> Result<backend_wine::WineBackend, 
     Ok(backend_wine::WineBackend::discover_with(launcher.clone())?)
 }
 
+/// Best-effort: deletes `id`'s `.desktop` entry and hicolor icons (`rt_desktop::entry::remove`), warning (never
+/// failing) on error. Shared by `remove` and `uninstall` so the two removal commands cannot drift apart on this
+/// again — both must clean up desktop integration, exactly like both already stop the backend and remove the
+/// store unconditionally.
+pub(crate) fn remove_desktop_entry(id: &rt_core::AppId) {
+    if let Err(e) = rt_desktop::entry::remove(id) {
+        safe::warn(&format!("could not remove this app's desktop menu entry: {e}"));
+    }
+}
+
 /// Writes to stdout; a closed pipe (`| head`) is the reader's choice, not an error.
 pub(crate) fn emit(text: &str) -> Result<(), CmdError> {
     let mut out = std::io::stdout().lock();

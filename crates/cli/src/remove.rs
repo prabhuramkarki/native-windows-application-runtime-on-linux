@@ -1,4 +1,5 @@
-//! `runtime remove <id>`: stops the app's Wine processes, then deletes its whole environment.
+//! `runtime remove <id>`: stops the app's Wine processes, best-effort removes its `.desktop` entry/icons, then
+//! deletes its whole environment.
 //!
 //! Only an app id is accepted (`AppId::parse`): never a path, so `..`, `/abs`, `a/b` and the empty string are
 //! refused before anything is looked at. `Store::remove` then refuses a symlink or non-directory at the app path.
@@ -31,6 +32,10 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
             "{e}; removing without stopping any running Wine process of this app"
         )),
     }
+    // Best-effort: an app installed via the Task 6 installer pipeline may have a `.desktop` entry/icons
+    // (`installer::pipeline` -> `rt_desktop::entry::write`); `remove` must clean those up too, exactly like
+    // `uninstall` does (`crate::remove_desktop_entry`), or they orphan a `runtime run <id>` that no longer works.
+    crate::remove_desktop_entry(&id);
     store.remove(&id)?;
     crate::emit(&format!("Removed {}\n", safe(id.as_str())))
 }
