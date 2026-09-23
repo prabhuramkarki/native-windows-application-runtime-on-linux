@@ -458,6 +458,20 @@ enum Discovery {
     NeedsChoice(Vec<Candidate>),
 }
 
+/// Refuses anything that is not a genuine regular file — checked with `symlink_metadata`, which does NOT follow
+/// a final symlink (the same discipline `resolve_exe_override` already uses) — before ever attempting to read
+/// it, then reads it with [`read_whole_file`]'s existing bounded-size, `O_NONBLOCK` discipline. Every path this
+/// is called on (a `.lnk`/`.exe` named by `diff.new_files`, an eventual winner's own bytes) is installer-written,
+/// hostile-input territory: without this check, a hostile installer leaving a FIFO as the sole new file would
+/// hang an unbounded `fs::read` forever (no writer), and a symlink (to `/dev/zero`, or a large/sensitive host
+/// file it can predict the path of) would have its TARGET read instead of being refused outright.
+fn read_bounded_regular_file(path: &Path) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file()) {
+        return None;
+    }
+    read_whole_file(path).ok()
+}
+
 /// `.lnk` files among `diff.new_files`, read and parsed (a file that fails to parse is silently excluded, same
 /// as `rank`'s own "no candidate" handling: this is best-effort signal, not a hard requirement).
 fn load_shortcuts(env: &AppEnv, diff: &InstallDiff) -> Vec<ShellLink> {
@@ -465,7 +479,7 @@ fn load_shortcuts(env: &AppEnv, diff: &InstallDiff) -> Vec<ShellLink> {
     diff.new_files
         .iter()
         .filter(|p| p.to_lowercase().ends_with(".lnk"))
-        .filter_map(|p| fs::read(drive_c.join(p)).ok())
+        .filter_map(|p| read_bounded_regular_file(&drive_c.join(p)))
         .filter_map(|bytes| ShellLink::parse(&bytes).ok())
         .collect()
 }
@@ -483,8 +497,16 @@ fn discover_winner(env: &AppEnv, diff: &InstallDiff, exe_override: Option<&str>)
     }
     let shortcuts = load_shortcuts(env, diff);
     let drive_c = env.drive_c();
-    let read = |p: &str| fs::read(drive_c.join(p)).ok();
-    let size = |p: &str| fs::metadata(drive_c.join(p)).ok().map(|m| m.len());
+    let read = |p: &str| read_bounded_regular_file(&drive_c.join(p));
+    // `symlink_metadata`, not `metadata`: a candidate whose bytes `read` above would refuse (a symlink, a FIFO,
+    // ...) must not be reported as having a size either — `rank` should see the same "not a genuine regular
+    // file" verdict from both closures, not a size for a file `read` then silently drops.
+    let size = |p: &str| {
+        fs::symlink_metadata(drive_c.join(p))
+            .ok()
+            .filter(|m| m.file_type().is_file())
+            .map(|m| m.len())
+    };
     Ok(match rank(diff, &shortcuts, read, size) {
         RankResult::Winner(c) => Discovery::Winner(c.path),
         RankResult::NeedsManualChoice(candidates) => Discovery::NeedsChoice(candidates),
@@ -606,7 +628,7 @@ fn run_after_create(
         }
     }
 
-    let winner_bytes = fs::read(env.drive_c().join(&winner_path)).ok();
+    let winner_bytes = read_bounded_regular_file(&env.drive_c().join(&winner_path));
     let pe_info = winner_bytes.as_deref().and_then(|b| pe::analyze(b).ok());
     let (architecture, subsystem) = arch_and_subsystem(pe_info.as_ref());
 
