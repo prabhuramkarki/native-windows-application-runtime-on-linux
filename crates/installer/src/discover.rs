@@ -28,11 +28,18 @@
 //!
 //! **Candidates** are the entries of `InstallDiff::new_files` whose extension is `.exe`
 //! (case-insensitive) — the only kind of file this ranking is ever asked to choose among (a
-//! `.dll`, `.ini`, or data file an installer also wrote is never "the application"), minus any
-//! `.exe` an Uninstall entry's `UninstallString` names — the uninstaller is never auto-picked (see
-//! [`rank`]).
+//! `.dll`, `.ini`, or data file an installer also wrote is never "the application"), minus the
+//! uninstallers [`rank`] excludes (see its doc for the exact rule).
+//!
+//! **Paths are matched structurally, never by substring.** Every registry value (`DisplayIcon`,
+//! `UninstallString`) is reduced to the one executable path it names ([`exe_in`]) and every `.lnk`
+//! target to its [`WinPath`]; both are then compared for equality against a candidate's
+//! drive_c-relative path, component-wise and case-insensitively. So `my-uninstall-helper.exe` is
+//! never mistaken for `uninstall.exe`, and `C:\App\a.exe` never matches `C:\App\a.exe.bak`.
 use crate::lnk::ShellLink;
 use crate::snapshot::InstallDiff;
+use crate::uninstall::split_command_line;
+use rt_core::WinPath;
 
 /// One installed-file candidate for "the application's own executable" and how it scored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,41 +76,73 @@ fn is_exe(path: &str) -> bool {
         && path.contains('.')
 }
 
-/// `.lnk` `relative_path` targets, normalised to the same drive_c-relative `/`-joined, lowercased
-/// form as `InstallDiff::new_files`, so the two can be compared directly. Only `C:` targets are
-/// considered (drive_c is the only drive a Wine prefix has; a shortcut naming another drive letter
-/// can never match anything an installer wrote there and is silently excluded, not an error).
-fn lnk_targets(shortcuts: &[ShellLink]) -> Vec<String> {
+/// The comparison key for a Windows path: drive_c-relative, `/`-joined, lowercased — the same form
+/// as a lowercased `InstallDiff::new_files` entry. `None` for any drive but `C:` (the only drive a
+/// Wine prefix has: a path elsewhere can never name anything an installer wrote there).
+fn key(p: &WinPath) -> Option<String> {
+    (p.drive() == 'C').then(|| p.components().join("/").to_lowercase())
+}
+
+/// The executable path a registry command line or icon location names, as a [`key`]. Handles
+/// `"C:\A B\app.exe" /S`, `"C:\A B\app.exe",0`, unquoted `C:\A B\app.exe /S` (the program is the
+/// shortest prefix ending in `.exe` followed by the end, a space, a tab, `,` or `"` — what Windows
+/// itself tries first), and `C:\App\app.exe,0`. Anything else (`%ProgramFiles%\...`, a bare
+/// `uninstall.exe`, `MsiExec.exe /X{...}`, not an absolute `C:` path) is `None`: it names nothing
+/// this ranking can match. Never panics: the `.exe` search runs on an ASCII-lowercased copy, whose
+/// byte offsets equal the original's, and `.` is ASCII, so every slice is on a char boundary.
+fn exe_in(value: &str) -> Option<String> {
+    let value = value.trim();
+    let program = if value.starts_with('"') {
+        split_command_line(value).into_iter().next()?
+    } else {
+        let lower = value.to_ascii_lowercase();
+        let end = lower
+            .match_indices(".exe")
+            .map(|(i, _)| i + 4)
+            .find(|&end| matches!(lower.as_bytes().get(end), None | Some(b' ' | b'\t' | b',' | b'"')))?;
+        value[..end].to_owned()
+    };
+    key(&WinPath::parse(&program).ok()?)
+}
+
+/// True for a file name an uninstaller conventionally has: `uninstall*`/`uninst*`, `unins<digits>`
+/// (Inno's `unins000.exe`), `remove*` — case-insensitive, `.exe` stripped. Matches the whole
+/// basename's start, never a substring (`my-uninstall-helper.exe` is not an uninstaller name).
+fn looks_like_uninstaller(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    stem.starts_with("uninst")
+        || stem.starts_with("remove")
+        || stem
+            .strip_prefix("unins")
+            .is_some_and(|d| d.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Keys of the `.lnk` targets that count as the app's own shortcuts: every shortcut except one
+/// whose own file name contains "uninstall" (NSIS/Inno's "Uninstall My App.lnk", which points at
+/// the uninstaller or at `app.exe /uninstall` and is evidence of nothing).
+fn lnk_targets(shortcuts: &[(String, ShellLink)]) -> Vec<String> {
     shortcuts
         .iter()
-        .filter_map(|s| s.relative_path.as_ref())
-        .filter(|p| p.drive() == 'C')
-        .map(|p| p.components().join("/").to_lowercase())
+        .filter(|(lnk_path, _)| {
+            let name = lnk_path.rsplit('/').next().unwrap_or(lnk_path);
+            !name.to_lowercase().contains("uninstall")
+        })
+        .filter_map(|(_, s)| key(s.relative_path.as_ref()?))
         .collect()
 }
 
-/// Normalises a registry path value (`"C:\App\app.exe" /S`, `C:\App\app.exe,0`) so a
-/// candidate path is found in it by substring containment however it is quoted or dressed up.
-fn normalise(value: &str) -> String {
-    value.replace('\\', "/").to_lowercase()
-}
-
-/// `(display_name, haystack)` per Uninstall entry, where `haystack` is only its `DisplayIcon`
-/// (`icon_path`). `UninstallString` is deliberately NOT part of tier (2): for NSIS/Inno/etc. it
-/// names the installer's own uninstaller (`uninstall.exe`, `unins000.exe`), never the app.
-fn icon_haystacks(diff: &InstallDiff) -> Vec<(Option<String>, String)> {
+/// Per Uninstall entry: `(display_name, DisplayIcon exe, UninstallString exe)`, each exe a [`key`].
+fn entries(diff: &InstallDiff) -> Vec<(Option<String>, Option<String>, Option<String>)> {
     diff.uninstall_entries
         .iter()
-        .filter_map(|e| Some((e.display_name.clone(), normalise(e.icon_path.as_deref()?))))
-        .collect()
-}
-
-/// Every Uninstall entry's `UninstallString`, normalised. A candidate found in any of these is the
-/// uninstaller, not the app — see [`rank`]'s doc for how it is excluded.
-fn uninstall_strings(diff: &InstallDiff) -> Vec<String> {
-    diff.uninstall_entries
-        .iter()
-        .filter_map(|e| e.uninstall_string.as_deref().map(normalise))
+        .map(|e| {
+            (
+                e.display_name.clone(),
+                e.icon_path.as_deref().and_then(exe_in),
+                e.uninstall_string.as_deref().and_then(exe_in),
+            )
+        })
         .collect()
 }
 
@@ -132,28 +171,40 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
 /// injected `read`/`size` closures (and exactly when `read` is and is not called), and exactly
 /// what counts as a candidate.
 ///
-/// **Uninstallers are never auto-picked.** A candidate whose path appears in any Uninstall
-/// entry's `UninstallString` is removed from the pool before any tier is scored — even when a
-/// Start Menu "Uninstall" `.lnk` or a `DisplayIcon` (e.g. `uninstall.exe,0`) also names it, and
-/// even when it is the largest GUI exe. If that leaves no candidates (the uninstaller was the
-/// only new `.exe`), the result is [`RankResult::NeedsManualChoice`] listing the uninstaller(s):
-/// a genuine ambiguity the user resolves (or `--exe`), never a silent pick. Known ceiling: an app
-/// whose `UninstallString` is its own main exe (`app.exe /uninstall`) is also never auto-picked;
-/// it falls to the lower tiers among the other exes, or to a manual choice.
+/// `shortcuts` pairs each parsed `.lnk` with its own `InstallDiff::new_files` path (its file name
+/// decides whether it is an "Uninstall" shortcut, see [`lnk_targets`]).
+///
+/// **Uninstallers are never auto-picked.** Before any tier is scored, a candidate is removed from
+/// the pool when EITHER
+/// - its basename looks like an uninstaller ([`looks_like_uninstaller`]: `uninstall*`, `uninst*`,
+///   `unins<digits>`, `remove*`) — always, whatever else names it; OR
+/// - an Uninstall entry's `UninstallString` names it (the parsed program, [`exe_in`]) AND there is
+///   no positive evidence it is the app: no non-"Uninstall" Start Menu `.lnk` targets it, and no
+///   entry's `DisplayIcon` names it unless that same entry's `UninstallString` names it too (NSIS
+///   commonly sets both to its uninstaller, so that pair is evidence of nothing).
+///
+/// So an app whose `UninstallString` is its own main exe (`app.exe /uninstall`) stays eligible
+/// when a normal shortcut, or another entry's `DisplayIcon`, names it. If the exclusion leaves no
+/// candidates, the result is [`RankResult::NeedsManualChoice`] listing the excluded exe(s): a
+/// genuine ambiguity the user resolves (or `--exe`), never a silent pick. Remaining limit: an
+/// `app.exe /uninstall` app with no such evidence (no shortcut, `DisplayIcon` only in its own
+/// entry) is excluded and falls to the other exes' lower tiers, or to a manual choice.
 pub fn rank(
     diff: &InstallDiff,
-    shortcuts: &[ShellLink],
+    shortcuts: &[(String, ShellLink)],
     read: impl Fn(&str) -> Option<Vec<u8>>,
     size: impl Fn(&str) -> Option<u64>,
 ) -> RankResult {
     let lnk_targets = lnk_targets(shortcuts);
-    let uninstall = icon_haystacks(diff);
-    let uninstallers = uninstall_strings(diff);
+    let entries = entries(diff);
 
     let (uninstaller_paths, candidates): (Vec<&String>, Vec<&String>) =
         diff.new_files.iter().filter(|p| is_exe(p)).partition(|p| {
             let lower = p.to_lowercase();
-            uninstallers.iter().any(|u| u.contains(&lower))
+            let is = |k: &Option<String>| k.as_deref() == Some(lower.as_str());
+            let named = entries.iter().any(|(_, _, u)| is(u));
+            let evidence = lnk_targets.contains(&lower) || entries.iter().any(|(_, icon, u)| is(icon) && !is(u));
+            looks_like_uninstaller(&lower) || (named && !evidence)
         });
     if candidates.is_empty() {
         return RankResult::NeedsManualChoice(
@@ -174,12 +225,14 @@ pub fn rank(
         .into_iter()
         .map(|path| {
             let lower = path.to_lowercase();
-            let uninstall_match = uninstall.iter().find(|(_, haystack)| haystack.contains(&lower));
+            let uninstall_match = entries
+                .iter()
+                .find(|(_, icon, _)| icon.as_deref() == Some(lower.as_str()));
             Partial {
                 path: path.clone(),
                 has_lnk: lnk_targets.contains(&lower),
                 has_uninstall: uninstall_match.is_some(),
-                uninstall_name: uninstall_match.and_then(|(name, _)| name.clone()),
+                uninstall_name: uninstall_match.and_then(|(name, _, _)| name.clone()),
             }
         })
         .collect();
@@ -200,9 +253,6 @@ pub fn rank(
         return RankResult::Winner(to_candidate(winner, false, file_size));
     }
 
-    // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never
-    // called for it, or for any candidate it already beat. `size` is still fetched (a stat, not a
-    // full read) so `Candidate.score`'s size bit stays accurate even in this early-exit path.
     // Tier (3): only the candidates still tied after (1)/(2) are ever read.
     let scored: Vec<(Partial, bool, u64)> = partials
         .into_iter()

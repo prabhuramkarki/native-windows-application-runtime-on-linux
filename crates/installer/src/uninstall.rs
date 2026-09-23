@@ -107,7 +107,7 @@ fn run_uninstall_command(
 /// then whitespace-separated, optionally double-quoted arguments. No escaped-quote or caret handling: never a
 /// shell, so nothing here can inject a second command, only fail to split an unusually exotic string cleanly
 /// (which surfaces as `resolve_uninstaller` returning `None`, a warning, never a panic).
-fn split_command_line(s: &str) -> Vec<String> {
+pub(crate) fn split_command_line(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = s.trim().chars().peekable();
     while chars.peek().is_some() {

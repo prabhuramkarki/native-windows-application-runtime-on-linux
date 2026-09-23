@@ -10,11 +10,19 @@ fn diff(new_files: &[&str], uninstall: Vec<UninstallEntry>) -> InstallDiff {
     }
 }
 
-fn lnk_to(target: &str) -> ShellLink {
-    ShellLink {
+fn lnk_to(target: &str) -> (String, ShellLink) {
+    named_lnk_to(
+        "ProgramData/Microsoft/Windows/Start Menu/Programs/App/My App.lnk",
+        target,
+    )
+}
+
+fn named_lnk_to(lnk_path: &str, target: &str) -> (String, ShellLink) {
+    let link = ShellLink {
         relative_path: Some(WinPath::parse(target).unwrap()),
         ..ShellLink::default()
-    }
+    };
+    (lnk_path.to_owned(), link)
 }
 
 /// No `read`/`size` closure in these tests ever needs to answer anything (no candidate reaches
@@ -330,7 +338,10 @@ fn a_start_menu_uninstall_shortcut_does_not_rescue_the_uninstaller() {
     );
     let shortcuts = [
         lnk_to(r"C:\Program Files\App\app.exe"),
-        lnk_to(r"C:\Program Files\App\uninstall.exe"),
+        named_lnk_to(
+            "ProgramData/Microsoft/Windows/Start Menu/Programs/App/Uninstall My App.lnk",
+            r"C:\Program Files\App\uninstall.exe",
+        ),
     ];
     let size = |p: &str| (p == "Program Files/App/uninstall.exe").then_some(1_000_000);
     let result = rank(&d, &shortcuts, no_bytes, size);
@@ -373,4 +384,219 @@ fn an_uninstaller_that_is_the_only_new_exe_is_a_manual_choice_not_a_winner() {
     };
     let paths: Vec<_> = candidates.iter().map(|c| c.path.as_str()).collect();
     assert_eq!(paths, ["Program Files/App/uninstall.exe"]);
+}
+
+// --- refined exclusion: an UninstallString-named exe with positive evidence is the app ---------
+
+#[test]
+fn an_app_whose_uninstall_string_is_itself_wins_via_a_normal_shortcut() {
+    // `app.exe /uninstall` is the app's own exe: a normal Start Menu shortcut to it is positive
+    // evidence, so it stays eligible (and wins over a bigger helper).
+    let d = diff(
+        &["Program Files/App/app.exe", "Program Files/App/helper.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r#""C:\Program Files\App\app.exe" /uninstall"#.into()),
+            icon_path: Some(r"C:\Program Files\App\app.exe,0".into()),
+        }],
+    );
+    let shortcuts = [lnk_to(r"C:\Program Files\App\app.exe")];
+    let size = |p: &str| (p == "Program Files/App/helper.exe").then_some(1_000_000);
+    let result = rank(&d, &shortcuts, no_bytes, size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "Program Files/App/app.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_display_icon_in_another_entry_is_positive_evidence() {
+    let d = diff(
+        &["App/app.exe"],
+        vec![
+            UninstallEntry {
+                display_name: Some("Maintenance".into()),
+                uninstall_string: Some(r"C:\App\app.exe /uninstall".into()),
+                icon_path: None,
+            },
+            UninstallEntry {
+                display_name: Some("My App".into()),
+                uninstall_string: None,
+                icon_path: Some(r"C:\App\app.exe,0".into()),
+            },
+        ],
+    );
+    let result = rank(&d, &[], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe" && c.name.as_deref() == Some("My App")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_display_icon_equal_to_its_own_uninstall_string_is_not_evidence() {
+    // NSIS often sets DisplayIcon to the uninstaller too; the pair proves nothing.
+    let d = diff(
+        &["App/setup.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r#""C:\App\setup.exe" /uninstall"#.into()),
+            icon_path: Some(r#""C:\App\setup.exe",0"#.into()),
+        }],
+    );
+    assert!(matches!(
+        rank(&d, &[], no_bytes, no_size),
+        RankResult::NeedsManualChoice(_)
+    ));
+}
+
+#[test]
+fn an_uninstall_named_shortcut_is_not_evidence_and_gives_no_tier_one() {
+    // "Uninstall My App.lnk" -> `app.exe /uninstall`: not a reason to keep or boost it.
+    let d = diff(&["App/app.exe", "App/other.exe"], vec![]);
+    let shortcuts = [named_lnk_to("Start Menu/Uninstall My App.lnk", r"C:\App\other.exe")];
+    let size = |p: &str| (p == "App/app.exe").then_some(1_000_000);
+    let result = rank(&d, &shortcuts, no_bytes, size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe" && c.score & 0b1000 == 0),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn an_uninstaller_named_file_never_wins_even_with_a_shortcut_and_display_icon() {
+    for name in ["uninstall.exe", "unins000.exe", "Uninst.exe", "REMOVE.EXE", "unins.exe"] {
+        let path = format!("App/{name}");
+        let d = diff(
+            &[&path, "App/helper.exe"],
+            vec![UninstallEntry {
+                display_name: Some("My App".into()),
+                uninstall_string: Some(format!(r"C:\App\{name} /SILENT")),
+                icon_path: Some(format!(r"C:\App\{name},0")),
+            }],
+        );
+        let shortcuts = [lnk_to(&format!(r"C:\App\{name}"))];
+        let size = |p: &str| (p == path).then_some(1_000_000);
+        let result = rank(&d, &shortcuts, no_bytes, size);
+        assert!(
+            matches!(&result, RankResult::Winner(c) if c.path == "App/helper.exe"),
+            "{name}: {result:?}"
+        );
+    }
+}
+
+// --- structured (not substring) path matching ---------------------------------------------------
+
+#[test]
+fn exe_in_extracts_the_program_path() {
+    let k = |s: &str| exe_in(s);
+    let app = Some("program files/my app/app.exe".to_owned());
+    assert_eq!(k(r"C:\Program Files\My App\app.exe /S --x"), app, "unquoted, spaces");
+    assert_eq!(k(r#""C:\Program Files\My App\app.exe" /S"#), app, "quoted");
+    assert_eq!(k(r#""C:\Program Files\My App\app.exe",0"#), app, "quoted icon");
+    assert_eq!(k(r"C:\Program Files\My App\app.exe,0"), app, "icon index");
+    assert_eq!(k(r"c:/program files/my app/APP.EXE"), app, "case, separators");
+    assert_eq!(
+        k(r"C:\Program Files\App\unins000.exe /SILENT"),
+        Some("program files/app/unins000.exe".to_owned())
+    );
+    assert_eq!(k(r"%ProgramFiles%\App\app.exe"), None, "%VAR% stays literal");
+    assert_eq!(k("MsiExec.exe /X{1234}"), None);
+    assert_eq!(k(r"D:\App\app.exe"), None, "not drive C");
+    assert_eq!(k(r"C:\App\app.ico,0"), None, "not an exe");
+    assert_eq!(k(r"C:\App\app.exe.bak"), None, ".exe must end the program");
+}
+
+#[test]
+fn a_candidate_merely_containing_the_uninstallers_name_is_not_excluded() {
+    let d = diff(
+        &["App/my-uninstall-helper.exe", "App/uninstall.exe"],
+        vec![UninstallEntry {
+            display_name: Some("My App".into()),
+            uninstall_string: Some(r"C:\App\uninstall.exe /S".into()),
+            icon_path: None,
+        }],
+    );
+    let result = rank(&d, &[], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/my-uninstall-helper.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn an_uninstall_string_path_ending_in_a_candidates_path_does_not_exclude_it() {
+    // `C:\MyApp\app.exe` ends with `app/app.exe`: a substring match would wrongly drop App/app.exe.
+    let d = diff(
+        &["App/app.exe", "MyApp/app.exe"],
+        vec![UninstallEntry {
+            display_name: None,
+            uninstall_string: Some(r#""C:\MyApp\app.exe" /uninstall"#.into()),
+            icon_path: None,
+        }],
+    );
+    let result = rank(&d, &[], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "App/app.exe"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_display_icon_ending_in_a_candidates_path_does_not_boost_it() {
+    // `C:\P\xa.exe` contains `a.exe`: only P/xa.exe may get tier (2).
+    let d = diff(
+        &["a.exe", "P/xa.exe"],
+        vec![UninstallEntry {
+            display_name: Some("X".into()),
+            uninstall_string: None,
+            icon_path: Some(r"C:\P\xa.exe".into()),
+        }],
+    );
+    let result = rank(&d, &[], no_bytes, no_size);
+    assert!(
+        matches!(&result, RankResult::Winner(c) if c.path == "P/xa.exe"),
+        "{result:?}"
+    );
+}
+
+/// Hostile registry/`.lnk`-derived strings: `exe_in` (and so `rank`) returns, never panics.
+#[test]
+fn exe_in_never_panics_on_hostile_input() {
+    let fixed = [
+        String::new(),
+        "\"".repeat(5000),
+        ".exe".repeat(10_000),
+        "\u{e9}.exe\u{e9}".repeat(1000),
+        "C:\\\u{130}.EXE,0".to_owned(),
+        "\"C:\\a.exe".to_owned(),
+        "C:\\".to_owned() + &"a\\".repeat(100_000) + "x.exe",
+    ];
+    for s in &fixed {
+        let _ = exe_in(s);
+    }
+    let alphabet: Vec<char> = " \"\\/:,%\0\u{130}\u{e9}Cc.exe0".chars().collect();
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 40) as usize;
+        let s: String = (0..len)
+            .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+            .collect();
+        let _ = exe_in(&s);
+        let d = diff(
+            &["App/app.exe", "App/uninstall.exe"],
+            vec![UninstallEntry {
+                display_name: None,
+                uninstall_string: Some(s.clone()),
+                icon_path: Some(s),
+            }],
+        );
+        let _ = rank(&d, &[], no_bytes, no_size);
+    }
 }
