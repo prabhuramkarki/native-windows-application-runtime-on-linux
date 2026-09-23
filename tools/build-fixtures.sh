@@ -16,4 +16,15 @@ for arch in x86_64 i686; do
   "$cc" $flags -shared -o "$out/exports$tag.dll" tools/fixtures/exports.c
   rm -f "$out/hello$tag.res.o"
 done
+
+command -v wixl >/dev/null || { echo "missing wixl: sudo apt install msitools wixl" >&2; exit 1; }
+wixl -o "$out/hello.msi" tools/fixtures/hello.wxs
+
+command -v makensis >/dev/null || { echo "missing makensis: sudo apt install nsis" >&2; exit 1; }
+makensis -NOCD tools/fixtures/hello.nsi
+grep -qa NullsoftInst "$out/hello-nsis.exe" || {
+  echo "hello-nsis.exe is missing the NullsoftInst marker" >&2
+  exit 1
+}
+
 ls -l "$out"
