@@ -419,6 +419,7 @@ dependencies = [
  "libc",
  "runtime-backend-wine",
  "runtime-core",
+ "runtime-installer",
  "runtime-pe",
  "serde_json",
  "tempfile",
