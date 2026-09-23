@@ -15,8 +15,13 @@ jobs:
       # skip loudly rather than failing, so without this and RUNTIME_REQUIRE_BWRAP below, CI could go green while
       # never actually running them. `desktop-file-utils` (provides `desktop-file-validate`) is required for the
       # same reason: `runtime-desktop`'s `.desktop`-writer tests gate on it and RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE
-      # below, the identical convention.
-      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 bubblewrap desktop-file-utils
+      # below, the identical convention. `nsis`/`msitools`/`wixl` are required too, not just nice-to-have for
+      # `wine-e2e`: `tools/build-fixtures.sh` (run unconditionally below) hard-`exit 1`s without `makensis`/`wixl`,
+      # and several NON-`#[ignore]`d tests in this very job (e.g. `apps.rs`'s
+      # `install_of_a_real_msi_is_routed_to_the_installer_pipeline_and_fails_cleanly_without_msiexec`) read
+      # `hello.msi`/`hello-nsis.exe` off disk — without these packages the fixture-build step itself fails
+      # before `cargo test` ever runs, taking down the whole (non-`continue-on-error`) job.
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 nsis msitools wixl bubblewrap desktop-file-utils
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
