@@ -3,12 +3,18 @@
 ; Payload (hello64.exe) comes from tools/build-fixtures.sh's mingw-w64 build; not rebuilt here.
 ; Silent install: hello-nsis.exe /S -- no dialogs, no user interaction, and no output artifacts differ
 ; from a normal run (SetAutoClose makes the normal run finish on its own too).
+; Variant: makensis -NOCD -DNOSHORTCUT tools/fixtures/hello.nsi builds hello-nsis-noshortcut.exe, identical
+; except it creates no Start Menu shortcut (exercises executable discovery without a .lnk).
 
 !define APP_NAME "Runtime Fixture NSIS"
 !define APP_DIR  "RuntimeFixtureNsis"
 
 Name "${APP_NAME}"
+!ifdef NOSHORTCUT
+OutFile "tests/fixtures/build/hello-nsis-noshortcut.exe"
+!else
 OutFile "tests/fixtures/build/hello-nsis.exe"
+!endif
 InstallDir "$PROGRAMFILES64\${APP_DIR}"
 RequestExecutionLevel admin
 
@@ -18,8 +24,10 @@ Section "Install"
   SetOutPath "$INSTDIR"
   File "tests/fixtures/build/hello64.exe"
 
+!ifndef NOSHORTCUT
   CreateDirectory "$SMPROGRAMS\${APP_DIR}"
   CreateShortcut "$SMPROGRAMS\${APP_DIR}\${APP_NAME}.lnk" "$INSTDIR\hello64.exe"
+!endif
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_DIR}" "DisplayName" "${APP_NAME}"
