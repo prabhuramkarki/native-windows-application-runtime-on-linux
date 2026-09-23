@@ -2,8 +2,8 @@
 //! snapshot diff and any Start Menu shortcuts parsed by Task 3's `lnk` module.
 //!
 //! **Never guesses on a genuine tie.** Scoring is strict priority order, exactly as the plan
-//! states: (1) named by a Start Menu `.lnk`'s target > (2) named in a new `Uninstall` registry
-//! entry > (3) GUI subsystem (per `pe::analyze`) > (4) largest file size. This is applied in two
+//! states: (1) named by a Start Menu `.lnk`'s target > (2) named by a new `Uninstall` registry
+//! entry's `DisplayIcon` > (3) GUI subsystem (per `pe::analyze`) > (4) largest file size. This is applied in two
 //! narrowing stages rather than one flat 4-tuple comparison (see [`rank`]'s laziness note just
 //! below for why): first every candidate is narrowed to the top `(has_lnk, has_uninstall)` pair,
 //! then — only if more than one candidate remains — narrowed again to the top `(is_gui,
@@ -28,7 +28,9 @@
 //!
 //! **Candidates** are the entries of `InstallDiff::new_files` whose extension is `.exe`
 //! (case-insensitive) — the only kind of file this ranking is ever asked to choose among (a
-//! `.dll`, `.ini`, or data file an installer also wrote is never "the application").
+//! `.dll`, `.ini`, or data file an installer also wrote is never "the application"), minus any
+//! `.exe` an Uninstall entry's `UninstallString` names — the uninstaller is never auto-picked (see
+//! [`rank`]).
 use crate::lnk::ShellLink;
 use crate::snapshot::InstallDiff;
 
@@ -80,23 +82,28 @@ fn lnk_targets(shortcuts: &[ShellLink]) -> Vec<String> {
         .collect()
 }
 
-/// `(display_name, haystack)` per Uninstall entry: `haystack` is `uninstall_string` and
-/// `icon_path` concatenated, backslashes normalised to `/` and lowercased, so a candidate path is
-/// found by substring containment however it is quoted or dressed up in the real value (e.g.
-/// `"C:\Program Files\App\app.exe" /uninstall` or `C:\Program Files\App\app.exe,0`).
-fn uninstall_haystacks(diff: &InstallDiff) -> Vec<(Option<String>, String)> {
+/// Normalises a registry path value (`"C:\App\app.exe" /S`, `C:\App\app.exe,0`) so a
+/// candidate path is found in it by substring containment however it is quoted or dressed up.
+fn normalise(value: &str) -> String {
+    value.replace('\\', "/").to_lowercase()
+}
+
+/// `(display_name, haystack)` per Uninstall entry, where `haystack` is only its `DisplayIcon`
+/// (`icon_path`). `UninstallString` is deliberately NOT part of tier (2): for NSIS/Inno/etc. it
+/// names the installer's own uninstaller (`uninstall.exe`, `unins000.exe`), never the app.
+fn icon_haystacks(diff: &InstallDiff) -> Vec<(Option<String>, String)> {
     diff.uninstall_entries
         .iter()
-        .map(|e| {
-            let haystack = [e.uninstall_string.as_deref(), e.icon_path.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .replace('\\', "/")
-                .to_lowercase();
-            (e.display_name.clone(), haystack)
-        })
+        .filter_map(|e| Some((e.display_name.clone(), normalise(e.icon_path.as_deref()?))))
+        .collect()
+}
+
+/// Every Uninstall entry's `UninstallString`, normalised. A candidate found in any of these is the
+/// uninstaller, not the app — see [`rank`]'s doc for how it is excluded.
+fn uninstall_strings(diff: &InstallDiff) -> Vec<String> {
+    diff.uninstall_entries
+        .iter()
+        .filter_map(|e| e.uninstall_string.as_deref().map(normalise))
         .collect()
 }
 
@@ -124,6 +131,15 @@ fn to_candidate(p: Partial, is_gui: bool, file_size: u64) -> Candidate {
 /// Ranks the `.exe` candidates in `diff.new_files`. See the module doc for the priority order, the
 /// injected `read`/`size` closures (and exactly when `read` is and is not called), and exactly
 /// what counts as a candidate.
+///
+/// **Uninstallers are never auto-picked.** A candidate whose path appears in any Uninstall
+/// entry's `UninstallString` is removed from the pool before any tier is scored — even when a
+/// Start Menu "Uninstall" `.lnk` or a `DisplayIcon` (e.g. `uninstall.exe,0`) also names it, and
+/// even when it is the largest GUI exe. If that leaves no candidates (the uninstaller was the
+/// only new `.exe`), the result is [`RankResult::NeedsManualChoice`] listing the uninstaller(s):
+/// a genuine ambiguity the user resolves (or `--exe`), never a silent pick. Known ceiling: an app
+/// whose `UninstallString` is its own main exe (`app.exe /uninstall`) is also never auto-picked;
+/// it falls to the lower tiers among the other exes, or to a manual choice.
 pub fn rank(
     diff: &InstallDiff,
     shortcuts: &[ShellLink],
@@ -131,13 +147,31 @@ pub fn rank(
     size: impl Fn(&str) -> Option<u64>,
 ) -> RankResult {
     let lnk_targets = lnk_targets(shortcuts);
-    let uninstall = uninstall_haystacks(diff);
+    let uninstall = icon_haystacks(diff);
+    let uninstallers = uninstall_strings(diff);
+
+    let (uninstaller_paths, candidates): (Vec<&String>, Vec<&String>) =
+        diff.new_files.iter().filter(|p| is_exe(p)).partition(|p| {
+            let lower = p.to_lowercase();
+            uninstallers.iter().any(|u| u.contains(&lower))
+        });
+    if candidates.is_empty() {
+        return RankResult::NeedsManualChoice(
+            uninstaller_paths
+                .into_iter()
+                .map(|path| Candidate {
+                    path: path.clone(),
+                    name: None,
+                    icon: None,
+                    score: 0,
+                })
+                .collect(),
+        );
+    }
 
     // Tiers (1) and (2): no I/O, computed for every candidate.
-    let mut partials: Vec<Partial> = diff
-        .new_files
-        .iter()
-        .filter(|p| is_exe(p))
+    let mut partials: Vec<Partial> = candidates
+        .into_iter()
         .map(|path| {
             let lower = path.to_lowercase();
             let uninstall_match = uninstall.iter().find(|(_, haystack)| haystack.contains(&lower));
@@ -150,14 +184,11 @@ pub fn rank(
         })
         .collect();
 
-    if partials.is_empty() {
-        return RankResult::NeedsManualChoice(Vec::new());
-    }
     let top_pair = partials
         .iter()
         .map(|p| (p.has_lnk, p.has_uninstall))
         .max()
-        .expect("partials is non-empty");
+        .unwrap_or_default();
     partials.retain(|p| (p.has_lnk, p.has_uninstall) == top_pair);
 
     // A unique winner from (1)/(2) alone needs no GUI-subsystem check at all: `read` is never

@@ -171,7 +171,10 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   `DISPLAY`/`XAUTHORITY` were passed straight through — only X auth-cookie binding stood between a `--network`
   installer and the host session. No socket is bound either (`/tmp` is a fresh tmpfs, `$XDG_RUNTIME_DIR` is not
   bound), so a program that guesses `DISPLAY=:0` on its own can still try the abstract socket under
-  `--network`; it would need the (unbound) X authority cookie to get in.
+  `--network`; it would need the (unbound) X authority cookie to get in — but only where the X server has no
+  `SI:localuser` grant (`xhost +si:localuser:$USER`, which some desktop sessions set by default and which
+  admits any process of the same user with no cookie at all). Where that grant exists, a `--network` installer
+  can reach the host display.
 - **Wine's registry flush happens inside the sandbox.** `--unshare-pid` makes `bwrap` tear down the PID namespace
   the instant its direct child exits, killing `wineserver` before it writes `system.reg`/`user.reg`. Every
   installer/uninstaller command is therefore wrapped by `CompatBackend::settle` (Wine:
@@ -268,9 +271,17 @@ through both together. Three things surfaced that were not previously visible:
   `LinkTargetIDList`, which `rt_installer::lnk` did not parse then; Task 9 added that fallback. Auto-discovery
   for `hello-nsis.exe` wrongly picked its `uninstall.exe`. Task 8 blamed tier (2) (the `Uninstall` registry
   entry), but the final review found the registry diff was always empty (the `wineserver` teardown bug above),
-  so the wrong pick really came from tier (3), the GUI-subsystem heuristic. Both causes are fixed: a real
-  auto-discovered `hello-nsis.exe --silent` install now records `hello64.exe`, and
-  `crates/cli/tests/e2e_installers.rs`'s NSIS test runs without `--exe` and asserts that.
+  so the wrong pick really came from tier (3), the GUI-subsystem heuristic. Once that teardown bug was fixed
+  and registry writes survived, tier (2) itself became a hazard: it matched candidates against
+  `UninstallString`, which for NSIS/Inno names the uninstaller, so with no matching `.lnk` the uninstaller
+  would have won tier (2) outright. Now: tier (2) matches only `DisplayIcon`, and any `.exe` an
+  `UninstallString` names is dropped from the candidate pool entirely (no tier, including a Start Menu
+  "Uninstall" shortcut or a `DisplayIcon` of `uninstall.exe,0`, can pick it); if it was the only new `.exe`,
+  discovery asks for a manual choice instead. Unit-tested in `rt_installer::discover`. A real
+  auto-discovered `hello-nsis.exe --silent` install records `hello64.exe` (via tier (1), the Start Menu
+  shortcut), and `crates/cli/tests/e2e_installers.rs`'s NSIS test runs without `--exe` and asserts that.
+  Known ceiling: an app whose `UninstallString` is its own main exe (`app.exe /uninstall`) is never
+  auto-picked either; it needs a `.lnk`/lower-tier win among the other exes, a manual choice, or `--exe`.
 
 ## Roadmap
 

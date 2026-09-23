@@ -167,7 +167,7 @@ WINE REGISTRY Version 2
 [Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{TESTGUID}] 1700000000
 #time=1
 "DisplayName"="Hello Nsis"
-"UninstallString"="C:\\Program Files\\HelloNsis\\hello.exe /uninstall"
+"UninstallString"="C:\\Program Files\\HelloNsis\\uninstall.exe /S"
 REG
 exit 5
 "#;
@@ -202,7 +202,9 @@ exit 5
     assert_eq!(installer.product_name.as_deref(), Some("Hello Nsis"));
     assert_eq!(
         installer.uninstall_command.as_deref(),
-        Some("C:\\Program Files\\HelloNsis\\hello.exe /uninstall")
+        // Real NSIS shape: a separate uninstaller. (An `UninstallString` naming the app itself would make
+        // discovery refuse to auto-pick it: `discover::rank` never auto-picks an exe an UninstallString names.)
+        Some("C:\\Program Files\\HelloNsis\\uninstall.exe /S")
     );
     // The "app" is a copy of the real NSIS stub's own bytes: its real architecture/subsystem are recorded.
     assert_eq!(md.architecture, "x86");
