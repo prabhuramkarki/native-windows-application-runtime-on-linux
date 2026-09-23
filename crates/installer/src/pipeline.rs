@@ -3,15 +3,33 @@
 //! Stages, in order (see [`install_via_installer`]): detect the file's real shape (content, never extension) ->
 //! analyze it (installer family, `MsiInfo` for an MSI) -> plan the run (silent flags, `msiexec` vs. the exe
 //! itself, [`crate::family::plan`]) -> pick a provisional name/id and `Store::create` + `backend.prepare` (Phase
-//! 2, unchanged) -> snapshot the environment -> place the installer file inside `drive_c` (never run from
-//! outside it) -> run it sandboxed ([`crate::sandbox::InstallerSandbox`] via [`rt_core::Launcher::wrap`]) ->
-//! snapshot again and diff -> locate `.lnk`s and rank candidates ([`crate::discover::rank`]) -> on ambiguity,
-//! return [`InstallOutcome::NeedsChoice`] and remove the half-built environment (nothing is installed); an
-//! `exe_override` short-circuits ranking entirely -> write `Metadata` (schema v2's `installer` field) -> return.
+//! 2, unchanged) -> place the installer file inside `drive_c` (never run from outside it) -> ONLY THEN snapshot
+//! the environment ("before") -> run it sandboxed ([`crate::sandbox::InstallerSandbox`] via
+//! [`rt_core::Launcher::wrap`]) -> snapshot again ("after") and diff -> locate `.lnk`s and rank candidates
+//! ([`crate::discover::rank`]) -> on ambiguity, return [`InstallOutcome::NeedsChoice`] and remove the half-built
+//! environment (nothing is installed); an `exe_override` short-circuits ranking entirely -> delete the staged
+//! installer file (its job is done) -> write `Metadata` (schema v2's `installer` field) -> return.
+//!
+//! **The installer is placed before the "before" snapshot, not after.** `Snapshot`/`InstallDiff` compare real
+//! on-disk paths; placing the installer first means it (and any directories created for it) are already part of
+//! the baseline and can never appear in `diff.new_files`, so ranking never has to know it was even involved. An
+//! earlier version of this pipeline placed the installer AFTER the "before" snapshot and tried to exclude its
+//! own path from the candidate list by string comparison after the fact — that comparison used the WinPath text
+//! as requested (`Windows\Temp\...`) rather than the real on-disk casing a live Wine prefix actually uses
+//! (`windows/temp/...`, all lowercase), so the exclusion silently never matched and the installer itself could
+//! win ranking outright on a real prefix. See the Task 6 fix-round report for the full story; the reorder here
+//! removes the whole fragile comparison rather than trying to get the casing right.
 //!
 //! **A non-zero installer exit code is not a failure.** Some installers (older InstallShield stubs especially)
 //! exit non-zero on a successful, silent install. The exit status is recorded as a warning and discovery is
 //! attempted regardless; only a genuine spawn/backend/metadata failure aborts the install.
+//!
+//! **No display access in the sandbox (default, non-`--silent` mode).** `InstallerSandbox`'s bwrap profile
+//! (Task 5) binds no X11/Wayland socket and unshares IPC (breaking X11 SHM), and provides no `$XDG_RUNTIME_DIR`.
+//! An installer run WITHOUT `--silent` (the CLI's own default: "show its own GUI") therefore likely cannot
+//! render a window inside this sandbox at all; only `--silent` installs are known to work reliably today. This
+//! is a property of Task 5's sandbox profile, not something this task changes — see `crates/cli/src/install.rs`
+//! for the user-facing warning. Task 8's real-Wine e2e tests are what will settle this for real.
 //!
 //! **Cleanup.** Every failure after `Store::create` (including the "ambiguous, nothing installed" case) stops
 //! the backend and removes the environment, exactly like `rt_core::install` (see `cleanup`/`cleanup_problem`
@@ -449,34 +467,21 @@ fn load_shortcuts(env: &AppEnv, diff: &InstallDiff) -> Vec<ShellLink> {
 }
 
 /// `exe_override`, resolved (case-insensitive, symlink-refusing) under `drive_c`; else `crate::discover::rank`
-/// over the diff and any `.lnk`s found in it. `staged_installer_path` (the installer file's OWN drive_c-relative
-/// path, `place_installer_file`'s return value) is excluded from `diff.new_files` first: it is a new file too
-/// (we just wrote it, inside `drive_c`, before the run), and an `.exe` in a real installer's own overlay/UI
-/// resources can easily outscore a small real app on the GUI-subsystem/size tiers, so left in, it would win
-/// ranking outright and be recorded as "the app" — never what a caller wants.
-fn discover_winner(
-    env: &AppEnv,
-    diff: &InstallDiff,
-    staged_installer_path: &str,
-    exe_override: Option<&str>,
-) -> Result<Discovery, InstallerError> {
+/// over the diff and any `.lnk`s found in it. The staged installer file itself is never a candidate here: it is
+/// placed inside `drive_c` BEFORE the "before" snapshot is captured (see `run_after_create`), so it is already
+/// present in both snapshots and never shows up in `diff.new_files` at all — no separate exclusion needed (an
+/// earlier version of this function tried to exclude it by comparing path strings after the fact, which was
+/// fragile against the installer's own real on-disk casing; see the Task 6 fix-round report for why that was
+/// wrong and how this reorder fixes it for good).
+fn discover_winner(env: &AppEnv, diff: &InstallDiff, exe_override: Option<&str>) -> Result<Discovery, InstallerError> {
     if let Some(raw) = exe_override {
         return Ok(Discovery::Winner(resolve_exe_override(env, raw)?));
     }
-    let diff = InstallDiff {
-        new_files: diff
-            .new_files
-            .iter()
-            .filter(|p| *p != staged_installer_path)
-            .cloned()
-            .collect(),
-        ..diff.clone()
-    };
-    let shortcuts = load_shortcuts(env, &diff);
+    let shortcuts = load_shortcuts(env, diff);
     let drive_c = env.drive_c();
     let read = |p: &str| fs::read(drive_c.join(p)).ok();
     let size = |p: &str| fs::metadata(drive_c.join(p)).ok().map(|m| m.len());
-    Ok(match rank(&diff, &shortcuts, read, size) {
+    Ok(match rank(diff, &shortcuts, read, size) {
         RankResult::Winner(c) => Discovery::Winner(c.path),
         RankResult::NeedsManualChoice(candidates) => Discovery::NeedsChoice(candidates),
     })
@@ -587,20 +592,36 @@ fn run_after_create(
 ) -> Result<InstallOutcome, InstallerError> {
     backend.prepare(env)?;
 
-    let before = Snapshot::capture(env);
+    // The installer is placed BEFORE the "before" snapshot is captured, on purpose: `Snapshot`/`InstallDiff`
+    // only know about real on-disk paths (see their own module docs on why an exact-string comparison against
+    // `new_files` is fragile — case, 8.3 names, ... are out of scope for that type). Placing it first means the
+    // staged file and the directories `place_installer_file` creates for it are already part of the baseline,
+    // so they can never appear in `diff.new_files` at all; no separate exclusion-by-path-string is needed (a
+    // prior version of this function tried that after the fact and got it wrong — see the Task 6 fix-round
+    // report).
     let installer_winpath = place_installer_file(env, path, bytes)?;
+    let before = Snapshot::capture(env);
     let mut warnings = run_installer_process(backend, launcher, env, &installer_winpath, run_plan, opts)?;
 
     let after = Snapshot::capture(env);
     let diff = Snapshot::diff(&before, &after);
-    // The exact on-disk relative path we placed the installer at, in the same `/`-joined form `Snapshot`'s file
-    // walker records it in (both come from the same, just-created, real directory names).
-    let staged_installer_path = installer_winpath.components().join("/");
 
-    let winner_path = match discover_winner(env, &diff, &staged_installer_path, opts.exe_override.as_deref())? {
+    let winner_path = match discover_winner(env, &diff, opts.exe_override.as_deref())? {
         Discovery::Winner(p) => p,
         Discovery::NeedsChoice(candidates) => return Ok(InstallOutcome::NeedsChoice(candidates)),
     };
+
+    // The installer has done its job: remove the scratch copy (and, best-effort, the now-empty staging
+    // directory) so it does not permanently double the app's disk footprint (unlike Phase 2's `install::place`,
+    // where the copy IS the app, this one is pure scratch). Best effort throughout: a failure here is cosmetic
+    // (a leftover temp file), never worth failing an otherwise-successful install over, and every failure path
+    // below this point removes the whole environment anyway.
+    if let Ok(installer_unix) = resolve_under(&env.drive_c(), &installer_winpath) {
+        let _ = fs::remove_file(&installer_unix);
+        if let Some(dir) = installer_unix.parent() {
+            let _ = fs::remove_dir(dir); // only succeeds if now empty; never removes a non-empty directory
+        }
+    }
 
     let winner_bytes = fs::read(env.drive_c().join(&winner_path)).ok();
     let pe_info = winner_bytes.as_deref().and_then(|b| pe::analyze(b).ok());

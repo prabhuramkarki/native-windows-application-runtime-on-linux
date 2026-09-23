@@ -114,7 +114,7 @@ fn split_command_line_never_panics_on_hostile_input() {
         state ^= state << 17;
         state
     };
-    for _ in 0..2000 {
+    for _ in 0..20_000 {
         let len = (next() % 50) as usize;
         let s: String = (0..len)
             .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
