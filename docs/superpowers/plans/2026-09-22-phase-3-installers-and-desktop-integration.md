@@ -193,6 +193,13 @@ The plan was spec-level; the repository is the truth. What differs from, or was 
 
 **Ready for Phase 4 (open items)**
 
+Fixed since the final review (no longer open): auto-discovery never picks an uninstaller (an exe with an uninstaller's basename, or one an `UninstallString` names without a normal shortcut / other `DisplayIcon` as evidence) while an `app.exe /uninstall` app with a normal shortcut is still auto-picked; tier (1)/(2) and that exclusion match parsed executable paths component-wise, not substrings; the no-shortcut NSIS path is covered by a real-Wine e2e (`hello-nsis-noshortcut.exe`).
+
+Still open:
+
+- Discovery limit: an `app.exe /uninstall` app with no normal Start Menu shortcut and no other entry's `DisplayIcon` naming it is excluded, so a lower tier picks among the other exes (or a manual choice); `--exe` overrides.
+- `pipeline::choose_uninstall_entry` (which Uninstall entry's metadata to record when there are several) still matches the winner's path by substring; it only affects the recorded name/uninstall command, not the executable pick.
+
 - The NSIS fixture's recorded uninstaller cannot run: its `UninstallString` is an unquoted path with spaces (`split_command_line` breaks it at the space; real Windows' `CreateProcess` would probe progressively longer prefixes), and it has no `/S` (NSIS's uninstaller wants a display to confirm). `runtime uninstall` warns and removes the environment anyway. Real installers often have both issues; `QuietUninstallString` and a `CreateProcess`-style path probe are the likely fixes.
 - MSI's recorded `MsiExec.exe /I{GUID}` is what Wine writes. It exits 0, but `/I` on an installed product is maintenance mode, so it is unverified whether it really uninstalls anything (not observable today: the environment is removed right after). A real uninstall likely needs `/X{GUID} /qn`.
 - No internal timeout on the installer run or the `wineserver -w` settle step (Task 8 ruling, M7).
