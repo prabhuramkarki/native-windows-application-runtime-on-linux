@@ -455,7 +455,9 @@ dependencies = [
 name = "runtime-installer"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "runtime-core",
+ "runtime-desktop",
  "runtime-pe",
  "tempfile",
  "thiserror",

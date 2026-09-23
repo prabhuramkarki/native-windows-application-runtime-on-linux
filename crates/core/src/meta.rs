@@ -472,9 +472,15 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(&json(&sample("app"))).unwrap();
         v["schemaVersion"] = serde_json::json!(1);
         let obj = v.as_object_mut().unwrap();
-        assert!(obj.remove("installer").is_some(), "sample must have serialised an installer key to remove");
+        assert!(
+            obj.remove("installer").is_some(),
+            "sample must have serialised an installer key to remove"
+        );
         let bytes = serde_json::to_vec(&v).unwrap();
-        assert!(!String::from_utf8_lossy(&bytes).contains("installer"), "installer key must really be gone");
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("installer"),
+            "installer key must really be gone"
+        );
 
         let m = Metadata::parse(&bytes).unwrap();
         assert_eq!(m.schema_version, 1);
@@ -506,7 +512,9 @@ mod tests {
         type Set = fn(&mut Metadata, String);
         let fields: [(&str, Set); 3] = [
             ("installer.family", |m, s| m.installer.as_mut().unwrap().family = s),
-            ("installer.productName", |m, s| m.installer.as_mut().unwrap().product_name = Some(s)),
+            ("installer.productName", |m, s| {
+                m.installer.as_mut().unwrap().product_name = Some(s)
+            }),
             ("installer.uninstallCommand", |m, s| {
                 m.installer.as_mut().unwrap().uninstall_command = Some(s)
             }),

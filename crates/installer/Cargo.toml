@@ -11,7 +11,11 @@ name = "rt_installer"
 [dependencies]
 runtime-core = { path = "../core" }
 runtime-pe = { path = "../pe" }
+runtime-desktop = { path = "../desktop" }
 thiserror.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
+# `FakeBackend` for the pipeline's logic tests (never part of a normal build); mirrors `crates/cli/Cargo.toml`.
+runtime-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
