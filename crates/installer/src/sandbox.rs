@@ -19,8 +19,9 @@
 //!
 //! [`InstallerSandbox::wrap`] is a pure argv-builder: given the already-finalized [`Command`] (final program,
 //! args, env and cwd — see `rt_core::launch`'s module docs), it returns a NEW `Command` that runs `bwrap` with
-//! that program/args after `--`, and the exact same env and cwd carried over (a brand-new `Command` otherwise
-//! inherits the calling process's own environment, which must never leak into the sandboxed child). It never
+//! that program/args after `--`, and the exact same env (minus [`SANDBOX_ENV_DENYLIST`]'s display/audio/D-Bus
+//! variables) and cwd carried over (a brand-new `Command` otherwise inherits the calling process's own
+//! environment, which must never leak into the sandboxed child). It never
 //! spawns anything itself, so it is unit-testable with only `Command` introspection (`get_program`, `get_args`,
 //! `get_envs`, `get_current_dir`), the same pattern `backend-wine`'s `command()` tests use.
 use rt_core::{AppEnv, Sandbox};
@@ -58,6 +59,21 @@ use std::sync::Arc;
 /// when it is outside this fixed set, rather than this crate growing a second binary-discovery mechanism.
 pub const RO_BINDS: [&str; 5] = ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives"];
 
+/// Host session variables [`InstallerSandbox::wrap`] never replays into the sandbox, whatever the wrapped
+/// command's finalized env holds (`rt_core::backend::ALLOWED` keeps them for ordinary, unsandboxed runs). With
+/// `--network` the sandbox shares the host's network namespace, so an abstract X11/Wayland/D-Bus/Pulse socket
+/// would otherwise be reachable and these variables say exactly where it is. Denying them means display, audio
+/// and D-Bus access are refused in the installer sandbox regardless of `--network`.
+pub const SANDBOX_ENV_DENYLIST: [&str; 7] = [
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "PULSE_SERVER",
+];
+
 /// The path used as `$HOME` inside the sandbox when the wrapped command's own finalized env has none. Nothing
 /// on the host is ever bound there: only an empty `tmpfs`, so a program that insists on some `$HOME` existing
 /// gets one, but finds it empty.
@@ -92,8 +108,8 @@ impl InstallerSandbox {
         &self.bwrap
     }
 
-    /// The pure argv-builder (module docs). `cmd` must already be finalized (its env and cwd are copied over
-    /// verbatim); `env` names the app whose `prefix` is bound read-write.
+    /// The pure argv-builder (module docs). `cmd` must already be finalized (its env, minus
+    /// [`SANDBOX_ENV_DENYLIST`], and cwd are copied over); `env` names the app whose `prefix` is bound read-write.
     pub fn wrap(&self, cmd: Command, env: &AppEnv, opts: &SandboxOpts) -> Command {
         let home = home_path(&cmd);
         let prefix = env.prefix();
@@ -144,6 +160,9 @@ impl InstallerSandbox {
         // `env_clear` + explicit `.env()` calls (see `rt_core::launch`'s own `envs()` test helper).
         out.env_clear();
         for (k, v) in cmd.get_envs() {
+            if SANDBOX_ENV_DENYLIST.iter().any(|d| k == OsStr::new(d)) {
+                continue;
+            }
             match v {
                 Some(v) => {
                     out.env(k, v);
