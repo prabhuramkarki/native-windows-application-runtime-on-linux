@@ -1,0 +1,74 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Minimal MSI fixture for tests that exercise the MSI installer path (Task 0 of Phase 3).
+  Built with: wixl -o tests/fixtures/build/hello.msi tools/fixtures/hello.wxs
+  Payload (hello64.exe) comes from tools/build-fixtures.sh's mingw-w64 build; not rebuilt here.
+
+  GUIDs below are FIXED, hand-generated once with `uuidgen`, and must never be regenerated:
+  later tasks' tests assert on the exact ProductCode/UpgradeCode values.
+    UpgradeCode (Product/@UpgradeCode):        99B86B86-FA62-4A0C-AA31-8D2DB4C7CBEE
+    ProductCode (Product/@Id):                 8965C2A7-9312-4D38-A0C4-76FAE288CAA7
+    MainExecutable component GUID:             891E2C8A-5D9C-4C7C-9A5D-FB37840B6F11
+    ApplicationShortcut component GUID:        F048BA83-6668-470F-A0C3-26074555117B
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product Id='8965C2A7-9312-4D38-A0C4-76FAE288CAA7'
+           UpgradeCode='99B86B86-FA62-4A0C-AA31-8D2DB4C7CBEE'
+           Name='Runtime Fixture MSI'
+           Language='1033'
+           Codepage='1252'
+           Version='1.0.0'
+           Manufacturer='Runtime Fixture Project'>
+
+    <Package Id='*'
+             Keywords='Installer'
+             Description='Runtime Fixture MSI Installer'
+             Comments='Test fixture for native-windows-application-runtime-on-linux'
+             Manufacturer='Runtime Fixture Project'
+             InstallerVersion='200'
+             Languages='1033'
+             Compressed='yes'
+             SummaryCodepage='1252' />
+
+    <Media Id='1' Cabinet='product.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1' />
+    <Property Id='DiskPrompt' Value='Runtime Fixture MSI Installation' />
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='ProgramFilesFolder' Name='PFiles'>
+        <Directory Id='INSTALLDIR' Name='RuntimeFixture'>
+          <Component Id='MainExecutable' Guid='891E2C8A-5D9C-4C7C-9A5D-FB37840B6F11'>
+            <File Id='hello64.exe'
+                  Name='hello64.exe'
+                  DiskId='1'
+                  Source='tests/fixtures/build/hello64.exe'
+                  KeyPath='yes' />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id='ProgramMenuFolder' Name='Programs'>
+        <Directory Id='ApplicationProgramsFolder' Name='Runtime Fixture MSI'>
+          <Component Id='ApplicationShortcut' Guid='F048BA83-6668-470F-A0C3-26074555117B'>
+            <Shortcut Id='ApplicationStartMenuShortcut'
+                      Name='Runtime Fixture MSI'
+                      Description='Runtime Fixture MSI'
+                      Target='[#hello64.exe]'
+                      WorkingDirectory='INSTALLDIR' />
+            <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall' />
+            <RegistryValue Root='HKCU'
+                            Key='Software\RuntimeFixtureMsi'
+                            Name='installed'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id='Complete' Level='1'>
+      <ComponentRef Id='MainExecutable' />
+      <ComponentRef Id='ApplicationShortcut' />
+    </Feature>
+  </Product>
+</Wix>
