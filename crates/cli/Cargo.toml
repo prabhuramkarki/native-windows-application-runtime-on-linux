@@ -13,6 +13,7 @@ path = "src/main.rs"
 runtime-pe = { path = "../pe" }
 runtime-core = { path = "../core" }
 runtime-installer = { path = "../installer" }
+runtime-desktop = { path = "../desktop" }
 runtime-backend-wine = { path = "../backend-wine" }
 clap = { version = "4", features = ["derive"] }
 libc.workspace = true

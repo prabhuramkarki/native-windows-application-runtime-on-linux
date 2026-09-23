@@ -58,6 +58,11 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
             "{e}; removing without running any recorded uninstaller or stopping a running Wine process"
         )),
     }
+    // Best-effort, same stance as the desktop entry's own creation (`installer::pipeline`): a `.desktop`/icon
+    // removal failure is desktop-shell cosmetics, never a reason to leave the app's environment in place.
+    if let Err(e) = rt_desktop::entry::remove(&id) {
+        warn(&format!("could not remove this app's desktop menu entry: {e}"));
+    }
     store.remove(&id)?;
     crate::emit(&format!("Uninstalled {}\n", safe(id.as_str())))
 }

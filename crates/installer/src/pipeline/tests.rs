@@ -80,6 +80,48 @@ fn require_real_bwrap() -> Option<PathBuf> {
     }
 }
 
+/// Serialises [`install_via_installer_isolated`] across this whole test binary: `std::env::set_var` is
+/// process-global and `cargo test` runs `#[test]`s on separate threads of the same process by default. Nothing
+/// else in this binary reads `XDG_DATA_HOME`/`HOME` from the real process environment for its own logic — every
+/// other real-`HOME`-like need in this crate's tests (`crate::sandbox::tests`) sets it on a *child* `Command`
+/// instead — so this lock only has to cover this file's own calls to be sufficient.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`install_via_installer`], with `XDG_DATA_HOME` pointed at a fresh scratch directory for the call's duration.
+///
+/// Task 7 wired `rt_desktop::entry::write`/`mime::register` into `run_after_create` on every path that returns
+/// `InstallOutcome::Installed`; both are real-env only BY DESIGN (`crates/desktop/src/entry.rs`'s public
+/// `write`/`register` take no injectable environment — that seam is deliberately internal to `rt_desktop`, to
+/// match the brief's own fixed signature). A test that calls `install_via_installer` directly, in-process, is
+/// therefore the one and only place a successful real install in THIS test binary could otherwise write straight
+/// into the real developer's `~/.local/share/applications` — exactly what happened before this wrapper existed
+/// (see the Task 7 report). Every call in this file goes through this wrapper rather than the bare function,
+/// even the ones that fail before reaching that point: cheap, and it removes the need to keep re-verifying which
+/// paths do or do not reach it as this pipeline evolves.
+fn install_via_installer_isolated(
+    store: &Store,
+    backend: &dyn CompatBackend,
+    launcher: Launcher,
+    path: &Path,
+    opts: InstallerOpts,
+) -> Result<InstallOutcome, InstallerError> {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scratch = tempfile::tempdir().unwrap();
+    let previous = std::env::var_os("XDG_DATA_HOME");
+    // SAFETY: serialised by `ENV_LOCK` above; nothing else in this process reads this variable concurrently.
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", scratch.path());
+    }
+    let result = install_via_installer(store, backend, launcher, path, opts);
+    unsafe {
+        match &previous {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+    }
+    result
+}
+
 // ---------------------------------------------------------------- detection against real bytes; clean failure
 
 /// `hello.msi`'s real `MsiInfo`/family are used for naming and planning; `FakeBackend` never creates a real
@@ -91,7 +133,8 @@ fn real_hello_msi_is_detected_and_the_install_fails_cleanly_without_a_real_msiex
     let f = fx();
     let path = f.input("hello.msi", &fixture("hello.msi"));
     let backend = FakeBackend::new();
-    let err = install_via_installer(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap_err();
     assert!(matches!(err, InstallerError::MsiExecMissing), "{err}");
     f.assert_no_app_left();
     // Named after the real MsiInfo::read'd ProductName ("Runtime Fixture MSI"), slugged the same way as Phase 2.
@@ -130,7 +173,8 @@ exit 5
 "#;
     let backend = fake_backend(script);
 
-    let outcome = install_via_installer(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
     let InstallOutcome::Installed {
         id,
         executable,
@@ -179,7 +223,8 @@ exit 5
 
     // Installing the very same file again must not collide: the id (and metadata) diverge, mirroring Phase 2's
     // "installing the same program twice gives distinct ids".
-    let second = install_via_installer(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let second =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
     let InstallOutcome::Installed { id: id2, .. } = second else {
         panic!("expected Installed");
     };
@@ -221,7 +266,7 @@ exit 0
         precreate_windows_temp: true,
         ..Wrap::new(fake_backend(script))
     };
-    let outcome = install_via_installer(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap();
     let InstallOutcome::Installed { id, executable, .. } = outcome else {
         panic!("expected Installed, got {outcome:?}");
     };
@@ -257,7 +302,7 @@ fn silent_on_an_unrecognised_installer_family_creates_nothing() {
         silent: true,
         ..Default::default()
     };
-    let err = install_via_installer(&f.store, &backend, launcher(), &path, opts).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
     assert!(
         matches!(
             err,
@@ -279,7 +324,8 @@ fn unrecognised_file_formats_are_refused_before_anything_is_created() {
         ("empty.bin", Vec::new()),
     ] {
         let path = f.input(name, &bytes);
-        let err = install_via_installer(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap_err();
+        let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default())
+            .unwrap_err();
         assert!(matches!(err, InstallerError::NotAnInstaller), "{name}: {err}");
     }
     assert!(!f.apps().exists());
@@ -305,7 +351,8 @@ fn ambiguous_discovery_returns_candidates_and_installs_nothing() {
     let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
     let backend = fake_backend(AMBIGUOUS_SCRIPT);
 
-    let outcome = install_via_installer(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome =
+        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
     let InstallOutcome::NeedsChoice(candidates) = outcome else {
         panic!("expected NeedsChoice, got {outcome:?}");
     };
@@ -327,7 +374,7 @@ fn exe_override_skips_discovery_and_installs_the_named_file() {
         ..Default::default()
     };
 
-    let outcome = install_via_installer(&f.store, &backend, launcher(), &path, opts).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap();
     let InstallOutcome::Installed { executable, .. } = outcome else {
         panic!("expected Installed, got {outcome:?}");
     };
@@ -422,7 +469,7 @@ exit 0
         version_fails: true,
         ..Wrap::new(fake_backend(script))
     };
-    let err = install_via_installer(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
     assert!(
         matches!(err, InstallerError::Backend(BackendError::Unavailable(_))),
         "{err}"
@@ -441,7 +488,7 @@ fn a_backend_command_failure_cleans_up_the_environment() {
         command_fails: true,
         ..Wrap::new(FakeBackend::new())
     };
-    let err = install_via_installer(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
     assert!(
         matches!(err, InstallerError::Backend(BackendError::Unavailable(_))),
         "{err}"
