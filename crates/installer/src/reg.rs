@@ -25,7 +25,8 @@
 //! (REG_BINARY, and its `hex(2):`/`hex(7):` siblings for REG_EXPAND_SZ/REG_MULTI_SZ), whose value may continue
 //! onto following physical lines ending in a trailing `\`. These are recognised (so a real prefix never produces
 //! a spurious warning) but not modelled: [`RegValue`] only has variants for the three shapes this crate's
-//! callers need.
+//! callers need. The one exception: `"Name"=str(2):"..."` (Wine's printable REG_EXPAND_SZ, what real MSI
+//! `UninstallString`s use) is parsed exactly like a quoted string, into [`RegValue::Str`], unexpanded.
 //!
 //! String escaping, confirmed against the real files above: `\\` -> `\` and `\"` -> `"` (seen directly, e.g.
 //! `@="\"C:\\windows\\system32\\notepad.exe\" \"%1\""` decodes to `"C:\windows\system32\notepad.exe" "%1"`).
@@ -335,6 +336,10 @@ impl Parser {
             self.note_malformed("value line outside any key");
             return;
         };
+        // `str(2):"..."` is Wine's printable REG_EXPAND_SZ: same quoted body as REG_SZ, modelled as `Str`
+        // (unexpanded; `%VAR%` is kept literally). Real MSI `UninstallString`s are written exactly this way,
+        // so without it no MSI install ever recorded an uninstall command.
+        let rest = rest.strip_prefix("str(2):").unwrap_or(rest);
         if let Some(quoted) = rest.strip_prefix('"') {
             let Some((s, tail)) = parse_quoted_body(quoted) else {
                 self.note_malformed("unterminated quoted value");

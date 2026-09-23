@@ -40,6 +40,37 @@ pub const BACKEND_ID: &str = "wine";
 /// fail until Phase 4; `doctor` says so).
 pub const WINEDLLOVERRIDES: &str = "winemenubuilder.exe=d;mscoree=d;mshtml=d";
 
+/// [`CompatBackend::settle`]'s shell wrapper: a FIXED script text, never built with `format!` or any other
+/// string-interpolation of caller-supplied data — the same "untrusted data only ever arrives as argv, never
+/// substituted into program text" discipline this codebase already uses everywhere a shell is involved (e.g.
+/// `InstallerSandbox::wrap` itself, `crate::uninstall`'s `split_command_line`/`resolve_uninstaller`). The
+/// wineserver path, the real program and its arguments are all separate `Command::arg()` calls (separate argv
+/// elements handed to `sh`), never spliced into this string.
+///
+/// `WS="$1"; shift` peels the wineserver path off the front of argv, so `"$@"` becomes exactly the original
+/// program plus its own arguments; `"$@"` runs it, `rc=$?` captures its real exit status BEFORE anything else
+/// can change `$?`. `"$WS" -w` then blocks until wineserver has no more clients for this prefix — Wine's own
+/// `wineserver -w` semantics, and the same daemon this command's own client process would otherwise leave
+/// running unsupervised — which is when it has flushed `system.reg`/`user.reg` to disk (verified empirically,
+/// both standalone against real `sh` — this file's `settle_*` tests — and end-to-end with real Wine and bwrap,
+/// `crates/cli/tests/e2e_installers.rs`'s registry-derived metadata assertions). Only then does `exit $rc`
+/// return the original command's own status, not wineserver's.
+///
+/// This must run inside the SAME process tree as the original command, never as a separate follow-up call: a
+/// `--unshare-pid` sandbox (`rt_installer::InstallerSandbox`) makes `bwrap` PID 1 of a fresh PID namespace, and
+/// `bwrap` tears that namespace down (killing every process still in it, `wineserver` included) the instant its
+/// own direct child — this whole `sh -c` invocation — exits. A follow-up command run after `wait()` returns
+/// would be waiting on an already-dead process; wrapping the ORIGINAL invocation is the only place this can
+/// work.
+///
+/// Residual risk (M7 of the Phase 3 final review; accepted, not actively bounded): if `wineserver -w` never
+/// returns (a stuck Wine process still holding the prefix open), this step now blocks with no internal timeout,
+/// where none existed before either (`pipeline::run_installer_process` already runs the installer itself with
+/// no internal deadline, by design: a non-silent GUI install may need unbounded wall-clock time for a human).
+/// In practice `wineserver -w` returns promptly once the direct child has exited and holds no other prefix
+/// clients open.
+const SETTLE_SCRIPT: &str = r#"WS="$1"; shift; "$@"; rc=$?; "$WS" -w >/dev/null 2>&1; exit $rc"#;
+
 /// The per-app `HOME` (see the module docs): `<app>/runtime/home`.
 pub fn app_home(env: &AppEnv) -> PathBuf {
     env.root().join("runtime").join("home")
@@ -364,6 +395,32 @@ impl CompatBackend for WineBackend {
     fn dll_dirs(&self) -> Vec<PathBuf> {
         self.dll_dirs.clone()
     }
+
+    /// Wraps `cmd` in [`SETTLE_SCRIPT`] (see its own docs for exactly why and how): `/bin/sh -c <script> sh
+    /// <wineserver> <program> <args...>`, with `cmd`'s env and cwd carried over unchanged. `cmd`'s own program
+    /// and args are read back with `get_program`/`get_args` (the same introspection this crate's tests already
+    /// use), never re-derived, so this is a pure wrap of whatever `command()` built — it does not know or care
+    /// whether that was a real installer, `msiexec`, or anything else.
+    fn settle(&self, cmd: Command) -> Command {
+        let mut out = Command::new("/bin/sh");
+        out.arg("-c").arg(SETTLE_SCRIPT).arg("sh").arg(&self.wineserver);
+        out.arg(cmd.get_program());
+        out.args(cmd.get_args());
+        for (k, v) in cmd.get_envs() {
+            match v {
+                Some(v) => {
+                    out.env(k, v);
+                }
+                None => {
+                    out.env_remove(k);
+                }
+            }
+        }
+        if let Some(dir) = cmd.get_current_dir() {
+            out.current_dir(dir);
+        }
+        out
+    }
 }
 
 enum Want {
@@ -405,6 +462,7 @@ mod tests {
     use super::*;
     use rt_core::{AppId, Store};
     use std::collections::BTreeSet;
+    use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1154,6 +1212,113 @@ esac
         let debug = envs(&cmd).into_iter().find(|(k, _)| k == "WINEDEBUG").unwrap().1;
         assert_eq!(debug, "err+all,fixme-all");
         assert_eq!(cmd.get_args().count(), 1);
+    }
+
+    // ---- settle ----
+
+    #[test]
+    fn settle_wraps_the_command_in_the_settle_script_with_wineserver_program_and_args_as_argv() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/hello64.exe");
+        let b = r.backend();
+        let args = [OsString::from("--flag"), OsString::from("value")];
+        let cmd = b.command(&r.env, &exe, &dir, &args, &RunOpts::default()).unwrap();
+        let cmd_envs = envs(&cmd);
+        let cmd_cwd = cmd.get_current_dir().map(Path::to_path_buf);
+
+        let out = b.settle(cmd);
+
+        assert_eq!(out.get_program(), OsStr::new("/bin/sh"));
+        let got_args: Vec<_> = out.get_args().collect();
+        assert_eq!(
+            got_args,
+            [
+                OsStr::new("-c"),
+                OsStr::new(SETTLE_SCRIPT),
+                OsStr::new("sh"),
+                r.bin.join("wineserver").as_os_str(),
+                r.bin.join("wine").as_os_str(),
+                OsStr::new(exe.as_os_str()),
+                OsStr::new("--flag"),
+                OsStr::new("value"),
+            ]
+        );
+        // The env and cwd of the ORIGINAL command are carried over unchanged (same discipline as
+        // `InstallerSandbox::wrap`'s own env-replay loop).
+        assert_eq!(envs(&out), cmd_envs);
+        assert_eq!(out.get_current_dir().map(Path::to_path_buf), cmd_cwd);
+    }
+
+    #[test]
+    fn settle_preserves_an_explicit_env_removal() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/a.exe");
+        let b = r.backend();
+        let mut cmd = b.command(&r.env, &exe, &dir, &[], &RunOpts::default()).unwrap();
+        cmd.env_remove("WINEARCH");
+        let out = b.settle(cmd);
+        assert_eq!(
+            out.get_envs()
+                .find(|(k, _)| *k == OsStr::new("WINEARCH"))
+                .map(|(_, v)| v),
+            Some(None),
+            "an explicit removal must be kept, not just absent"
+        );
+    }
+
+    /// The script itself, run standalone against a real `sh`: proves it (a) runs the wrapped command with the
+    /// right argv, (b) captures ITS exit code even though a second command (the "wineserver -w" stand-in) runs
+    /// after it, (c) genuinely waits for that second command before the shell itself exits. This is the one
+    /// mechanism the whole C1 fix depends on; the real Wine + bwrap proof is in
+    /// `crates/cli/tests/e2e_installers.rs`.
+    #[test]
+    fn settle_script_runs_for_real_captures_the_real_exit_code_and_waits_for_the_second_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let waiter = tmp.path().join("waiter.sh");
+        let marker = tmp.path().join("marker");
+        // Stands in for `wineserver -w`: blocks until the marker exists, proving it actually ran and was waited
+        // for (not just launched and abandoned).
+        fs::write(
+            &waiter,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -w ] || exit 9\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&waiter, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let program = tmp.path().join("prog.sh");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\necho \"argv:$*\"\n(sleep 0.2; touch {}) &\nexit 42\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let start = Instant::now();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(SETTLE_SCRIPT)
+            .arg("sh")
+            .arg(&waiter)
+            .arg(&program)
+            .arg("a")
+            .arg("b")
+            .output()
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(out.status.code(), Some(42), "the original command's exit code");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "argv:a b\n");
+        assert!(marker.exists(), "the background write must have completed");
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "the shell must have blocked on the waiter, not returned immediately: {elapsed:?}"
+        );
     }
 
     #[test]

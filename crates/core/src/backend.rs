@@ -129,6 +129,17 @@ pub trait CompatBackend: Send + Sync {
     fn stop(&self, env: &AppEnv) -> Result<(), BackendError>;
     /// Directories with the backend's built-in DLLs (for `doctor`).
     fn dll_dirs(&self) -> Vec<PathBuf>;
+    /// Wraps `cmd` so it does not report done until whatever background process it started (if any) has also
+    /// finished — e.g. Wine's `wineserver`, which keeps running after its client exits and flushes the registry
+    /// to disk a few seconds later. This matters because a caller that tears down the whole process tree the
+    /// instant the direct child exits (a `--unshare-pid` sandbox: see `rt_installer::InstallerSandbox`, which
+    /// makes `bwrap` PID 1 of a fresh PID namespace) kills that background process before it gets to finish, and
+    /// there is no way to fix this with a follow-up call afterwards — by the time such a call could run, the
+    /// process is already dead. The wrapping has to happen INSIDE the same spawn `cmd` becomes, before the
+    /// sandbox (or anything else) ever sees it. Identity by default: most backends spawn nothing persistent.
+    fn settle(&self, cmd: Command) -> Command {
+        cmd
+    }
 }
 
 /// The variable names a child may inherit from the host, besides anything starting with `LC_`.
