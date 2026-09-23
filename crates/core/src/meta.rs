@@ -21,8 +21,13 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The only schema version this crate reads or writes.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The schema version this crate writes.
+pub const SCHEMA_VERSION: u32 = 2;
+/// The oldest schema version this crate still reads. Schema 1 (Phase 2) had no `installer` field; it deserialises
+/// fine into today's `Metadata` because `installer` is `#[serde(default)]`, so `1..=SCHEMA_VERSION` is accepted
+/// rather than exact equality. There is no other shape difference between 1 and 2 yet, so no field-by-field
+/// migration code exists: `installer: None` for a v1 file already IS its correct v2 reading.
+pub const MIN_SCHEMA_VERSION: u32 = 1;
 /// Largest `metadata.json` that is read, in bytes.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Longest `name`, in bytes.
@@ -41,7 +46,7 @@ pub enum MetaError {
     /// `Display` may quote (clipped) file content: sanitise before printing.
     #[error("metadata is malformed: {0}")]
     Parse(String),
-    #[error("unsupported schemaVersion {0} (expected {SCHEMA_VERSION})")]
+    #[error("unsupported schemaVersion {0} (expected {MIN_SCHEMA_VERSION}..={SCHEMA_VERSION})")]
     SchemaVersion(u64),
     #[error("field `{field}` is longer than {max} bytes")]
     TooLong { field: &'static str, max: usize },
@@ -65,6 +70,26 @@ pub struct BackendInfo {
     pub version: String,
 }
 
+/// What `installer::pipeline` (Phase 3 Task 6) recorded about the installer that produced this app, when it was
+/// installed via `.msi`/`.exe` installer rather than as a portable executable. Added in schema version 2;
+/// `#[serde(default)]` on [`Metadata::installer`] is what lets a schema-1 file (which has no `installer` key at
+/// all) still deserialise, as `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallerMeta {
+    /// `InstallerFamily`'s label (`"inno"`, `"nsis"`, `"installshield"`, `"wix-burn"`, `"msi"`, `"unknown"`). A
+    /// plain `String` here, not the `rt_installer` enum: `runtime-core` does not depend on `runtime-installer`
+    /// (the dependency runs the other way), so the family is recorded as its stable text label.
+    pub family: String,
+    /// The installer's own product name (an MSI's `ProductName`, or a `DisplayName` recovered from the
+    /// `Uninstall` registry key the installer wrote), if one could be determined.
+    pub product_name: Option<String>,
+    /// The uninstaller command line recorded by the installer (an `UninstallString` value under `Uninstall`),
+    /// if the installer registered one. `runtime uninstall` runs this, when present, before removing the app's
+    /// environment.
+    pub uninstall_command: Option<String>,
+}
+
 /// The contents of `metadata.json`. The public fields make it easy to build; `serde` alone does not validate,
 /// so read and write only through [`Metadata::parse`], [`Metadata::read`] and [`Metadata::write_atomic`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +108,10 @@ pub struct Metadata {
     pub subsystem: String,
     /// Unix seconds.
     pub created: u64,
+    /// `Some` when this app was installed via `.msi`/`.exe` installer (schema version 2). `#[serde(default)]`
+    /// so a schema-1 file (no `installer` key) still deserialises, as `None`.
+    #[serde(default)]
+    pub installer: Option<InstallerMeta>,
 }
 
 fn cap(field: &'static str, value: &str, max: usize) -> Result<(), MetaError> {
@@ -175,11 +204,12 @@ impl Metadata {
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
+            installer: None,
         }
     }
 
     pub fn validate(&self) -> Result<(), MetaError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !(MIN_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(MetaError::SchemaVersion(self.schema_version.into()));
         }
         cap("name", &self.name, MAX_NAME_LEN)?;
@@ -207,6 +237,15 @@ impl Metadata {
         cap("backend.id", &self.backend.id, MAX_FIELD_LEN)?;
         cap("backend.version", &self.backend.version, MAX_FIELD_LEN)?;
         cap("subsystem", &self.subsystem, MAX_FIELD_LEN)?;
+        if let Some(installer) = &self.installer {
+            cap("installer.family", &installer.family, MAX_FIELD_LEN)?;
+            if let Some(p) = &installer.product_name {
+                cap("installer.productName", p, MAX_FIELD_LEN)?;
+            }
+            if let Some(u) = &installer.uninstall_command {
+                cap("installer.uninstallCommand", u, MAX_FIELD_LEN)?;
+            }
+        }
         Ok(())
     }
 
@@ -214,7 +253,7 @@ impl Metadata {
     pub fn parse(bytes: &[u8]) -> Result<Metadata, MetaError> {
         let parse_err = |e: serde_json::Error| MetaError::Parse(clip(e.to_string()));
         let probe: Probe = serde_json::from_slice(bytes).map_err(parse_err)?;
-        if probe.schema_version != u64::from(SCHEMA_VERSION) {
+        if !(u64::from(MIN_SCHEMA_VERSION)..=u64::from(SCHEMA_VERSION)).contains(&probe.schema_version) {
             return Err(MetaError::SchemaVersion(probe.schema_version));
         }
         let md: Metadata = serde_json::from_slice(bytes).map_err(parse_err)?;
@@ -308,6 +347,7 @@ pub(crate) fn sample(id: &str) -> Metadata {
         },
         subsystem: "gui".into(),
         created: 1_700_000_000,
+        installer: None,
     }
 }
 
@@ -349,7 +389,7 @@ mod tests {
         m.write_atomic(&path).unwrap();
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
-        for key in ["\"schemaVersion\": 1", "\"created\"", "\"backend\"", "\"executable\""] {
+        for key in ["\"schemaVersion\": 2", "\"created\"", "\"backend\"", "\"executable\""] {
             assert!(text.contains(key), "{key} missing in {text}");
         }
         let mut none_version = m.clone();
@@ -404,17 +444,79 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_must_be_exactly_one() {
-        for v in [0u64, 2, 99, u64::MAX] {
+    fn schema_version_accepts_1_and_2_and_rejects_everything_else() {
+        for v in [0u64, 3, 99, u64::MAX] {
             let err = Metadata::parse(&with("schemaVersion", Some(serde_json::json!(v)))).unwrap_err();
             assert!(matches!(err, MetaError::SchemaVersion(n) if n == v), "{v}: {err:?}");
         }
+        // Both ends of the supported range parse (the sample's own shape already carries `installer: None`).
+        for v in [1u64, 2] {
+            let bytes = with("schemaVersion", Some(serde_json::json!(v)));
+            Metadata::parse(&bytes).unwrap_or_else(|e| panic!("schemaVersion {v} should parse: {e}"));
+        }
         // An unknown future version with a shape we do not know is still reported as the version.
-        let err = Metadata::parse(br#"{"schemaVersion":2,"totally":"different"}"#).unwrap_err();
-        assert!(matches!(err, MetaError::SchemaVersion(2)), "{err:?}");
+        let err = Metadata::parse(br#"{"schemaVersion":3,"totally":"different"}"#).unwrap_err();
+        assert!(matches!(err, MetaError::SchemaVersion(3)), "{err:?}");
         let mut m = sample("app");
-        m.schema_version = 2;
-        assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(2))));
+        m.schema_version = 3;
+        assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(3))));
+        let mut m = sample("app");
+        m.schema_version = 1;
+        m.validate().unwrap();
+    }
+
+    /// The migration proper: genuine OLD-shape bytes (schema version 1, no `installer` key at all — not merely a
+    /// `Metadata` struct literal that happens to omit it) still read, with `installer: None`.
+    #[test]
+    fn old_v1_metadata_with_no_installer_key_still_reads() {
+        let mut v: serde_json::Value = serde_json::from_str(&json(&sample("app"))).unwrap();
+        v["schemaVersion"] = serde_json::json!(1);
+        let obj = v.as_object_mut().unwrap();
+        assert!(obj.remove("installer").is_some(), "sample must have serialised an installer key to remove");
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("installer"), "installer key must really be gone");
+
+        let m = Metadata::parse(&bytes).unwrap();
+        assert_eq!(m.schema_version, 1);
+        assert_eq!(m.installer, None);
+
+        // Same, but through `Metadata::read` (a real file on disk), per the task's requirement.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        fs::write(&path, &bytes).unwrap();
+        let read = Metadata::read(&path).unwrap();
+        assert_eq!(read.schema_version, 1);
+        assert_eq!(read.installer, None);
+    }
+
+    #[test]
+    fn installer_meta_round_trips_and_its_string_fields_are_capped() {
+        let mut m = sample("app");
+        m.installer = Some(InstallerMeta {
+            family: "nsis".into(),
+            product_name: Some("Hello NSIS".into()),
+            uninstall_command: Some("C:\\Program Files\\hello\\uninstall.exe".into()),
+        });
+        m.validate().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        m.write_atomic(&path).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), m);
+
+        type Set = fn(&mut Metadata, String);
+        let fields: [(&str, Set); 3] = [
+            ("installer.family", |m, s| m.installer.as_mut().unwrap().family = s),
+            ("installer.productName", |m, s| m.installer.as_mut().unwrap().product_name = Some(s)),
+            ("installer.uninstallCommand", |m, s| {
+                m.installer.as_mut().unwrap().uninstall_command = Some(s)
+            }),
+        ];
+        for (field, set) in fields {
+            let mut long = m.clone();
+            set(&mut long, "a".repeat(MAX_FIELD_LEN + 1));
+            let err = long.validate().unwrap_err();
+            assert!(matches!(err, MetaError::TooLong { .. }), "{field}: {err:?}");
+        }
     }
 
     #[test]
