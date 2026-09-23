@@ -137,9 +137,10 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
 **The profile**, verified against a real `bwrap` (bubblewrap 0.11.1) in `crates/installer/src/sandbox/tests.rs`:
 - The app's own `prefix` (which contains `drive_c`) is bound read-write, at the same path. Nothing else on the
   real filesystem is bound: no `Downloads`, no other app's data, no arbitrary host path.
-- `/usr`, `/lib`, `/lib64`, `/etc/alternatives` are bound read-only (a fixed, documented set a system Wine
-  package needs to run at all — not a walk of its actual shared-library dependency closure, and not everything
-  under `/`; a distro without one of these directories just does not get it, `--ro-bind-try`), plus any extra
+- `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/alternatives` are bound read-only (a fixed, documented set a system
+  Wine package needs to run at all — not a walk of its actual shared-library dependency closure, and not
+  everything under `/`; a distro without one of these directories just does not get it, `--ro-bind-try`; `/bin`
+  was added by Task 8, see below — plain Wine binaries alone were not the whole story), plus any extra
   read-only paths the caller passes (`SandboxOpts::extra_ro_binds`, also `--ro-bind-try`) — for a Wine install
   outside the fixed set, e.g. a WineHQ package under `/opt/wine-stable`. Nothing walks the fixed set today, so a
   Wine there needs Task 6 to add its install root explicitly.
@@ -191,9 +192,71 @@ other apps' data or any other host path, and (by default) has no network at all,
   hostile installer can still fill disk inside its own prefix or spin the CPU until the helper's timeout fires.
 - **TOCTOU on the bound paths.** Same caveat as the rest of this document: nothing here uses `openat2` path
   confinement: what is real at the moment `bwrap` sets up its mounts is what gets bound.
-- **Not yet wired into any real installer run.** Task 5 only builds and tests the sandbox and the `Launcher`
-  seam; nothing in `runtime install`/`run` calls it yet (that is Task 6). Until then this section describes
-  what the primitive does when used, not something the CLI already does.
+- **Wired into `runtime install` since Task 6** (this bullet was true only through Task 5; corrected by
+  Task 8, which is what actually ran a real installer through it end to end for the first time — see
+  below). `installer::pipeline::install_via_installer` runs every `.msi`/`.exe` installer through this
+  sandbox unconditionally (no bwrap on `$PATH` is `InstallerError::BwrapNotFound`, never a silent
+  fallback to running it unsandboxed); `runtime uninstall`'s recorded uninstall command runs through it
+  too (`crate::uninstall`).
+
+### Task 8: what real end-to-end testing found
+
+Task 8 ran real `hello.msi`/`hello-nsis.exe` installs through this exact sandbox on a stock Ubuntu Wine
+setup (Wine 10.0~repack, the `wine`/`wine64` apt packages) for the first time — Tasks 5-7 verified the
+sandbox itself (a plain `/usr/bin/sh` payload) and the pipeline's logic, but never a real installer
+through both together. Three things surfaced that were not previously visible:
+
+- **The fixed read-only bind set was missing `/bin`, and every real installer run silently failed
+  because of it.** Ubuntu's/Debian's `wine`/`wine64` commands are `update-alternatives` symlinks to
+  small `#!/bin/sh -e` wrapper scripts (`/usr/bin/wine{,64}-stable`), not plain ELF binaries. Without
+  `/bin` in [`RO_BINDS`](../crates/installer/src/sandbox.rs), the sandbox's mount namespace has no
+  `/bin` at all (only `/usr`, `/lib`, `/lib64`, `/etc/alternatives` existed), so the kernel's own
+  shebang resolution for `/bin/sh` failed with ENOENT before Wine ever started — `bwrap` reported this
+  as `execvp /usr/bin/wine: No such file or directory`, which reads exactly like "Wine is missing" and
+  is not: the wrapper script itself was reachable, its interpreter was not. The practical effect: EVERY
+  installer run through this sandbox failed (silently, as an empty-candidate "nothing installed"), on a
+  completely stock Ubuntu install, regardless of `--silent`. Fixed by adding `/bin` to `RO_BINDS`
+  (`crates/installer/src/sandbox.rs`); real installs now succeed (verified: `hello.msi --silent` and
+  `hello-nsis.exe --silent` both install, run and uninstall cleanly end to end). The exact set of real
+  host paths reachable read-only inside the sandbox is now `/usr`, `/bin`, `/lib`, `/lib64`,
+  `/etc/alternatives` (plus `SandboxOpts::extra_ro_binds`, the backend's own `dll_dirs()`) — everything
+  else on the real filesystem is still invisible, and the app's own `prefix` (`drive_c` included) is
+  still the only path bound read-write, exactly as designed.
+- **The no-display-socket gap is real, but which outcome it produces depends on the installer — checked
+  for real, not assumed (task Ruling 4).** Two non-`--silent` installs were run against the FIXED
+  sandbox above (so Wine genuinely starts this time, unlike the `/bin` bug's silent no-op):
+  - `hello.msi` (`msiexec /i ...` with no silent flags): **installs successfully anyway**, in about the
+    same ~15 seconds as a silent install. `hello.wxs` (the MSI fixture) defines no `<UI>` table at all
+    (no `WixUI` extension), so `msiexec` has no dialog sequence to show in the first place; with nothing
+    to render, the missing display socket never matters, and the install completes as if headless. This
+    is not the CLI "silently forcing `--silent`" (`family::plan` genuinely adds zero `msiexec` flags for
+    `silent=false`, unit-tested): it is a property of THIS installer package, and a real MSI shipping
+    Microsoft's standard UI dialogs could behave differently.
+  - `hello-nsis.exe` (no `/S`, so NSIS tries to show its real wizard UI): **fails fast**, in about 10-15
+    seconds, reporting no new files ("nothing installed") rather than hanging — because there is no
+    display for it to attach to (no `/tmp/.X11-unix` socket bound, no `$XDG_RUNTIME_DIR`, `--unshare-ipc`
+    breaks X11 shared memory even if a socket were reachable). Never a fake success, never a silent
+    fallback to `--silent` behaviour.
+
+  Neither case hangs, but there is currently no *internal* bounded timeout on this step
+  (`pipeline::run_installer_process` calls `Running::wait()` directly, not `Launcher::run_helper`'s
+  deadline form) — today it is the installer's own fast failure (or, for a dialog-less MSI, its own fast
+  success) that keeps this from hanging, not a guarantee this sandbox or pipeline provides.
+  `crates/cli/tests/e2e_installers.rs`'s `e2e_install_without_silent_never_silently_forces_silent_mode`
+  (using the NSIS fixture, the one that actually needs a display) bounds this from the OUTSIDE (a test
+  timeout that kills the process) so the test suite itself can never hang on this, but a real user
+  running `runtime install` without `--silent` on an installer that manages to render (e.g. if a display
+  socket were ever added to this sandbox in a later phase, or one with a dialog sequence that blocks
+  differently than NSIS's) has no such external bound today.
+- **A separate, non-sandbox finding from the same real end-to-end testing: `.lnk`-based executable
+  discovery (`rt_installer::discover::rank`'s tier (1)) does not fire for a real Wine-created Start Menu
+  shortcut**, because such a shortcut carries its target only in `LinkTargetIDList`, which
+  `rt_installer::lnk` deliberately never parses (documented scope limit since Task 3). For
+  `hello-nsis.exe`, whose installer also registers a separate `uninstall.exe` in the `Uninstall` registry
+  key, this means tier (2) uniquely — and wrongly — picks `uninstall.exe` as the app's own executable.
+  This is a ranking/parsing gap, not a sandbox one; see this task's report and the plan's Execution notes
+  for the full story. `crates/cli/tests/e2e_installers.rs`'s NSIS test uses `--exe` to name the real
+  executable directly rather than rely on discovery, until this is fixed.
 
 ## Roadmap
 
