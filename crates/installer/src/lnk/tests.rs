@@ -158,6 +158,26 @@ fn id_list_fallback_does_not_override_present_relative_path() {
     assert!(link.warnings.is_empty(), "{:?}", link.warnings);
 }
 
+/// The IDList fallback must fire only when `HAS_RELATIVE_PATH` is unset — never merely because the
+/// present `RelativePath` string failed to parse. A shortcut with `HAS_RELATIVE_PATH` SET to a
+/// genuinely relative (unparseable-as-absolute) string, plus a present, valid `LinkTargetIDList`,
+/// must still resolve to `relative_path: None` with the existing "unparseable" warning — Task 3's
+/// original behavior for this case, not silently superseded by an IDList-derived guess. Mutation-
+/// checked: reverting `ShellLink::parse`'s gate from `flags & HAS_RELATIVE_PATH == 0 &&
+/// relative_path.is_none()` back to the earlier, broader `relative_path.is_none()` makes this fail
+/// — the IDList's real `C:\target\hello.exe` gets recovered and no warning is produced.
+#[test]
+fn id_list_fallback_does_not_fire_when_relative_path_flag_is_set_but_unparseable() {
+    let lnk = Lnk {
+        id_list_items: Some(hello_id_list_items()),
+        relative_path: Some(r"target\hello.exe"), // HAS_RELATIVE_PATH set; no drive letter: rejected
+        ..Lnk::default()
+    };
+    let link = ShellLink::parse(&lnk.build()).expect("parses");
+    assert_eq!(link.relative_path, None);
+    assert_eq!(link.warnings.len(), 1, "{:?}", link.warnings);
+}
+
 #[test]
 fn minimal_header_with_no_optional_structures_is_a_complete_valid_file() {
     let bytes = Lnk::default().build();
