@@ -19,8 +19,9 @@ jobs:
       # `wine-e2e`: `tools/build-fixtures.sh` (run unconditionally below) hard-`exit 1`s without `makensis`/`wixl`,
       # and several NON-`#[ignore]`d tests in this very job (e.g. `apps.rs`'s
       # `install_of_a_real_msi_is_routed_to_the_installer_pipeline_and_fails_cleanly_without_msiexec`) read
-      # `hello.msi`/`hello-nsis.exe` off disk — without these packages the fixture-build step itself fails
-      # before `cargo test` ever runs, taking down the whole (non-`continue-on-error`) job.
+      # `hello.msi`/`hello-nsis.exe`/`hello-nsis-noshortcut.exe` off disk — without these packages the
+      # fixture-build step itself fails before `cargo test` ever runs, taking down the whole
+      # (non-`continue-on-error`) job.
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64 nsis msitools wixl bubblewrap desktop-file-utils
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,8 +53,8 @@ jobs:
       # Task 8's real-Wine installer e2e tests (`e2e_installers.rs`) need `nsis` (makensis) and `wixl`
       # (a SEPARATE apt package from `msitools` on this system's split, confirmed by this session's own
       # install history and by `tools/build-fixtures.sh`'s own error hint: "sudo apt install msitools
-      # wixl") to build `hello.msi`/`hello-nsis.exe`, `bubblewrap` for the installer sandbox
-      # (`rt_installer::sandbox`), and `desktop-file-utils` (`desktop-file-validate`) for the
+      # wixl") to build `hello.msi`/`hello-nsis.exe`/`hello-nsis-noshortcut.exe`, `bubblewrap` for the
+      # installer sandbox (`rt_installer::sandbox`), and `desktop-file-utils` (`desktop-file-validate`) for the
       # `.desktop`-entry checks, matching the `test` job's already-established convention.
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64 nsis msitools wixl bubblewrap desktop-file-utils
       - uses: dtolnay/rust-toolchain@stable

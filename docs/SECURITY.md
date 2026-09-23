@@ -281,16 +281,29 @@ through both together. Three things surfaced that were not previously visible:
   dropped from the pool before any tier is scored when (a) its basename looks like an uninstaller
   (`uninstall*`, `uninst*`, `unins<digits>`, `remove*`, case-insensitive) — always, whatever names it, so a
   file named `uninstall.exe`/`unins000.exe` never wins — or (b) an `UninstallString` names it and there is no
-  positive evidence it is the app: no Start Menu `.lnk` whose own name lacks "uninstall" targets it, and no
-  `DisplayIcon` names it other than in an entry whose `UninstallString` names it too. So an app whose
-  `UninstallString` is its own main exe (`app.exe /uninstall`) is still auto-picked when a normal shortcut
-  names it. "Uninstall …" shortcuts count for nothing (not tier (1), not evidence). If the exclusion leaves
-  no candidate, discovery asks for a manual choice. Unit-tested in `rt_installer::discover`. For real:
+  positive evidence it is the app: no normal Start Menu `.lnk` targets it, and no `DisplayIcon` names it
+  other than in an entry whose `UninstallString` names it too. A `.lnk` is not normal when its own name
+  contains an uninstall word (`uninst`, `remove`, `deinstall`, `entfern`, `désinstall`, `desinstal`); such
+  shortcuts count for nothing (not tier (1), not evidence). So an app whose `UninstallString` is its own main
+  exe (`app.exe /uninstall`) is still auto-picked when a normal shortcut names it. An exclusion is
+  *doubtful* when the exe was dropped by (b) alone, or by (a) despite positive evidence (a real app named
+  `Remove Background.exe`); then, if the surviving winner has no tier (1)/(2) signal of its own, discovery
+  asks for a manual choice listing the survivor(s) and the doubtful exes, instead of letting a bundled
+  `helper.exe`/`vcredist.exe` win by elimination. A file named like an uninstaller with no evidence
+  (`uninstall.exe`, `unins000.exe`) is a confident exclusion and never forces a choice. If the exclusion
+  leaves no candidate, discovery asks too. Unit-tested in `rt_installer::discover`. For real:
   `hello-nsis.exe --silent` records `hello64.exe` via tier (1) (its Start Menu shortcut), and
   `hello-nsis-noshortcut.exe --silent` (no shortcut) records `hello64.exe` with `uninstall.exe` excluded;
-  both run without `--exe` in `crates/cli/tests/e2e_installers.rs`. Remaining limit: an `app.exe /uninstall`
-  app with no normal shortcut and no other entry's `DisplayIcon` naming it is excluded, so discovery falls
-  to the other new exes' lower tiers or a manual choice; `--exe` overrides.
+  both run without `--exe` in `crates/cli/tests/e2e_installers.rs`. Which `Uninstall` entry's
+  `DisplayName`/`UninstallString` gets recorded is decided the same structural way: the only entry, else the
+  one whose `DisplayIcon` names the winner, else the one whose `UninstallString` program is in the winner's
+  directory; with several entries and no tie, nothing is recorded from the registry and the install warns
+  (never a bundled redistributable's name and `MsiExec` command). Known limits (all end in a manual choice,
+  a wrong recorded name at worst, or `--exe`): the filename rule has false positives (an app really named
+  `Remove*.exe`/`Uninst*.exe` is excluded; with evidence that becomes a manual choice, but if its only
+  shortcut is itself named `Remove …` there is no evidence and another exe can win); and the path parser
+  does not normalise doubled separators (`C:\App\\app.exe`) or 8.3 short names (`C:\PROGRA~1\...`), so such
+  registry values match nothing.
 
 ## Roadmap
 
