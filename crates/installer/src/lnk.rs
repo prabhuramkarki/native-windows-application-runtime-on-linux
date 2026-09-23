@@ -17,19 +17,31 @@
 //! `.lnk` crate is a dependency of this project; nothing added to `docs/THIRD_PARTY.md`.
 //!
 //! **What is read.** The fixed 76-byte `ShellLinkHeader` (signature, `LinkCLSID`, `LinkFlags`,
-//! `IconIndex`); `LinkTargetIDList` and `LinkInfo`, if present, are skipped by their own declared
-//! size (never interpreted: both exist only to resolve a target that is not found where the link
-//! says it is, which is out of scope here); then whichever of the `NAME_STRING` /
-//! `RELATIVE_PATH` / `WORKING_DIR` / `COMMAND_LINE_ARGUMENTS` / `ICON_LOCATION` StringData
-//! records `LinkFlags` says are present, in that fixed order, keeping only the three this module
-//! exposes. `ExtraData` (anything after the last StringData) is never read.
+//! `IconIndex`); `LinkInfo`, if present, is skipped by its own declared size (never interpreted:
+//! it exists only to resolve a target that is not found where the link says it is, which is out
+//! of scope here). `LinkTargetIDList`, if present, is skipped by its declared size for the
+//! purposes of locating the next structure, but — since real Wine-created shortcuts turn out to
+//! encode their target *only* here, with `RELATIVE_PATH` StringData absent — its `SHITEMID` item
+//! sequence is also walked as a fallback: when `RELATIVE_PATH` is absent (or present but
+//! unparseable), a best-effort absolute path is reconstructed from the list's drive/folder/file
+//! items (see [`id_list_path`]) and fed through [`WinPath::parse`] exactly like the StringData
+//! fields. `RELATIVE_PATH` StringData, when present and parseable, always wins; this is purely a
+//! fallback for when it is not. No other shell-namespace item shapes (e.g. CLSID-rooted special
+//! folders) are resolved — those are skipped as unrecognized, not walked into. Then whichever of
+//! the `NAME_STRING` / `RELATIVE_PATH` / `WORKING_DIR` / `COMMAND_LINE_ARGUMENTS` /
+//! `ICON_LOCATION` StringData records `LinkFlags` says are present, in that fixed order, keeping
+//! only the three this module exposes. `ExtraData` (anything after the last StringData) is never
+//! read.
 //!
 //! **Bounds.** Every size taken from the file is checked before use (`checked_add`, `.get(..)`,
 //! never raw indexing) — a malformed or hostile size ends the parse with `Err`, never a panic and
-//! never a read past the buffer. There is no loop whose iteration count is attacker-controlled
-//! (unlike `pe::version`'s TLV tree), so there is nothing here that needs its own iteration
-//! budget: the whole parse is a fixed sequence of "read one bounded thing, check it fits, move
-//! on" steps, each touching the file at most once.
+//! never a read past the buffer. Most of the parse is a fixed sequence of "read one bounded
+//! thing, check it fits, move on" steps, each touching the file at most once. The one exception
+//! is [`id_list_path`]'s walk over `LinkTargetIDList`'s items, whose count is attacker-controlled
+//! — but each iteration consumes at least 2 bytes of the already-validated, finite `[start, end)`
+//! region `skip_id_list` computes (a zero or negative advance is rejected, not looped on), so the
+//! loop is bounded by that region's length and never reads past `end`; a malformed *individual*
+//! item is skipped or ends the walk early, never the whole `ShellLink::parse` call.
 //!
 //! **Paths inside a `.lnk` are Windows paths, parsed through [`rt_core::WinPath`]** (Phase 2's
 //! validated type; no second path type is invented here). `RELATIVE_PATH` in particular is
@@ -63,6 +75,9 @@ const IS_UNICODE: u32 = 0x80;
 pub struct ShellLink {
     /// The `RELATIVE_PATH` StringData, if present AND it parsed as a [`WinPath`] (see the module
     /// doc: a genuinely relative string is common and expected here, and leaves this `None`).
+    /// When `RELATIVE_PATH` is absent or unparseable, falls back to a best-effort absolute path
+    /// reconstructed from `LinkTargetIDList`'s items, if that IDList is present and yields one
+    /// (see [`id_list_path`]) — the common case for real Wine-created shortcuts.
     pub relative_path: Option<WinPath>,
     /// The `ICON_LOCATION` StringData path, paired with the header's `IconIndex`. `None` when
     /// `ICON_LOCATION` is absent or its path did not parse as a [`WinPath`]; the index alone,
@@ -112,8 +127,14 @@ impl ShellLink {
         let unicode = flags & IS_UNICODE != 0;
 
         let mut pos = HEADER_LEN;
+        // The item region within LinkTargetIDList, if present: `[start, end)`, content only (the
+        // 2-byte IDListSize field itself excluded). Captured here, walked later as a fallback —
+        // see the module doc and `id_list_path`.
+        let mut id_list_region: Option<(usize, usize)> = None;
         if flags & HAS_LINK_TARGET_ID_LIST != 0 {
+            let content_start = pos + 2;
             pos = skip_id_list(bytes, pos)?;
+            id_list_region = Some((content_start, pos));
         }
         if flags & HAS_LINK_INFO != 0 {
             pos = skip_link_info(bytes, pos)?;
@@ -146,9 +167,24 @@ impl ShellLink {
                 }
             }
         };
-        let relative_path = parse_field(relative_path_str, "RelativePath");
+        let mut relative_path = parse_field(relative_path_str, "RelativePath");
         let working_dir = parse_field(working_dir_str, "WorkingDir");
         let icon_location = parse_field(icon_location_str, "IconLocation").map(|p| (p, icon_index));
+
+        // Fallback: RELATIVE_PATH absent (or present but unparseable) is exactly the case real
+        // Wine-created shortcuts hit — their target lives only in LinkTargetIDList. Never
+        // overrides a RELATIVE_PATH that already parsed.
+        if relative_path.is_none()
+            && let Some((start, end)) = id_list_region
+            && let Some(assembled) = id_list_path(bytes, start, end)
+        {
+            match WinPath::parse(&assembled) {
+                Ok(p) => relative_path = Some(p),
+                Err(e) => {
+                    warnings.push(format!("LinkTargetIDList: recovered path not usable: {e}"));
+                }
+            }
+        }
 
         Ok(ShellLink {
             relative_path,
@@ -186,6 +222,131 @@ fn skip_id_list(bytes: &[u8], pos: usize) -> Result<usize, LnkError> {
         ));
     }
     Ok(end)
+}
+
+/// Walks a `LinkTargetIDList`'s `SHITEMID` item sequence at `bytes[pos..end]` (`pos`/`end` from
+/// `skip_id_list`: `end` is already validated `<= bytes.len()`) and reconstructs a best-effort
+/// absolute Windows path string, or `None` if nothing usable was found (no drive item, or the
+/// list was empty). Each item is `cbSize: u16` (itself included in the count) then `cbSize - 2`
+/// bytes, terminated by `cbSize == 0`; this walker never reads outside `[pos, end)`.
+///
+/// Only three item shapes are recognized (see the module doc for why nothing else is): a
+/// CLSID-rooted item (`0x1F`/`0x2F`, e.g. "My Computer") is a known, fixed, ignorable prefix; a
+/// drive item (type byte `0x20..=0x2E`) holds a null-terminated ANSI drive path like `C:\\`; a
+/// folder/file item (type byte `0x30..=0x3F`) holds a fixed 12-byte header then a null-terminated
+/// ANSI short (8.3) name, optionally followed (after padding to an even item-relative offset) by
+/// an extension block whose long UTF-16LE name is preferred when present and non-empty. Anything
+/// else, or any item whose bytes do not fit the shape being attempted, is skipped: one bad or
+/// unrecognized item narrows the result, it never aborts the walk (and never aborts
+/// [`ShellLink::parse`] — see its caller).
+fn id_list_path(bytes: &[u8], mut pos: usize, end: usize) -> Option<String> {
+    let mut drive: Option<String> = None;
+    let mut segments: Vec<String> = Vec::new();
+    while pos < end {
+        let cbsize = usize::from(u16_at(bytes, pos)?);
+        if cbsize < 2 {
+            break; // 0 is the list terminator; anything else below 2 can't even cover itself
+        }
+        let item_end = match pos.checked_add(cbsize) {
+            Some(e) if e <= end => e,
+            _ => break, // declared size overflows or runs past the validated region: stop here
+        };
+        let content_start = pos + 2; // safe: cbsize >= 2, so item_end >= content_start
+        if content_start < item_end
+            && let Some(&type_byte) = bytes.get(content_start)
+        {
+            match type_byte {
+                0x1F | 0x2F => {} // CLSID-rooted item ("My Computer" etc.): not a path segment
+                0x20..=0x2E => {
+                    if let Some(s) = read_drive_item(bytes, content_start, item_end) {
+                        drive = Some(s);
+                    }
+                }
+                0x30..=0x3F => {
+                    if let Some(s) = read_file_entry_name(bytes, content_start, item_end)
+                        && !s.is_empty()
+                    {
+                        segments.push(s);
+                    }
+                }
+                _ => {} // unrecognized shape: not a general shell-namespace resolver, skip it
+            }
+        }
+        pos = item_end;
+    }
+    let mut path = drive?;
+    if !path.ends_with('\\') {
+        path.push('\\');
+    }
+    path.push_str(&segments.join("\\"));
+    Some(path)
+}
+
+/// Reads a drive item's path (e.g. `C:\\`): a null-terminated ANSI string starting right after
+/// the type byte, bounded within `[content_start, item_end)`.
+fn read_drive_item(bytes: &[u8], content_start: usize, item_end: usize) -> Option<String> {
+    let str_start = content_start.checked_add(1)?;
+    let raw = bytes.get(str_start..item_end)?; // `.get` on a backwards range is `None`, never a panic
+    let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    let s = std::str::from_utf8(&raw[..nul]).ok()?;
+    (!s.is_empty()).then_some(s.to_owned())
+}
+
+/// Reads a folder/file item's name: the fixed 12-byte header (type byte already consumed by the
+/// caller; reserved byte, 4-byte file size, 4-byte date, 2-byte attributes — none of which this
+/// project needs), then a null-terminated ANSI short (8.3) name, then — if an extension block
+/// with a usable long name follows — that long name instead. Bounded within
+/// `[content_start, item_end)`. `None` if even the short name is not recoverable.
+fn read_file_entry_name(bytes: &[u8], content_start: usize, item_end: usize) -> Option<String> {
+    let name_start = content_start.checked_add(12)?;
+    let short_region = bytes.get(name_start..item_end)?; // `.get` on a backwards range is `None`, never a panic
+    let nul_rel = short_region.iter().position(|&b| b == 0)?;
+    let short_name = std::str::from_utf8(&short_region[..nul_rel]).ok().map(str::to_owned);
+
+    let mut ext_pos = name_start.checked_add(nul_rel)?.checked_add(1)?;
+    if !ext_pos.checked_sub(content_start)?.is_multiple_of(2) {
+        ext_pos = ext_pos.checked_add(1)?;
+    }
+    if let Some(long_name) = read_long_name(bytes, ext_pos, item_end) {
+        return Some(long_name);
+    }
+    short_name
+}
+
+/// Reads a folder/file item's extension block's long (non-8.3) name, if present: a 2-byte
+/// `ExtensionSize` (itself included in the count), then a fixed 18-byte sub-header (version,
+/// signature, timestamps — not needed here), then a null-terminated UTF-16LE name. Bounded within
+/// `[ext_pos, item_end)`. `None` on any shape mismatch or truncation — the caller falls back to
+/// the short name.
+fn read_long_name(bytes: &[u8], ext_pos: usize, item_end: usize) -> Option<String> {
+    let ext_size = usize::from(u16_at(bytes, ext_pos)?);
+    if ext_size < 20 {
+        return None; // too small to hold its own 18-byte sub-header past the size field
+    }
+    let ext_end = ext_pos.checked_add(ext_size)?;
+    if ext_end > item_end {
+        return None;
+    }
+    let name_start = ext_pos.checked_add(20)?;
+    let region = bytes.get(name_start..ext_end)?;
+    let mut i = 0;
+    let nul_at = loop {
+        if i + 1 >= region.len() {
+            return None; // no UTF-16 NUL terminator found within the extension block
+        }
+        if region[i] == 0 && region[i + 1] == 0 {
+            break i;
+        }
+        i += 2;
+    };
+    let units: Vec<u16> = region[..nul_at]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let s = String::from_utf16_lossy(&units);
+    (!s.is_empty()).then_some(s)
 }
 
 /// Skips a `LinkInfo` structure at `bytes[pos..]` (a 4-byte `LinkInfoSize`, itself included in
