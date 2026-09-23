@@ -35,14 +35,28 @@ use std::sync::Arc;
 /// libraries, plus the distro's `/etc/alternatives` symlinks such as `/usr/bin/wine` -> `/etc/alternatives/wine`).
 /// A directory that does not exist on this distro is silently skipped (`--ro-bind-try`), never an error.
 ///
-/// ponytail: this only covers a Wine install rooted under one of these four paths (true for a distro package).
+/// **`/bin` (added by Task 8, found by real-Wine e2e testing under this exact sandbox).** Ubuntu's/Debian's
+/// `wine`/`wine64` apt packages install `/usr/bin/wine{,64}` as an `update-alternatives` symlink to a small
+/// `#!/bin/sh -e` wrapper script (`/usr/bin/wine{,64}-stable`), not a plain ELF binary — confirmed on this exact
+/// machine (`wine`, Ubuntu 10.0~repack-12ubuntu1). On a merged-`/usr` system `/bin` is itself a symlink to
+/// `/usr/bin`, but the literal path `/bin/sh` from that shebang line still has to resolve INSIDE the sandbox's
+/// own mount namespace, and without `/bin` in this fixed set there is no `/bin` at all in there (only `/usr`,
+/// `/lib`, `/lib64`, `/etc/alternatives` existed), so the kernel's own shebang resolution failed with ENOENT
+/// before Wine ever started — `bwrap` reported it as `execvp /usr/bin/wine: No such file or directory`, which
+/// reads exactly like a missing Wine binary and is not: the wrapper script itself was reachable, its
+/// interpreter was not. Without this, EVERY installer run through this sandbox failed silently (a `NeedsChoice`
+/// with zero candidates, since nothing was ever installed) on a completely stock Ubuntu Wine setup, silent or
+/// not, regardless of the display-socket gap documented below. See `docs/SECURITY.md`'s installer-sandbox
+/// section for the fuller story.
+///
+/// ponytail: this only covers a Wine install rooted under one of these five paths (true for a distro package).
 /// WineHQ's own official packages commonly install to `/opt/wine-stable/...`, outside all of them; a Wine there
 /// would fail to `execvp` inside the sandbox. Fixing that generally means walking the discovered Wine binary's
 /// own install root/dependency closure, which is out of THIS task's scope (the plan's own wording reads as
 /// "this fixed set is enough" for now) — Task 6, which actually knows the discovered Wine path
 /// (`backend_wine::discover::Found`), should pass its install root through [`SandboxOpts::extra_ro_binds`]
 /// when it is outside this fixed set, rather than this crate growing a second binary-discovery mechanism.
-pub const RO_BINDS: [&str; 4] = ["/usr", "/lib", "/lib64", "/etc/alternatives"];
+pub const RO_BINDS: [&str; 5] = ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives"];
 
 /// The path used as `$HOME` inside the sandbox when the wrapped command's own finalized env has none. Nothing
 /// on the host is ever bound there: only an empty `tmpfs`, so a program that insists on some `$HOME` existing
