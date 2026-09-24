@@ -18,9 +18,9 @@ toml.workspace = true
 sha2.workspace = true
 ureq.workspace = true
 libc.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
-flate2.workspace = true
