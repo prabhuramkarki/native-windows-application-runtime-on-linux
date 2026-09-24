@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 pub mod fetch;
+pub mod install_archive;
 pub mod manifest;
 pub mod resolve;
 pub mod state;
