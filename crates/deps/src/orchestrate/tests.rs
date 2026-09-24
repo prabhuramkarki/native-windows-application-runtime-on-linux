@@ -351,7 +351,7 @@ fn a_second_run_prompts_for_nothing_and_installs_nothing_even_with_the_lock_held
     assert!(f.calls().is_empty());
     assert!(rep.completed.is_empty() && rep.failed.is_empty());
     assert_eq!(ids(&rep.skipped), ["gated", "gdep", "perm"]);
-    assert!(rep.skipped.iter().all(|(_, why)| why == "already installed"), "{rep:?}");
+    assert!(rep.skipped.iter().all(|(_, why)| why == ALREADY_INSTALLED), "{rep:?}");
 }
 
 /// Metadata recording `gated` at `version` with a consent hash of `hash` (a different sha256 than the manifest's).
@@ -826,7 +826,19 @@ fn a_symlinked_lock_file_is_refused() {
     let target = r.tmp.path().join("elsewhere");
     fs::write(&target, b"").unwrap();
     std::os::unix::fs::symlink(&target, r.env.root().join(LOCK_FILE)).unwrap();
-    assert!(matches!(lock_app(&r.env), Err(DepsError::Io(_))));
+    assert!(matches!(lock_app(&r.env), Err(DepsError::LockFileUnusable(_))));
+    assert!(matches!(lock_app_shared(&r.env), Err(DepsError::LockFileUnusable(_))));
+    // A directory in its place: unusable too.
+    let r = abc();
+    fs::create_dir(r.env.root().join(LOCK_FILE)).unwrap();
+    assert!(matches!(lock_app(&r.env), Err(DepsError::LockFileUnusable(_))));
+    // Any other failure (here: cannot create it) is a plain I/O error.
+    let r = abc();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    let got = lock_app(&r.env);
+    fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(got, Err(DepsError::Io(_))), "{got:?}");
 }
 
 /// A shell script named `wineserver` that blocks reading its (never written) stdin; killed on drop. `comm` is the
@@ -940,7 +952,7 @@ fn serves_parses_proc_like_inputs() {
 }
 
 #[test]
-fn a_program_started_between_packages_stops_the_run() {
+fn a_program_started_during_a_download_stops_the_run_before_installing() {
     let r = abc();
     let bin = tempfile::tempdir().unwrap();
     let prefix = r.env.prefix();
@@ -956,10 +968,12 @@ fn a_program_started_between_packages_stops_the_run() {
         ..FakeFetcher::default()
     };
     let rep = run(&r, &r.plan(ABC), &f, &Answers::default()).unwrap();
-    assert_eq!(rep.completed, ["a"]);
-    assert!(reason(&rep.failed, "b").contains("close"), "{rep:?}");
+    assert!(rep.completed.is_empty(), "{rep:?}");
+    assert!(reason(&rep.failed, "a").contains("close"), "{rep:?}");
     assert_eq!(f.calls(), ["a"]);
-    assert_eq!(ids(&rep.skipped), ["c"]);
+    assert_eq!(ids(&rep.skipped), ["b", "c"]);
+    assert!(!r.c("windows/system32/a.dll").exists(), "installed under a running app");
+    assert!(r.recorded().is_empty());
     slot.borrow_mut().take();
 }
 

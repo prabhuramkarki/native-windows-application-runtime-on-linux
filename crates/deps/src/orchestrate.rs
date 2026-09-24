@@ -47,6 +47,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+/// The [`RunReport`] skip reason of a package that was already installed (the only skip that is not a shortfall).
+pub const ALREADY_INSTALLED: &str = "already installed";
 /// The per-app lock file, directly in the app root.
 pub const LOCK_FILE: &str = "deps.lock";
 /// Longest reason string in a [`RunReport`].
@@ -137,6 +139,9 @@ pub enum DepsError {
          install again"
     )]
     PrefixBusy { pids: Vec<u32> },
+    /// `deps.lock` is a symlink, a directory or another non-regular file: no lock can be taken on it by anyone.
+    #[error("{LOCK_FILE} in the app's directory is unusable ({0}); delete it to install dependencies again")]
+    LockFileUnusable(String),
     #[error("cannot read the app's metadata: {0}")]
     Metadata(#[source] StoreError),
     #[error("i/o error: {0}")]
@@ -212,10 +217,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// regular file, a FIFO, a symlink, not a PE, over the size cap) gives a warning and a plan without imports.
 /// Delay-load imports are included (a missed need is worse than an unused package).
 pub fn plan_for_app(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> AppPlan {
+    plan_for_pe(md, read_exe(env, md).as_ref().map_err(String::as_str), manifest)
+}
+
+/// [`plan_for_app`] for a caller that already analysed the app's executable (`doctor`), so it is not read twice.
+/// `Err` is why it could not be read, shown in the warning.
+pub fn plan_for_pe(md: &Metadata, exe: Result<&pe::PeInfo, &str>, manifest: &Manifest) -> AppPlan {
     let mut warnings = Vec::new();
     let mut facts = Facts::default();
     let mut arch = md.architecture.clone();
-    match read_exe(env, md) {
+    match exe {
         Ok(info) => {
             facts.imports = info.imports.iter().map(|i| i.dll.clone()).collect();
             arch = match info.arch {
@@ -293,9 +304,14 @@ fn lock_app_as(env: &AppEnv, mode: libc::c_int) -> Result<AppLock, DepsError> {
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(env.root().join(LOCK_FILE))?;
+        .open(env.root().join(LOCK_FILE))
+        .map_err(|e| match e.raw_os_error() {
+            // O_NOFOLLOW on a symlink; a directory opened for writing.
+            Some(libc::ELOOP | libc::EISDIR) => DepsError::LockFileUnusable(e.to_string()),
+            _ => e.into(),
+        })?;
     if !file.metadata()?.is_file() {
-        return Err(io::Error::other(format!("{LOCK_FILE} is not a regular file")).into());
+        return Err(DepsError::LockFileUnusable("not a regular file".into()));
     }
     // SAFETY: flock on a file descriptor we own; no memory is passed.
     if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
@@ -500,7 +516,7 @@ fn execute(o: &Orchestrator, plan: &Plan, d: &Decisions, recorded: &[DependencyR
     for e in &plan.entries {
         let id = e.package.clone();
         match &e.action {
-            Action::AlreadyInstalled => report.skipped.push((id, "already installed".into())),
+            Action::AlreadyInstalled => report.skipped.push((id, ALREADY_INSTALLED.into())),
             Action::Blocked { reason } => {
                 let why = d.refused.get(&id).unwrap_or(reason);
                 report.skipped.push((id, line(why)));
@@ -543,21 +559,13 @@ fn install_one(
     if !manifest::valid_sha256(&pkg.sha256) {
         return Err("the manifest's sha256 for this package is malformed; nothing was downloaded".into());
     }
-    match wineservers_for(&o.env.prefix()) {
-        Ok(pids) if pids.is_empty() => {}
-        Ok(_) => {
-            return Err(
-                "not started: a Wine program is now running in this app's prefix; close the app first, \
-                        then install again"
-                    .into(),
-            );
-        }
-        Err(e) => return Err(format!("not started: cannot check for running Wine programs: {e}")),
-    }
+    // Before the download (saves it) and again right before installing: an app may start while it downloads.
+    not_busy_now(o)?;
     let file = o
         .fetcher
         .fetch(pkg, o.cache_dir)
         .map_err(|e| format!("download failed: {e}"))?;
+    not_busy_now(o)?;
     let warnings = match pkg.kind {
         Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
             .map(|_| Vec::new())
@@ -579,6 +587,19 @@ fn install_one(
         )
     })?;
     Ok(warnings)
+}
+
+/// No `wineserver` serves the prefix at this moment; the error is the report reason (nothing was installed).
+fn not_busy_now(o: &Orchestrator) -> Result<(), String> {
+    match wineservers_for(&o.env.prefix()) {
+        Ok(pids) if pids.is_empty() => Ok(()),
+        Ok(_) => Err(
+            "not installed: a Wine program is now running in this app's prefix; close the app first, \
+                      then install again"
+                .into(),
+        ),
+        Err(e) => Err(format!("not installed: cannot check for running Wine programs: {e}")),
+    }
 }
 
 /// Records `pkg` in the app's metadata: read, edit, atomic write. Only called after the installer returned `Ok`.

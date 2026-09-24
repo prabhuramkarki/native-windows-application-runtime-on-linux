@@ -27,13 +27,10 @@ pub fn run(target: &str, args: &[OsString], debug: bool) -> Result<u8, CmdError>
     // An installed app is started under a SHARED hold of its dependency lock: refused while a dependency install
     // (or a removal) holds it exclusively, and an install cannot start until the app is running (then its
     // running-wineserver check refuses). Dropped once the app is started: the fd is close-on-exec, so the app
-    // never inherits it.
+    // never inherits it. No missing-dependency hint here: it would read the whole executable on every start
+    // (`install` and `doctor` show it).
     let deps_lock = match &found {
-        Target::Installed(id) => {
-            let lock = crate::deps::lock_or_refuse(&store.get(id)?, true, "start")?;
-            crate::deps::print_hint(&store, id);
-            lock
-        }
+        Target::Installed(id) => crate::deps::lock_or_refuse(&store.get(id)?, true, "start")?,
         Target::File(_) => None,
     };
     eprintln!("{SANDBOX_NOTE}");
