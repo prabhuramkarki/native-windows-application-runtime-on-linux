@@ -18,6 +18,7 @@ requires = []
 provides = ["d3d9", "d3d10core", "d3d11", "dxgi"]
 
 [package.install]
+format = "tar.gz"
 extract = [
     { from = "x64/d3d9.dll", to = "windows/system32/d3d9.dll" },
     { from = "x64/d3d10core.dll", to = "windows/system32/d3d10core.dll" },
@@ -32,13 +33,16 @@ version = "2.14.1"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000002"  # PLACEHOLDER
 size = 1                                                                      # PLACEHOLDER
 licence = "LGPL-2.1-or-later"
-url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v2.14.1/vkd3d-proton-2.14.1.tar.zst"  # PLACEHOLDER
+# PLACEHOLDER: upstream ships .tar.zst, which is deliberately unsupported; Task 8 must pin a zip/tar.gz source
+# or drop this package.
+url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v2.14.1/vkd3d-proton-2.14.1.tar.gz"
 kind = "archive"
 requires_consent = false
 requires = ["dxvk"]  # synthetic edge (d3d12 via dxgi), to exercise dependency ordering
 provides = ["d3d12", "d3d12core"]
 
 [package.install]
+format = "tar.gz"
 extract = [
     { from = "x64/d3d12.dll", to = "windows/system32/d3d12.dll" },
     { from = "x64/d3d12core.dll", to = "windows/system32/d3d12core.dll" },

@@ -22,6 +22,8 @@ pub const MAX_URL_LEN: usize = 2048;
 pub const MAX_LIST_LEN: usize = 64;
 /// Longest id, version, licence or provided name.
 const MAX_NAME_LEN: usize = 64;
+/// The one non-SPDX licence value; it forces `requires_consent = true`.
+pub const PROPRIETARY: &str = "proprietary-redistributable";
 /// Longest attacker-controlled value echoed in an error message.
 const MAX_ECHO: usize = 80;
 
@@ -49,7 +51,10 @@ pub struct Package {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Install {
+    /// A downloaded archive in `format` (the url's extension must agree) whose `extract` entries are copied into
+    /// `drive_c`; `dll_overrides` names only DLLs from the package's `provides`.
     Archive {
+        format: ArchiveFormat,
         extract: Vec<Extract>,
         dll_overrides: Vec<String>,
     },
@@ -57,6 +62,15 @@ pub enum Install {
         silent_args: Vec<String>,
         marker: Marker,
     },
+}
+
+/// Supported archive containers. There is intentionally no zstd (`.tar.zst`) support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    /// `format = "zip"`, url ending `.zip`.
+    Zip,
+    /// `format = "tar.gz"`, url ending `.tar.gz` or `.tgz`.
+    TarGz,
 }
 
 /// Copy `from` (a path inside the archive) to `to` (a path relative to `drive_c`).
@@ -100,6 +114,16 @@ pub enum ManifestError {
     BadVersion { id: String, version: String },
     #[error("package {id:?}: invalid licence {licence:?}")]
     BadLicence { id: String, licence: String },
+    #[error("package {0:?}: a {PROPRIETARY:?} licence needs requires_consent = true")]
+    BadConsent(String),
+    #[error("package {id:?}: unsupported archive format {format:?} (zip or tar.gz)")]
+    UnsupportedFormat { id: String, format: String },
+    #[error("package {id:?}: url {url:?} does not end with the extension of its {format:?} format")]
+    FormatMismatch {
+        id: String,
+        url: String,
+        format: ArchiveFormat,
+    },
     #[error("package {id:?}: invalid url {url:?} ({reason})")]
     BadUrl {
         id: String,
@@ -139,6 +163,19 @@ pub enum ManifestError {
     UnknownRef { id: String, name: String },
     #[error("dependency cycle through package {0:?}")]
     Cycle(String),
+    #[error("destination {path:?} is used by both {first:?} and {second:?} (paths compare case-insensitively)")]
+    DuplicateDestination {
+        path: String,
+        first: String,
+        second: String,
+    },
+    #[error("destination {path:?} of {second:?} overlaps {other:?} of {first:?} (one is a directory of the other)")]
+    OverlappingDestination {
+        path: String,
+        second: String,
+        other: String,
+        first: String,
+    },
 }
 
 // Serde shapes. They mirror the TOML exactly; `Package`/`Install` are built from them after validation.
@@ -169,6 +206,7 @@ struct RawPackage {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInstall {
+    format: Option<String>,
     extract: Option<Vec<Extract>>,
     dll_overrides: Option<Vec<String>>,
     silent_args: Option<Vec<String>>,
@@ -258,11 +296,20 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
             version: clip(&raw.version),
         });
     }
-    if !valid_text(&raw.licence, MAX_NAME_LEN) {
+    // Shown in the consent prompt: SPDX-like printable ASCII only.
+    if !valid_text(&raw.licence, MAX_NAME_LEN)
+        || !raw
+            .licence
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'+' | b' ' | b'(' | b')'))
+    {
         return Err(ManifestError::BadLicence {
             id,
             licence: clip(&raw.licence),
         });
+    }
+    if raw.licence == PROPRIETARY && !raw.requires_consent {
+        return Err(ManifestError::BadConsent(id));
     }
     if let Err(reason) = check_url(&raw.url) {
         return Err(ManifestError::BadUrl {
@@ -292,6 +339,25 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
         }
     }
     let install = install(&id, raw.kind, raw.install, &raw.provides)?;
+    if let Install::Archive { format, .. } = install {
+        let path = raw
+            .url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let exts: &[&str] = match format {
+            ArchiveFormat::Zip => &[".zip"],
+            ArchiveFormat::TarGz => &[".tar.gz", ".tgz"],
+        };
+        if !exts.iter().any(|e| path.ends_with(e)) {
+            return Err(ManifestError::FormatMismatch {
+                id,
+                url: clip(&raw.url),
+                format,
+            });
+        }
+    }
     Ok(Package {
         id,
         version: raw.version,
@@ -381,12 +447,23 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
         (
             Kind::Archive,
             RawInstall {
+                format: Some(format),
                 extract: Some(extract),
                 dll_overrides: Some(dll_overrides),
                 silent_args: None,
                 marker: None,
             },
         ) => {
+            let format = match format.as_str() {
+                "zip" => ArchiveFormat::Zip,
+                "tar.gz" => ArchiveFormat::TarGz,
+                _ => {
+                    return Err(ManifestError::UnsupportedFormat {
+                        id: id.to_owned(),
+                        format: clip(&format),
+                    });
+                }
+            };
             if extract.is_empty() || extract.len() > MAX_LIST_LEN {
                 return Err(bad("extract must have 1 to 64 entries"));
             }
@@ -402,11 +479,16 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
                     });
                 }
             }
-            Ok(Install::Archive { extract, dll_overrides })
+            Ok(Install::Archive {
+                format,
+                extract,
+                dll_overrides,
+            })
         }
         (
             Kind::Installer,
             RawInstall {
+                format: None,
                 extract: None,
                 dll_overrides: None,
                 silent_args: Some(silent_args),
@@ -443,12 +525,63 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
             }
             Ok(Install::Installer { silent_args, marker })
         }
-        (Kind::Archive, _) => Err(bad("archive needs extract and dll_overrides, and no installer fields")),
+        (Kind::Archive, _) => Err(bad(
+            "archive needs format, extract and dll_overrides, and no installer fields",
+        )),
         (Kind::Installer, _) => Err(bad("installer needs silent_args and marker, and no archive fields")),
     }
 }
 
-/// Unique ids, unique provided names, known references and no cycles. Linear time, no recursion.
+/// No two destinations (`extract.to`, marker file) name the same file, compared ASCII-case-insensitively as Wine
+/// does, and none is a directory of another, so each prefix file has exactly one owning package.
+fn check_destinations(packages: &[Package]) -> Result<(), ManifestError> {
+    // lowercased destination -> (as written, owner); lowercased proper ancestor -> (a destination under it, owner)
+    let mut files: HashMap<String, (&str, &str)> = HashMap::new();
+    let mut dirs: HashMap<String, (&str, &str)> = HashMap::new();
+    for p in packages {
+        let dests: Vec<&str> = match &p.install {
+            Install::Archive { extract, .. } => extract.iter().map(|e| e.to.as_str()).collect(),
+            Install::Installer {
+                marker: Marker::File(f),
+                ..
+            } => vec![f.as_str()],
+            Install::Installer { .. } => vec![],
+        };
+        for d in dests {
+            let key = d.to_ascii_lowercase();
+            if let Some(&(_, first)) = files.get(&key) {
+                return Err(ManifestError::DuplicateDestination {
+                    path: clip(d),
+                    first: first.to_owned(),
+                    second: p.id.clone(),
+                });
+            }
+            let overlap = |other: &str, first: &str| ManifestError::OverlappingDestination {
+                path: clip(d),
+                second: p.id.clone(),
+                other: clip(other),
+                first: first.to_owned(),
+            };
+            if let Some(&(other, first)) = dirs.get(&key) {
+                return Err(overlap(other, first));
+            }
+            // Paths are validated relative paths of at most MAX_PATH_LEN bytes, so this is bounded.
+            let ancestors: Vec<&str> = key.match_indices('/').map(|(i, _)| &key[..i]).collect();
+            for a in &ancestors {
+                if let Some(&(other, first)) = files.get(*a) {
+                    return Err(overlap(other, first));
+                }
+            }
+            for a in ancestors {
+                dirs.entry(a.to_owned()).or_insert((d, &p.id));
+            }
+            files.insert(key, (d, &p.id));
+        }
+    }
+    Ok(())
+}
+
+/// Unique ids, unique provided names and destinations, known references and no cycles. Linear time, no recursion.
 fn check_graph(packages: &[Package]) -> Result<(), ManifestError> {
     let mut index: HashMap<&str, usize> = HashMap::with_capacity(packages.len());
     let mut providers: HashMap<&str, &str> = HashMap::new();
@@ -511,7 +644,7 @@ fn check_graph(packages: &[Package]) -> Result<(), ManifestError> {
             .unwrap_or_default();
         return Err(ManifestError::Cycle(id.to_owned()));
     }
-    Ok(())
+    check_destinations(packages)
 }
 
 #[cfg(test)]
