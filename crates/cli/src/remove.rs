@@ -19,6 +19,9 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
         Err(StoreError::NotFound) => return Err(format!("no app named {id} is installed (see `runtime list`)").into()),
         other => other?,
     };
+    // Exclusive for the whole removal: refused while a dependency install (or a start) holds the lock, so no
+    // package can be recorded into an app that is being deleted (or into a new app of the same id).
+    let _deps_lock = crate::deps::lock_or_refuse(&env, false, "remove")?;
     // Wine is only needed to stop what is still running: without it the app is removed anyway.
     match crate::backend(&Launcher::new()) {
         Ok(backend) => {

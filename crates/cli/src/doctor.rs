@@ -43,10 +43,10 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     };
     // The error as text: what `doctor` shows for a Wine that could not be found.
     let wine = backend_wine::WineBackend::discover_with(Launcher::new()).map_err(|e| e.to_string());
-    let facts = match found {
+    let facts = match &found {
         None => Facts::system(),
-        Some((store, Target::Installed(id))) => Facts::app(&store, &id),
-        Some((_, Target::File(path))) => Facts::file(&path),
+        Some((store, Target::Installed(id))) => Facts::app(store, id),
+        Some((_, Target::File(path))) => Facts::file(path),
     };
     let report = doctor(DoctorInput {
         subject: facts.subject,
@@ -80,6 +80,10 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     } else {
         render(&report)
     })?;
+    // Read-only like the rest: `plan_for_app` reads the metadata and the executable, nothing else.
+    if let Some((store, Target::Installed(id))) = &found {
+        crate::deps::print_hint(store, id);
+    }
     Ok(u8::from(report.verdict == Verdict::Fail))
 }
 

@@ -58,6 +58,7 @@ pub fn run(
                 ..
             } => {
                 print_installed(&store, &id, &executable.to_string(), &warnings)?;
+                crate::deps::print_hint(&store, &id);
                 Ok(0)
             }
             rt_installer::InstallOutcome::NeedsChoice(candidates) => {
@@ -72,6 +73,7 @@ pub fn run(
     }
     let outcome = rt_core::install(&store, &backend, file, &InstallOpts { name, exe })?;
     print_installed(&store, &outcome.id, &outcome.executable.to_string(), &outcome.warnings)?;
+    crate::deps::print_hint(&store, &outcome.id);
     Ok(0)
 }
 
