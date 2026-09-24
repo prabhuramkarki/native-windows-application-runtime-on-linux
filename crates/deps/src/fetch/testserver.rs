@@ -29,6 +29,8 @@ pub(crate) enum Reply {
     Endless,
     /// 302 to `location`.
     Redirect(String),
+    /// Waits `delay`, then 302 to `location`.
+    SlowRedirect { location: String, delay: Duration },
     /// Chunked body, optionally with a (lying) Content-Length alongside.
     Chunked { body: Vec<u8>, content_length: Option<u64> },
     /// Honest Content-Length, `sent` bytes of the body, then a TCP reset.
@@ -334,6 +336,15 @@ fn serve(
                 stats.body_bytes.fetch_add(zeros.len() as u64, Ordering::SeqCst);
             }
             Ok(())
+        }
+        Reply::SlowRedirect { location, delay } => {
+            thread::sleep(delay);
+            write_head(
+                &mut s,
+                302,
+                &[("Location".into(), location), ("Content-Length".into(), "0".into())],
+            )?;
+            close(s)
         }
         Reply::Redirect(location) => {
             write_head(

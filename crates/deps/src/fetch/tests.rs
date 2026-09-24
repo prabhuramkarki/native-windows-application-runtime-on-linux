@@ -315,6 +315,42 @@ fn dribbled_redirect_hop_is_bounded_by_total_deadline() {
     assert_empty(&e);
 }
 
+/// Redirect hops SHARE one deadline: hop 1 uses 1.2 s of a 2 s budget before redirecting, hop 2's TLS handshake is
+/// dribbled for ~1.6 s (under the budget on its own, where ureq's relative handshake timeout never fires). Shared, the
+/// fetch ends at ~2.0 s; a per-hop deadline would let the handshake finish (~2.8 s) before ureq's own global
+/// timeout ends it, so the elapsed-time bound fails.
+#[test]
+fn redirect_hops_share_the_total_deadline() {
+    let data = body(10);
+    let target = Server::start(vec![("/f", honest(&data))]);
+    let d = Dribble::start(target.port, Duration::from_micros(2200));
+    let location = format!("https://127.0.0.1:{}/f", d.port);
+    let s = Server::start(vec![(
+        "/r",
+        Reply::SlowRedirect {
+            location,
+            delay: Duration::from_millis(1200),
+        },
+    )]);
+    let e = env();
+    let o = FetchOpts {
+        connect_timeout: Duration::from_secs(10),
+        total_deadline: Duration::from_secs(2),
+        stall_timeout: Duration::from_secs(3),
+        max_redirects: 3,
+    };
+    let roots = [s.cert.clone(), target.cert.clone()];
+    let t = Instant::now();
+    let r = fetch_with_roots(&pkg_for(s.url("/r"), &data), &e.cache, &o, &roots);
+    let took = t.elapsed();
+    assert!(matches!(r, Err(FetchError::Timeout)), "{r:?}");
+    assert!(
+        took >= Duration::from_millis(1900) && took < Duration::from_millis(2400),
+        "{took:?}"
+    );
+    assert_empty(&e);
+}
+
 /// The connect timeout is absolute from the start of the connection and covers the whole TLS handshake.
 #[test]
 fn dribbled_handshake_is_bounded_by_connect_timeout() {
