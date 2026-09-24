@@ -1909,3 +1909,105 @@ fn an_r_entry_whose_backup_was_never_made_is_skipped_by_rollback() {
     assert!(matches!(err, ArchiveError::Zip(_)), "not a rollback failure: {err:?}");
     assert_untouched(&e, &before, "R without backup");
 }
+
+// ------------------------------------------------------------------------------------------------ fix round 2
+
+#[test]
+fn a_retry_with_a_different_extract_selection_still_owns_everything_the_killed_run_did() {
+    for format in FORMATS {
+        // Killed after all four files, retried with a SMALLER selection (same archive, same sha256).
+        let (e, full, file, before) = interrupted_fixture(format);
+        crash_install(&e, full.clone(), &file, 4);
+        let small = pkg(format, &[("x/d3d11.dll", "windows/system32/d3d11.dll")]);
+        let done = install(&e, small, &file).unwrap();
+        assert!(
+            done.replaced.contains(&PathBuf::from("windows/system32/dxgi.dll")),
+            "{done:?}"
+        );
+        remove(&e, &done).unwrap();
+        assert_untouched(&e, &before, &format!("{format:?} smaller retry"));
+
+        // Killed after one file with the small selection, retried with the FULL one.
+        let (e, full, file, before) = interrupted_fixture(format);
+        let small = pkg(format, &[("x/d3d11.dll", "windows/system32/d3d11.dll")]);
+        crash_install(&e, small, &file, 1);
+        let done = install(&e, full, &file).unwrap();
+        remove(&e, &done).unwrap();
+        assert_untouched(&e, &before, &format!("{format:?} larger retry"));
+    }
+}
+
+#[test]
+fn a_torn_journal_tail_is_cut_before_appending() {
+    for format in FORMATS {
+        // Only the directory-prefix entry, so the first line appended after the torn tail is `D newdir`.
+        let (e, _, file, before) = interrupted_fixture(format);
+        let p = pkg(format, &[("x/new/", "newdir/deep")]);
+        fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+        fs::write(e.journal(), format!("rt-deps-journal 1 {HASH}\nF zz/q.d")).unwrap();
+        crash_install(&e, p.clone(), &file, 1);
+        let done = install(&e, p, &file).unwrap();
+        remove(&e, &done).unwrap();
+        assert_untouched(&e, &before, &format!("{format:?} torn tail"));
+    }
+    // A torn header is not a journal: refused, and not discardable either (it is created atomically, so this is
+    // damage, not a crash).
+    let (e, p, file, _) = interrupted_fixture(ArchiveFormat::Zip);
+    fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+    fs::write(e.journal(), format!("rt-deps-journal 1 {}", &HASH[..20])).unwrap();
+    assert!(matches!(install(&e, p, &file), Err(ArchiveError::Journal(_))));
+    assert!(matches!(
+        discard_interrupted("dxvk", &e.env),
+        Err(ArchiveError::Journal(_))
+    ));
+    // A complete header must still name a valid sha256, for discard too.
+    fs::write(e.journal(), "rt-deps-journal 1 xyz\n").unwrap();
+    assert!(matches!(
+        discard_interrupted("dxvk", &e.env),
+        Err(ArchiveError::Journal(_))
+    ));
+}
+
+#[test]
+fn a_journal_of_another_archive_blocks_install_until_discarded() {
+    for format in FORMATS {
+        let (e, p, file, before) = interrupted_fixture(format);
+        crash_install(&e, p.clone(), &file, 3);
+        let mut newer = p.clone();
+        newer.sha256 = "f".repeat(64);
+        let err = install(&e, newer.clone(), &file).unwrap_err();
+        assert!(matches!(err, ArchiveError::Journal(_)), "{err:?}");
+        // An empty record must not be used to "clean up": it would drop the journal and leak the killed run.
+        let err = remove(&e, &ArchiveInstalled::default()).unwrap_err();
+        assert!(
+            matches!(&err, ArchiveError::Journal(m) if m.contains("discard_interrupted")),
+            "{err:?}"
+        );
+        let report = discard_interrupted("dxvk", &e.env).unwrap();
+        assert!(
+            !report.removed_files.is_empty() && !report.restored.is_empty(),
+            "{report:?}"
+        );
+        assert_untouched(&e, &before, &format!("{format:?} discarded"));
+        assert_eq!(discard_interrupted("dxvk", &e.env).unwrap(), DiscardReport::default());
+        let done = install(&e, newer, &file).unwrap();
+        remove(&e, &done).unwrap();
+        assert_untouched(&e, &before, &format!("{format:?} newer archive"));
+    }
+}
+
+#[test]
+fn discarding_a_corrupt_journal_is_a_typed_error() {
+    let e = Env::new();
+    fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+    fs::write(e.journal(), format!("rt-deps-journal 1 {HASH}\nF ../../victim\n")).unwrap();
+    assert!(matches!(
+        discard_interrupted("dxvk", &e.env),
+        Err(ArchiveError::Journal(_))
+    ));
+    assert!(e.journal().is_file(), "a corrupt journal is kept for inspection");
+    assert!(matches!(
+        discard_interrupted("../x", &e.env),
+        Err(ArchiveError::BadPackage(_))
+    ));
+}

@@ -16,8 +16,8 @@
 //!   missing must not report success). A file selected by two `extract` entries, and two files mapped to the
 //!   same destination (compared case-insensitively, as Wine does; this includes a selected path that occurs twice
 //!   in the archive) are [`ArchiveError::Destination`]. All of this is decided BEFORE anything is written: a zip
-//!   is planned from its central directory, a tar.gz is read twice (a first pass that writes nothing validates the whole archive
-//!   and lists its files; the second pass writes, and must see the same file list).
+//!   is planned from its central directory, a tar.gz is read twice (a first pass that writes nothing validates the
+//!   whole archive and lists its files; the second pass writes, and must see the same file list).
 //! * Everything not selected is never written.
 //!
 //! **Writing.** A destination is `C:\<to...>` parsed by [`WinPath`] (reserved names, `..`, streams, trailing dots
@@ -31,7 +31,9 @@
 //!
 //! **Replaced files.** Wine ships builtin placeholder DLLs, so a destination may already be a regular file. Its
 //! original is first copied (same temp + rename discipline, `0600`) to `<app root>/deps-backup/<package id>/c/<path
-//! relative to drive_c>` (directories `0700`; outside the prefix, so nothing running in the prefix can reach it).
+//! relative to drive_c>` (directories `0700`; outside the prefix, but NOT out of reach: Wine's `Z:` drive maps `/`,
+//! so a program in the prefix running as the same user can reach it by path, like anything else of that user; the
+//! Phase 5 sandbox is the real boundary).
 //! A backup that already exists there is KEPT, not overwritten: only this package writes there, and only before
 //! replacing a file it did not create, so it is the original saved by an earlier attempt that was killed, and the
 //! file now at the destination may be that attempt's copy. Restoring copies the backup back (temp + rename,
@@ -52,14 +54,24 @@
 //!   replaced files it had not reached yet, so a fully rolled-back retry leaves the prefix as before the first
 //!   attempt.
 //!
-//! A journal written for a DIFFERENT archive of the package (another sha256) is [`ArchiveError::Journal`]: its
-//! entries are never trusted for another state. The journal is read defensively (regular file only, `O_NOFOLLOW`,
-//! at most 4 MiB and 16384 entries, UTF-8, strict `F `/`D `/`R ` lines whose paths pass the same rules as a recorded
+//! * if the retry SUCCEEDS but selects less than the killed run wrote (the selection comes from the manifest's
+//!   `extract`, which can change while the archive stays pinned), the listed files it did not write again are
+//!   still recorded in `files` (and listed replaced ones in `replaced`), so [`remove_archive`] removes them too.
+//!
+//! The `F`/`D`/`R` entries are facts about the prefix, not about an archive. A journal written for a DIFFERENT
+//! archive of the package (another sha256) is still [`ArchiveError::Journal`] for [`install_archive`]: the way out
+//! is [`discard_interrupted`], which undoes exactly what the journal lists and deletes it. Calling
+//! [`remove_archive`] with an empty record instead would delete the journal and make the next install back up the
+//! killed run's files as originals, so it refuses (with [`ArchiveError::Journal`]) while a journal exists.
+//!
+//! The journal is read defensively (regular file only, `O_NOFOLLOW`, at most 4 MiB and 16384 entries, UTF-8, a
+//! header naming a valid sha256, strict `F `/`D `/`R ` lines whose paths pass the same rules as a recorded
 //! install); anything else is [`ArchiveError::Journal`], never ignored. One exception: a LAST line without its
 //! newline is dropped, because it was being appended when the process died and the step it announced had not
-//! started. The journal stays after a successful install (the caller may die before recording it) and is
-//! deleted by a successful [`remove_archive`] and by a fully rolled-back install (which also removes what the
-//! killed attempt left).
+//! started; before appending to such a journal, the torn tail is cut off (`ftruncate`), so reading and appending
+//! agree. A torn HEADER cannot come from a crash (the journal is created atomically) and is an error. The journal
+//! stays after a successful install (the caller may die before recording it) and is deleted by a successful
+//! [`remove_archive`] and by a fully rolled-back install (which also removes what the killed attempt left).
 //!
 //! **Failure.** On any error [`install_archive`] undoes exactly what the call did (overrides deleted newest
 //! first, new files deleted, replaced files restored, created directories removed when empty) and returns the
@@ -199,10 +211,26 @@ pub fn install_archive(
         Ok(())
     })();
     match result {
-        // Same archive, same selection: every adopted file was written again and is in `files`.
-        Ok(()) => Ok(ledger.done),
+        Ok(()) => {
+            // The selection comes from the manifest, not the archive: a retry may select less than the killed run
+            // wrote. Whatever it did not write again stays ours (the file on disk is the killed run's copy, the
+            // backup the original), so it is recorded and `remove_archive` takes it away too.
+            for f in &ledger.adopted {
+                if !ledger.done.files.contains(f) {
+                    ledger.done.files.push(f.clone());
+                }
+            }
+            for r in &ledger.adopted_replaced {
+                if !ledger.done.replaced.contains(r) {
+                    ledger.done.replaced.push(r.clone());
+                    ledger.done.files.push(r.clone());
+                }
+            }
+            Ok(ledger.done)
+        }
         Err(original) => {
-            let mut failures = ledger.undo(env, backend, launcher);
+            let mut failures = ledger.undo_overrides(env, backend, launcher);
+            failures.extend(ledger.undo_files());
             if failures.is_empty()
                 && let Err(e) = ledger.drop_journal()
             {
@@ -214,6 +242,47 @@ pub fn install_archive(
                 rollback_error(&original, &failures)
             })
         }
+    }
+}
+
+/// What [`discard_interrupted`] undid. DLL overrides are not journaled, so it never touches the registry: an
+/// override a killed install had already added stays (it is only a `native,builtin` load order; the next install
+/// of the package sets it again and records it, so its removal deletes it).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscardReport {
+    /// Files the killed install had created, deleted.
+    pub removed_files: Vec<PathBuf>,
+    /// Files it had replaced, restored from their backups.
+    pub restored: Vec<PathBuf>,
+    /// Directories it had created, removed if empty.
+    pub removed_dirs: Vec<PathBuf>,
+}
+
+/// Undoes what an interrupted install of package `pkg_id` left, as its journal lists it, WHATEVER archive it was
+/// installing (the entries are facts about the prefix, not about an archive), then deletes the journal. This is the
+/// way out when [`install_archive`] refuses because a journal of a different archive exists. No journal: nothing
+/// to do. A corrupt journal is [`ArchiveError::Journal`] and is kept. On undo failures the first one is returned
+/// and the journal is kept, so it can be retried.
+pub fn discard_interrupted(pkg_id: &str, env: &AppEnv) -> Result<DiscardReport, ArchiveError> {
+    if !manifest::valid_id(pkg_id) {
+        return Err(ArchiveError::BadPackage(format!(
+            "invalid package id {:?}",
+            clip(pkg_id)
+        )));
+    }
+    let mut ledger = Ledger::new(env, pkg_id);
+    let Some(j) = read_journal(&ledger.journal_path(), None)? else {
+        return Ok(DiscardReport::default());
+    };
+    ledger.adopt_entries(j)?;
+    let report = DiscardReport {
+        removed_files: ledger.adopted.clone(),
+        restored: ledger.adopted_replaced.clone(),
+        removed_dirs: ledger.done.created_dirs.clone(),
+    };
+    match ledger.undo_files().into_iter().next() {
+        Some(first) => Err(first),
+        None => ledger.drop_journal().map(|()| report),
     }
 }
 
@@ -236,10 +305,18 @@ pub fn remove_archive(
     }
     check_record(installed)?;
     let mut ledger = Ledger::new(env, pkg_id);
+    if installed.files.is_empty() && fs::symlink_metadata(ledger.journal_path()).is_ok() {
+        return Err(ArchiveError::Journal(format!(
+            "package {pkg_id:?} has an interrupted install; an empty record would drop its journal and leak it: use \
+             discard_interrupted"
+        )));
+    }
     ledger.done = installed.clone();
     // A record may list directories in any order: children first.
     ledger.done.created_dirs.sort_by_key(|d| d.components().count());
-    match ledger.undo(env, backend, launcher).into_iter().next() {
+    let mut failures = ledger.undo_overrides(env, backend, launcher);
+    failures.extend(ledger.undo_files());
+    match failures.into_iter().next() {
         Some(first) => Err(first),
         None => ledger.drop_journal(),
     }
@@ -652,7 +729,8 @@ struct JournalEntries {
 }
 
 /// Reads and validates a journal (module docs). `None` if there is none.
-fn read_journal(path: &Path, sha256: &str) -> Result<Option<JournalEntries>, ArchiveError> {
+/// With `sha256`, the header must name exactly that archive; without, any well-formed header is accepted.
+fn read_journal(path: &Path, sha256: Option<&str>) -> Result<Option<JournalEntries>, ArchiveError> {
     let bad = |why: &str| ArchiveError::Journal(format!("{}: {why}", path.display()));
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -671,14 +749,15 @@ fn read_journal(path: &Path, sha256: &str) -> Result<Option<JournalEntries>, Arc
     // A last line without its newline was being appended when the process died: its step never started.
     let complete = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
     let mut lines = complete.lines();
-    match lines.next() {
-        Some(h) if h == format!("{JOURNAL_MAGIC} {sha256}") => {}
-        Some(h) if h.starts_with(JOURNAL_MAGIC) => {
-            return Err(bad(
-                "left by an interrupted install of a different archive of this package",
-            ));
-        }
-        _ => return Err(bad("missing or unknown header")),
+    let named = lines
+        .next()
+        .and_then(|h| h.strip_prefix(JOURNAL_MAGIC)?.strip_prefix(' '))
+        .filter(|sha| manifest::valid_sha256(sha))
+        .ok_or_else(|| bad("missing or unknown header"))?;
+    if sha256.is_some_and(|want| want != named) {
+        return Err(bad(
+            "left by an interrupted install of a different archive of this package (see discard_interrupted)",
+        ));
     }
     let mut j = JournalEntries::default();
     for (n, line) in lines.enumerate() {
@@ -721,9 +800,13 @@ impl Ledger {
 
     /// Takes over what a killed earlier attempt of the same archive listed in its journal (module docs).
     fn adopt(&mut self) -> Result<(), ArchiveError> {
-        let Some(j) = read_journal(&self.journal_path(), &self.sha256)? else {
-            return Ok(());
-        };
+        match read_journal(&self.journal_path(), Some(&self.sha256))? {
+            Some(j) => self.adopt_entries(j),
+            None => Ok(()),
+        }
+    }
+
+    fn adopt_entries(&mut self, j: JournalEntries) -> Result<(), ArchiveError> {
         for d in j.dirs {
             if !self.done.created_dirs.contains(&d) && self.resolve(&d)?.is_some_and(|p| p.is_dir()) {
                 self.done.created_dirs.push(d);
@@ -754,12 +837,20 @@ impl Ledger {
                 atomic_write(&path, &mut header.as_bytes(), None, 0o600)?;
                 File::open(self.app_root.join(&self.pkg_dir))?.sync_all()?;
             }
-            self.journal = Some(
-                OpenOptions::new()
-                    .append(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&path)?,
-            );
+            let mut journal = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            // Cut a torn last line (reading drops it) so the next line cannot be glued onto it.
+            let mut text = Vec::new();
+            (&mut journal).take(MAX_JOURNAL_BYTES).read_to_end(&mut text)?;
+            let complete = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            if complete < text.len() {
+                journal.set_len(complete as u64)?;
+                journal.sync_data()?;
+            }
+            self.journal = Some(journal);
             crash_point();
         }
         Ok(self.journal.as_mut().expect("just opened"))
@@ -895,17 +986,22 @@ impl Ledger {
         }
     }
 
-    /// Undoes everything in `done`, continuing past failures; returns them.
-    fn undo(&self, env: &AppEnv, backend: &dyn CompatBackend, launcher: &Launcher) -> Vec<ArchiveError> {
+    /// Deletes the overrides in `done`, newest first, continuing past failures.
+    fn undo_overrides(&self, env: &AppEnv, backend: &dyn CompatBackend, launcher: &Launcher) -> Vec<ArchiveError> {
+        let deleted = self.done.overrides.iter().rev();
+        deleted
+            .filter_map(|name| delete_override(name, env, backend, launcher).err())
+            .collect()
+    }
+
+    /// Undoes the file-system part of `done` plus what was adopted from a journal, continuing past failures.
+    fn undo_files(&self) -> Vec<ArchiveError> {
         let mut failures = Vec::new();
         let mut note = |r: Result<(), ArchiveError>| {
             if let Err(e) = r {
                 failures.push(e);
             }
         };
-        for name in self.done.overrides.iter().rev() {
-            note(delete_override(name, env, backend, launcher));
-        }
         for rel in self.done.files.iter().rev() {
             if !self.done.replaced.contains(rel) {
                 note(self.remove_file(rel));
