@@ -158,6 +158,90 @@ impl Drop for Recorder {
     }
 }
 
+/// A TCP proxy to `127.0.0.1:upstream` that forwards client bytes at once but server bytes one at a time, `gap`
+/// apart: a peer (or on-path attacker) dribbling the TLS handshake and everything after it.
+pub(crate) struct Dribble {
+    pub port: u16,
+    stop: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
+}
+
+impl Dribble {
+    pub fn start(upstream: u16, gap: Duration) -> Dribble {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let stop2 = stop.clone();
+                accept_loop(listener, &stop, move |client| {
+                    let stop = stop2.clone();
+                    Some(thread::spawn(move || dribble(client, upstream, gap, &stop)))
+                })
+            })
+        };
+        Dribble {
+            port,
+            stop,
+            accept: Some(accept),
+        }
+    }
+}
+
+impl Drop for Dribble {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.accept.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn dribble(mut client: TcpStream, upstream: u16, gap: Duration, stop: &Arc<AtomicBool>) {
+    let Ok(mut server) = TcpStream::connect(("127.0.0.1", upstream)) else {
+        return;
+    };
+    let poll = Some(Duration::from_millis(50));
+    let _ = client.set_read_timeout(poll);
+    let _ = server.set_read_timeout(poll);
+    let done = Arc::new(AtomicBool::new(false));
+    let up = {
+        let (mut from, mut to) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+        let (stop, done) = (stop.clone(), done.clone());
+        thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while !stop.load(Ordering::SeqCst) && !done.load(Ordering::SeqCst) {
+                match from.read(&mut b) {
+                    Ok(0) => break,
+                    Ok(n) if to.write_all(&b[..n]).is_err() => break,
+                    Ok(_) => {}
+                    Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                    Err(_) => break,
+                }
+            }
+        })
+    };
+    let mut b = [0u8; 1];
+    while !stop.load(Ordering::SeqCst) {
+        match server.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {
+                thread::sleep(gap);
+                if client.write_all(&b).is_err() {
+                    break;
+                }
+            }
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(_) => break,
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    let _ = server.shutdown(std::net::Shutdown::Both);
+    let _ = up.join();
+}
+
 fn accept_loop(listener: TcpListener, stop: &AtomicBool, mut on: impl FnMut(TcpStream) -> Option<JoinHandle<()>>) {
     listener.set_nonblocking(true).unwrap();
     let mut handles = vec![];
