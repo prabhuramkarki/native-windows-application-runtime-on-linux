@@ -1980,3 +1980,130 @@ fn doctor_calls_a_prefix_without_drive_c_incomplete() {
     assert!(l[0].contains("[warn]") && l[0].contains("drive_c missing"), "{}", l[0]);
     assert!(!out.contains("cannot be examined"), "{out}");
 }
+
+// ================================================================ deps
+
+/// Holds `id`'s dependency lock exclusively, as a running `runtime deps <id> --install` does.
+fn hold_deps_lock(r: &Rig, id: &str) -> rt_deps::AppLock {
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    rt_deps::lock_app(&store.get(&rt_core::AppId::parse(id).unwrap()).unwrap()).unwrap()
+}
+
+/// Installs `hello64.exe` with its `msvcrt.dll` import renamed to `d3d11.dll`: the bundled manifest plans DXVK.
+fn install_d3d11(r: &Rig) -> (String, Output) {
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .expect("msvcrt.dll import");
+    bytes[at..at + 10].copy_from_slice(b"d3d11.dll\0");
+    let p = r.input("game.exe", &bytes);
+    let out = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&out);
+    (installed_id(&out), out)
+}
+
+#[test]
+fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() {
+    let r = rig();
+    let (id, installed) = install_d3d11(&r);
+    let hint = format!("hint: 1 dependency missing: run `runtime deps {id}`\n");
+    assert!(s(&installed.stderr).contains(&hint), "{}", s(&installed.stderr));
+    let (tree, calls) = (r.tree(), r.calls());
+    let o = r.rt(&["deps", &id]);
+    assert_ok(&o);
+    assert_eq!(
+        s(&o.stdout),
+        format!("Dependencies of {id}:\n  dxvk 2.5.3 (Zlib): to install\nInstall with: runtime deps {id} --install\n")
+    );
+    assert_eq!(
+        (r.tree(), r.calls()),
+        (tree, calls),
+        "`deps <app>` wrote something or ran Wine"
+    );
+    let d = r.rt(&["doctor", &id]);
+    assert!(s(&d.stderr).contains(&hint), "{}", s(&d.stderr));
+    let run = r.rt(&["run", &id]);
+    assert_ok(&run);
+    assert!(s(&run.stderr).contains(&hint), "{}", s(&run.stderr));
+    let list = r.rt(&["deps", "list"]);
+    assert_ok(&list);
+    assert!(s(&list.stdout).contains("vcrun2022 14.40.33810 (proprietary-redistributable, needs consent)"));
+    // Nothing interrupted: nothing to discard.
+    let o = r.rt(&["deps", &id, "--discard-interrupted", "dxvk"]);
+    assert_ok(&o);
+    assert_eq!(s(&o.stdout), "Nothing to discard for dxvk.\n");
+}
+
+#[test]
+fn deps_yes_mistakes_are_refused_before_anything_happens() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let tree = r.tree();
+    let bare = r.rt(&["deps", &id, "--install", "--yes"]);
+    assert_eq!(bare.status.code(), Some(2), "{}", s(&bare.stderr));
+    // dxvk needs no consent; nope is not in the plan.
+    for pkg in ["dxvk", "nope"] {
+        let err = assert_fails(&r.rt(&["deps", &id, "--install", "--yes", pkg]));
+        assert!(err.contains(pkg) && err.contains("nothing was installed"), "{err}");
+    }
+    assert_eq!(r.tree(), tree, "no lock file, no cache directory, nothing");
+}
+
+#[test]
+fn remove_uninstall_run_and_install_refuse_while_a_dependency_install_holds_the_lock() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let lock = hold_deps_lock(&r, &id);
+    let before = r.calls();
+    for (cmd, verb) in [("remove", "remove"), ("uninstall", "uninstall"), ("run", "start")] {
+        let err = assert_fails(&r.rt(&[cmd, &id]));
+        assert!(
+            err.contains(&format!("cannot {verb} {id}")) && err.contains("wait"),
+            "{cmd}: {err}"
+        );
+    }
+    let err = assert_fails(&r.rt(&["deps", &id, "--install"]));
+    assert!(err.contains("another runtime command"), "{err}");
+    assert_eq!(r.app_dirs(), std::slice::from_ref(&id));
+    assert_eq!(r.calls(), before, "nothing was stopped, run or removed");
+    drop(lock);
+    assert_ok(&r.rt(&["run", &id]));
+    assert_ok(&r.rt(&["remove", &id]));
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn deps_cache_lists_and_clears_only_completed_downloads() {
+    let r = rig().no_wine();
+    let o = r.rt(&["deps", "cache"]);
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).ends_with("Total: 0 file(s), 0 bytes\n"),
+        "{}",
+        s(&o.stdout)
+    );
+    assert!(!r.data.join("deps-cache").exists(), "listing created the cache");
+    let dir = r.data.join("deps-cache");
+    fs::create_dir(&dir).unwrap();
+    let hex = "ab".repeat(32);
+    fs::write(dir.join(&hex), b"123").unwrap();
+    fs::write(dir.join(".tmp-1-0-00000000"), b"in progress").unwrap();
+    symlink(r.root.join("in"), dir.join("cd".repeat(32))).unwrap();
+    let o = r.rt(&["deps", "cache"]);
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).contains(&format!("  {hex}  3 bytes\nTotal: 1 file(s), 3 bytes\n")),
+        "{}",
+        s(&o.stdout)
+    );
+    let o = r.rt(&["deps", "cache", "--clear"]);
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).ends_with("Deleted 1 file(s), 3 bytes\n"),
+        "{}",
+        s(&o.stdout)
+    );
+    assert!(!dir.join(&hex).exists());
+    assert!(dir.join(".tmp-1-0-00000000").exists() && dir.join("cd".repeat(32)).is_symlink());
+}

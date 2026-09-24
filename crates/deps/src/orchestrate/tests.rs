@@ -1208,8 +1208,8 @@ fn shared_locks_coexist_and_exclude_an_exclusive_one_both_ways() {
 #[test]
 fn a_lock_is_not_inherited_by_a_child_process() {
     let r = abc();
-    let take: [fn(&AppEnv) -> Result<AppLock, DepsError>; 2] = [lock_app_shared, lock_app];
-    for take in take {
+    type Take = fn(&AppEnv) -> Result<AppLock, DepsError>;
+    for take in [lock_app_shared as Take, lock_app] {
         let lock = take(&r.env).unwrap();
         let out = Command::new("/bin/sh")
             .args(["-c", "ls -l /proc/$$/fd"])

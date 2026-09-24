@@ -15,6 +15,7 @@ runtime-core = { path = "../core" }
 runtime-installer = { path = "../installer" }
 runtime-desktop = { path = "../desktop" }
 runtime-backend-wine = { path = "../backend-wine" }
+runtime-deps = { path = "../deps" }
 clap = { version = "4", features = ["derive"] }
 libc.workspace = true
 serde_json.workspace = true
@@ -25,4 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `FakeBackend` for the unit tests of the front end (never part of a normal build).
 runtime-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
+sha2.workspace = true
 zip.workspace = true
