@@ -695,7 +695,7 @@ fn a_full_dependency_list_is_failed_not_recorded() {
 }
 
 #[test]
-fn a_journal_error_points_at_discard_interrupted_and_discards_nothing() {
+fn a_journal_error_names_the_cli_discard_command_and_discards_nothing() {
     let r = abc();
     let dir = r.env.root().join(install_archive::BACKUP_DIR).join("a");
     fs::create_dir_all(&dir).unwrap();
@@ -705,7 +705,7 @@ fn a_journal_error_points_at_discard_interrupted_and_discards_nothing() {
     let rep = run(&r, &r.plan(ABC), &FakeFetcher::default(), &Answers::default()).unwrap();
     let why = reason(&rep.failed, "a");
     assert!(
-        why.contains("discard_interrupted") && why.contains("nothing was installed"),
+        why.contains("runtime deps app --discard-interrupted a") && why.contains("nothing was installed"),
         "{why}"
     );
     assert!(r.c("windows/system32/leftover.dll").is_file(), "auto-discarded");
@@ -850,7 +850,18 @@ impl FakeServer {
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
-        FakeServer(cmd.spawn().unwrap())
+        // Another test thread may have forked while the script was open for writing; that child holds the write fd
+        // until its exec, and executing the script meanwhile fails with ETXTBSY (errno 26). Retry, as the
+        // backend-wine rig does.
+        for _ in 0..500 {
+            match cmd.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(4))
+                }
+                r => return FakeServer(r.unwrap()),
+            }
+        }
+        panic!("{} stayed busy (ETXTBSY)", exe.display())
     }
 }
 
@@ -1175,4 +1186,69 @@ fn dropping_the_lock_releases_it_even_while_the_open_file_is_shared() {
     drop(lock);
     drop(lock_app(&r.env).expect("the lock outlived its AppLock"));
     drop(dup);
+}
+
+#[test]
+fn shared_locks_coexist_and_exclude_an_exclusive_one_both_ways() {
+    let r = abc();
+    let (s1, s2) = (lock_app_shared(&r.env).unwrap(), lock_app_shared(&r.env).unwrap());
+    assert!(matches!(lock_app(&r.env), Err(DepsError::LockHeld)));
+    drop(s1);
+    assert!(
+        matches!(lock_app(&r.env), Err(DepsError::LockHeld)),
+        "one shared holder is enough"
+    );
+    drop(s2);
+    let ex = lock_app(&r.env).unwrap();
+    assert!(matches!(lock_app_shared(&r.env), Err(DepsError::LockHeld)));
+    drop(ex);
+    drop(lock_app_shared(&r.env).unwrap());
+}
+
+#[test]
+fn a_lock_is_not_inherited_by_a_child_process() {
+    let r = abc();
+    let take: [fn(&AppEnv) -> Result<AppLock, DepsError>; 2] = [lock_app_shared, lock_app];
+    for take in take {
+        let lock = take(&r.env).unwrap();
+        let out = Command::new("/bin/sh")
+            .args(["-c", "ls -l /proc/$$/fd"])
+            .output()
+            .unwrap();
+        let fds = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && fds.contains("->"), "{fds}");
+        assert!(!fds.contains(LOCK_FILE), "the lock fd leaked into a child: {fds}");
+        drop(lock);
+    }
+}
+
+/// `install_one`'s own consent check, reached directly: a plan that (wrongly) carries an unconsented gated Install.
+#[test]
+fn execute_never_fetches_a_gated_install_without_consent() {
+    let r = three();
+    let (f, a) = (FakeFetcher::default(), Answers::default());
+    let (l, b) = (launcher(), FakeBackend::new());
+    let o = Orchestrator {
+        manifest: &r.manifest,
+        cache_dir: &r.tmp.path().join("files"),
+        env: &r.env,
+        store: &r.store,
+        backend: &b,
+        launcher: &l,
+        fetcher: &f,
+        consent: &a,
+        now,
+    };
+    let plan = Plan {
+        entries: vec![PlanEntry {
+            package: "gated".into(),
+            action: Action::Install,
+            consent: ConsentState::Needed,
+        }],
+        unsatisfied: vec![],
+    };
+    let rep = execute(&o, &plan, &Decisions::default(), &[]);
+    assert!(f.calls().is_empty(), "fetched without consent");
+    assert!(reason(&rep.failed, "gated").contains("consent missing"), "{rep:?}");
+    assert!(r.recorded().is_empty() && a.asked().is_empty());
 }
