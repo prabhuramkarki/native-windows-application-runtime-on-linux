@@ -354,10 +354,9 @@ fn a_second_run_prompts_for_nothing_and_installs_nothing_even_with_the_lock_held
     assert!(rep.skipped.iter().all(|(_, why)| why == "already installed"), "{rep:?}");
 }
 
-/// A record at the package's version whose consent hash matches the current text, but a different sha256 (so the
-/// plan says Install): consent was already given for exactly this text.
-fn with_recorded_consent(r: &Rig, version: &str, hash: String) {
-    let mut m = r.md();
+/// Metadata recording `gated` at `version` with a consent hash of `hash` (a different sha256 than the manifest's).
+fn md_with_consent(version: &str, hash: String) -> Metadata {
+    let mut m = md();
     state::record(
         &mut m,
         DependencyRecord {
@@ -372,52 +371,134 @@ fn with_recorded_consent(r: &Rig, version: &str, hash: String) {
         },
     )
     .unwrap();
-    r.set_md(&m);
+    m
 }
 
+// `reusable_consent` is unreachable from `install_plan` while upgrades are refused (any record refuses the package),
+// so its rule (same version AND same consent text) is tested directly.
 #[test]
-fn recorded_consent_for_the_same_version_and_text_is_not_asked_again() {
-    let r = three();
-    with_recorded_consent(&r, "1.0", text_hash(r.manifest.get("gated").unwrap()));
-    let (f, a) = (FakeFetcher::default(), Answers::default());
-    let rep = run(&r, &r.plan(&["vcruntime140"]), &f, &a).unwrap();
-    assert!(a.asked().is_empty());
-    assert_eq!(rep.completed, ["gated"]);
-    let md = r.md();
-    let c = md.dependencies[0].consent.as_ref().unwrap();
-    assert_eq!(c.given_at, OLD, "reused consent keeps when it was given");
-    assert_eq!(md.dependencies[0].sha256, r.manifest.get("gated").unwrap().sha256);
-}
-
-#[test]
-fn consent_recorded_for_another_version_is_asked_again() {
-    let r = three();
+fn recorded_consent_counts_only_for_the_same_version_and_text() {
+    let (p, _) = archive("gated", true, &[], &[]);
+    let hash = text_hash(&p);
+    let m = md_with_consent("1.0", hash.clone());
+    assert_eq!(reusable_consent(&m, &p, &hash).unwrap().given_at, OLD);
     // Same text hash on purpose: only the version differs.
-    with_recorded_consent(&r, "0.9", text_hash(r.manifest.get("gated").unwrap()));
-    let (f, a) = (FakeFetcher::default(), Answers::default());
-    let rep = run(&r, &r.plan(&["vcruntime140"]), &f, &a).unwrap();
-    assert_eq!(a.asked(), ["gated"]);
-    assert!(f.calls().is_empty());
-    assert!(rep.completed.is_empty());
-}
-
-#[test]
-fn consent_to_different_text_is_asked_again_even_at_the_same_version() {
+    assert_eq!(reusable_consent(&md_with_consent("0.9", hash.clone()), &p, &hash), None);
     for change in ["licence", "url", "size", "sha256"] {
-        let r = three();
-        let mut old = r.manifest.get("gated").unwrap().clone();
+        let mut old = p.clone();
         match change {
             "licence" => old.licence = "MIT".into(),
             "url" => old.url = "https://example.com/other.zip".into(),
             "size" => old.size += 1,
             _ => old.sha256 = OTHER_SHA.into(),
         }
-        with_recorded_consent(&r, "1.0", text_hash(&old));
-        let (f, a) = (FakeFetcher::default(), Answers::default());
-        run(&r, &r.plan(&["vcruntime140"]), &f, &a).unwrap();
-        assert_eq!(a.asked(), ["gated"], "{change}");
-        assert!(f.calls().is_empty(), "{change}");
+        assert_eq!(
+            reusable_consent(&md_with_consent("1.0", text_hash(&old)), &p, &hash),
+            None,
+            "{change}"
+        );
     }
+}
+
+/// `id` bumped to version 2.0 with new bytes (the old file stays in the cache dir too).
+fn bump(r: &mut Rig, id: &str) {
+    let p = r.manifest.packages.iter_mut().find(|p| p.id == id).unwrap();
+    let body = zip_one("f.dll", format!("v2 of {id}").as_bytes());
+    p.version = "2.0".into();
+    p.sha256 = sha(&body);
+    p.size = body.len() as u64;
+    fs::write(r.tmp.path().join("files").join(&p.sha256), body).unwrap();
+}
+
+const UPGRADE: &str = "version 1.0 is installed; upgrading installed packages is not supported yet: recreate the \
+                       environment to get version 2.0";
+
+#[test]
+fn an_upgrade_of_an_installed_package_is_refused_before_any_download() {
+    let mut r = abc();
+    run(&r, &r.plan(&["d3d9"]), &FakeFetcher::default(), &Answers::default()).unwrap();
+    let before = r.md();
+    let dll = fs::read(r.c("windows/system32/a.dll")).unwrap();
+    bump(&mut r, "a");
+    let f = FakeFetcher::default();
+    let app = r.plan(&["d3d9"]);
+    assert_eq!(
+        app.plan.entries[0].action,
+        Action::Install,
+        "the resolver plans the upgrade"
+    );
+    let rep = run(&r, &app, &f, &Answers::default()).unwrap();
+    assert!(f.calls().is_empty());
+    assert!(rep.completed.is_empty() && rep.failed.is_empty(), "{rep:?}");
+    assert_eq!(reason(&rep.skipped, "a"), UPGRADE);
+    assert_eq!(r.md(), before);
+    assert_eq!(fs::read(r.c("windows/system32/a.dll")).unwrap(), dll);
+}
+
+#[test]
+fn an_installer_upgrade_is_refused_before_the_marker_check() {
+    let r = Rig::new(vec![installer("vc", &["vcruntime140"])]);
+    let mut m = r.md();
+    state::record(
+        &mut m,
+        DependencyRecord {
+            id: "vc".into(),
+            version: "1.0".into(),
+            sha256: OTHER_SHA.into(),
+            installed_at: OLD,
+            consent: None,
+        },
+    )
+    .unwrap();
+    r.set_md(&m);
+    fs::write(r.c("windows/system32/vc-marker.dll"), b"from 1.0").unwrap();
+    let f = FakeFetcher::default();
+    let rep = run(&r, &r.plan(&["vcruntime140"]), &f, &Answers::default()).unwrap();
+    assert!(f.calls().is_empty());
+    let why = reason(&rep.skipped, "vc");
+    assert!(why.contains("upgrading installed packages is not supported"), "{why}");
+    assert!(!why.contains("outside the runtime"), "{why}");
+    assert_eq!(r.md(), m);
+}
+
+#[test]
+fn a_refused_upgrade_skips_its_dependents_without_asking_and_unrelated_packages_install() {
+    // gated (consent) -> gdep (consent) needs it; perm unrelated. gated 1.0 is recorded, the manifest has 2.0.
+    let mut r = Rig::new(vec![
+        archive("perm", false, &[], &["d3d11"]),
+        archive("gated", true, &[], &["vcruntime140"]),
+        archive("gdep", true, &["gated"], &["msvcp140"]),
+    ]);
+    let hash = text_hash(r.manifest.get("gated").unwrap());
+    let mut m = md_with_consent("1.0", hash);
+    m.dependencies[0].sha256 = r.manifest.get("gated").unwrap().sha256.clone();
+    r.set_md(&m);
+    bump(&mut r, "gated");
+    let (f, a) = (
+        FakeFetcher::default(),
+        Answers {
+            never: vec!["gated", "gdep"],
+            ..Answers::default()
+        },
+    );
+    let rep = run(&r, &r.plan(THREE), &f, &a).unwrap();
+    assert_eq!(f.calls(), ["perm"]);
+    assert_eq!(rep.completed, ["perm"]);
+    assert_eq!(reason(&rep.skipped, "gated"), UPGRADE);
+    assert!(reason(&rep.skipped, "gdep").contains("blocked"), "{rep:?}");
+    assert!(a.asked().is_empty(), "no prompt for a refused upgrade or behind it");
+}
+
+#[test]
+fn the_same_version_and_sha256_stays_already_installed() {
+    let r = abc();
+    run(&r, &r.plan(&["d3d9"]), &FakeFetcher::default(), &Answers::default()).unwrap();
+    let f = FakeFetcher::default();
+    let app = r.plan(ABC);
+    let rep = run(&r, &app, &f, &Answers::default()).unwrap();
+    assert_eq!(reason(&rep.skipped, "a"), "already installed");
+    assert_eq!(rep.completed, ["b", "c"]);
+    assert_eq!(f.calls(), ["b", "c"]);
 }
 
 #[test]
@@ -630,8 +711,8 @@ fn a_journal_error_points_at_discard_interrupted_and_discards_nothing() {
     assert!(r.c("windows/system32/leftover.dll").is_file(), "auto-discarded");
     assert_eq!(fs::read_to_string(dir.join("journal")).unwrap(), journal);
     assert!(r.recorded().is_empty());
-    // The passthrough does discard, when asked.
-    discard_interrupted_for("a", &r.env).unwrap();
+    // The guarded passthrough does discard, when asked.
+    discard_interrupted_for(&r.store, &r.env, "a").unwrap();
     assert!(!r.c("windows/system32/leftover.dll").exists());
 }
 
@@ -1001,4 +1082,97 @@ fn installed_packages_come_from_metadata() {
     .unwrap();
     let app = plan_for_app(&r.env, &md, &m);
     assert_eq!(app.plan.entries[0].action, Action::AlreadyInstalled);
+}
+
+// ------------------------------------------------------------------------------------------------ discard
+
+/// A killed-run journal for package `zz` (not recorded) that created `windows/system32/zz.dll`; returns the journal
+/// path and its text.
+fn killed_journal(r: &Rig) -> (PathBuf, String) {
+    let dir = r.env.root().join(install_archive::BACKUP_DIR).join("zz");
+    fs::create_dir_all(&dir).unwrap();
+    let text = format!("rt-deps-journal 1 {OTHER_SHA}\nF windows/system32/zz.dll\n");
+    fs::write(dir.join("journal"), &text).unwrap();
+    fs::write(r.c("windows/system32/zz.dll"), b"left by a killed run").unwrap();
+    (dir.join("journal"), text)
+}
+
+#[test]
+fn discard_during_a_running_install_is_lock_held_and_touches_nothing() {
+    let r = abc();
+    let (journal, text) = killed_journal(&r);
+    let (store, env) = (r.store.clone(), r.env.clone());
+    let got = std::rc::Rc::new(RefCell::new(None));
+    let got2 = got.clone();
+    let f = FakeFetcher {
+        hook: Some(Box::new(move |p: &Package| {
+            if p.id == "a" {
+                *got2.borrow_mut() = Some(discard_interrupted_for(&store, &env, "zz"));
+            }
+        })),
+        ..FakeFetcher::default()
+    };
+    run(&r, &r.plan(&["d3d9"]), &f, &Answers::default()).unwrap();
+    let got = got.borrow_mut().take().unwrap();
+    assert!(matches!(got, Err(DepsError::LockHeld)), "{got:?}");
+    assert_eq!(fs::read_to_string(&journal).unwrap(), text);
+    assert!(r.c("windows/system32/zz.dll").is_file());
+}
+
+#[test]
+fn discard_under_a_running_app_is_prefix_busy() {
+    let r = abc();
+    let (journal, text) = killed_journal(&r);
+    let bin = tempfile::tempdir().unwrap();
+    let _server = FakeServer::start(bin.path(), Some(&r.env.prefix()), None);
+    let got = discard_interrupted_for(&r.store, &r.env, "zz");
+    assert!(matches!(got, Err(DepsError::PrefixBusy { .. })), "{got:?}");
+    assert_eq!(fs::read_to_string(&journal).unwrap(), text);
+    assert!(r.c("windows/system32/zz.dll").is_file());
+}
+
+#[test]
+fn discard_of_a_recorded_package_is_refused() {
+    let r = abc();
+    let (journal, text) = killed_journal(&r);
+    let mut m = r.md();
+    state::record(
+        &mut m,
+        DependencyRecord {
+            id: "zz".into(),
+            version: "1.0".into(),
+            sha256: OTHER_SHA.into(),
+            installed_at: OLD,
+            consent: None,
+        },
+    )
+    .unwrap();
+    r.set_md(&m);
+    let got = discard_interrupted_for(&r.store, &r.env, "zz");
+    assert!(matches!(&got, Err(DepsError::Recorded(id)) if id == "zz"), "{got:?}");
+    assert_eq!(fs::read_to_string(&journal).unwrap(), text);
+    assert!(r.c("windows/system32/zz.dll").is_file());
+}
+
+#[test]
+fn discard_of_an_unrecorded_killed_install_restores_the_prefix() {
+    let r = abc();
+    let (journal, _) = killed_journal(&r);
+    let rep = discard_interrupted_for(&r.store, &r.env, "zz").unwrap();
+    assert_eq!(rep.removed_files, [PathBuf::from("windows/system32/zz.dll")]);
+    assert!(!r.c("windows/system32/zz.dll").exists());
+    assert!(!journal.exists());
+    // The lock was released: a run can start.
+    drop(lock_app(&r.env).unwrap());
+}
+
+#[test]
+fn dropping_the_lock_releases_it_even_while_the_open_file_is_shared() {
+    // What a child forked by another thread holds until it execs: another reference to the same open file.
+    let r = abc();
+    let lock = lock_app(&r.env).unwrap();
+    let dup = lock.0.try_clone().unwrap();
+    drop(lock);
+    drop(lock_app(&r.env).expect("the lock outlived its AppLock"));
+    drop(dup);
 }

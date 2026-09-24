@@ -8,12 +8,19 @@
 //!    ([`DepsError::LockHeld`]) and no `wineserver` serving this prefix ([`DepsError::PrefixBusy`]: installing
 //!    under a running app blocks on `wineserver -w`, swaps DLLs under it and lets its later registry flush
 //!    overwrite the installer's writes; the user closes the app, the runtime never kills it).
-//! 3. The plan is resolved again from the metadata read under the lock, then consent is decided for EVERY
-//!    consent-gated `Install` entry up front (dependency order; never for a `Blocked` or `AlreadyInstalled` entry,
-//!    nor for one behind a denial). Recorded consent counts only for the same package version AND the same
-//!    [`consent_text`] (hash compared); anything else asks the [`ConsentProvider`].
-//! 4. The plan is resolved once more with the denied ids, so a denied package and everything that needs it are
-//!    `Blocked` (and reported as skipped) and nothing is downloaded for them.
+//! 3. The plan is resolved again from the metadata read under the lock, then every `Install` entry is decided up
+//!    front (dependency order; never a `Blocked` or `AlreadyInstalled` entry, nor one behind a refusal):
+//!    - UPGRADES ARE REFUSED (Ruling 13): a package the metadata already records (at another version or sha256,
+//!      or it would be `AlreadyInstalled`) is refused without a prompt: the kept install journal and an installer's
+//!      marker would make the new version fail anyway, after a wasted download. The user recreates the
+//!      environment to get the new version.
+//!    - a consent-gated package asks the [`ConsentProvider`]. Recorded consent would count only for the same
+//!      version AND the same [`consent_text`] hash ([`reusable_consent`]), but with upgrades refused that path is
+//!      unreachable today: consent lives on the install record, any record refuses the package, and
+//!      `state::forget` drops the consent with the record. It is kept as the spec's rule for when upgrades land.
+//! 4. The plan is resolved once more with the denied and refused ids, so they and everything that needs them are
+//!    `Blocked` (and reported as skipped, a refused upgrade with its own reason) and nothing is downloaded for
+//!    them.
 //! 5. Packages install in plan order: busy re-check, fetch, install, then record (read, `state::record`, atomic
 //!    write) after EACH success. The first failure stops the run; the rest are skipped.
 //!
@@ -127,6 +134,10 @@ pub enum DepsError {
     Metadata(#[source] StoreError),
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
+    #[error("package {0:?} is recorded as installed: use remove/recreate, not discard")]
+    Recorded(String),
+    #[error("cannot discard what the interrupted install left: {0}")]
+    Discard(#[source] ArchiveError),
 }
 
 // ------------------------------------------------------------------------------------------------ text
@@ -244,7 +255,17 @@ fn read_exe(env: &AppEnv, md: &Metadata) -> Result<pe::PeInfo, String> {
 
 /// Holds the app's dependency lock; released on drop (or process exit).
 #[derive(Debug)]
-pub struct AppLock(#[allow(dead_code)] File);
+pub struct AppLock(File);
+
+impl Drop for AppLock {
+    /// Unlocks explicitly: closing the fd alone does not release a flock while another reference to the same open
+    /// file description exists, e.g. a child another thread forked and has not yet exec'd (O_CLOEXEC only closes
+    /// it at exec).
+    fn drop(&mut self) {
+        // SAFETY: flock on a file descriptor we own; no memory is passed.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 /// Takes `<app root>/deps.lock` exclusively without waiting. The file is created 0600 and never followed if it
 /// is a symlink.
@@ -368,28 +389,54 @@ fn check_not_busy(env: &AppEnv) -> Result<(), DepsError> {
 /// Installs what `app`'s plan needs, behind consent (see the module docs). `Err` only for run-level refusals.
 pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsError> {
     if !has_install(&app.plan) {
-        return Ok(execute(o, &app.plan, &HashMap::new()));
+        return Ok(execute(o, &app.plan, &Decisions::default(), &[]));
     }
     let _lock = lock_app(o.env)?;
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;
     let installed = state::installed_set(&md);
     let first = resolve(&app.facts, &installed, &[], o.manifest);
-    let (denied, consents) = decide_consent(o, &md, &first);
-    let plan = resolve(&app.facts, &installed, &denied, o.manifest);
-    Ok(execute(o, &plan, &consents))
+    let d = decide(o, &md, &first);
+    let plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    Ok(execute(o, &plan, &d, &md.dependencies))
 }
 
 fn has_install(plan: &Plan) -> bool {
     plan.entries.iter().any(|e| e.action == Action::Install)
 }
 
-/// Consent for every consent-gated `Install` entry, before anything is downloaded: the denied ids, and the
-/// consent to record for each authorised one.
-fn decide_consent(o: &Orchestrator, md: &Metadata, plan: &Plan) -> (Vec<String>, HashMap<String, ConsentRecord>) {
-    let mut denied = Vec::new();
-    let mut consents = HashMap::new();
-    // Denied, or needing something denied: never asked about (the re-resolve blocks it).
+/// The up-front decisions of a run.
+#[derive(Default)]
+struct Decisions {
+    /// Consent denied or upgrade refused: re-resolved as denied, so they and their dependents are `Blocked`.
+    denied: Vec<String>,
+    /// The consent to record for each authorised consent-gated package.
+    consents: HashMap<String, ConsentRecord>,
+    /// Refused upgrades and the reason reported for them.
+    refused: HashMap<String, String>,
+}
+
+fn upgrade_reason(installed: &str, planned: &str) -> String {
+    format!(
+        "version {} is installed; upgrading installed packages is not supported yet: recreate the environment to \
+         get version {}",
+        manifest::clip(installed),
+        manifest::clip(planned)
+    )
+}
+
+/// Recorded consent that still counts for `pkg`: same version, and given to exactly the current [`consent_text`]
+/// (`hash`). Unreachable from [`install_plan`] while upgrades are refused (see the module docs).
+fn reusable_consent(md: &Metadata, pkg: &Package, hash: &str) -> Option<ConsentRecord> {
+    state::consent_of(md, &pkg.id, &pkg.version)
+        .filter(|c| c.licence_text_sha256 == hash)
+        .cloned()
+}
+
+/// Decides every `Install` entry before anything is downloaded: refused upgrades, then consent.
+fn decide(o: &Orchestrator, md: &Metadata, plan: &Plan) -> Decisions {
+    let mut d = Decisions::default();
+    // Denied, refused, or needing one of those: never asked about (the re-resolve blocks it).
     let mut out: HashSet<&str> = HashSet::new();
     for e in plan.entries.iter().filter(|e| e.action == Action::Install) {
         let Some(pkg) = o.manifest.get(&e.package) else {
@@ -399,43 +446,52 @@ fn decide_consent(o: &Orchestrator, md: &Metadata, plan: &Plan) -> (Vec<String>,
             out.insert(&e.package);
             continue;
         }
+        if let Some(rec) = md.dependencies.iter().find(|r| r.id == pkg.id) {
+            d.refused
+                .insert(pkg.id.clone(), upgrade_reason(&rec.version, &pkg.version));
+            d.denied.push(pkg.id.clone());
+            out.insert(&e.package);
+            continue;
+        }
         if !pkg.requires_consent {
             continue;
         }
         let text = consent_text(pkg);
         let hash = sha256_hex(text.as_bytes());
-        let given = match state::consent_of(md, &pkg.id, &pkg.version) {
-            Some(c) if c.licence_text_sha256 == hash => Some(c.clone()),
-            _ => o.consent.confirm(pkg, &text).then(|| ConsentRecord {
+        let given = reusable_consent(md, pkg, &hash).or_else(|| {
+            o.consent.confirm(pkg, &text).then(|| ConsentRecord {
                 given_at: (o.now)(),
                 licence_text_sha256: hash,
-            }),
-        };
+            })
+        });
         match given {
             Some(c) => {
-                consents.insert(pkg.id.clone(), c);
+                d.consents.insert(pkg.id.clone(), c);
             }
             None => {
-                denied.push(pkg.id.clone());
+                d.denied.push(pkg.id.clone());
                 out.insert(&e.package);
             }
         }
     }
-    (denied, consents)
+    d
 }
 
-fn execute(o: &Orchestrator, plan: &Plan, consents: &HashMap<String, ConsentRecord>) -> RunReport {
+fn execute(o: &Orchestrator, plan: &Plan, d: &Decisions, recorded: &[DependencyRecord]) -> RunReport {
     let mut report = RunReport::default();
     let mut stopped = false;
     for e in &plan.entries {
         let id = e.package.clone();
         match &e.action {
             Action::AlreadyInstalled => report.skipped.push((id, "already installed".into())),
-            Action::Blocked { reason } => report.skipped.push((id, line(reason))),
+            Action::Blocked { reason } => {
+                let why = d.refused.get(&id).unwrap_or(reason);
+                report.skipped.push((id, line(why)));
+            }
             Action::Install if stopped => report
                 .skipped
                 .push((id, "not attempted: an earlier package failed".into())),
-            Action::Install => match install_one(o, &e.package, consents) {
+            Action::Install => match install_one(o, &e.package, &d.consents, recorded) {
                 Ok(warnings) => {
                     report.warnings.extend(warnings.iter().map(|w| (id.clone(), line(w))));
                     report.completed.push(id);
@@ -451,8 +507,17 @@ fn execute(o: &Orchestrator, plan: &Plan, consents: &HashMap<String, ConsentReco
 }
 
 /// Fetch, install and record one package; the error is the report reason.
-fn install_one(o: &Orchestrator, id: &str, consents: &HashMap<String, ConsentRecord>) -> Result<Vec<String>, String> {
+fn install_one(
+    o: &Orchestrator,
+    id: &str,
+    consents: &HashMap<String, ConsentRecord>,
+    recorded: &[DependencyRecord],
+) -> Result<Vec<String>, String> {
     let pkg = o.manifest.get(id).ok_or("not in the manifest")?;
+    // Defence in depth: `decide` already refused every recorded package (no upgrades, Ruling 13).
+    if let Some(rec) = recorded.iter().find(|r| r.id == pkg.id) {
+        return Err(upgrade_reason(&rec.version, &pkg.version));
+    }
     let consent = consents.get(id).cloned();
     // Defence in depth: the re-resolve already blocks every gated package without consent.
     if pkg.requires_consent && consent.is_none() {
@@ -548,10 +613,18 @@ fn installer_reason(e: InstallerPkgError) -> String {
     }
 }
 
-/// [`install_archive::discard_interrupted`], for the CLI to offer after a journal error. Only for a package with
-/// NO install record: it also undoes a recorded, successful install.
-pub fn discard_interrupted_for(pkg_id: &str, env: &AppEnv) -> Result<DiscardReport, ArchiveError> {
-    install_archive::discard_interrupted(pkg_id, env)
+/// [`install_archive::discard_interrupted`] behind the run guards, for the CLI to offer after a journal error:
+/// holds `deps.lock` for the whole call (a running install's live journal is never adopted), refuses under a
+/// running app, and refuses a package the metadata records (discarding would undo a recorded install while the
+/// record stays).
+pub fn discard_interrupted_for(store: &Store, env: &AppEnv, pkg_id: &str) -> Result<DiscardReport, DepsError> {
+    let _lock = lock_app(env)?;
+    check_not_busy(env)?;
+    let md = store.read_metadata(env).map_err(DepsError::Metadata)?;
+    if md.dependencies.iter().any(|d| d.id == pkg_id) {
+        return Err(DepsError::Recorded(manifest::clip(pkg_id)));
+    }
+    install_archive::discard_interrupted(pkg_id, env).map_err(DepsError::Discard)
 }
 
 #[cfg(test)]
