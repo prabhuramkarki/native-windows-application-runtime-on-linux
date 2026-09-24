@@ -15,8 +15,8 @@
 //! * An `extract` entry that selects nothing is [`ArchiveError::NoMatch`] (a package whose declared files are
 //!   missing must not report success). A file selected by two `extract` entries, and two files mapped to the
 //!   same destination (compared case-insensitively, as Wine does; this includes a selected path that occurs twice
-//!   in the archive) are [`ArchiveError::Destination`]. All of this is decided BEFORE anything is written: a zip is planned from
-//!   its central directory, a tar.gz is read twice (a first pass that writes nothing validates the whole archive
+//!   in the archive) are [`ArchiveError::Destination`]. All of this is decided BEFORE anything is written: a zip
+//!   is planned from its central directory, a tar.gz is read twice (a first pass that writes nothing validates the whole archive
 //!   and lists its files; the second pass writes, and must see the same file list).
 //! * Everything not selected is never written.
 //!
@@ -30,18 +30,43 @@
 //! on an error or unwind the temporary file is removed).
 //!
 //! **Replaced files.** Wine ships builtin placeholder DLLs, so a destination may already be a regular file. Its
-//! original is first copied (same temp + rename discipline, `0600`) to `<app root>/deps-backup/<package id>/<path
+//! original is first copied (same temp + rename discipline, `0600`) to `<app root>/deps-backup/<package id>/c/<path
 //! relative to drive_c>` (directories `0700`; outside the prefix, so nothing running in the prefix can reach it).
-//! A backup that already exists there is KEPT, not overwritten: it can only be the original saved by an earlier
-//! install of the same package that was killed before it was recorded, and the file now at the destination may
-//! be that install's copy. Restoring copies the backup back (temp + rename, `0644`: the original's mode is not
-//! kept), deletes it and prunes empty backup directories up to `deps-backup`.
+//! A backup that already exists there is KEPT, not overwritten: only this package writes there, and only before
+//! replacing a file it did not create, so it is the original saved by an earlier attempt that was killed, and the
+//! file now at the destination may be that attempt's copy. Restoring copies the backup back (temp + rename,
+//! `0644`: the original's mode is not kept), deletes it and prunes empty backup directories up to `deps-backup`.
+//!
+//! **Journal (interrupted installs).** Before the first write, `<app root>/deps-backup/<package id>/journal` is
+//! created atomically (temp + fsync + rename, then the directory is fsynced) with the header
+//! `rt-deps-journal 1 <package sha256>`. Before each directory it creates and each file it writes to an ABSENT
+//! destination, and before each backup it creates, the install appends `D <path>` / `F <path>` / `R <path>`
+//! (drive_c-relative) and fsyncs. So after a kill, every new file or directory and every replaced file that may
+//! exist is listed. On the next install of the SAME archive (same sha256):
+//! * a listed directory that exists is adopted into `created_dirs`;
+//! * a listed file that exists is the killed attempt's own (`F` is only written for an absent destination): it is
+//!   overwritten and recorded in
+//!   `files`, never backed up and never in `replaced`;
+//! * an existing file that is not listed is handled as above (backed up, or its kept backup reused);
+//! * if the retry fails, its rollback also removes the listed files and directories and restores the listed
+//!   replaced files it had not reached yet, so a fully rolled-back retry leaves the prefix as before the first
+//!   attempt.
+//!
+//! A journal written for a DIFFERENT archive of the package (another sha256) is [`ArchiveError::Journal`]: its
+//! entries are never trusted for another state. The journal is read defensively (regular file only, `O_NOFOLLOW`,
+//! at most 4 MiB and 16384 entries, UTF-8, strict `F `/`D `/`R ` lines whose paths pass the same rules as a recorded
+//! install); anything else is [`ArchiveError::Journal`], never ignored. One exception: a LAST line without its
+//! newline is dropped, because it was being appended when the process died and the step it announced had not
+//! started. The journal stays after a successful install (the caller may die before recording it) and is
+//! deleted by a successful [`remove_archive`] and by a fully rolled-back install (which also removes what the
+//! killed attempt left).
 //!
 //! **Failure.** On any error [`install_archive`] undoes exactly what the call did (overrides deleted newest
 //! first, new files deleted, replaced files restored, created directories removed when empty) and returns the
 //! ORIGINAL error; if undoing fails too, the result is [`ArchiveError::Rollback`] carrying both. A process that is
-//! KILLED mid-install cannot roll back: earlier files (and backups) stay. That is why the caller records a package
-//! in the app's state only after `install_archive` returned `Ok`, and why a stale backup is kept (see above).
+//! KILLED mid-install cannot roll back: earlier files, backups and the journal stay, and the next install (or its
+//! rollback) takes them over (see the journal). The caller records a package in the app's state only after
+//! `install_archive` returned `Ok`.
 //!
 //! **DLL overrides** (ledger Ruling 2). Each name must be in the package's `provides` (checked again here) and
 //! match `[a-z0-9_]{1,32}` before it is used, and then only as ONE argv element (never shell text). The value is
@@ -89,6 +114,11 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_EXPANDED: u64 = 2 << 30;
 const MAX_RATIO: u64 = 200;
 const MAX_OVERRIDE_LEN: usize = 32;
+/// The journal of an install, inside `deps-backup/<package id>/`, next to the `c/` backup tree.
+const JOURNAL: &str = "journal";
+const JOURNAL_MAGIC: &str = "rt-deps-journal 1";
+const MAX_JOURNAL_BYTES: u64 = 4 << 20;
+const MAX_JOURNAL_ENTRIES: usize = 4 * MAX_ENTRIES;
 /// Most rollback failures quoted in an error.
 const MAX_REPORTED: usize = 5;
 
@@ -130,6 +160,14 @@ pub enum ArchiveError {
     Rollback(String),
     #[error("unusable package or record: {0}")]
     BadPackage(String),
+    #[error("unusable install journal: {0}")]
+    Journal(String),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: simulate SIGKILL (a panic, so no rollback runs) after this many steps; see `crash_point`.
+    pub(crate) static CRASH_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// Installs `pkg` (an archive package) from `file`, the verified download, into `env`'s `drive_c`. See the module
@@ -145,6 +183,8 @@ pub fn install_archive(
     check_overrides(overrides, Some(&pkg.provides))?;
     let src = open_archive(file, pkg.size)?;
     let mut ledger = Ledger::new(env, &pkg.id);
+    ledger.sha256.clone_from(&pkg.sha256);
+    ledger.adopt()?;
     let result = (|| {
         match format {
             ArchiveFormat::Zip => install_zip(&src, pkg.size, extract, &mut ledger)?,
@@ -159,9 +199,15 @@ pub fn install_archive(
         Ok(())
     })();
     match result {
+        // Same archive, same selection: every adopted file was written again and is in `files`.
         Ok(()) => Ok(ledger.done),
         Err(original) => {
-            let failures = ledger.undo(env, backend, launcher);
+            let mut failures = ledger.undo(env, backend, launcher);
+            if failures.is_empty()
+                && let Err(e) = ledger.drop_journal()
+            {
+                failures.push(e);
+            }
             Err(if failures.is_empty() {
                 original
             } else {
@@ -195,7 +241,7 @@ pub fn remove_archive(
     ledger.done.created_dirs.sort_by_key(|d| d.components().count());
     match ledger.undo(env, backend, launcher).into_iter().next() {
         Some(first) => Err(first),
-        None => Ok(()),
+        None => ledger.drop_journal(),
     }
 }
 
@@ -514,8 +560,15 @@ fn atomic_write(dest: &Path, src: &mut dyn Read, expect: Option<u64>, mode: u32)
 }
 
 /// Creates the missing directories of `base/rel` (with `mode`), refusing anything that is not a real directory.
-/// Each created one is pushed to `created` (relative to `base`, parents first) as soon as it exists.
-fn make_dirs(base: &Path, rel: &Path, mode: u32, created: &mut Vec<PathBuf>) -> Result<(), ArchiveError> {
+/// `announce` runs before each is created; each is pushed to `created` (relative to `base`, parents first) as soon
+/// as it exists.
+fn make_dirs(
+    base: &Path,
+    rel: &Path,
+    mode: u32,
+    created: &mut Vec<PathBuf>,
+    announce: &mut dyn FnMut(&Path) -> Result<(), ArchiveError>,
+) -> Result<(), ArchiveError> {
     let mut cur = base.to_path_buf();
     for c in rel.components() {
         cur.push(c);
@@ -528,9 +581,11 @@ fn make_dirs(base: &Path, rel: &Path, mode: u32, created: &mut Vec<PathBuf>) -> 
                 )));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let rel = cur.strip_prefix(base).unwrap_or(&cur).to_path_buf();
+                announce(&rel)?;
                 DirBuilder::new().mode(mode).create(&cur)?;
                 fs::set_permissions(&cur, Permissions::from_mode(mode))?;
-                created.push(cur.strip_prefix(base).unwrap_or(&cur).to_path_buf());
+                created.push(rel);
             }
             Err(e) => return Err(e.into()),
         }
@@ -546,19 +601,180 @@ fn resolve_err(what: &Path, e: ResolveError) -> ArchiveError {
 struct Ledger {
     drive_c: PathBuf,
     app_root: PathBuf,
-    /// `deps-backup/<package id>`, relative to `app_root`.
+    /// `deps-backup/<package id>`, relative to `app_root`: holds the journal and the `c/` backup tree.
+    pkg_dir: PathBuf,
+    /// `deps-backup/<package id>/c`, relative to `app_root`.
     backups: PathBuf,
     done: ArchiveInstalled,
+    /// The package's sha256 (install only): the journal header.
+    sha256: String,
+    /// Open for appending once the first write is near.
+    journal: Option<File>,
+    /// Files a killed earlier attempt listed in the journal.
+    prior_files: HashSet<PathBuf>,
+    /// Those of them that exist: ours, removed on rollback even if not rewritten yet. (An `F` line is only written
+    /// for an absent destination and a backup only for a present one, so a listed file never has a backup.)
+    adopted: Vec<PathBuf>,
+    /// Files the killed attempt listed as replaced whose backup still exists: restored on rollback.
+    adopted_replaced: Vec<PathBuf>,
+}
+
+/// Appends one journal line and makes it durable before the step it announces.
+fn journal_line(journal: &mut File, kind: char, rel: &Path) -> Result<(), ArchiveError> {
+    let s = rel
+        .to_str()
+        .ok_or_else(|| ArchiveError::Journal(format!("{} is not UTF-8", rel.display())))?;
+    io::Write::write_all(journal, format!("{kind} {s}\n").as_bytes())?;
+    journal.sync_data()?;
+    Ok(())
+}
+
+/// Test hook: counts down `CRASH_AFTER` and panics at zero, as if the process were killed there.
+fn crash_point() {
+    #[cfg(test)]
+    CRASH_AFTER.with(|c| match c.get() {
+        Some(0) => {
+            c.set(None);
+            panic!("simulated crash");
+        }
+        Some(n) => c.set(Some(n - 1)),
+        None => {}
+    });
+}
+
+/// The entries of a journal, in order: `F` new files, `D` created directories, `R` files whose original was
+/// backed up.
+#[derive(Default)]
+struct JournalEntries {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+    replaced: Vec<PathBuf>,
+}
+
+/// Reads and validates a journal (module docs). `None` if there is none.
+fn read_journal(path: &Path, sha256: &str) -> Result<Option<JournalEntries>, ArchiveError> {
+    let bad = |why: &str| ArchiveError::Journal(format!("{}: {why}", path.display()));
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(m) if !m.file_type().is_file() => return Err(bad("not a regular file")),
+        Ok(_) => {}
+    }
+    let mut bytes = Vec::new();
+    open_nofollow(path)?
+        .take(MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+        return Err(bad("too large"));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad("not UTF-8"))?;
+    // A last line without its newline was being appended when the process died: its step never started.
+    let complete = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
+    let mut lines = complete.lines();
+    match lines.next() {
+        Some(h) if h == format!("{JOURNAL_MAGIC} {sha256}") => {}
+        Some(h) if h.starts_with(JOURNAL_MAGIC) => {
+            return Err(bad(
+                "left by an interrupted install of a different archive of this package",
+            ));
+        }
+        _ => return Err(bad("missing or unknown header")),
+    }
+    let mut j = JournalEntries::default();
+    for (n, line) in lines.enumerate() {
+        if n >= MAX_JOURNAL_ENTRIES {
+            return Err(bad("too many entries"));
+        }
+        let (list, rel) = match line.split_at_checked(2) {
+            Some(("F ", rel)) => (&mut j.files, rel),
+            Some(("D ", rel)) => (&mut j.dirs, rel),
+            Some(("R ", rel)) => (&mut j.replaced, rel),
+            _ => return Err(bad("malformed entry")),
+        };
+        let rel = PathBuf::from(rel);
+        win_path(&rel).map_err(|_| bad(&format!("unsafe path {:?}", clip(&rel.to_string_lossy()))))?;
+        list.push(rel);
+    }
+    Ok(Some(j))
 }
 
 impl Ledger {
     fn new(env: &AppEnv, id: &str) -> Ledger {
+        let pkg_dir = Path::new(BACKUP_DIR).join(id);
         Ledger {
             drive_c: env.drive_c(),
             app_root: env.root().to_path_buf(),
-            backups: Path::new(BACKUP_DIR).join(id),
+            backups: pkg_dir.join("c"),
+            pkg_dir,
             done: ArchiveInstalled::default(),
+            sha256: String::new(),
+            journal: None,
+            prior_files: HashSet::new(),
+            adopted: Vec::new(),
+            adopted_replaced: Vec::new(),
         }
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.app_root.join(&self.pkg_dir).join(JOURNAL)
+    }
+
+    /// Takes over what a killed earlier attempt of the same archive listed in its journal (module docs).
+    fn adopt(&mut self) -> Result<(), ArchiveError> {
+        let Some(j) = read_journal(&self.journal_path(), &self.sha256)? else {
+            return Ok(());
+        };
+        for d in j.dirs {
+            if !self.done.created_dirs.contains(&d) && self.resolve(&d)?.is_some_and(|p| p.is_dir()) {
+                self.done.created_dirs.push(d);
+            }
+        }
+        for f in j.files {
+            if self.prior_files.insert(f.clone()) && self.resolve(&f)?.is_some() {
+                self.adopted.push(f);
+            }
+        }
+        for r in j.replaced {
+            if !self.adopted_replaced.contains(&r)
+                && fs::symlink_metadata(self.app_root.join(&self.backups).join(&r)).is_ok_and(|m| m.is_file())
+            {
+                self.adopted_replaced.push(r);
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the journal for appending, creating it (atomically, with its header) if needed.
+    fn open_journal(&mut self) -> Result<&mut File, ArchiveError> {
+        if self.journal.is_none() {
+            make_dirs(&self.app_root, &self.pkg_dir, 0o700, &mut Vec::new(), &mut |_| Ok(()))?;
+            let path = self.journal_path();
+            if !fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+                let header = format!("{JOURNAL_MAGIC} {}\n", self.sha256);
+                atomic_write(&path, &mut header.as_bytes(), None, 0o600)?;
+                File::open(self.app_root.join(&self.pkg_dir))?.sync_all()?;
+            }
+            self.journal = Some(
+                OpenOptions::new()
+                    .append(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)?,
+            );
+            crash_point();
+        }
+        Ok(self.journal.as_mut().expect("just opened"))
+    }
+
+    /// Deletes the journal and prunes the empty package and `deps-backup` directories.
+    fn drop_journal(&self) -> Result<(), ArchiveError> {
+        match fs::remove_file(self.journal_path()) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        for d in [&self.backups, &self.pkg_dir, Path::new(BACKUP_DIR)] {
+            let _ = fs::remove_dir(self.app_root.join(d));
+        }
+        Ok(())
     }
 
     /// Writes one selected file (see the module docs).
@@ -569,8 +785,14 @@ impl Ledger {
             .map_err(|_| ArchiveError::Destination(format!("{dest} is outside drive_c")))?
             .to_path_buf();
         let parent = rel.parent().unwrap_or(Path::new(""));
-        make_dirs(&self.drive_c, parent, 0o755, &mut self.done.created_dirs)?;
+        self.open_journal()?;
+        let journal = self.journal.as_mut().expect("opened above");
+        make_dirs(&self.drive_c, parent, 0o755, &mut self.done.created_dirs, &mut |d| {
+            journal_line(journal, 'D', d)
+        })?;
         match fs::symlink_metadata(&path) {
+            // Written by a killed earlier attempt of this archive (journal): ours, not an original.
+            Ok(m) if m.file_type().is_file() && self.prior_files.contains(&rel) => {}
             Ok(m) if m.file_type().is_file() => {
                 self.backup(&rel, &path)?;
                 self.done.replaced.push(rel.clone());
@@ -581,16 +803,19 @@ impl Ledger {
                     clip(&rel.to_string_lossy())
                 )));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                journal_line(self.open_journal()?, 'F', &rel)?;
+            }
             Err(e) => return Err(e.into()),
         }
         atomic_write(&path, src, Some(size), 0o644)?;
         self.done.files.push(rel);
+        crash_point();
         Ok(())
     }
 
     /// Saves the original at `path` (relative `rel`) unless a backup is already there (module docs).
-    fn backup(&self, rel: &Path, path: &Path) -> Result<(), ArchiveError> {
+    fn backup(&mut self, rel: &Path, path: &Path) -> Result<(), ArchiveError> {
         let below_root = self.backups.join(rel);
         // Backup directories are not recorded: `restore` prunes them once empty.
         make_dirs(
@@ -598,6 +823,7 @@ impl Ledger {
             below_root.parent().unwrap_or(&self.backups),
             0o700,
             &mut Vec::new(),
+            &mut |_| Ok(()),
         )?;
         let target = self.app_root.join(below_root);
         match fs::symlink_metadata(&target) {
@@ -611,6 +837,7 @@ impl Ledger {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
             Err(_) => {}
         }
+        journal_line(self.open_journal()?, 'R', rel)?;
         let mut original = open_nofollow(path)?;
         atomic_write(&target, &mut original, None, 0o600)
     }
@@ -684,8 +911,18 @@ impl Ledger {
                 note(self.remove_file(rel));
             }
         }
+        for rel in self.adopted.iter().rev() {
+            if !self.done.files.contains(rel) {
+                note(self.remove_file(rel));
+            }
+        }
         for rel in self.done.replaced.iter().rev() {
             note(self.restore(rel));
+        }
+        for rel in self.adopted_replaced.iter().rev() {
+            if !self.done.replaced.contains(rel) {
+                note(self.restore(rel));
+            }
         }
         for rel in self.done.created_dirs.iter().rev() {
             note(self.remove_dir(rel));
