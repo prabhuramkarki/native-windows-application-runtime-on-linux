@@ -426,7 +426,7 @@ fn win_path(rel: &Path) -> Result<WinPath, ArchiveError> {
 
 /// Opens the archive read-only without following a symlink, and checks it is the regular file `size` bytes long
 /// that was verified (the same inode that `lstat` saw).
-fn open_archive(file: &Path, size: u64) -> Result<File, ArchiveError> {
+pub(crate) fn open_archive(file: &Path, size: u64) -> Result<File, ArchiveError> {
     let bad = |why: &str| ArchiveError::BadPackage(format!("archive {}: {why}", file.display()));
     let before = fs::symlink_metadata(file)?;
     if !before.file_type().is_file() {

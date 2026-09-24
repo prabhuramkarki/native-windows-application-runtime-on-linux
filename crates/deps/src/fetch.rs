@@ -269,7 +269,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// True if `file` is a regular file of exactly `pkg.size` bytes hashing to `pkg.sha256`. Reads at most size+1.
-fn verify(file: File, pkg: &Package) -> io::Result<bool> {
+pub(crate) fn verify(file: File, pkg: &Package) -> io::Result<bool> {
     // Defensive: a FIFO (the only special file we can meet without root) already fails by reading EOF at once.
     if !file.metadata()?.file_type().is_file() {
         return Ok(false);
