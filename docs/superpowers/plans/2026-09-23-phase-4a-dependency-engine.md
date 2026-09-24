@@ -88,7 +88,7 @@ pub struct Package {
     pub requires: Vec<String>, pub provides: Vec<String>, pub install: Install,
 }
 pub enum Install {
-    Archive { extract: Vec<Extract>, dll_overrides: Vec<String> },
+    Archive { format: ArchiveFormat /* Zip | TarGz; no zstd */, extract: Vec<Extract>, dll_overrides: Vec<String> },
     Installer { silent_args: Vec<String>, marker: Marker },
 }
 pub struct Extract { pub from: String, pub to: String }
@@ -196,7 +196,7 @@ and in `rt_deps::state`: `pub fn installed_set(md: &Metadata) -> InstalledSet;`,
 - Create: `crates/deps/src/install_archive.rs`, `crates/deps/src/install_archive/tests.rs`
 
 **Interfaces:**
-- Consumes: `Package` with `Install::Archive`, a verified cache file path (Task 3), `AppEnv` (`env.drive_c()`, `env.prefix()`), `rt_core::unzip` (`open`, `extract`, `Limits`), `rt_core::{resolve_under, join_new, WinPath}`.
+- Consumes: `Package` with `Install::Archive`, a verified cache file path (Task 3), `AppEnv` (`env.drive_c()`, `env.prefix()`), `rt_core::unzip` (`open`, `extract`, `Limits`) for `format = "zip"`, a NEW small hand-rolled bounded tar reader over the `flate2` gzip decoder for `format = "tar.gz"` (Ruling 5: caps on entry count, name length, per-file and total bytes; refuse symlinks, hardlinks, devices, absolute or `..` names; no zstd), `rt_core::{resolve_under, join_new, WinPath}`.
 - Produces:
 ```rust
 pub struct ArchiveInstalled { pub files: Vec<PathBuf> /* drive_c-relative, exactly what was written */, pub overrides: Vec<String> }
@@ -207,7 +207,7 @@ pub fn remove_archive(installed: &ArchiveInstalled, env: &AppEnv) -> Result<(), 
 DLL overrides are written by running the backend's registry helper (or writing `user.reg` through a bounded, tested writer if the backend has none); pick and document one approach in the task.
 
 - [ ] **Step 1: Write failing tests (real zip files built in the test):** happy path extracts only declared `from`->`to` pairs under `drive_c` and records exact paths; path traversal (`../x`), absolute names, backslash tricks, and symlink entries write nothing outside (RF-5); zip bomb over `Limits` rejected before writing (RF-5); an entry not listed in `extract` is ignored; a DLL override for a name not in `provides` is refused (RF-5); failure halfway (second entry corrupt) removes what this package already wrote and records nothing (RF-3); two prefixes, same cache file: independent results, removing from one leaves the other (RF-2); a cache file is never modified.
-- [ ] **Step 2:** Run; confirm failing. **Step 3:** Implement on top of `unzip::open`/`extract` with an extraction limit set derived from the manifest `size`; resolve every destination with `join_new` under `drive_c`; track every created path for rollback/removal. **Step 4:** Mutation-check containment, provides-filter and rollback. **Step 5:** commit `feat(deps): archive package installer`.
+- [ ] **Step 2:** Run; confirm failing. **Step 3:** Implement on top of `unzip::open`/`extract` (zip) and the bounded tar.gz reader (tests for the tar reader: traversal, absolute names, symlink/hardlink/device entries, oversized headers, truncated archive, gzip bomb, name over cap, all must extract nothing) with an extraction limit set derived from the manifest `size`; resolve every destination with `join_new` under `drive_c`; track every created path for rollback/removal. **Step 4:** Mutation-check containment, provides-filter and rollback. **Step 5:** commit `feat(deps): archive package installer`.
 
 **Exit:** archive installs are contained, reversible and exactly tracked.
 
