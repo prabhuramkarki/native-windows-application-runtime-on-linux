@@ -1991,12 +1991,18 @@ fn hold_deps_lock(r: &Rig, id: &str) -> rt_deps::AppLock {
 
 /// Installs `hello64.exe` with its `msvcrt.dll` import renamed to `d3d11.dll`: the bundled manifest plans DXVK.
 fn install_d3d11(r: &Rig) -> (String, Output) {
+    install_patched(r, b"msvcrt.dll\0", b"d3d11.dll\0\0")
+}
+
+/// Installs `hello64.exe` with the import `from` renamed to `to` (same length, NUL terminated).
+fn install_patched(r: &Rig, from: &[u8], to: &[u8]) -> (String, Output) {
+    assert_eq!(from.len(), to.len());
     let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
     let at = bytes
-        .windows(11)
-        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
-        .expect("msvcrt.dll import");
-    bytes[at..at + 10].copy_from_slice(b"d3d11.dll\0");
+        .windows(from.len())
+        .position(|w| w.eq_ignore_ascii_case(from))
+        .expect("import");
+    bytes[at..at + to.len()].copy_from_slice(to);
     let p = r.input("game.exe", &bytes);
     let out = r.rt(&[OsString::from("install"), p.into_os_string()]);
     assert_ok(&out);
@@ -2023,9 +2029,10 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     );
     let d = r.rt(&["doctor", &id]);
     assert!(s(&d.stderr).contains(&hint), "{}", s(&d.stderr));
+    // `run` stays cheap: no hint, so the executable is never read for one.
     let run = r.rt(&["run", &id]);
     assert_ok(&run);
-    assert!(s(&run.stderr).contains(&hint), "{}", s(&run.stderr));
+    assert!(!s(&run.stderr).contains("hint:"), "{}", s(&run.stderr));
     let list = r.rt(&["deps", "list"]);
     assert_ok(&list);
     assert!(s(&list.stdout).contains("vcrun2022 14.40.33810 (proprietary-redistributable, needs consent)"));
@@ -2106,4 +2113,67 @@ fn deps_cache_lists_and_clears_only_completed_downloads() {
     );
     assert!(!dir.join(&hex).exists());
     assert!(dir.join(".tmp-1-0-00000000").exists() && dir.join("cd".repeat(32)).is_symlink());
+}
+
+/// hello64.exe with `KERNEL32.dll` renamed to `msvcp140.dll`: the bundled manifest plans the consent-gated vcrun2022.
+fn install_msvcp140(r: &Rig) -> String {
+    install_patched(r, b"KERNEL32.dll\0", b"msvcp140.dll\0").0
+}
+
+#[test]
+fn deps_install_without_a_terminal_never_consents_even_when_stdin_says_yes() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    // A file where the download cache belongs: a fetch fails on it before any network access (the fetcher checks
+    // the cache directory first), so this test can never download, and the file shows whether one was tried.
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+    let mut child = r
+        .cmd()
+        .args(["deps", &id, "--install"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    }
+    let o = child.wait_with_output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}\n{}", s(&o.stderr));
+    assert!(
+        out.contains("vcrun2022 14.40.33810 (proprietary-redistributable): to install, needs your consent"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Package: vcrun2022\nVersion: 14.40.33810\nLicence: proprietary-redistributable\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("No consent: vcrun2022 is skipped (no terminal to ask on"),
+        "{out}"
+    );
+    assert!(!out.contains("[y/N]") && !out.contains("download failed"), "{out}");
+    assert!(out.contains("skipped:   vcrun2022: "), "{out}");
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
+}
+
+#[test]
+fn deps_discard_of_an_installer_package_does_not_claim_a_clean_prefix() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    let o = r.rt(&["deps", &id, "--discard-interrupted", "vcrun2022"]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(!out.contains("Nothing to discard"), "{out}");
+    assert!(
+        out.contains("installer package") && out.contains("no journal") && out.contains("recreate the environment"),
+        "{out}"
+    );
 }

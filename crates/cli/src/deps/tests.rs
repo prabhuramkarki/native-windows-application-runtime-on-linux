@@ -473,7 +473,10 @@ fn report_exit_codes_and_the_ruling_texts() {
         ("Nothing to install.\n".into(), 0),
         "nothing to do"
     );
-    assert_eq!(format_report(&ok(vec![("b".into(), ALREADY.into())])).1, 0);
+    assert_eq!(
+        format_report(&ok(vec![("b".into(), rt_deps::ALREADY_INSTALLED.into())])).1,
+        0
+    );
     let upgrade = "version 1.0 is installed; upgrading installed packages is not supported yet: recreate the \
                    environment to get version 2.0";
     let (text, code) = format_report(&ok(vec![("b".into(), upgrade.into())]));
@@ -569,6 +572,17 @@ fn the_hint_is_one_line_and_only_when_something_is_missing() {
     assert!(text.starts_with("installed: gated\n"), "{text}");
     let md = r.store.read_metadata(&r.env).unwrap();
     assert_eq!(missing_hint(&r.env, &md, &r.manifest), None);
+    // A second --install finds everything there: full success, not "skipped".
+    let (text, code) = r.install(
+        &rt_deps::plan_for_app(&r.env, &md, &r.manifest),
+        &FakeFetcher::default(),
+        &consent(&[], &Shared::default(), None),
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.ends_with("0 installed, 0 failed, 0 skipped, 3 already installed\n"),
+        "{text}"
+    );
 }
 
 // ------------------------------------------------------------------------------------------------ cache
@@ -666,8 +680,49 @@ fn lock_or_refuse_refuses_while_held_and_names_the_command() {
     );
     drop(s);
     assert!(lock_or_refuse(&r.env, false, "remove").unwrap().is_some());
-    // An unusable lock file is a warning, not a refusal.
+    // An unusable lock file (a directory, a symlink) is a warning, not a refusal: nobody can lock it.
     let r = three();
     fs::create_dir(r.env.root().join(rt_deps::LOCK_FILE)).unwrap();
+    for shared in [true, false] {
+        assert!(lock_or_refuse(&r.env, shared, "x").unwrap().is_none());
+    }
+    let r = three();
+    symlink("/nonexistent", r.env.root().join(rt_deps::LOCK_FILE)).unwrap();
     assert!(lock_or_refuse(&r.env, false, "remove").unwrap().is_none());
+    // Any other failure (here: the lock file cannot be created) refuses, for starting and for removing.
+    let r = three();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    let got: Vec<_> = [true, false]
+        .map(|shared| lock_or_refuse(&r.env, shared, "remove").map(|l| l.is_some()))
+        .into_iter()
+        .collect();
+    fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o700)).unwrap();
+    for g in got {
+        let e = g.unwrap_err().to_string();
+        assert!(e.starts_with("cannot remove app: "), "{e}");
+    }
+}
+
+#[test]
+fn only_a_terminal_on_both_ends_is_asked() {
+    assert!(can_ask(true, true));
+    assert!(!can_ask(true, false), "a prompt the user cannot see");
+    assert!(!can_ask(false, true));
+    assert!(!can_ask(false, false));
+}
+
+#[test]
+fn the_rest_of_an_over_long_answer_is_never_the_next_answer() {
+    let (p, _) = archive("gated", true, &[], &[]);
+    let out = Shared::default();
+    let long: &'static str = Box::leak(format!("{}y\nn\ny\n", "x".repeat(300)).into_boxed_str());
+    let c = consent(&[], &out, Some(long));
+    assert!(!c.confirm(&p, "T"), "an over-long line is no");
+    assert!(!c.confirm(&p, "T"), "its tail \"y\" became the next answer");
+    assert!(c.confirm(&p, "T"), "the line after is read as it is");
+    // An over-long "yes" is no too, and one without a newline at EOF.
+    let long_yes: &'static str = Box::leak(format!("yes{}\n", " ".repeat(300)).into_boxed_str());
+    assert!(!consent(&[], &Shared::default(), Some(long_yes)).confirm(&p, "T"));
+    assert!(consent(&[], &Shared::default(), Some("y")).confirm(&p, "T"));
 }

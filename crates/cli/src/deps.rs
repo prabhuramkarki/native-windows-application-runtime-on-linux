@@ -1,15 +1,16 @@
 //! `runtime deps <app> [--install [--yes <pkg>]...] [--discard-interrupted <pkg>]`, `runtime deps list`,
-//! `runtime deps cache [--clear]`, and the one-line missing-dependency hint `install`, `run` and `doctor` print.
+//! `runtime deps cache [--clear]`, and the one-line missing-dependency hint `install` and `doctor` print
+//! (not `run`: it would read the whole executable on every start).
 //!
 //! * `runtime deps <app>` prints the plan: no network, no writes.
 //! * `--install` fetches and installs it through `rt_deps::install_plan`, behind consent: a consent-gated package
-//!   shows its consent text in full, then asks y/N on a terminal. Without a terminal only `--yes <pkg>` consents
-//!   (the text is still printed). Every `--yes` must name a package the plan installs and that needs consent,
+//!   shows its consent text in full, then asks y/N when stdin AND stdout are terminals. Otherwise only
+//!   `--yes <pkg>` consents (the text is still printed). Every `--yes` must name a package the plan installs and that needs consent,
 //!   checked before anything else happens.
 //! * A package you do not consent to is skipped together with everything that needs it; the packages IT needs
 //!   still install ([`DENIED_NOTE`], spec §4).
-//! * The hint ([`missing_hint`]) is computed with `plan_for_app` only. It takes no `Fetcher`, so `install`, `run`
-//!   and `doctor` cannot download anything through it.
+//! * The hint ([`missing_hint`], [`hint_for`]) is computed with `plan_for_app` / `plan_for_pe` only (doctor
+//!   reuses the PE it already analysed). It takes no `Fetcher`, so neither command can download through it.
 //!
 //! Formatting is pure (`format_*` return strings, tested as such); every untrusted string goes through `safe`.
 //! Exit codes: 0 when everything planned is installed (or nothing was to do); 1 when anything failed or was
@@ -19,8 +20,8 @@ use crate::safe::{safe, safe_lines, shorten, warn};
 use clap::{Args, Subcommand};
 use rt_core::{AppEnv, AppId, Launcher, Metadata, Store, StoreError};
 use rt_deps::{
-    Action, AppLock, AppPlan, ConsentProvider, ConsentState, DepsError, Manifest, NetFetcher, Orchestrator, Package,
-    Plan, RunReport,
+    Action, AppLock, AppPlan, ConsentProvider, ConsentState, DepsError, Kind, Manifest, NetFetcher, Orchestrator,
+    Package, Plan, RunReport,
 };
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -31,9 +32,8 @@ use std::path::{Path, PathBuf};
 /// Printed with every plan that asks for consent (Task 7a minor: documented spec-literal behaviour).
 pub(crate) const DENIED_NOTE: &str = "note: a package you do not consent to is skipped together with everything \
                                       that needs it; the packages it needs itself still install";
-/// The report reason `rt_deps` gives a package that was already there (the only skip that is not a failure).
-const ALREADY: &str = "already installed";
-/// Longest answer read from the terminal.
+use rt_deps::ALREADY_INSTALLED as ALREADY;
+/// Longest answer read from the terminal; the rest of a longer line is read and dropped (the answer is no).
 const MAX_ANSWER: u64 = 256;
 
 #[derive(Args)]
@@ -99,6 +99,10 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     let store = crate::store()?;
     let env = app_env(&store, app)?;
     if let Some(pkg) = discard {
+        if Manifest::bundled().get(pkg).is_some_and(|p| p.kind == Kind::Installer) {
+            crate::emit(&installer_discard_text(pkg))?;
+            return Ok(0);
+        }
         let report = rt_deps::discard_interrupted_for(&store, &env, pkg).map_err(|e| discard_error(e, pkg))?;
         crate::emit(&format_discard(pkg, &report))?;
         return Ok(0);
@@ -115,7 +119,8 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     let backend = crate::backend(&launcher)?;
     let cache = cache_dir()?;
     let stdin = io::stdin();
-    let answers: Option<Box<dyn BufRead>> = stdin.is_terminal().then(|| Box::new(stdin.lock()) as Box<dyn BufRead>);
+    let answers: Option<Box<dyn BufRead>> =
+        can_ask(stdin.is_terminal(), io::stdout().is_terminal()).then(|| Box::new(stdin.lock()) as Box<dyn BufRead>);
     let consent = CliConsent::new(yes, Box::new(io::stdout()), answers);
     let o = Orchestrator {
         manifest,
@@ -156,6 +161,20 @@ pub(crate) fn check_yes(plan: &Plan, yes: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Installer packages keep no journal: there is nothing to discard, and nothing is known about the prefix either.
+fn installer_discard_text(pkg: &str) -> String {
+    format!(
+        "{} is an installer package: installer packages keep no journal, so the runtime has nothing to discard. \
+         What an interrupted vendor installer left in the prefix is unknown; recreate the environment if in doubt.\n",
+        safe(pkg)
+    )
+}
+
+/// Only a terminal on both ends is asked: the user must see the prompt they answer.
+pub(crate) fn can_ask(stdin_tty: bool, stdout_tty: bool) -> bool {
+    stdin_tty && stdout_tty
 }
 
 fn discard_error(e: DepsError, pkg: &str) -> String {
@@ -221,10 +240,20 @@ impl ConsentProvider for CliConsent<'_> {
         {
             return false;
         }
-        let mut line = String::new();
+        let mut line = Vec::new();
         let mut input = answers.borrow_mut();
-        let read = (&mut *input).take(MAX_ANSWER).read_line(&mut line);
-        let yes = matches!(read, Ok(n) if n > 0) && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        let read = (&mut *input).take(MAX_ANSWER).read_until(b'\n', &mut line);
+        // An over-long line: drop the rest of it, so it cannot become the next answer (and it is a no).
+        let whole = line.ends_with(b"\n") || matches!(read, Ok(n) if (n as u64) < MAX_ANSWER);
+        if !whole {
+            let _ = input.skip_until(b'\n');
+        }
+        let yes = whole
+            && matches!(read, Ok(n) if n > 0)
+            && matches!(
+                String::from_utf8_lossy(&line).trim().to_ascii_lowercase().as_str(),
+                "y" | "yes"
+            );
         if !yes {
             let _ = writeln!(out, "No consent: {id} is skipped.");
         }
@@ -429,19 +458,19 @@ fn cache(dir: &Path, clear: bool) -> Result<u8, CmdError> {
 /// One line when the app's plan has packages that are not installed: computed with `plan_for_app` only (reads
 /// the metadata and the executable; no network, no writes, no `Fetcher`).
 pub(crate) fn missing_hint(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> Option<String> {
-    let n = rt_deps::plan_for_app(env, md, manifest)
+    hint_for(env.id().as_str(), &rt_deps::plan_for_app(env, md, manifest))
+}
+
+/// The hint line for `app`'s plan (see [`missing_hint`]).
+pub(crate) fn hint_for(app: &str, plan: &AppPlan) -> Option<String> {
+    let n = plan
         .plan
         .entries
         .iter()
         .filter(|e| e.action != Action::AlreadyInstalled)
         .count();
     let noun = if n == 1 { "dependency" } else { "dependencies" };
-    (n > 0).then(|| {
-        format!(
-            "hint: {n} {noun} missing: run `runtime deps {}`",
-            safe(env.id().as_str())
-        )
-    })
+    (n > 0).then(|| format!("hint: {n} {noun} missing: run `runtime deps {}`", safe(app)))
 }
 
 /// Best effort: prints [`missing_hint`] for an installed app on stderr (stdout may belong to a program).
@@ -464,11 +493,12 @@ pub(crate) fn lock_or_refuse(env: &AppEnv, shared: bool, what: &str) -> Result<O
     };
     match got {
         Ok(lock) => Ok(Some(lock)),
-        Err(e @ DepsError::LockHeld) => Err(format!("cannot {what} {}: {e}", env.id()).into()),
-        Err(e) => {
+        // Nobody can lock such a file, so no dependency install can be running either.
+        Err(e @ DepsError::LockFileUnusable(_)) => {
             warn(&format!("could not take this app's lock ({e}); continuing without it"));
             Ok(None)
         }
+        Err(e) => Err(format!("cannot {what} {}: {e}", env.id()).into()),
     }
 }
 

@@ -80,9 +80,8 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     } else {
         render(&report)
     })?;
-    // Read-only like the rest: `plan_for_app` reads the metadata and the executable, nothing else.
-    if let Some((store, Target::Installed(id))) = &found {
-        crate::deps::print_hint(store, id);
+    if let Some(h) = &facts.hint {
+        eprintln!("{h}");
     }
     Ok(u8::from(report.verdict == Verdict::Fail))
 }
@@ -106,6 +105,8 @@ struct Facts {
     /// Installed apps only: [`backend_wine::check_app_home`], the check `run` makes, as text.
     app_home: Option<Result<(), String>>,
     prefix_root: Option<PathBuf>,
+    /// Installed apps only: the missing-dependency hint, planned from the PE facts above (no second read).
+    hint: Option<String>,
 }
 
 impl Facts {
@@ -118,6 +119,7 @@ impl Facts {
             prefix: PrefixState::NotApplicable,
             app_home: None,
             prefix_root: None,
+            hint: None,
         }
     }
 
@@ -134,20 +136,30 @@ impl Facts {
     fn app(store: &Store, id: &AppId) -> Facts {
         let env = store.get(id).ok();
         match rt_core::resolve_program(store, id, backend_wine::BACKEND_ID) {
-            Ok(p) => Facts {
-                subject: Subject::App {
-                    id: id.to_string(),
-                    name: Some(p.metadata.name.clone()),
-                    version: p.metadata.version.clone(),
-                },
-                pe: read_pe(&p.exe),
-                program: Some(Ok(p.metadata.executable.clone())),
-                // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
-                app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
-                prefix: prefix_state(&p.env.prefix()),
-                app_home: Some(home_state(&p.env)),
-                prefix_root: Some(p.env.prefix()),
-            },
+            Ok(p) => {
+                let pe = read_pe(&p.exe);
+                let exe = match &pe {
+                    Pe::Analysed(info) => Ok(info.as_ref()),
+                    Pe::Unreadable(why) => Err(why.as_str()),
+                    Pe::Skipped | Pe::Archive => Err("not a PE file"),
+                };
+                let plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled());
+                Facts {
+                    subject: Subject::App {
+                        id: id.to_string(),
+                        name: Some(p.metadata.name.clone()),
+                        version: p.metadata.version.clone(),
+                    },
+                    hint: crate::deps::hint_for(id.as_str(), &plan),
+                    pe,
+                    program: Some(Ok(p.metadata.executable.clone())),
+                    // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
+                    app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
+                    prefix: prefix_state(&p.env.prefix()),
+                    app_home: Some(home_state(&p.env)),
+                    prefix_root: Some(p.env.prefix()),
+                }
+            }
             // The program cannot be used, and that is the report: the name and the prefix are still shown.
             Err(e) => {
                 let md = env.as_ref().and_then(|env| store.read_metadata(env).ok());
