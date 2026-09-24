@@ -20,7 +20,8 @@
 //!      `state::forget` drops the consent with the record. It is kept as the spec's rule for when upgrades land.
 //! 4. The plan is resolved once more with the denied and refused ids, so they and everything that needs them are
 //!    `Blocked` (and reported as skipped, a refused upgrade with its own reason) and nothing is downloaded for
-//!    them.
+//!    them. What a denied package itself NEEDS still installs (spec §4: only the denied package and its dependents
+//!    are blocked).
 //! 5. Packages install in plan order: busy re-check, fetch, install, then record (read, `state::record`, atomic
 //!    write) after EACH success. The first failure stops the run; the rest are skipped.
 //!
@@ -76,7 +77,9 @@ impl Fetcher for NetFetcher {
 
 /// Asks the user (or a fixed `--yes` list) whether a consent-gated package may be downloaded and installed.
 pub trait ConsentProvider {
-    /// `consent_text` is exactly what must be shown; a `true` is recorded against its hash.
+    /// Returns `true` ONLY after `consent_text` was displayed to the user verbatim and in full (a `--yes` list
+    /// still prints it), because the `true` is recorded against the text's hash as the licence the user accepted.
+    /// If the text could not be shown (e.g. the write failed), the answer is `false`.
     fn confirm(&self, pkg: &Package, consent_text: &str) -> bool;
 }
 
@@ -123,7 +126,11 @@ pub struct RunReport {
 /// Run-level refusals; package failures are in the [`RunReport`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum DepsError {
-    #[error("another dependency install is running for this app; wait for it to finish")]
+    /// Held exclusively by a dependency install, `remove` or `uninstall`, or shared by an app being started.
+    #[error(
+        "another runtime command is using this app (a dependency install, a removal, or an app being started); \
+         wait for it to finish, then try again"
+    )]
     LockHeld,
     #[error(
         "a Wine program is running in this app's prefix (wineserver pid {pids:?}); close the app first, then \
@@ -268,8 +275,18 @@ impl Drop for AppLock {
 }
 
 /// Takes `<app root>/deps.lock` exclusively without waiting. The file is created 0600 and never followed if it
-/// is a symlink.
+/// is a symlink; the fd is close-on-exec, so no child (a Wine program, an installer) inherits the lock.
 pub fn lock_app(env: &AppEnv) -> Result<AppLock, DepsError> {
+    lock_app_as(env, libc::LOCK_EX)
+}
+
+/// [`lock_app`] in shared mode: any number of shared holders (apps being started) at once, but never alongside an
+/// exclusive holder (a dependency install or a removal).
+pub fn lock_app_shared(env: &AppEnv) -> Result<AppLock, DepsError> {
+    lock_app_as(env, libc::LOCK_SH)
+}
+
+fn lock_app_as(env: &AppEnv, mode: libc::c_int) -> Result<AppLock, DepsError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -281,7 +298,7 @@ pub fn lock_app(env: &AppEnv) -> Result<AppLock, DepsError> {
         return Err(io::Error::other(format!("{LOCK_FILE} is not a regular file")).into());
     }
     // SAFETY: flock on a file descriptor we own; no memory is passed.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
         let e = io::Error::last_os_error();
         return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
             DepsError::LockHeld
@@ -544,7 +561,7 @@ fn install_one(
     let warnings = match pkg.kind {
         Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
             .map(|_| Vec::new())
-            .map_err(archive_reason)?,
+            .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?,
         Kind::Installer => install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher)
             .map(|done| {
                 let mut w = done.warnings;
@@ -581,11 +598,12 @@ fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Re
     o.store.write_metadata(o.env, &md).map_err(|e| e.to_string())
 }
 
-fn archive_reason(e: ArchiveError) -> String {
+fn archive_reason(e: ArchiveError, app: &str, pkg: &str) -> String {
     match e {
         ArchiveError::Journal(_) => format!(
             "{e}; nothing was installed. If this package is not recorded as installed, an earlier install of it \
-             was interrupted: discard what that left (discard_interrupted) and install again"
+             was interrupted: discard what that left with `runtime deps {app} --discard-interrupted {pkg}`, then \
+             install again"
         ),
         other => other.to_string(),
     }
