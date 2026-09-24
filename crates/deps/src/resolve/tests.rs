@@ -215,7 +215,9 @@ fn denied_blocks_it_and_its_dependents_only() {
 }
 
 #[test]
-fn installed_dependent_of_denied_package_is_blocked() {
+fn installed_dependent_of_denied_package_stays_installed() {
+    // dxvk denied and not installed: blocked. vkd3d-proton installed exactly: nothing to download, so it stays
+    // AlreadyInstalled rather than being blocked by something below it.
     let m = Manifest::bundled();
     let vk = m.get("vkd3d-proton").unwrap();
     let plan = resolve(
@@ -225,7 +227,83 @@ fn installed_dependent_of_denied_package_is_blocked() {
         m,
     );
     assert_eq!(ids(&plan), ["dxvk", "vkd3d-proton"]);
-    assert!(plan.entries.iter().all(|e| matches!(e.action, Action::Blocked { .. })));
+    assert!(matches!(plan.entries[0].action, Action::Blocked { .. }));
+    assert_eq!(plan.entries[0].consent, ConsentState::Denied);
+    assert_eq!(
+        plan.entries[1],
+        entry("vkd3d-proton", Action::AlreadyInstalled, ConsentState::NotNeeded)
+    );
+
+    // Same denial, dependent not installed: its would-be Install is blocked.
+    let plan = resolve(&imports(&["d3d12"]), &none(), &["dxvk".into()], m);
+    assert!(matches!(plan.entries[1].action, Action::Blocked { .. }));
+}
+
+#[test]
+fn denied_but_installed_is_already_installed() {
+    let m = Manifest::bundled();
+    let vc = m.get("vcrun2022").unwrap();
+    let plan = resolve(
+        &imports(&["vcruntime140.dll"]),
+        &InstalledSet(vec![installed_ref(vc)]),
+        &["vcrun2022".into()],
+        m,
+    );
+    assert_eq!(
+        plan.entries,
+        [entry("vcrun2022", Action::AlreadyInstalled, ConsentState::NotNeeded)]
+    );
+
+    // A broken graph stays blocked even when installed.
+    let hand = manifest(vec![pkg("c", &["ghost"], &["c"], false)]);
+    let plan = resolve(
+        &caps(&["c"]),
+        &InstalledSet(vec![installed_ref(&hand.packages[0])]),
+        &[],
+        &hand,
+    );
+    assert!(matches!(plan.entries[0].action, Action::Blocked { .. }), "{plan:?}");
+    let hand = manifest(vec![pkg("a", &["b"], &["a"], false), pkg("b", &["a"], &[], false)]);
+    let all = InstalledSet(hand.packages.iter().map(installed_ref).collect());
+    let plan = resolve(&caps(&["a"]), &all, &[], &hand);
+    assert!(
+        plan.entries.iter().all(|e| matches!(e.action, Action::Blocked { .. })),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn unsatisfied_capabilities_are_reported() {
+    let m = Manifest::bundled();
+    let plan = resolve(&imports(&["MSCOREE.dll", "d3d11.dll"]), &none(), &[], m);
+    assert_eq!(plan.unsatisfied, ["dotnet"]);
+    assert_eq!(ids(&plan), ["dxvk"]);
+    assert!(
+        resolve(&imports(&["d3d11.dll"]), &none(), &[], m)
+            .unsatisfied
+            .is_empty()
+    );
+    assert!(
+        resolve(&imports(&["kernel32.dll"]), &none(), &[], m)
+            .unsatisfied
+            .is_empty()
+    );
+
+    // Extras count too; sorted, deduped, clipped, deterministic.
+    let long = "z".repeat(10_000);
+    let facts = Facts {
+        imports: vec!["mscoree".into()],
+        extra_capabilities: vec!["zzz".into(), "aaa".into(), "zzz".into(), long.clone(), "d3d9".into()],
+    };
+    let plan = resolve(&facts, &none(), &[], m);
+    assert_eq!(plan.unsatisfied[..3], ["aaa", "dotnet", "zzz"]);
+    assert_eq!(plan.unsatisfied.len(), 4);
+    assert!(plan.unsatisfied[3].len() < 100);
+    assert_eq!(plan, resolve(&facts, &none(), &[], m));
+
+    // Two long names that differ only past the clip point collapse to one entry.
+    let facts = caps(&[&format!("{long}a"), &format!("{long}b")]);
+    assert_eq!(resolve(&facts, &none(), &[], m).unsatisfied.len(), 1);
 }
 
 #[test]
@@ -420,6 +498,7 @@ fn random_facts_keep_plan_invariants() {
         assert_eq!(plan, resolve(&facts, &installed, &denied, m), "round {round}");
 
         let mut placed = HashSet::new();
+        let mut blocked = HashSet::new();
         for e in &plan.entries {
             let p = m
                 .get(&e.package)
@@ -432,12 +511,36 @@ fn random_facts_keep_plan_invariants() {
                 );
             }
             assert!(placed.insert(e.package.as_str()), "round {round}: {} twice", e.package);
+            // Reference model over the acyclic bundled graph, checked in both directions.
+            let exact = installed.0.contains(&installed_ref(p));
             let is_denied = denied.contains(&e.package);
-            assert_eq!(e.consent == ConsentState::Denied, is_denied, "round {round}: {e:?}");
-            if is_denied || p.requires.iter().any(|r| denied.contains(r)) {
-                assert!(matches!(e.action, Action::Blocked { .. }), "round {round}: {e:?}");
+            let dep_blocked = p.requires.iter().any(|r| blocked.contains(r.as_str()));
+            let (blocks, consent) = if exact {
+                (false, ConsentState::NotNeeded)
+            } else if is_denied {
+                (true, ConsentState::Denied)
+            } else if p.requires_consent {
+                (dep_blocked, ConsentState::Needed)
+            } else {
+                (dep_blocked, ConsentState::NotNeeded)
+            };
+            assert_eq!(e.action == Action::AlreadyInstalled, exact, "round {round}: {e:?}");
+            assert_eq!(
+                matches!(e.action, Action::Blocked { .. }),
+                blocks,
+                "round {round}: {e:?}"
+            );
+            assert_eq!(e.consent, consent, "round {round}: {e:?}");
+            if blocks {
+                blocked.insert(e.package.as_str());
             }
         }
+        let mut unsatisfied: Vec<String> = required_capabilities(&facts)
+            .into_iter()
+            .filter(|c| !m.packages.iter().any(|p| p.provides.contains(c)))
+            .collect();
+        unsatisfied.dedup();
+        assert_eq!(plan.unsatisfied, unsatisfied, "round {round}");
         // Every capability the facts need, if some package provides it, is covered by a plan entry.
         for cap in required_capabilities(&facts) {
             if let Some(p) = m.packages.iter().find(|p| p.provides.contains(&cap)) {

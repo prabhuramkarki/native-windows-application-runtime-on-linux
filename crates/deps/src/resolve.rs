@@ -1,5 +1,8 @@
 //! The pure resolver: what an app needs (facts), what the runtime recorded as installed, and which consents were
 //! denied, turned into an ordered install plan. No I/O, no globals, no clock.
+//!
+//! The plan is architecture-agnostic: it names packages, not per-architecture files. Known limitation: DXVK
+//! extraction is currently x64-only (the manifest's `extract` lists), so a 32-bit app gets a 64-bit DXVK.
 
 use crate::capabilities::capability_for;
 use crate::manifest::{Manifest, Package, clip};
@@ -9,7 +12,8 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 /// What the runtime knows about an app.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Facts {
-    /// Imported DLL names as found in the PE (any case, with or without `.dll`).
+    /// Imported DLL names as found in the PE (any case, with or without `.dll`). The caller includes delay-load
+    /// imports too: missing a real need is worse than a harmless extra plan entry (e.g. an unused DXVK).
     pub imports: Vec<String>,
     /// Capabilities known from elsewhere (installer family, MSI facts), as manifest `provides` names.
     pub extra_capabilities: Vec<String>,
@@ -26,6 +30,7 @@ pub struct InstalledRef {
     pub sha256: String,
 }
 
+/// Consent to download a package. Meaningless on a `Blocked` entry: callers (Task 7) must not prompt for those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentState {
     NotNeeded,
@@ -40,6 +45,7 @@ pub enum Action {
     Blocked { reason: String },
 }
 
+/// One package in the plan. `consent` only matters when `action` is `Install`; see [`ConsentState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanEntry {
     pub package: String,
@@ -51,6 +57,9 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
     pub entries: Vec<PlanEntry>,
+    /// Required capabilities that no manifest package provides (sorted, deduplicated, clipped), so callers can
+    /// say something is missing instead of reporting an empty plan as "nothing needed".
+    pub unsatisfied: Vec<String>,
 }
 
 /// Capabilities the app needs: its imports mapped through the capability table, plus `extra_capabilities`. Sorted
@@ -69,8 +78,10 @@ pub fn required_capabilities(facts: &Facts) -> Vec<String> {
 ///
 /// Each package appears once, after all of its requirements; ties are broken by id, so the plan does not depend on
 /// input or manifest order. A package counts as installed only if `installed` has its exact id, version and
-/// sha256. A `denied` package is blocked, and so is everything that requires a blocked package. Robust against a
-/// hand-built (unvalidated) manifest: unknown requirements and cycles block the packages involved.
+/// sha256; an installed package is `AlreadyInstalled` (consent `NotNeeded`) even if denied or if something below
+/// it is blocked, since consent only gates downloads. A package that would otherwise be installed is blocked if it
+/// is denied or requires a blocked package. Robust against a hand-built (unvalidated) manifest: unknown
+/// requirements and cycles block the packages involved, ahead of the installed check.
 pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manifest: &Manifest) -> Plan {
     // id -> package (first wins on a duplicate id, as in `Manifest::get`); capability -> smallest providing id.
     let mut index: HashMap<&str, &Package> = HashMap::with_capacity(manifest.packages.len());
@@ -86,10 +97,18 @@ pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manif
     }
 
     // Transitive closure of the providers, iteratively.
-    let mut stack: Vec<&str> = required_capabilities(facts)
+    let required = required_capabilities(facts);
+    let mut stack: Vec<&str> = required
         .iter()
         .filter_map(|c| provider.get(c.as_str()).copied())
         .collect();
+    // `required` is sorted; clipping can only merge neighbours, so dedup after it keeps the result sorted-unique.
+    let mut unsatisfied: Vec<String> = required
+        .iter()
+        .filter(|c| !provider.contains_key(c.as_str()))
+        .map(|c| clip(c))
+        .collect();
+    unsatisfied.dedup();
     let mut wanted: HashSet<&str> = HashSet::new();
     while let Some(id) = stack.pop() {
         if let Some(p) = index.get(id)
@@ -153,25 +172,29 @@ pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manif
             let blocked_by = |why: &str, other: &str| Action::Blocked {
                 reason: format!("{why} {:?}", clip(other)),
             };
-            let action = if denied.contains(id) {
-                blocked_by("consent denied for", id)
-            } else if i >= acyclic {
+            // A broken graph stays blocked; otherwise an exact installed match wins, since consent and blocking
+            // only gate downloads.
+            let action = if i >= acyclic {
                 blocked_by("dependency cycle through", id)
             } else if let Some(r) = p.requires.iter().find(|r| !index.contains_key(r.as_str())) {
                 blocked_by("requires unknown package", r)
-            } else if let Some(r) = p.requires.iter().find(|r| blocked.contains(r.as_str())) {
-                blocked_by("requires blocked package", r)
             } else if installed.contains(&(id, p.version.as_str(), p.sha256.as_str())) {
                 Action::AlreadyInstalled
+            } else if denied.contains(id) {
+                blocked_by("consent denied for", id)
+            } else if let Some(r) = p.requires.iter().find(|r| blocked.contains(r.as_str())) {
+                blocked_by("requires blocked package", r)
             } else {
                 Action::Install
             };
             if matches!(action, Action::Blocked { .. }) {
                 blocked.insert(id);
             }
-            let consent = if denied.contains(id) {
+            let consent = if action == Action::AlreadyInstalled {
+                ConsentState::NotNeeded
+            } else if denied.contains(id) {
                 ConsentState::Denied
-            } else if p.requires_consent && action != Action::AlreadyInstalled {
+            } else if p.requires_consent {
                 ConsentState::Needed
             } else {
                 ConsentState::NotNeeded
@@ -183,7 +206,7 @@ pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manif
             }
         })
         .collect();
-    Plan { entries }
+    Plan { entries, unsatisfied }
 }
 
 #[cfg(test)]
