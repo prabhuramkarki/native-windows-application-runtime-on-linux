@@ -245,7 +245,11 @@ impl Env {
     }
 
     fn backup(&self, id: &str, rel: &str) -> PathBuf {
-        self.env.root().join(BACKUP_DIR).join(id).join(rel)
+        self.env.root().join(BACKUP_DIR).join(id).join("c").join(rel)
+    }
+
+    fn journal(&self) -> PathBuf {
+        self.env.root().join(BACKUP_DIR).join("dxvk").join("journal")
     }
 
     fn snapshot(&self) -> BTreeMap<String, String> {
@@ -398,9 +402,10 @@ fn declared_files_are_extracted_and_exactly_recorded() {
             ]
         );
         assert!(
-            !e.env.root().join(BACKUP_DIR).exists(),
+            !e.env.root().join(BACKUP_DIR).join("dxvk/c").exists(),
             "no backup without a replaced file"
         );
+        assert!(e.journal().is_file(), "the journal stays until the package is removed");
     }
 }
 
@@ -913,7 +918,7 @@ fn an_existing_file_is_replaced_backed_up_and_restored_by_remove() {
         let backup = e.backup("dxvk", "windows/system32/d3d11.dll");
         assert_eq!(fs::read(&backup).unwrap(), b"WINE BUILTIN");
         assert_eq!(mode_of(&backup), 0o600);
-        for d in ["", "/dxvk", "/dxvk/windows", "/dxvk/windows/system32"] {
+        for d in ["", "/dxvk", "/dxvk/c", "/dxvk/c/windows", "/dxvk/c/windows/system32"] {
             let dir = PathBuf::from(format!("{}{d}", e.env.root().join(BACKUP_DIR).display()));
             assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
         }
@@ -1694,4 +1699,213 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
         eprintln!("{format:?}: removed; exports64 absent from user.reg");
         backend.stop(&env).unwrap();
     }
+}
+
+// ------------------------------------------------------------------------------------------------ interrupted installs
+
+/// Runs `install` and simulates SIGKILL after `steps` steps (a panic that skips every rollback): 0 = right after the
+/// journal was created, n = right after the n-th file was written.
+fn crash_install(e: &Env, p: Package, file: &Path, steps: u32) {
+    CRASH_AFTER.with(|c| c.set(Some(steps)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| install(e, p, file)));
+    CRASH_AFTER.with(|c| c.set(None));
+    assert!(r.is_err(), "the simulated crash did not happen (step {steps})");
+}
+
+/// An original `d3d11.dll` (replaced first), two new files below a new directory tree, and an original `dxgi.dll`
+/// that is replaced last.
+fn interrupted_fixture(format: ArchiveFormat) -> (Env, Package, PathBuf, BTreeMap<String, String>) {
+    let e = Env::new();
+    put(&e.c("windows/system32/d3d11.dll"), b"ORIGINAL D3D11");
+    put(&e.c("windows/system32/dxgi.dll"), b"ORIGINAL DXGI");
+    let before = e.snapshot();
+    let file = e.archive(
+        "a",
+        &files_in(
+            format,
+            &[
+                ("x/d3d11.dll", b"PKG D3D11"),
+                ("x/new/a.dll", b"PKG A"),
+                ("x/new/sub/b.dll", b"PKG B"),
+                ("x/zz/dxgi.dll", b"PKG DXGI"),
+            ],
+        ),
+    );
+    let p = pkg(
+        format,
+        &[
+            ("x/d3d11.dll", "windows/system32/d3d11.dll"),
+            ("x/new/", "newdir/deep"),
+            ("x/zz/dxgi.dll", "windows/system32/dxgi.dll"),
+        ],
+    );
+    (e, p, file, before)
+}
+
+#[test]
+fn a_retry_after_a_killed_install_tracks_the_killed_runs_files_as_its_own() {
+    for format in FORMATS {
+        for steps in 0..=4 {
+            let (e, p, file, before) = interrupted_fixture(format);
+            crash_install(&e, p.clone(), &file, steps);
+            assert!(
+                e.journal().is_file(),
+                "{format:?} {steps}: the journal is written before the first file"
+            );
+            let done = install(&e, p, &file).unwrap_or_else(|err| panic!("{format:?} {steps}: {err}"));
+            let what = format!("{format:?} crash after {steps}");
+            assert_eq!(
+                done.replaced,
+                paths(&["windows/system32/d3d11.dll", "windows/system32/dxgi.dll"]),
+                "{what}: only the genuine originals are replaced"
+            );
+            let mut files = done.files.clone();
+            files.sort();
+            assert_eq!(
+                files,
+                paths(&[
+                    "newdir/deep/a.dll",
+                    "newdir/deep/sub/b.dll",
+                    "windows/system32/d3d11.dll",
+                    "windows/system32/dxgi.dll"
+                ]),
+                "{what}"
+            );
+            let mut dirs = done.created_dirs.clone();
+            dirs.sort();
+            assert_eq!(dirs, paths(&["newdir", "newdir/deep", "newdir/deep/sub"]), "{what}");
+            assert_eq!(
+                fs::read(e.backup("dxvk", "windows/system32/d3d11.dll")).unwrap(),
+                b"ORIGINAL D3D11"
+            );
+            assert_eq!(
+                fs::read(e.backup("dxvk", "windows/system32/dxgi.dll")).unwrap(),
+                b"ORIGINAL DXGI"
+            );
+            remove(&e, &done).unwrap();
+            // Everything the killed run and the retry did is gone: files, directories, backups and the journal.
+            assert_untouched(&e, &before, &what);
+        }
+    }
+}
+
+#[test]
+fn a_failed_retry_after_a_killed_install_rolls_back_the_killed_runs_work_too() {
+    for format in FORMATS {
+        for steps in [0, 2, 3] {
+            let (e, mut p, file, before) = interrupted_fixture(format);
+            crash_install(&e, p.clone(), &file, steps);
+            if let Install::Archive { dll_overrides, .. } = &mut p.install {
+                dll_overrides.push("d3d11".into());
+            }
+            let err = install_with(&e, p, &file, &FakeBackend::with_script("exit 1")).unwrap_err();
+            assert!(matches!(err, ArchiveError::Registry(_)), "{err:?}");
+            assert_untouched(&e, &before, &format!("{format:?} crash after {steps}, failed retry"));
+        }
+    }
+    // A retry that fails BEFORE it rewrites the killed run's files (a truncated archive) still removes them.
+    for format in FORMATS {
+        let (e, p, file, before) = interrupted_fixture(format);
+        crash_install(&e, p.clone(), &file, 3);
+        let bytes = fs::read(&file).unwrap();
+        let truncated = e.archive("truncated", &bytes[..bytes.len() - 20]);
+        let err = install(&e, p, &truncated).unwrap_err();
+        assert!(matches!(err, ArchiveError::Zip(_) | ArchiveError::Tar(_)), "{err:?}");
+        assert_untouched(&e, &before, &format!("{format:?} truncated retry"));
+    }
+}
+
+#[test]
+fn a_file_that_existed_before_without_a_journal_entry_is_a_genuine_original() {
+    // The reviewer's case without a journal: a file nobody recorded is backed up, restored and kept.
+    let e = Env::new();
+    put(&e.c("windows/system32/newdep.dll"), b"SOMEONE ELSE'S");
+    let before = e.snapshot();
+    let file = e.archive("a", &files_in(ArchiveFormat::TarGz, &[("newdep.dll", b"PKG")]));
+    let done = install(
+        &e,
+        pkg(ArchiveFormat::TarGz, &[("newdep.dll", "windows/system32/newdep.dll")]),
+        &file,
+    )
+    .unwrap();
+    assert_eq!(done.replaced, paths(&["windows/system32/newdep.dll"]));
+    remove(&e, &done).unwrap();
+    assert_untouched(&e, &before, "genuine original");
+}
+
+#[test]
+fn a_torn_last_journal_line_is_dropped() {
+    let (e, p, file, _) = interrupted_fixture(ArchiveFormat::Zip);
+    fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+    fs::write(e.journal(), format!("rt-deps-journal 1 {HASH}\nF newdir/deep/a.d")).unwrap();
+    install(&e, p, &file).unwrap();
+}
+
+#[test]
+fn a_bad_journal_is_a_typed_error_and_nothing_is_written() {
+    let header = format!("rt-deps-journal 1 {HASH}\n");
+    let other = format!("rt-deps-journal 1 {}\n", "f".repeat(64));
+    let huge = header.clone() + &"F a\n".repeat(2 << 20);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("garbage", b"hello\n".to_vec()),
+        ("empty", vec![]),
+        ("torn header", header.trim_end().as_bytes().to_vec()),
+        ("other archive", other.into_bytes()),
+        ("unknown kind", format!("{header}X a.dll\n").into_bytes()),
+        ("traversal", format!("{header}F ../../victim\n").into_bytes()),
+        ("absolute", format!("{header}F /etc/passwd\n").into_bytes()),
+        ("reserved", format!("{header}D con\n").into_bytes()),
+        ("empty path", format!("{header}F \n").into_bytes()),
+        ("not utf-8", [header.as_bytes(), b"F \xff\n"].concat()),
+        ("oversized", huge.into_bytes()),
+        (
+            "oversized but otherwise valid",
+            (header.clone() + &format!("F {}\n", "a".repeat(255)).repeat(16384)).into_bytes(),
+        ),
+        (
+            "too many entries",
+            (header.clone() + &"F a\n".repeat(16385)).into_bytes(),
+        ),
+    ];
+    for (what, bytes) in cases {
+        let (e, p, file, _) = interrupted_fixture(ArchiveFormat::Zip);
+        fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+        fs::write(e.journal(), &bytes).unwrap();
+        let before = e.snapshot();
+        let err = install(&e, p, &file).unwrap_err();
+        assert!(matches!(err, ArchiveError::Journal(_)), "{what}: {err:?}");
+        assert_untouched(&e, &before, what);
+    }
+    for what in ["symlink", "directory"] {
+        let (e, p, file, _) = interrupted_fixture(ArchiveFormat::Zip);
+        fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+        let real = e.tmp.path().join("real-journal");
+        fs::write(&real, &header).unwrap();
+        if what == "symlink" {
+            symlink(&real, e.journal()).unwrap();
+        } else {
+            fs::create_dir(e.journal()).unwrap();
+        }
+        let before = e.snapshot();
+        let err = install(&e, p, &file).unwrap_err();
+        assert!(matches!(err, ArchiveError::Journal(_)), "{what}: {err:?}");
+        assert_untouched(&e, &before, what);
+    }
+}
+
+#[test]
+fn an_r_entry_whose_backup_was_never_made_is_skipped_by_rollback() {
+    // Killed between the `R` line and the backup's rename: the original is still in place, nothing to restore.
+    let (e, p, file, before) = interrupted_fixture(ArchiveFormat::Zip);
+    fs::create_dir_all(e.journal().parent().unwrap()).unwrap();
+    fs::write(
+        e.journal(),
+        format!("rt-deps-journal 1 {HASH}\nR windows/system32/dxgi.dll\n"),
+    )
+    .unwrap();
+    let bytes = fs::read(&file).unwrap();
+    let truncated = e.archive("truncated", &bytes[..bytes.len() - 20]);
+    let err = install(&e, p, &truncated).unwrap_err();
+    assert!(matches!(err, ArchiveError::Zip(_)), "not a rollback failure: {err:?}");
+    assert_untouched(&e, &before, "R without backup");
 }
