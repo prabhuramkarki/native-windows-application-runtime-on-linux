@@ -52,9 +52,18 @@ pub fn forget(md: &mut Metadata, id: &str) -> bool {
     md.dependencies.len() != before
 }
 
-/// The consent recorded for `id`, if the package is recorded and consent was given.
-pub fn consent_of<'a>(md: &'a Metadata, id: &str) -> Option<&'a ConsentRecord> {
-    md.dependencies.iter().find(|d| d.id == id)?.consent.as_ref()
+/// The consent recorded for `id` at exactly `version` (consent is per package and per version, spec §4). `None`
+/// if the package is not recorded, was recorded at a different version, or was recorded without consent.
+///
+/// Caller obligation (Task 7): a `Some` is not enough to skip the prompt. The caller must ALSO compare
+/// `licence_text_sha256` with the hash of the licence text it is about to show; consent to different licence text
+/// is not consent.
+pub fn consent_of<'a>(md: &'a Metadata, id: &str, version: &str) -> Option<&'a ConsentRecord> {
+    md.dependencies
+        .iter()
+        .find(|d| d.id == id && d.version == version)?
+        .consent
+        .as_ref()
 }
 
 #[cfg(test)]

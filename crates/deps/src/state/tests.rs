@@ -37,7 +37,7 @@ fn ids(md: &Metadata) -> Vec<&str> {
 fn empty_metadata_has_nothing_installed_and_no_consent() {
     let m = md();
     assert_eq!(installed_set(&m), InstalledSet::default());
-    assert_eq!(consent_of(&m, "vcrun2022"), None);
+    assert_eq!(consent_of(&m, "vcrun2022", "14.40"), None);
     let mut m = m;
     assert!(!forget(&mut m, "vcrun2022"));
 }
@@ -92,8 +92,8 @@ fn record_replaces_an_entry_with_the_same_id() {
     record(&mut m, newer.clone()).unwrap();
     assert_eq!(ids(&m), ["a", "b"]);
     assert_eq!(m.dependencies[0], newer);
-    assert_eq!(consent_of(&m, "a").unwrap().given_at, 5);
-    assert_eq!(consent_of(&m, "b"), None);
+    assert_eq!(consent_of(&m, "a", "2").unwrap().given_at, 5);
+    assert_eq!(consent_of(&m, "b", "1"), None);
     m.validate().unwrap();
 }
 
@@ -130,4 +130,25 @@ fn forget_removes_only_that_id() {
     assert_eq!(ids(&m), ["a", "c"]);
     assert!(!forget(&mut m, "b"));
     assert_eq!(ids(&m), ["a", "c"]);
+}
+
+#[test]
+fn consent_is_per_package_and_per_version() {
+    let mut m = md();
+    let mut vc = rec("vcrun2022", "14.40");
+    vc.consent = Some(ConsentRecord {
+        given_at: 7,
+        licence_text_sha256: HASH_B.into(),
+    });
+    record(&mut m, vc).unwrap();
+    record(&mut m, rec("dxvk", "2.4")).unwrap();
+    assert_eq!(consent_of(&m, "vcrun2022", "14.40").unwrap().given_at, 7);
+    assert_eq!(
+        consent_of(&m, "vcrun2022", "14.42"),
+        None,
+        "old consent must not cover a new version"
+    );
+    assert_eq!(consent_of(&m, "vcrun2022", "14.4"), None, "exact match, not a prefix");
+    assert_eq!(consent_of(&m, "missing", "14.40"), None);
+    assert_eq!(consent_of(&m, "dxvk", "2.4"), None, "recorded without consent");
 }
