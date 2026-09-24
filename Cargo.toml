@@ -20,6 +20,9 @@ libc = "0.2"
 # chosen explicitly through the direct `flate2` dependency (runtime-core enables feature `rust_backend`).
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+sha2 = { version = "0.11", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 # Zip tests inflate/deflate hundreds of MiB; unoptimised miniz_oxide would take minutes.
 [profile.dev.package.miniz_oxide]

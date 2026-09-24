@@ -1,0 +1,22 @@
+[package]
+name = "runtime-deps"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rt_deps"
+
+[dependencies]
+runtime-core = { path = "../core" }
+runtime-pe = { path = "../pe" }
+runtime-installer = { path = "../installer" }
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
