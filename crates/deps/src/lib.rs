@@ -2,4 +2,4 @@
 
 pub mod manifest;
 
-pub use manifest::{Extract, Install, Kind, Manifest, ManifestError, Marker, Package};
+pub use manifest::{ArchiveFormat, Extract, Install, Kind, Manifest, ManifestError, Marker, Package};

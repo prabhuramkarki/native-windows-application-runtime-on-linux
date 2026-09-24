@@ -19,6 +19,7 @@ requires_consent = false
 requires = {requires:?}
 provides = {provides:?}
 [package.install]
+format = "zip"
 extract = [{{ from = "x64/{id}.dll", to = "windows/system32/{id}.dll" }}]
 dll_overrides = []
 "#
@@ -68,6 +69,7 @@ fn valid_manifest_parses() {
     assert_eq!(
         base.install,
         Install::Archive {
+            format: ArchiveFormat::Zip,
             extract: vec![Extract {
                 from: "x64/base.dll".into(),
                 to: "windows/system32/base.dll".into()
@@ -239,7 +241,8 @@ fn malformed_urls_rejected() {
         "https://example.org:8443/a?b=c#d",
         "https://a.example.org/x/y.zip",
     ] {
-        Manifest::parse(&valid_with("https://example.org/base.zip", url)).unwrap();
+        // On the installer, which has no archive-extension rule.
+        Manifest::parse(&valid_with("https://download.example.com/vc_redist.x64.exe", url)).unwrap();
     }
 }
 
@@ -367,6 +370,9 @@ fn kind_install_mismatch_rejected() {
         // Installer with archive fields.
         (marker, format!("{marker}\ndll_overrides = []")),
         (marker, format!("{marker}\nextract = [{{ from = \"a\", to = \"b\" }}]")),
+        // Archive without format, installer with one.
+        ("format = \"zip\"\n", String::new()),
+        (marker, format!("{marker}\nformat = \"zip\"")),
     ] {
         let e = err(&valid_with(from, &to));
         assert!(matches!(e, ManifestError::BadInstall { .. }), "{to:?}: {e:?}");
@@ -523,6 +529,16 @@ fn bundled_manifest_invariants() {
         for r in &p.requires {
             assert!(m.get(r).is_some(), "{} requires unknown {r}", p.id);
         }
+        if let Install::Archive { format, .. } = p.install {
+            let ext = match format {
+                ArchiveFormat::Zip => ".zip",
+                ArchiveFormat::TarGz => ".tar.gz",
+            };
+            assert!(p.url.ends_with(ext), "{}", p.id);
+        }
+        if p.licence == PROPRIETARY {
+            assert!(p.requires_consent, "{}", p.id);
+        }
     }
 }
 
@@ -584,4 +600,120 @@ fn mutated_manifests_never_panic() {
     }
     // Some mutations (inside comments or benign value changes) must still pass, others must fail.
     assert!(accepted > 0 && accepted < 10_000, "accepted {accepted}");
+}
+
+#[test]
+fn proprietary_licence_needs_consent() {
+    // `valid()`'s installer is proprietary with consent: accepted.
+    Manifest::parse(&valid()).unwrap();
+    // Permissive without consent: accepted (the archive in `valid()`).
+    assert!(!Manifest::parse(&valid()).unwrap().get("base").unwrap().requires_consent);
+    let text = valid_with("requires_consent = true", "requires_consent = false");
+    assert!(matches!(err(&text), ManifestError::BadConsent(id) if id == "vcrun"));
+}
+
+#[test]
+fn licence_charset_restricted() {
+    for l in ["MIT OR Apache-2.0", "(MIT OR Apache-2.0)", "LGPL-2.1+", "Zlib"] {
+        Manifest::parse(&valid_with("licence = \"Zlib\"", &format!("licence = \"{l}\""))).unwrap();
+    }
+    for l in ["MIT; rm", "MIT/BSD", "<b>MIT</b>", "MIT\\u00e9", "MIT_1", "'MIT'"] {
+        let e = err(&valid_with("licence = \"Zlib\"", &format!("licence = \"{l}\"")));
+        assert!(matches!(e, ManifestError::BadLicence { .. }), "{l:?}: {e:?}");
+    }
+}
+
+#[test]
+fn archive_format_parsed_and_checked() {
+    let text = valid_with("format = \"zip\"", "format = \"tar.gz\"").replacen(
+        "example.org/base.zip",
+        "example.org/base.tar.gz",
+        1,
+    );
+    let m = Manifest::parse(&text).unwrap();
+    assert!(matches!(
+        m.get("base").unwrap().install,
+        Install::Archive {
+            format: ArchiveFormat::TarGz,
+            ..
+        }
+    ));
+    let tgz = text.replacen("base.tar.gz", "base.TGZ?x=1#y", 1);
+    Manifest::parse(&tgz).unwrap();
+    Manifest::parse(&valid_with("base.zip", "base.zip?v=1")).unwrap();
+
+    for f in ["tar.zst", "ZIP", "tar", "", "7z"] {
+        let e = err(&valid_with("format = \"zip\"", &format!("format = \"{f}\"")));
+        assert!(matches!(e, ManifestError::UnsupportedFormat { .. }), "{f:?}: {e:?}");
+    }
+    // Url extension disagreeing with the format.
+    for (fmt, url) in [
+        ("zip", "https://example.org/base.tar.gz"),
+        ("zip", "https://example.org/base"),
+        ("zip", "https://example.org/base.zip.exe"),
+        ("zip", "https://example.org/x?f=base.zip"),
+        ("tar.gz", "https://example.org/base.zip"),
+        ("tar.gz", "https://example.org/base.tar.zst"),
+        ("tar.gz", "https://example.org/base.gz"),
+    ] {
+        let text = valid_with("format = \"zip\"", &format!("format = \"{fmt}\"")).replacen(
+            "https://example.org/base.zip",
+            url,
+            1,
+        );
+        let e = err(&text);
+        assert!(matches!(e, ManifestError::FormatMismatch { .. }), "{fmt} {url}: {e:?}");
+    }
+}
+
+/// An archive package extracting to each of `to`.
+fn archive_to(id: &str, to: &[&str]) -> String {
+    let extract: Vec<String> = to.iter().map(|t| format!("{{ from = \"f\", to = \"{t}\" }}")).collect();
+    archive(id, &[], &[&format!("{id}-cap")]).replacen(
+        &format!("extract = [{{ from = \"x64/{id}.dll\", to = \"windows/system32/{id}.dll\" }}]"),
+        &format!("extract = [{}]", extract.join(",")),
+        1,
+    )
+}
+
+#[test]
+fn duplicate_destinations_rejected() {
+    let dup = |text: &str| matches!(err(text), ManifestError::DuplicateDestination { .. });
+    assert!(dup(&archive_to("a", &["w/x.dll", "w/x.dll"])), "same package");
+    assert!(
+        dup(&(archive_to("a", &["w/x.dll"]) + &archive_to("b", &["w/x.dll"]))),
+        "cross package"
+    );
+    assert!(
+        dup(&(archive_to("a", &["Windows/X.dll"]) + &archive_to("b", &["windows/x.DLL"]))),
+        "case only"
+    );
+    // Extract target vs installer marker (valid()'s marker is windows/system32/vcruntime140.dll).
+    let text = valid() + &archive_to("c", &["WINDOWS/system32/vcruntime140.dll"]);
+    assert!(dup(&text), "extract vs marker");
+}
+
+#[test]
+fn overlapping_destinations_rejected() {
+    let overlap = |text: &str| matches!(err(text), ManifestError::OverlappingDestination { .. });
+    assert!(overlap(&archive_to("a", &["w", "w/x.dll"])), "file then child");
+    assert!(
+        overlap(&archive_to("a", &["w/x.dll", "W"])),
+        "child then ancestor, case-folded"
+    );
+    assert!(
+        overlap(&(archive_to("a", &["w/s/x.dll"]) + &archive_to("b", &["w/s"]))),
+        "cross package"
+    );
+    assert!(
+        overlap(&(archive_to("a", &["w/s"]) + &archive_to("b", &["w/S/x.dll"]))),
+        "cross package, reversed"
+    );
+}
+
+#[test]
+fn distinct_destinations_accepted() {
+    let text = archive_to("a", &["w/s/x.dll", "w/s/y.dll", "w/sx", "w/s.dll"])
+        + &archive_to("b", &["w/s/xy.dll", "w/x.dll", "ws/x.dll"]);
+    assert_eq!(Manifest::parse(&text).unwrap().packages.len(), 2);
 }
