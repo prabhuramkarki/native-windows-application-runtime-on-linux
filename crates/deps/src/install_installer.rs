@@ -36,7 +36,10 @@
 //!    [`InstallerPkgError::MarkerMissing`] (an installer that "succeeds" without its marker FAILED). Non-zero and
 //!    no marker: [`InstallerPkgError::NonZeroAndNoMarker`].
 //! 8. The staged copy (and its now-empty directories) is removed best-effort on every path, success or failure;
-//!    [`InstallerPkgInstalled::staged_removed`] reports it on success.
+//!    [`InstallerPkgInstalled::staged_removed`] reports it on success. The staging path is resolved AGAIN (no
+//!    symlink anywhere) right before each removal: the installer may have swapped part of it for a symlink to a
+//!    host directory, and cleanup must never follow that out of the prefix. What cannot be removed safely is left
+//!    in place, with a warning.
 //!
 //! **Registry markers.** `HKLM\...` is looked up in `<prefix>/system.reg`, `HKCU\...` in `<prefix>/user.reg`
 //! (Wine's text format, parsed by [`rt_installer::read_reg_file`] with its size, line and key bounds). Keys and
@@ -131,7 +134,8 @@ pub struct InstallerPkgInstalled {
     pub marker_confirmed: bool,
     /// E.g. a non-zero exit code that still produced the marker.
     pub warnings: Vec<String>,
-    /// The staged installer copy was removed (best effort; `false` leaves a scratch file in `windows\temp`).
+    /// The staged installer copy was removed (best effort; `false` leaves it, or whatever replaced it, in
+    /// `windows\temp`, and a warning says why).
     pub staged_removed: bool,
 }
 
@@ -179,10 +183,11 @@ fn install_with(
     let name = format!("{}.{}", pkg.id, if msi { "msi" } else { "exe" });
     remove_stale_stage(&drive_c, &format!("{dir}\\{name}")).map_err(|e| stage_err(&e))?;
     let winpath = stage_file(env, &dir, &name, &mut src).map_err(|e| stage_err(&e))?;
-    let mut staged = Staged(resolve_under(&drive_c, &winpath).ok());
-    let Some(staged_unix) = staged.0.clone() else {
-        return Err(InstallerPkgError::Stage("the staged copy cannot be found again".into()));
+    let mut staged = Staged {
+        drive_c: drive_c.clone(),
+        winpath: Some(winpath.clone()),
     };
+    let staged_unix = resolve_under(&drive_c, &winpath).map_err(|e| stage_err(&e))?;
     verify_staged(&staged_unix, pkg)?;
 
     if marker_present(env, marker)? {
@@ -215,20 +220,25 @@ fn install_with(
     };
 
     let present = marker_present(env, marker)?;
-    let staged_removed = staged.remove();
+    let removed = staged.remove();
     match (status.success(), present) {
-        (ok, true) => Ok(InstallerPkgInstalled {
-            marker_confirmed: true,
-            warnings: if ok {
-                Vec::new()
-            } else {
-                vec![format!(
+        (ok, true) => {
+            let mut warnings = Vec::new();
+            if !ok {
+                warnings.push(format!(
                     "the installer exited with {status} but its marker is present; treated as installed (some \
                      installers exit non-zero on success)"
-                )]
-            },
-            staged_removed,
-        }),
+                ));
+            }
+            if let Err(why) = &removed {
+                warnings.push(format!("the staged installer copy was not removed: {why}"));
+            }
+            Ok(InstallerPkgInstalled {
+                marker_confirmed: true,
+                warnings,
+                staged_removed: removed.is_ok(),
+            })
+        }
         (true, false) => Err(InstallerPkgError::MarkerMissing),
         (false, false) => Err(InstallerPkgError::NonZeroAndNoMarker { code: status.code() }),
     }
@@ -335,24 +345,52 @@ fn remove_stale_stage(drive_c: &Path, winpath: &str) -> Result<(), String> {
 }
 
 /// The staged copy, removed (with its package and `rt-deps` directories, when empty) when dropped.
-struct Staged(Option<PathBuf>);
+///
+/// Only the `WinPath` is kept, never a host path resolved earlier: the installer ran in between with the prefix
+/// bound read-write at its host path, so it may have replaced any part of the staging path with a symlink to a
+/// host directory. Every removal resolves again with [`resolve_under`] (which refuses a symlink anywhere on the
+/// way) right before it acts, and removes only what that re-resolution shows is a regular file (or, for the
+/// parents, a real directory). Anything else is left alone and reported. The installer is no longer running when
+/// this happens (the run returned, or its sandbox was killed).
+struct Staged {
+    drive_c: PathBuf,
+    winpath: Option<WinPath>,
+}
 
 impl Staged {
-    /// Removes the copy now; `true` if it is gone.
-    fn remove(&mut self) -> bool {
-        let Some(p) = self.0.take() else { return true };
-        let gone = fs::remove_file(&p).is_ok() || fs::symlink_metadata(&p).is_err();
-        // Only succeeds on an empty directory: never removes anything else.
-        for dir in p.ancestors().skip(1).take(2) {
-            let _ = fs::remove_dir(dir);
+    /// Removes the copy now; `Err` says why it (or something that replaced it) was left in place.
+    fn remove(&mut self) -> Result<(), String> {
+        let Some(wp) = self.winpath.take() else {
+            return Ok(());
+        };
+        match resolve_under(&self.drive_c, &wp) {
+            Err(ResolveError::NotFound) => {}
+            Err(e) => return Err(format!("{wp} cannot be resolved safely ({e})")),
+            // `resolve_under` only returns a regular file or a directory, and `remove_file` refuses a directory.
+            Ok(p) => fs::remove_file(&p).map_err(|e| format!("{wp}: {}", bounded(&e)))?,
         }
-        gone
+        // The `<id>` and `rt-deps` directories, each re-resolved; `remove_dir` only removes an empty directory.
+        let comps = wp.components();
+        for n in [comps.len() - 1, comps.len() - 2] {
+            let Ok(dir) = WinPath::parse(&format!("C:\\{}", comps[..n].join("\\"))) else {
+                break;
+            };
+            match resolve_under(&self.drive_c, &dir) {
+                Ok(p) if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_dir()) => {
+                    if fs::remove_dir(&p).is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        self.remove();
+        let _ = self.remove();
     }
 }
 

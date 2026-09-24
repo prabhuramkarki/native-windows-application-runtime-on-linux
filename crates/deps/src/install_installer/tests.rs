@@ -840,7 +840,7 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
 /// Task 1 review I-3: is the bundled placeholder vcrun2022 marker already in a FRESH prefix? Prints the finding.
 #[test]
 #[ignore = "needs Wine"]
-fn e2e_real_wine_fresh_prefix_bundled_vcrun_marker() {
+fn probe_real_wine_fresh_prefix_bundled_vcrun_marker() {
     use backend_wine::WineBackend;
     let launcher = Launcher::new();
     let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
@@ -887,4 +887,68 @@ fn a_hive_with_more_keys_than_are_read_is_an_error_when_the_marker_is_not_among_
     fs::write(tmp.path().join("system.reg"), text).unwrap();
     let err = registry_marker_present(tmp.path(), "HKLM\\Software\\Missing", "V").unwrap_err();
     assert!(matches!(err, InstallerPkgError::Registry(_)), "{err:?}");
+}
+
+// ------------------------------------------------------------------------------------------------ hostile cleanup
+
+/// The installer (hostile, prefix bound read-write at its host path) swaps part of the staging path for something
+/// else before it exits. Cleanup must never follow it out of the prefix, and says it could not clean up.
+fn hostile_swap(swap: &str, host_layout: &[&str]) {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let host = f.tmp.path().join("host");
+    for rel in host_layout {
+        let p = host.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "host file").unwrap();
+    }
+    fs::create_dir_all(&host).unwrap();
+    let script = format!("{MAKE_MARKER}; {}", swap.replace("HOST", host.to_str().unwrap()));
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    let got = run_with(&f, &p, &backend(&script), &bwrap).unwrap();
+    assert!(got.marker_confirmed, "the result still reflects the marker");
+    assert!(!got.staged_removed, "{got:?}");
+    assert!(
+        got.warnings.iter().any(|w| w.contains("staged")),
+        "no warning: {:?}",
+        got.warnings
+    );
+    for rel in host_layout {
+        assert_eq!(
+            fs::read_to_string(host.join(rel)).unwrap(),
+            "host file",
+            "{rel} outside the prefix was touched"
+        );
+    }
+}
+
+#[test]
+fn cleanup_never_follows_a_symlink_the_installer_put_at_the_staging_dir() {
+    hostile_swap(
+        "rm -rf windows/temp/rt-deps/testpkg; ln -s HOST windows/temp/rt-deps/testpkg",
+        &["testpkg.exe"],
+    );
+}
+
+#[test]
+fn cleanup_never_follows_a_symlink_the_installer_put_at_an_ancestor() {
+    hostile_swap(
+        "mv windows/temp windows/temp.real; ln -s HOST windows/temp",
+        &["rt-deps/testpkg/testpkg.exe"],
+    );
+}
+
+#[test]
+fn cleanup_leaves_a_directory_the_installer_put_at_the_staged_path() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let script = format!(
+        "{MAKE_MARKER}; rm -f windows/temp/rt-deps/testpkg/testpkg.exe; mkdir windows/temp/rt-deps/testpkg/testpkg.exe"
+    );
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    let got = run_with(&f, &p, &backend(&script), &bwrap).unwrap();
+    assert!(got.marker_confirmed);
+    assert!(!got.staged_removed);
+    assert!(got.warnings.iter().any(|w| w.contains("staged")), "{:?}", got.warnings);
+    assert!(f.c("windows/temp/rt-deps/testpkg/testpkg.exe").is_dir());
 }
