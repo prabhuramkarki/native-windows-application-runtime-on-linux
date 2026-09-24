@@ -265,6 +265,11 @@ pub(crate) fn clip(s: &str) -> String {
     format!("{}...", &s[..end])
 }
 
+/// Exactly 64 lowercase hex characters (also guards `fetch`, which uses it as a file name).
+pub(crate) fn valid_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// `[a-z0-9][a-z0-9._-]{0,63}`
 fn valid_id(s: &str) -> bool {
     let b = s.as_bytes();
@@ -318,7 +323,7 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
             reason,
         });
     }
-    if raw.sha256.len() != 64 || !raw.sha256.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if !valid_sha256(&raw.sha256) {
         return Err(ManifestError::BadHash {
             id,
             sha256: clip(&raw.sha256),

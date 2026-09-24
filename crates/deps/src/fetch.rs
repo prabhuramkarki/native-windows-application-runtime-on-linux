@@ -6,14 +6,15 @@
 //! against the declared size; only an exact size and hash match is made read-only and renamed to
 //! `cache/<sha256>`. Every other outcome removes the temp file.
 
-use crate::manifest::{Package, clip};
+use crate::manifest::{MAX_PACKAGE_SIZE, Package, clip, valid_sha256};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::Timeout as UTimeout;
 use ureq::tls::{RootCerts, TlsConfig};
 use ureq::unversioned::resolver::DefaultResolver;
@@ -33,11 +34,13 @@ const STALL: UTimeout = UTimeout::PerCall;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FetchOpts {
-    /// TCP connect plus TLS handshake (and DNS resolution).
+    /// Per connection: DNS resolution, and TCP connect plus the whole TLS handshake measured from the start of the
+    /// connection (an absolute deadline, so a handshake dribbled a byte at a time cannot extend it).
     pub connect_timeout: Duration,
-    /// Whole fetch, redirects and body included.
+    /// Absolute deadline for the whole fetch from the moment the request starts: every redirect hop, connect, TLS
+    /// handshake, headers and body.
     pub total_deadline: Duration,
-    /// Longest a single socket read or write may block.
+    /// Longest a single socket read or write may block (reported as `Stalled`).
     pub stall_timeout: Duration,
     /// Clamped to [`MAX_REDIRECTS`].
     pub max_redirects: u8,
@@ -56,6 +59,10 @@ impl Default for FetchOpts {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    /// The package's `sha256` is not 64 lowercase hex characters or its `size` is outside 1..=4 GiB (only possible
+    /// for a `Package` built without `manifest::parse`); nothing is touched.
+    #[error("package has an invalid sha256 or size")]
+    BadPackage,
     #[error("package url is not https")]
     NotHttps,
     #[error("too many redirects")]
@@ -109,6 +116,9 @@ pub(crate) fn fetch_with_roots(
 
 /// The cached copy of `pkg` if its size and hash still match; a corrupt entry is deleted. Never follows symlinks.
 pub fn cached(pkg: &Package, cache_dir: &Path) -> Option<PathBuf> {
+    if !valid_pkg(pkg) {
+        return None;
+    }
     check_cache_dir(cache_dir, false).ok()?;
     let path = cache_dir.join(&pkg.sha256);
     // O_NOFOLLOW: a symlink is never opened (nor deleted); O_NONBLOCK: a FIFO opens without blocking, then fails the
@@ -126,7 +136,15 @@ pub fn cached(pkg: &Package, cache_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `sha256` becomes a path component, so it must be exactly what the manifest validator allows.
+fn valid_pkg(pkg: &Package) -> bool {
+    valid_sha256(&pkg.sha256) && (1..=MAX_PACKAGE_SIZE).contains(&pkg.size)
+}
+
 fn fetch_inner(pkg: &Package, cache_dir: &Path, opts: &FetchOpts, roots: RootCerts) -> Result<PathBuf, FetchError> {
+    if !valid_pkg(pkg) {
+        return Err(FetchError::BadPackage);
+    }
     // Checked here so an http url never reaches the network stack at all.
     if !pkg.url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
         return Err(FetchError::NotHttps);
@@ -156,7 +174,7 @@ fn fetch_inner(pkg: &Package, cache_dir: &Path, opts: &FetchOpts, roots: RootCer
 
 /// Streams the response body into `out`, counting against `pkg.size` and hashing as it goes.
 fn download(pkg: &Package, opts: &FetchOpts, roots: RootCerts, out: &mut File) -> Result<(), FetchError> {
-    let agent = agent(opts, roots);
+    let agent = agent(opts, roots, Instant::now() + opts.total_deadline);
     let resp = agent.get(&pkg.url).call().map_err(map_err)?;
     let status = resp.status().as_u16();
     if status != 200 {
@@ -193,7 +211,7 @@ fn download(pkg: &Package, opts: &FetchOpts, roots: RootCerts, out: &mut File) -
 }
 
 /// ureq's defaults are unsafe (no https-only, no timeouts, env proxies): every relevant setting is explicit here.
-fn agent(opts: &FetchOpts, roots: RootCerts) -> ureq::Agent {
+fn agent(opts: &FetchOpts, roots: RootCerts, deadline: Instant) -> ureq::Agent {
     let tls = TlsConfig::builder().root_certs(roots).build();
     let config = ureq::Agent::config_builder()
         .https_only(true)
@@ -214,6 +232,8 @@ fn agent(opts: &FetchOpts, roots: RootCerts) -> ureq::Agent {
     // Our own chain: TCP, stall cap, TLS. No SOCKS or CONNECT-proxy connector exists in it at all.
     let connector = FetchConnector {
         stall: opts.stall_timeout,
+        connect: opts.connect_timeout,
+        deadline,
     };
     ureq::Agent::with_parts(config, connector, DefaultResolver::default())
 }
@@ -344,6 +364,9 @@ impl std::error::Error for TlsFailed {}
 #[derive(Debug)]
 struct FetchConnector {
     stall: Duration,
+    connect: Duration,
+    /// Absolute end of the whole fetch, shared by every redirect hop.
+    deadline: Instant,
 }
 
 impl Connector<()> for FetchConnector {
@@ -353,35 +376,64 @@ impl Connector<()> for FetchConnector {
         let Some(tcp) = Connector::<()>::connect(&TcpConnector::default(), details, None)? else {
             return Ok(None);
         };
+        let established = Arc::new(AtomicBool::new(false));
         let stalled = StallTransport {
             inner: tcp,
             limit: self.stall,
+            deadline: self.deadline,
+            connect_deadline: Instant::now() + self.connect,
+            established: established.clone(),
         };
         match RustlsConnector::default().connect(details, Some(stalled)) {
-            Ok(t) => Ok(t.map(|t| Box::new(t) as Box<dyn Transport>)),
+            Ok(t) => {
+                established.store(true, Ordering::SeqCst);
+                Ok(t.map(|t| Box::new(t) as Box<dyn Transport>))
+            }
             Err(e @ ureq::Error::Timeout(_)) => Err(e),
             Err(e) => Err(ureq::Error::Other(Box::new(TlsFailed(clip(&e.to_string()))))),
         }
     }
 }
 
-/// Caps every socket read and write at `limit`, so a peer that stops sending fails fast with [`STALL`].
+/// Caps every socket read and write at the tightest of: ureq's own timeout, the stall `limit` ([`STALL`]), the time
+/// left before the absolute fetch `deadline` and, until the TLS handshake is done, the connect deadline. ureq hands
+/// the TLS handshake one relative timeout reused for every read, so without the absolute deadlines a peer dribbling
+/// the handshake a byte at a time could stretch it without bound.
 #[derive(Debug)]
 struct StallTransport<T> {
     inner: T,
     limit: Duration,
+    deadline: Instant,
+    connect_deadline: Instant,
+    established: Arc<AtomicBool>,
 }
 
 impl<T: Transport> StallTransport<T> {
-    fn cap(&self, t: NextTimeout) -> NextTimeout {
-        if *t.after > self.limit {
-            NextTimeout {
-                after: time::Duration::Exact(self.limit),
-                reason: STALL,
-            }
+    fn cap(&self, t: NextTimeout) -> Result<NextTimeout, ureq::Error> {
+        let now = Instant::now();
+        let connect_left = if self.established.load(Ordering::SeqCst) {
+            Duration::MAX
         } else {
-            t
+            self.connect_deadline.saturating_duration_since(now)
+        };
+        let mut best = (*t.after, t.reason);
+        for c in [
+            (self.limit, STALL),
+            (self.deadline.saturating_duration_since(now), UTimeout::Global),
+            (connect_left, UTimeout::Connect),
+        ] {
+            if c.0 < best.0 {
+                best = c;
+            }
         }
+        if best.0.is_zero() {
+            // A zero timeout means "already expired", but ureq would turn it into a 1 s socket timeout.
+            return Err(ureq::Error::Timeout(best.1));
+        }
+        Ok(NextTimeout {
+            after: time::Duration::Exact(best.0),
+            reason: best.1,
+        })
     }
 }
 
@@ -391,12 +443,12 @@ impl<T: Transport> Transport for StallTransport<T> {
     }
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
-        let t = self.cap(timeout);
+        let t = self.cap(timeout)?;
         self.inner.transmit_output(amount, t)
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        let t = self.cap(timeout);
+        let t = self.cap(timeout)?;
         self.inner.await_input(t)
     }
 

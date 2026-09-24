@@ -1,4 +1,4 @@
-use super::testserver::{Recorder, Reply, Server, honest};
+use super::testserver::{Dribble, Recorder, Reply, Server, honest};
 use super::*;
 use crate::manifest::{ArchiveFormat, Install, Kind};
 use std::os::unix::fs::symlink;
@@ -271,6 +271,86 @@ fn slow_headers_are_stalled() {
         Err(FetchError::Stalled)
     ));
     assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+}
+
+/// I-1: ureq gives the TLS handshake one relative timeout reused per read, so a handshake dribbled a byte at a
+/// time (each read well inside the stall timeout) must still end at the absolute total deadline.
+#[test]
+fn dribbled_handshake_is_bounded_by_total_deadline() {
+    let data = body(10);
+    let s = Server::start(vec![("/f", honest(&data))]);
+    let d = Dribble::start(s.port, Duration::from_millis(20));
+    let e = env();
+    let o = FetchOpts {
+        connect_timeout: Duration::from_secs(10),
+        total_deadline: Duration::from_secs(1),
+        ..opts()
+    };
+    let p = pkg_for(format!("https://127.0.0.1:{}/f", d.port), &data);
+    let t = Instant::now();
+    assert!(matches!(get_with(&s, &e, &p, &o), Err(FetchError::Timeout)));
+    assert!(t.elapsed() < Duration::from_millis(1800), "{:?}", t.elapsed());
+    assert_empty(&e);
+}
+
+/// The total deadline spans redirect hops: a fast first hop, then a dribbled second one.
+#[test]
+fn dribbled_redirect_hop_is_bounded_by_total_deadline() {
+    let data = body(10);
+    let target = Server::start(vec![("/f", honest(&data))]);
+    let d = Dribble::start(target.port, Duration::from_millis(20));
+    let s = Server::start(vec![("/r", Reply::Redirect(format!("https://127.0.0.1:{}/f", d.port)))]);
+    let e = env();
+    let o = FetchOpts {
+        connect_timeout: Duration::from_secs(10),
+        total_deadline: Duration::from_secs(1),
+        ..opts()
+    };
+    // Both servers need trusting: pass both certificates.
+    let roots = [s.cert.clone(), target.cert.clone()];
+    let t = Instant::now();
+    let r = fetch_with_roots(&pkg_for(s.url("/r"), &data), &e.cache, &o, &roots);
+    assert!(matches!(r, Err(FetchError::Timeout)), "{r:?}");
+    assert!(t.elapsed() < Duration::from_millis(1800), "{:?}", t.elapsed());
+    assert_empty(&e);
+}
+
+/// The connect timeout is absolute from the start of the connection and covers the whole TLS handshake.
+#[test]
+fn dribbled_handshake_is_bounded_by_connect_timeout() {
+    let data = body(10);
+    let s = Server::start(vec![("/f", honest(&data))]);
+    let d = Dribble::start(s.port, Duration::from_millis(20));
+    let e = env();
+    let o = FetchOpts {
+        connect_timeout: Duration::from_millis(500),
+        total_deadline: Duration::from_secs(5),
+        ..opts()
+    };
+    let p = pkg_for(format!("https://127.0.0.1:{}/f", d.port), &data);
+    let t = Instant::now();
+    assert!(matches!(get_with(&s, &e, &p, &o), Err(FetchError::Timeout)));
+    assert!(t.elapsed() < Duration::from_millis(1300), "{:?}", t.elapsed());
+    assert_empty(&e);
+}
+
+/// The connect deadline stops applying once TLS is up: a body taking longer than `connect_timeout` is fine.
+#[test]
+fn body_may_outlast_connect_timeout() {
+    let data = body(6);
+    let s = Server::start(vec![(
+        "/f",
+        Reply::Drip {
+            body: data.clone(),
+            every: Duration::from_millis(150),
+        },
+    )]);
+    let e = env();
+    let o = FetchOpts {
+        connect_timeout: Duration::from_millis(400),
+        ..opts()
+    };
+    get_with(&s, &e, &pkg_for(s.url("/f"), &data), &o).unwrap();
 }
 
 #[test]
@@ -685,6 +765,43 @@ fn rf2_concurrent_fetches_of_one_package_both_succeed() {
     assert_eq!(listing(&e.cache), vec![p.sha256.clone()]);
 }
 
+/// I-2: `sha256` is a path component; a `Package` built by hand must not reach outside the cache dir.
+#[test]
+fn invalid_package_sha256_or_size_is_refused_and_touches_nothing() {
+    let data = body(100);
+    let s = Server::start(vec![("/f", honest(&data))]);
+    let e = env();
+    fs::DirBuilder::new().mode(0o700).create(&e.cache).unwrap();
+    let canary = e._tmp.path().join("victim");
+    fs::write(&canary, b"keep").unwrap();
+    let abs = canary.to_str().unwrap().to_string();
+    let good = sha(&data);
+    let bad_hashes = [
+        "../victim".to_string(),
+        abs,
+        good.to_uppercase(),
+        good[..63].to_string(),
+        format!("{good}0"),
+        format!("{}\0", &good[..63]),
+        String::new(),
+    ];
+    for h in bad_hashes {
+        let mut p = pkg_for(s.url("/f"), &data);
+        p.sha256 = h.clone();
+        assert_eq!(cached(&p, &e.cache), None, "{h:?}");
+        assert!(matches!(get(&s, &e, &p), Err(FetchError::BadPackage)), "{h:?}");
+    }
+    for size in [0, crate::manifest::MAX_PACKAGE_SIZE + 1] {
+        let mut p = pkg_for(s.url("/f"), &data);
+        p.size = size;
+        assert_eq!(cached(&p, &e.cache), None);
+        assert!(matches!(get(&s, &e, &p), Err(FetchError::BadPackage)));
+    }
+    assert_eq!(fs::read(&canary).unwrap(), b"keep");
+    assert_empty(&e);
+    assert_eq!(s.stats.connections.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn open_temp_is_exclusive_0600_and_never_follows() {
     let tmp = tempfile::tempdir().unwrap();
@@ -740,3 +857,42 @@ const SMOKE_SHA256: &str = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67
 const SMOKE_SIZE: u64 = 1023;
 
 use std::thread;
+
+#[test]
+fn stall_cap_picks_tightest_bound_and_fails_once_expired() {
+    let now = Instant::now();
+    let st = |limit_ms, deadline_ms, connect_ms, established| StallTransport {
+        inner: (),
+        limit: Duration::from_millis(limit_ms),
+        deadline: now + Duration::from_millis(deadline_ms),
+        connect_deadline: now + Duration::from_millis(connect_ms),
+        established: Arc::new(AtomicBool::new(established)),
+    };
+    let ureq_t = NextTimeout {
+        after: time::Duration::Exact(Duration::from_secs(30)),
+        reason: UTimeout::RecvBody,
+    };
+    assert_eq!(st(100, 60_000, 60_000, false).cap(ureq_t).unwrap().reason, STALL);
+    assert_eq!(
+        st(60_000, 100, 60_000, false).cap(ureq_t).unwrap().reason,
+        UTimeout::Global
+    );
+    assert_eq!(
+        st(60_000, 60_000, 100, false).cap(ureq_t).unwrap().reason,
+        UTimeout::Connect
+    );
+    assert_eq!(
+        st(60_000, 60_000, 100, true).cap(ureq_t).unwrap().reason,
+        UTimeout::RecvBody
+    );
+    // Already past the deadline: an error at once, never a zero timeout (which ureq would turn into 1 s).
+    let expired = StallTransport {
+        deadline: now,
+        ..st(60_000, 0, 60_000, true)
+    };
+    thread::sleep(Duration::from_millis(1));
+    assert!(matches!(
+        expired.cap(ureq_t),
+        Err(ureq::Error::Timeout(UTimeout::Global))
+    ));
+}
