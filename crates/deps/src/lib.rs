@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod manifest;
 pub mod resolve;
 pub mod state;
+pub mod tarball;
 
 pub use capabilities::capability_for;
 pub use fetch::{FetchError, FetchOpts, cached, fetch};
