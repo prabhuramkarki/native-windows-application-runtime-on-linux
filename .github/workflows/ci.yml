@@ -70,6 +70,14 @@ jobs:
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
+      # The dependency engine's real-Wine tests (Phase 4A Tasks 5/6: archive install + DLL override via reg.exe,
+      # sandboxed NSIS installer with file and registry markers; fixtures `exports64.dll`/`dep-installer.exe` come
+      # from `tools/build-fixtures.sh` above). The `e2e_real_wine` filter keeps out the other ignored tests of this
+      # crate: `real_download_smoke` needs the internet and `probe_real_wine_*` only prints a finding.
+      - run: cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1 --nocapture
+        env:
+          RUNTIME_REQUIRE_BWRAP: "1"
+          RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
   deny:
     runs-on: ubuntu-latest
     steps:
