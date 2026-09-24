@@ -59,7 +59,7 @@ url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 kind = "installer"
 requires_consent = true
 requires = []
-provides = ["vcruntime140.dll", "msvcp140.dll"]
+provides = ["concrt140", "msvcp140", "msvcp140_1", "msvcp140_2", "vcruntime140", "vcruntime140_1"]
 
 [package.install]
 silent_args = ["/install", "/quiet", "/norestart"]

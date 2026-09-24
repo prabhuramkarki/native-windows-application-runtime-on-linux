@@ -254,7 +254,7 @@ fn parse_uncapped(text: &str) -> Result<Manifest, ManifestError> {
 }
 
 /// Truncate an echoed value so an error never carries unbounded attacker text.
-fn clip(s: &str) -> String {
+pub(crate) fn clip(s: &str) -> String {
     if s.len() <= MAX_ECHO {
         return s.to_owned();
     }
