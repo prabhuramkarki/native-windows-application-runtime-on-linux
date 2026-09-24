@@ -18,7 +18,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub(crate) mod text;
-pub(crate) mod unzip;
+pub mod unzip;
 pub mod winpath;
 
 pub use backend::{BackendError, CompatBackend, Detail, RunOpts, allowed_env};

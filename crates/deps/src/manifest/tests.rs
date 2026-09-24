@@ -311,10 +311,28 @@ fn extract_to_unsafe_paths_rejected() {
 
 #[test]
 fn extract_from_unsafe_paths_rejected() {
-    for from in ["/x64/base.dll", "../base.dll", "x64/../../base.dll", ""] {
+    for from in [
+        "/x64/base.dll",
+        "../base.dll",
+        "x64/../../base.dll",
+        "",
+        "/",
+        "x64//",
+        "../",
+        "x64/./",
+    ] {
         let e = err(&valid_with("from = \"x64/base.dll\"", &format!("from = \"{from}\"")));
         assert!(matches!(e, ManifestError::BadPath { .. }), "{from:?}: {e:?}");
     }
+}
+
+#[test]
+fn extract_from_may_name_a_directory_prefix_with_one_trailing_slash() {
+    let m = Manifest::parse(&valid_with("from = \"x64/base.dll\"", "from = \"x64/\"")).unwrap();
+    let Install::Archive { extract, .. } = &m.packages[0].install else {
+        panic!("not an archive")
+    };
+    assert_eq!(extract[0].from, "x64/");
 }
 
 #[test]

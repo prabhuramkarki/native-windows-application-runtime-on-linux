@@ -73,7 +73,8 @@ pub enum ArchiveFormat {
     TarGz,
 }
 
-/// Copy `from` (a path inside the archive) to `to` (a path relative to `drive_c`).
+/// Copy `from` (a path inside the archive; ending in `/`, every file below that directory) to `to` (a path
+/// relative to `drive_c`). See `install_archive` for the exact semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Extract {
@@ -271,7 +272,7 @@ pub(crate) fn valid_sha256(s: &str) -> bool {
 }
 
 /// `[a-z0-9][a-z0-9._-]{0,63}`
-fn valid_id(s: &str) -> bool {
+pub(crate) fn valid_id(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_NAME_LEN
@@ -421,7 +422,7 @@ fn check_url(url: &str) -> Result<(), &'static str> {
 
 /// A plain relative path: `/`-separated, non-empty components, none `.`/`..` or ending in `.`/space (Windows
 /// strips those), no backslash, colon (drive letters, streams) or control characters, bounded length.
-fn check_rel_path(p: &str) -> Result<(), &'static str> {
+pub(crate) fn check_rel_path(p: &str) -> Result<(), &'static str> {
     if p.is_empty() || p.len() > MAX_PATH_LEN {
         return Err("empty or too long");
     }
@@ -473,7 +474,8 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
                 return Err(bad("extract must have 1 to 64 entries"));
             }
             for e in &extract {
-                path("extract.from", &e.from)?;
+                // One trailing `/` makes `from` a directory prefix (see `install_archive`).
+                path("extract.from", e.from.strip_suffix('/').unwrap_or(&e.from))?;
                 path("extract.to", &e.to)?;
             }
             for name in &dll_overrides {
