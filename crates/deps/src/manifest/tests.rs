@@ -107,9 +107,45 @@ fn registry_marker_parses() {
         *marker,
         Marker::RegistryValue {
             key: r"HKLM\Software\Vendor".into(),
-            name: "Version".into()
+            name: "Version".into(),
+            min_dword: None,
         }
     );
+}
+
+#[test]
+fn a_registry_marker_may_carry_a_min_dword() {
+    let from = r#"marker = { file = "windows/system32/vcruntime140.dll" }"#;
+    let m = Manifest::parse(&valid_with(
+        from,
+        r#"marker = { registry_value = { key = 'HKLM\Software\Vendor', name = "Bld", min_dword = 35211 } }"#,
+    ))
+    .unwrap();
+    let Install::Installer { marker, .. } = &m.get("vcrun").unwrap().install else {
+        panic!("installer expected")
+    };
+    assert_eq!(
+        *marker,
+        Marker::RegistryValue {
+            key: r"HKLM\Software\Vendor".into(),
+            name: "Bld".into(),
+            min_dword: Some(35211),
+        }
+    );
+    // Not for the default (unnamed) value, which the hive parser only knows as a string.
+    let e = err(&valid_with(
+        from,
+        r#"marker = { registry_value = { key = 'HKLM\Software\Vendor', name = "", min_dword = 1 } }"#,
+    ));
+    assert!(matches!(e, ManifestError::BadMarker { .. }), "{e:?}");
+    // Not negative, not over u32, not on a file marker.
+    for bad in [
+        r#"marker = { registry_value = { key = 'HKLM\Software\Vendor', name = "Bld", min_dword = -1 } }"#,
+        r#"marker = { registry_value = { key = 'HKLM\Software\Vendor', name = "Bld", min_dword = 4294967296 } }"#,
+        r#"marker = { file = "a.dll", min_dword = 1 }"#,
+    ] {
+        assert!(Manifest::parse(&valid_with(from, bad)).is_err(), "{bad}");
+    }
 }
 
 #[test]

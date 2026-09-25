@@ -38,8 +38,8 @@ dll_overrides = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"]
 # provides: the base names the x64 "Minimum" and "Additional" runtime MSIs inside the bundle install into
 # system32 (their File tables; a real run installed all 16 as native DLLs). The MFC locale resource DLLs
 # (mfc140enu, ...) are never imported.
-# marker: a dword the Minimum runtime MSI writes (its Registry table); absent in a fresh Wine 10.0 prefix and
-# present after a real silent run of this exact file through `install_installer_pkg` (the Task 8/8b report). The
+# marker: a dword the Minimum runtime MSI writes (its Registry table: Bld = #35211); absent in a fresh Wine 10.0
+# prefix and dword:0000898b (35211) after a real silent run of this exact file through `install_installer_pkg`. The
 # file marker windows/system32/vcruntime140.dll cannot be used: Wine puts a builtin placeholder there.
 # The installer is a WiX Burn bundle: it needs a window even with /quiet, so it only works because non-MSI
 # installers run on Wine's null-driver desktop (see `install_installer`).
@@ -94,4 +94,6 @@ dll_overrides = [
     "vcruntime140_1",
     "vcruntime140_threads",
 ]
-marker = { registry_value = { key = 'HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64', name = "Installed" } }
+# Bld (the build number) rather than Installed: VC++ 2015-2019 write the same key with Installed=1 but an older
+# Bld and fewer DLLs, so an older runtime in the prefix must not count as this one (it is upgraded in place).
+marker = { registry_value = { key = 'HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64', name = "Bld", min_dword = 35211 } }

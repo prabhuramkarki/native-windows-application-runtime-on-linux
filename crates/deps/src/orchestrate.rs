@@ -65,8 +65,8 @@ const VENDOR_PARTIAL: &str =
     "vendor installers can leave partial changes in the prefix; if the app misbehaves, recreate the environment";
 /// The skip reason of an installer package whose marker is already in the prefix (Ruling 15). Also what
 /// [`plan_for_app`] warns instead of planning it, so the hint does not keep asking for it.
-pub const MARKER_PRESENT: &str =
-    "already present in the prefix (probably installed by the app's own installer); nothing to do";
+pub const MARKER_PRESENT: &str = "already present in the prefix at this version or newer (probably installed by the \
+                                  app's own installer); nothing to do";
 
 /// Where downloads come from. [`NetFetcher`] is the real one; tests inject fakes.
 pub trait Fetcher {
@@ -607,7 +607,11 @@ fn install_one(
     // Before the download (saves it) and again right before installing: an app may start while it downloads.
     not_busy_now(o)?;
     // Under the lock, the prefix idle: an installer whose marker is there already has nothing to do (Ruling 15).
-    if pkg.kind == Kind::Installer && install_installer::marker_already_present(pkg, o.env).map_err(installer_reason)? {
+    if pkg.kind == Kind::Installer
+        && install_installer::marker_already_present(pkg, o.env).map_err(|e| {
+            format!("cannot check whether it is already in the prefix ({e}); nothing was downloaded or run")
+        })?
+    {
         return Ok(None);
     }
     let file = o

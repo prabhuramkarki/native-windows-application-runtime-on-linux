@@ -814,6 +814,88 @@ fn an_installer_marker_that_appears_before_its_download_skips_it_at_install_time
     assert_eq!(r.recorded(), ["first"]);
 }
 
+/// A consent-gated installer `vc` whose marker is VC++'s `Bld` with `min_dword = 35211`; the prefix's system.reg
+/// holds `bld` under that key, when given.
+fn vc_bld_rig(bld: Option<u32>) -> Rig {
+    let (mut vc, body) = installer("vc", &["vcruntime140"]);
+    vc.licence = manifest::PROPRIETARY.into();
+    vc.requires_consent = true;
+    vc.install = Install::Installer {
+        silent_args: vec!["/S".into()],
+        marker: Marker::RegistryValue {
+            key: r"HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64".into(),
+            name: "Bld".into(),
+            min_dword: Some(35211),
+        },
+        dll_overrides: vec![],
+    };
+    let r = Rig::new(vec![(vc, body)]);
+    if let Some(bld) = bld {
+        fs::write(
+            r.env.prefix().join("system.reg"),
+            format!(
+                "WINE REGISTRY Version 2\n\n[Software\\\\Microsoft\\\\VisualStudio\\\\14.0\\\\VC\\\\Runtimes\\\\X64] 1\n\
+                 \"Installed\"=dword:00000001\n\"Bld\"=dword:{bld:08x}\n\n"
+            ),
+        )
+        .unwrap();
+    }
+    r
+}
+
+#[test]
+fn an_older_version_under_the_same_marker_key_is_not_treated_as_present() {
+    // VC++ 2015 (Bld 23026) in the prefix: vc is still needed, so it is asked about (here: denied).
+    let r = vc_bld_rig(Some(23026));
+    let (f, a) = (FakeFetcher::default(), Answers::default());
+    let rep = run(&r, &r.plan(&["vcruntime140.dll"]), &f, &a).unwrap();
+    assert_eq!(a.asked(), ["vc"]);
+    assert!(reason(&rep.skipped, "vc").contains("consent denied"), "{rep:?}");
+    let mut app = r.plan(&["vcruntime140.dll"]);
+    drop_present_installers(&r.env, &r.manifest, &mut app);
+    assert_eq!(
+        app.plan.entries.len(),
+        1,
+        "an older version must not hide the package: {app:?}"
+    );
+    // This build or newer: present, nothing asked or fetched.
+    for bld in [35211, 40000] {
+        let r = vc_bld_rig(Some(bld));
+        let f = FakeFetcher::default();
+        let a = Answers {
+            never: vec!["vc"],
+            ..Answers::default()
+        };
+        let rep = run(&r, &r.plan(&["vcruntime140.dll"]), &f, &a).unwrap();
+        assert_eq!(reason(&rep.skipped, "vc"), MARKER_PRESENT);
+        assert!(f.calls().is_empty());
+    }
+}
+
+#[test]
+fn a_marker_that_cannot_be_read_before_the_download_fails_without_the_vendor_partial_warning() {
+    let r = vc_bld_rig(None);
+    let outside = r.tmp.path().join("outside.reg");
+    fs::write(&outside, "WINE REGISTRY Version 2\n\n").unwrap();
+    std::os::unix::fs::symlink(&outside, r.env.prefix().join("system.reg")).unwrap();
+    let f = FakeFetcher::default();
+    let a = Answers {
+        yes: vec!["vc"],
+        ..Answers::default()
+    };
+    let rep = run(&r, &r.plan(&["vcruntime140.dll"]), &f, &a).unwrap();
+    let why = reason(&rep.failed, "vc");
+    assert!(
+        why.contains("nothing was downloaded or run") && !why.contains("partial") && !why.contains("recreate"),
+        "{why}"
+    );
+    assert!(
+        f.calls().is_empty(),
+        "downloaded although the marker could not be checked"
+    );
+    assert!(r.recorded().is_empty());
+}
+
 #[test]
 fn the_plan_drops_an_installer_whose_marker_is_present_with_a_warning() {
     let r = gated_installer_and_dependent();

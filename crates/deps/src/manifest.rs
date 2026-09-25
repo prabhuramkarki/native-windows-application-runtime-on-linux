@@ -92,9 +92,14 @@ pub struct Extract {
 pub enum Marker {
     /// A file relative to `drive_c`.
     File(String),
+    /// Value `name` of `key` exists. With `min_dword`, it must also be a DWORD of at least that value: anything else
+    /// (absent, a string, a smaller number such as an older build) counts as ABSENT, so an older version already in
+    /// the prefix does not stop the installer from upgrading it, and success needs the new value.
     RegistryValue {
         key: String,
         name: String,
+        #[serde(default)]
+        min_dword: Option<u32>,
     },
 }
 
@@ -523,11 +528,17 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
             }
             match &marker {
                 Marker::File(p) => path("marker.file", p)?,
-                Marker::RegistryValue { key, name } => {
+                Marker::RegistryValue { key, name, min_dword } => {
                     let bad_marker = |reason| ManifestError::BadMarker {
                         id: id.to_owned(),
                         reason,
                     };
+                    // A default (unnamed) value is a string in the hive parser, never a DWORD.
+                    if min_dword.is_some() && name.is_empty() {
+                        return Err(bad_marker(
+                            "min_dword needs a named (DWORD) value, not the default value",
+                        ));
+                    }
                     if !valid_text(key, MAX_TEXT_LEN) {
                         return Err(bad_marker(
                             "registry key must be non-empty, bounded, without control characters",
