@@ -888,7 +888,11 @@ fn dotnet_and_installers_are_warnings_that_name_what_is_missing() {
     let r = s.run();
     let c = one(&r, Area::Runtime, ".NET");
     assert_eq!(c.status, Status::Warn);
-    assert!(c.text.contains("no .NET runtime is bundled"), "{}", c.text);
+    assert!(
+        c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
+        "{}",
+        c.text
+    );
     assert_eq!(r.verdict, Verdict::MayFail);
 
     for (kind, label) in [
@@ -1922,7 +1926,7 @@ fn a_managed_program_warns_that_no_dotnet_runtime_is_bundled_and_a_native_one_do
     let c = one(&r, Area::Runtime, ".NET");
     assert_eq!(c.status, Status::Warn);
     assert!(
-        c.text.contains(".NET") && c.text.contains("no .NET runtime is bundled"),
+        c.text.contains(".NET") && c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
         "{}",
         c.text
     );
@@ -1950,6 +1954,7 @@ fn each_predicted_direct3d_route_is_one_graphics_check() {
             D3dFamily::D3d12,
             D3dRoute::Wined3d {
                 reason: "Vulkan unusable: x".into(),
+                actionable: true,
             },
         ),
     ]);
@@ -1974,8 +1979,20 @@ fn d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in_never_dxvk() {
     let mut s = app(vec![]);
     let why = "Vulkan unusable: no loader";
     s.d3d_routes = Some(vec![
-        (D3dFamily::D3d11, D3dRoute::Wined3d { reason: why.into() }),
-        (D3dFamily::D3d12, D3dRoute::Wined3d { reason: why.into() }),
+        (
+            D3dFamily::D3d11,
+            D3dRoute::Wined3d {
+                reason: why.into(),
+                actionable: true,
+            },
+        ),
+        (
+            D3dFamily::D3d12,
+            D3dRoute::Wined3d {
+                reason: why.into(),
+                actionable: true,
+            },
+        ),
     ]);
     let r = s.run();
     let c = routes_of(&r);
@@ -2018,6 +2035,7 @@ fn a_hostile_or_long_route_reason_is_cleaned_and_bounded() {
         D3dFamily::D3d9,
         D3dRoute::Wined3d {
             reason: format!("bad\x1b]0;x\x07\u{202e} {}", "y".repeat(900)),
+            actionable: true,
         },
     )]);
     let r = s.run();
@@ -2026,4 +2044,77 @@ fn a_hostile_or_long_route_reason_is_cleaned_and_bounded() {
     assert!(c[0].text.chars().count() <= 300, "{}", c[0].text.chars().count());
     s.d3d_routes = Some(vec![(D3dFamily::D3d8, D3dRoute::Dxvk); 50]);
     assert_eq!(routes_of(&s.run()).len(), 5, "the number of route checks is bounded");
+}
+
+#[test]
+fn an_installed_provider_on_an_unusable_vulkan_is_a_failure_that_says_so() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![
+        (
+            D3dFamily::D3d11,
+            D3dRoute::Broken {
+                reason: "no loader".into(),
+            },
+        ),
+        (
+            D3dFamily::D3d12,
+            D3dRoute::Broken {
+                reason: format!("x\x1b[1m\u{202e}{}", "z".repeat(900)),
+            },
+        ),
+    ]);
+    let r = s.run();
+    let c = routes_of(&r);
+    assert_eq!(c.len(), 2);
+    assert!(c.iter().all(|c| c.status == Status::Fail));
+    assert!(
+        c[0].text
+            .contains("DXVK is installed but Vulkan is unusable (no loader)"),
+        "{}",
+        c[0].text
+    );
+    assert!(c[0].text.contains("fail to create a Direct3D device"), "{}", c[0].text);
+    assert!(c[1].text.contains("vkd3d-proton is installed"), "{}", c[1].text);
+    for c in c {
+        assert_tame(&c.text);
+        assert!(c.text.chars().count() <= 300, "{}", c.text.chars().count());
+    }
+    assert_eq!(r.verdict, Verdict::Fail);
+}
+
+#[test]
+fn a_non_actionable_built_in_route_is_ok_and_keeps_the_verdict_good() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![(
+        D3dFamily::D3d11,
+        D3dRoute::Wined3d {
+            reason: "DXVK covers 64-bit only".into(),
+            actionable: false,
+        },
+    )]);
+    let base = s.run().verdict;
+    s.d3d_routes = None;
+    assert_eq!(base, s.run().verdict, "the route adds nothing to the verdict");
+    assert_eq!(
+        routes_of(&{
+            s.d3d_routes = Some(vec![(
+                D3dFamily::D3d11,
+                D3dRoute::Wined3d {
+                    reason: "r".into(),
+                    actionable: false,
+                },
+            )]);
+            s.run()
+        })[0]
+            .status,
+        Status::Ok
+    );
+    s.d3d_routes = Some(vec![(
+        D3dFamily::D3d11,
+        D3dRoute::Wined3d {
+            reason: "r".into(),
+            actionable: true,
+        },
+    )]);
+    assert_eq!(routes_of(&s.run())[0].status, Status::Warn);
 }

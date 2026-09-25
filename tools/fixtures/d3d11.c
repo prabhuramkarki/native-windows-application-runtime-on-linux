@@ -1,9 +1,10 @@
 /* D3D11 render fixture (Phase 4E): renders offscreen (no window, no swapchain) through whatever d3d11.dll the
  * prefix loads -- DXVK once the `dxvk` package is installed.
  *   hardware device at feature level 11_0 -> 64x64 R8G8B8A8_UNORM render target -> 100 x (clear to
- *   (0.25, 0.5, 0.75, 1.0) + Flush), timed with QueryPerformanceCounter -> copy to a staging texture -> Map ->
+ *   (0.25, 0.5, 0.75, 1.0) + Flush), CPU submit time only (Flush does not wait for the GPU),
+ *   timed with QueryPerformanceCounter -> copy to a staging texture -> Map ->
  *   pixel (0,0) must be (64,128,191,255) +-1 per channel.
- * Prints `pixel ok` or `pixel BAD r g b a`, then `frame ms: <mean>` and `adapter: <DXGI description>`.
+ * Prints `pixel ok` or `pixel BAD r g b a`, then `frame ms (CPU submit time only): <mean>` and `adapter: <DXGI description>`.
  * Exit 0 only on `pixel ok`; 1 on a wrong pixel; any failing HRESULT prints `fail: <call> 0x........` and exits 2.
  * WANT_R..WANT_A can be overridden with -D to check the wrong-pixel path. */
 #define COBJMACROS
@@ -83,7 +84,7 @@ int main(void) {
         printf("pixel ok\n");
     else
         printf("pixel BAD %d %d %d %d\n", r, g, b, a);
-    printf("frame ms: %.4f\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart / 100.0);
+    printf("frame ms (CPU submit time only): %.4f\n", (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart / 100.0);
 
     IDXGIDevice *dxgi;
     IDXGIAdapter *adapter;
@@ -96,5 +97,12 @@ int main(void) {
         name[0] = 0;
     printf("adapter: %s\n", name);
     fflush(stdout);
+    IDXGIAdapter_Release(adapter);
+    IDXGIDevice_Release(dxgi);
+    ID3D11Texture2D_Release(staging);
+    ID3D11RenderTargetView_Release(rtv);
+    ID3D11Texture2D_Release(target);
+    ID3D11DeviceContext_Release(ctx);
+    ID3D11Device_Release(dev);
     return ok ? 0 : 1;
 }

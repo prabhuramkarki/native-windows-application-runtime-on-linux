@@ -2116,13 +2116,14 @@ fn doctor_predicts_dxvk_when_it_is_recorded_and_vulkan_is_usable_and_built_in_wh
         .stdout);
     let l = route_lines(&out);
     assert_eq!(l.len(), 1, "{out}");
+    // installed + Vulkan unusable: DXVK's DLLs still win, so the app fails: a failing check, not "built-in"
     assert!(
-        l[0].contains("[warn]")
-            && l[0].contains("built-in")
-            && l[0].contains("Vulkan unusable")
-            && !l[0].contains("DXVK"),
+        l[0].contains("[FAIL]")
+            && l[0].contains("DXVK is installed but Vulkan is unusable")
+            && l[0].contains("fail to create a Direct3D device"),
         "{out}"
     );
+    assert!(out.contains("Application cannot run"), "{out}");
     // JSON: the areas stay `graphics` and `runtime`
     let j: serde_json::Value =
         serde_json::from_slice(&r.desktop().args(["doctor", &id, "--json"]).output().unwrap().stdout).unwrap();
@@ -2188,6 +2189,13 @@ fn doctor_d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in() {
 #[test]
 fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded() {
     let r = rig();
+    r.wine_dlls(&[
+        "kernel32.dll",
+        "msvcrt.dll",
+        "d3d11.dll",
+        "winepulse.drv",
+        "winewayland.drv",
+    ]);
     let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
     let at = bytes
         .windows(11)
@@ -2204,7 +2212,7 @@ fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded()
         let l = route_lines(out);
         assert!(
             l.len() == 1
-                && l[0].contains("[warn]")
+                && l[0].contains("[ok]")
                 && l[0].contains("built-in")
                 && l[0].contains(why)
                 && !l[0].contains("DXVK:"),
@@ -2215,7 +2223,9 @@ fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded()
     want(&out, "64-bit only");
     record_installed(&r, &id, "dxvk");
     let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
-    want(&out, "DXVK is installed for 64-bit only");
+    want(&out, "DXVK covers 64-bit only");
+    // nothing to act on: the whole report is as good as the rest of it (a 32-bit app is not "may fail")
+    assert!(out.contains("Looks good."), "{out}");
 }
 
 #[test]
@@ -2273,7 +2283,7 @@ fn doctor_warns_about_a_managed_program_and_not_about_a_native_one() {
     let l = lines_with(&out, ".NET");
     assert_eq!(l.len(), 1, "{out}");
     assert!(
-        l[0].contains("[warn]") && l[0].contains("no .NET runtime is bundled"),
+        l[0].contains("[warn]") && l[0].contains("no .NET runtime is bundled") && l[0].contains("mscoree=d"),
         "{out}"
     );
     let j: serde_json::Value =

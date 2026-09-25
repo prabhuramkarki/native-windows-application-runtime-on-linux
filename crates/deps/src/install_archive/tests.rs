@@ -1807,7 +1807,7 @@ fn real_net_wine_d3d11_renders_via_dxvk() {
     crate::tarball::walk(
         fs::File::open(&file).unwrap(),
         &crate::tarball::TarLimits::for_package(p.size),
-        |e| match e.path == "dxvk-3.1.1/x64/d3d11.dll" {
+        |e| match e.path == format!("dxvk-{}/x64/d3d11.dll", p.version) {
             true => crate::tarball::Selection::Take,
             false => crate::tarball::Selection::Skip,
         },

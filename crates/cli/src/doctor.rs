@@ -248,7 +248,14 @@ fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFami
                 D3dFamily::D3d12 => ("vkd3d-proton", "vkd3d-proton", D3dRoute::Vkd3dProton),
                 _ => ("dxvk", "DXVK", D3dRoute::Dxvk),
             };
-            let builtin = |reason: String| D3dRoute::Wined3d { reason };
+            let builtin = |reason: String| D3dRoute::Wined3d {
+                reason,
+                actionable: true,
+            };
+            let plain = |reason: String| D3dRoute::Wined3d {
+                reason,
+                actionable: false,
+            };
             let entry = plan.plan.entries.iter().find(|e| e.package == pkg);
             // Installed for 64-bit only: a 32-bit app keeps Wine's built-in DLL, whatever is recorded.
             let x64_only = info.arch == pe::Arch::X86
@@ -256,10 +263,10 @@ fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFami
                     .get(pkg)
                     .is_some_and(|p| p.provides.iter().any(|c| rt_deps::X64_ONLY_CAPS.contains(&c.as_str())));
             let route = match entry.map(|e| &e.action) {
-                Some(rt_deps::Action::Install | rt_deps::Action::AlreadyInstalled) if x64_only => builtin(format!(
-                    "{label} is installed for 64-bit only; this 32-bit app keeps Wine's built-in Direct3D"
+                Some(_) if x64_only => plain(format!(
+                    "{label} covers 64-bit only; this 32-bit app uses Wine's built-in Direct3D"
                 )),
-                None => builtin(format!("no package provides {}", family_name(f))),
+                None => plain(format!("no package provides {}", family_name(f))),
                 Some(rt_deps::Action::Install) => {
                     builtin(format!("{label} not installed: run `runtime deps {app} --install`"))
                 }
@@ -267,7 +274,9 @@ fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFami
                 Some(rt_deps::Action::AlreadyInstalled) => {
                     let min = rt_deps::Manifest::bundled().get(pkg).and_then(|p| p.min_vulkan);
                     match crate::graphics::verdict_for(min) {
-                        rt_core::VulkanVerdict::Unusable(why) => builtin(format!("Vulkan unusable: {why}")),
+                        // Recorded DLLs win over Wine's and nothing at launch consults Vulkan, so this app fails.
+                        // (`runtime deps` does not warn about an installed package: block_for_vulkan skips it.)
+                        rt_core::VulkanVerdict::Unusable(why) => D3dRoute::Broken { reason: why },
                         _ => route,
                     }
                 }

@@ -7,8 +7,8 @@
 #   cargo run -q -p runtime-cli -- compat > docs/COMPAT.md
 # (the test `compat_md_matches_records` fails until you do).
 
-# The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, no GPU) with the two test
-# commands of the `wine-e2e` CI job. That job is configured but has not yet run on a hosted runner, so none of them
+# The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, a record without a `gpu` field is
+# not a graphics test) with the two test commands of the `wine-e2e` CI job. That job is configured but has not yet run on a hosted runner, so none of them
 # claims `ci:`.
 
 

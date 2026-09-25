@@ -232,8 +232,16 @@ pub enum D3dFamily {
 pub enum D3dRoute {
     Dxvk,
     Vkd3dProton,
-    /// Wine's built-in implementation, and why (untrusted text: cleaned when printed).
+    /// Wine's built-in implementation, and why (untrusted text: cleaned when printed). `actionable`: the user can
+    /// change it (install the package, unblock it), so it is a warning; otherwise (a 32-bit app, a family no
+    /// package covers) built-in is simply the working route and the check is `Ok`.
     Wined3d {
+        reason: String,
+        actionable: bool,
+    },
+    /// The package is recorded as installed (its DLLs are in the prefix and win over Wine's) but the host's Vulkan
+    /// is unusable (the text why): the app fails to create a Direct3D device. A `Fail`.
+    Broken {
         reason: String,
     },
 }
@@ -494,7 +502,7 @@ fn runtime_needs(info: &PeInfo, out: &mut Out) {
         out.add(
             Area::Runtime,
             Status::Warn,
-            ".NET program: no .NET runtime is bundled, so it fails unless Wine provides Mono".into(),
+            ".NET program: no .NET runtime is bundled and Wine's Mono is disabled (mscoree=d), so it fails".into(),
         );
     }
     if let Some(installer) = &info.installer {
@@ -928,9 +936,21 @@ fn d3d_routes(input: &DoctorInput<'_>, out: &mut Out) {
         let (status, text) = match route {
             D3dRoute::Dxvk => (Status::Ok, format!("Direct3D {n}: DXVK{note}")),
             D3dRoute::Vkd3dProton => (Status::Ok, format!("Direct3D {n}: vkd3d-proton{note}")),
-            D3dRoute::Wined3d { reason } => (
-                Status::Warn,
+            D3dRoute::Wined3d { reason, actionable } => (
+                if *actionable { Status::Warn } else { Status::Ok },
                 format!("Direct3D {n}: Wine's built-in {builtin} ({})", clean(reason, 200)),
+            ),
+            D3dRoute::Broken { reason } => (
+                Status::Fail,
+                format!(
+                    "Direct3D {n}: {} is installed but Vulkan is unusable ({}); the app will fail to create a Direct3D device: fix Vulkan or recreate the environment",
+                    if *family == D3dFamily::D3d12 {
+                        "vkd3d-proton"
+                    } else {
+                        "DXVK"
+                    },
+                    clean(reason, 150)
+                ),
             ),
         };
         out.add(Area::Graphics, status, text);
