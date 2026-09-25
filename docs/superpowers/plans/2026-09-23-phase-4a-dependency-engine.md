@@ -342,6 +342,11 @@ Written last, at the end of Task 9 (branch `phase-4-dependencies`, 35+ commits o
 14. Installer packages may declare `dll_overrides` (set `native,builtin` after the marker is confirmed).
 15. An installer whose marker is already in the prefix is skipped before any prompt or download, never recorded.
 16. Registry markers may carry `min_dword`: an older build counts as absent (vcrun2022 `Bld >= 35211`).
+17. (Final review fix wave) The runtime's own `reg.exe` runs after a vendor installer (set/delete/query of its DLL
+    overrides) run in the installer sandbox, offline: the Wine session they start also starts what the installer
+    registered (auto-start services, ...). Any later unsandboxed Wine session (`runtime run`) still does.
+18. (Final review fix wave, minimal) A marker-present installer package gets no overrides and there is no way to ask
+    for them yet: `deps` and `doctor` say so plainly and point at recreating the environment.
 
 ### Verification record (numbers from real runs)
 
@@ -367,6 +372,15 @@ Written last, at the end of Task 9 (branch `phase-4-dependencies`, 35+ commits o
   + 8, all killed. Task 9: 6 of 6 killed (the three lock-classification guards; the Wine version gate; the consent
   gate and the cache rename, each disabled and caught by the real-Wine orchestrator e2e).
 
+- **Final-review fix wave (Rulings 17, 18; I-3, I-4, minors):** workspace gate 1327 passed, 0 failed, 22 ignored
+  (`rt_deps` lib 354 + 11 ignored); CI's deps filter now selects 7 real-Wine tests (the new one: an "installer",
+  Wine's own `sc.exe`, registers an auto-start service that writes to a host directory through `\\?\unix\`; before the
+  fix the runtime's override step wrote the host file, after it the file stays unwritten, and a plain Wine session
+  afterwards writes it as the control), run 3 times: 7/7 each (123 s, 124 s, 122 s). The real vcrun2022 download and
+  install with the sandboxed overrides passed (61 s including the download). 11 of 11 mutants killed (3 on the
+  sandboxed reg calls, 4 on the size-scaled fetch deadline including its wiring into ureq, d3d8 x64-only, the
+  marker-present text, 2 on the doctor note). The fetch suite ran 5 times plain and 3 times under 8 CPU hogs, green.
+
 ### Deviations and notes
 
 - Commit trailers: several implementer sessions (Tasks 3, 5, 9) used their harness's accurate
@@ -376,7 +390,11 @@ Written last, at the end of Task 9 (branch `phase-4-dependencies`, 35+ commits o
 - A real SIGKILL of an in-process install is not practical in a test; the killed-install e2e uses Task 5's
   `#[cfg(test)]` crash hook (a panic at a numbered point, so no rollback runs), on a real prefix, at the two points
   where the prefix is affected (journal created; the DLL written over Wine's placeholder).
-- The CI `wine-e2e` job has still never run on a hosted runner.
+- The CI `wine-e2e` job has still never run on a hosted runner and does not gate (`continue-on-error`). It now runs
+  in an `ubuntu:26.04` container (distro Wine 10, the packaging verified locally) with `--privileged` for bubblewrap,
+  as root. WineHQ's packages were deliberately not used: they install under `/opt/wine-*`, which the installer
+  sandbox does not bind, so every sandboxed installer run would fail there (that is itself an open limit, below).
+- The fetch deadline is no longer a flat 300 s: 300 s plus one second per 32 KiB of the package, at most one hour.
 
 ### Ready for the next sub-project (Phase 4B, graphics selection)
 
@@ -389,6 +407,12 @@ Written last, at the end of Task 9 (branch `phase-4-dependencies`, 35+ commits o
   the exit code); `explorer.exe`/`msiexec.exe`/`reg.exe` from the prefix are unpinned; path-based file operations must
   move to `openat`/`renameat`/`unlinkat` before Phase 5 makes the prefix a boundary; the shared run lock is released
   once an app has started.
+- **Follow-ups from the final review:** offer DLL overrides for marker-present installer packages (Ruling 18 only
+  explains); M-1 (list and sweep stale `.tmp-*` files in the download cache), M-3, M-6 and M-7 as listed by the final
+  review; the deferred minors in the SDD ledger (among them: `FetchOpts { total_deadline: Duration::MAX }` overflows
+  `Instant`, a torn journal tail cut inside a UTF-8 character blocks the package, `cached()` delete race, restored
+  originals come back `0644`, DLL overrides are not journalled, archive packages' `reg.exe` runs unsandboxed like any
+  later Wine session); bind a Wine install outside `/usr` (e.g. WineHQ's `/opt/wine-*`) into the installer sandbox.
 - **Follow-ups:** package upgrade (undo the old install from the kept journal under the lock, then install) and
   single-package removal (including removing overrides, which today are never removed); a per-DLL override policy
   (which DLLs a graphics selection turns on or off, per app, instead of a fixed `native,builtin` list per package);
