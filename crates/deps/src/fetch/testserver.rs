@@ -57,6 +57,8 @@ pub(crate) struct Stats {
     pub body_bytes: AtomicU64,
     /// A body write failed because the client went away.
     pub client_closed: AtomicBool,
+    /// The path of every request whose head was read, in arrival order.
+    pub requests: std::sync::Mutex<Vec<String>>,
 }
 
 pub(crate) struct Server {
@@ -285,6 +287,7 @@ fn serve(
     }
     let line = String::from_utf8_lossy(&head);
     let path = line.split(' ').nth(1).unwrap_or("").to_string();
+    stats.requests.lock().unwrap().push(path.clone());
     let reply = routes
         .iter()
         .find(|(p, _)| *p == path)
