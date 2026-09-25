@@ -10,7 +10,13 @@
 //! **Bounds.** Directory listings are read through [`FsProbe::list`] with a cap of [`MAX_LISTING`] names (at most
 //! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (the import and the
 //! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
-//! code, not by the input.
+//! code, not by the input: one Graphics session check, one Vulkan check, one more for the app's graphics driver setting (an
+//! app report only: its setting, or why it could not be read), and one Audio check.
+//!
+//! **Audio.** Wine 10 has `winepulse` and `winealsa` and no native PipeWire driver, so the socket that counts is the
+//! PulseAudio-compatible `$XDG_RUNTIME_DIR/pulse/native` (`pipewire-pulse` provides it); `pipewire-0` alone is a
+//! warning. `wine_drivers` (`None`: not listed) is only used to say that a driver module is absent when the
+//! listing was made.
 //! Names printed from the input go through `text::quote_max` (control, bidi and other invisible characters are
 //! escaped); free-form messages through `text::clean` (those characters are removed).
 //!
@@ -23,6 +29,7 @@
 //! itself (a directory that does not exist is fine and silent) is REPORTED: the imports get one extra Warn
 //! "DLL listing incomplete", and the missing-DLL lines then say "not found in the listed files", not "not found".
 use crate::CompatBackend;
+use crate::display::GraphicsDriver;
 use crate::graphics::{HostVulkan, VulkanVerdict, host_verdict};
 use crate::text::{clean, quote_max};
 use pe::{Arch, InstallerKind, Kind, PeInfo, Subsystem};
@@ -191,6 +198,13 @@ pub struct DoctorInput<'a> {
     pub vulkan: Option<&'a HostVulkan>,
     /// The highest Vulkan API version a bundled package needs (DXVK), if any: a device below it is not usable.
     pub vulkan_min: Option<(u32, u32)>,
+    /// File names of the Wine driver modules (`wine*.drv`: `winepulse.drv`, `winealsa.drv`, `winewayland.drv`)
+    /// found in the backend's DLL directories, at most 200; `None` when those directories could not be listed at
+    /// all (the driver checks then say "not verified", never "missing").
+    pub wine_drivers: Option<&'a [String]>,
+    /// The app's Wine graphics driver setting, or why it could not be read (a symlinked, oversized or unparsable
+    /// `user.reg`); `None` for a system report.
+    pub graphics_driver: Option<Result<GraphicsDriver, &'a str>>,
 }
 
 /// Names read from one directory listing at most.
@@ -335,6 +349,7 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     wine(&input, &mut out);
     vulkan(&input, &mut out);
     display(&input, &mut out);
+    graphics_setting(&input, &mut out);
     audio(&input, &mut out);
     prefix(&input.prefix, &mut out);
     program(input.program, &mut out);
@@ -713,18 +728,27 @@ fn runtime_dir(input: &DoctorInput<'_>) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// The Wayland socket of the session: `$WAYLAND_DISPLAY` (absolute, or under an absolute `$XDG_RUNTIME_DIR`)
+/// when it is set and that socket exists. `runtime display` uses the same test as `doctor`.
+pub fn wayland_socket(env: &dyn Fn(&str) -> Option<OsString>, fs: &dyn FsProbe) -> Option<PathBuf> {
+    let get = |n: &str| env(n).filter(|v| !v.is_empty());
+    let p = PathBuf::from(get("WAYLAND_DISPLAY")?);
+    let socket = if p.is_absolute() {
+        p
+    } else {
+        let dir = PathBuf::from(get("XDG_RUNTIME_DIR")?);
+        if !dir.is_absolute() {
+            return None;
+        }
+        dir.join(p)
+    };
+    fs.exists(&socket).then_some(socket)
+}
+
 fn display(input: &DoctorInput<'_>, out: &mut Out) {
     let wayland = var(input, "WAYLAND_DISPLAY");
-    let socket = wayland.as_ref().and_then(|name| {
-        let p = PathBuf::from(name);
-        if p.is_absolute() {
-            Some(p)
-        } else {
-            runtime_dir(input).map(|d| d.join(p))
-        }
-    });
-    if let (Some(name), Some(socket)) = (&wayland, &socket)
-        && input.fs.exists(socket)
+    if let Some(name) = &wayland
+        && wayland_socket(input.env, input.fs).is_some()
     {
         let name = name.to_string_lossy();
         out.add(
@@ -756,16 +780,100 @@ fn display(input: &DoctorInput<'_>, out: &mut Out) {
 }
 
 fn audio(input: &DoctorInput<'_>, out: &mut Out) {
-    let found = runtime_dir(input).is_some_and(|d| input.fs.exists(&d.join("pipewire-0")));
-    if found {
-        out.add(Area::Audio, Status::Ok, "PipeWire socket found".into());
+    let dir = runtime_dir(input);
+    let has = |name: &str| dir.as_ref().is_some_and(|d| input.fs.exists(&d.join(name)));
+    // `Some(present)` when the driver modules were listed.
+    let driver = |name: &str| {
+        input
+            .wine_drivers
+            .map(|l| l.iter().any(|n| n.eq_ignore_ascii_case(name)))
+    };
+    let unverified = if input.wine_drivers.is_none() {
+        " (Wine driver modules not verified)"
     } else {
-        out.add(
-            Area::Audio,
+        ""
+    };
+    let (status, text) = if has("pulse/native") {
+        if driver("winepulse.drv") == Some(false) {
+            (
+                Status::Warn,
+                "PulseAudio-compatible socket found, but this Wine build has no PulseAudio driver (winepulse.drv): audio may not work".into(),
+            )
+        } else {
+            (
+                Status::Ok,
+                format!("PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native){unverified}"),
+            )
+        }
+    } else if has("pipewire-0") {
+        (
             Status::Warn,
-            "PipeWire socket ($XDG_RUNTIME_DIR/pipewire-0) not found: audio may not work".into(),
-        );
-    }
+            format!(
+                "only the PipeWire socket was found: Wine needs the PulseAudio-compatible socket \
+                 ($XDG_RUNTIME_DIR/pulse/native, from pipewire-pulse), audio may not work{unverified}"
+            ),
+        )
+    } else if driver("winealsa.drv") == Some(true) {
+        (
+            Status::Warn,
+            "no PulseAudio-compatible socket ($XDG_RUNTIME_DIR/pulse/native): ALSA only, audio may not work".into(),
+        )
+    } else {
+        (
+            Status::Warn,
+            format!("no audio path: no PulseAudio-compatible socket ($XDG_RUNTIME_DIR/pulse/native) found{unverified}"),
+        )
+    };
+    out.add(Area::Audio, status, text);
+}
+
+/// The app's graphics driver setting against the session and Wine's driver modules: exactly one check for an app.
+fn graphics_setting(input: &DoctorInput<'_>, out: &mut Out) {
+    let driver = match &input.graphics_driver {
+        None => return,
+        Some(Ok(d)) => d,
+        Some(Err(why)) => {
+            return out.add(
+                Area::Graphics,
+                Status::Warn,
+                format!("graphics driver setting not verified: {}", clean(why, 200)),
+            );
+        }
+    };
+    let socket = wayland_socket(input.env, input.fs).is_some();
+    let display = var(input, "DISPLAY").is_some();
+    let session = match (socket, display) {
+        (true, _) => "wayland socket",
+        (false, true) => "DISPLAY",
+        (false, false) => "none",
+    };
+    let no_wl_driver = input
+        .wine_drivers
+        .is_some_and(|l| !l.iter().any(|n| n.eq_ignore_ascii_case("winewayland.drv")));
+    let (status, text) = match driver {
+        GraphicsDriver::Wayland if !socket => (
+            Status::Warn,
+            "the app's graphics driver is set to wayland, but no Wayland socket was found: it cannot open windows"
+                .to_owned(),
+        ),
+        GraphicsDriver::Wayland if no_wl_driver => (
+            Status::Warn,
+            "the app's graphics driver is set to wayland, but this Wine build has no winewayland driver".to_owned(),
+        ),
+        GraphicsDriver::X11 if !display => (
+            Status::Warn,
+            "the app's graphics driver is set to x11, but DISPLAY is not set: it cannot open windows".to_owned(),
+        ),
+        GraphicsDriver::Custom(s) => (
+            Status::Warn,
+            format!("custom graphics driver setting {}: not checked", quote_max(s, 60)),
+        ),
+        other => (
+            Status::Ok,
+            format!("Wine graphics driver: {} (session: {session})", other.as_str()),
+        ),
+    };
+    out.add(Area::Graphics, status, text);
 }
 
 // ---------------------------------------------------------------- the prefix and the program

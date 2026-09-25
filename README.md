@@ -23,7 +23,7 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 | `remove <app>` | Stops the app's Wine processes and deletes the app, its prefix and its desktop menu entry/icon (if any). Takes an id, never a path. |
 | `uninstall <app>` | Runs the app's recorded installer uninstall command (if any), sandboxed, then removes the environment and its desktop menu entry/icon regardless of what that did. An app with no recorded uninstaller (a portable-exe install) behaves like `remove`. Takes an id, never a path. |
 | `logs <app> [--lines N]` | Shows the end of the newest log (the app's stderr from its last run). |
-| `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, Vulkan, audio. Exit 1 when a check fails. |
+| `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 | `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
 | `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
@@ -40,6 +40,16 @@ runtime remove tool
 `--json` output is the stable interface for `list`, `doctor` and `analyze`; free-form text fields (warnings,
 check texts) may change, do not parse them. Strings from files are escaped in human output; in JSON,
 sanitise before displaying.
+
+## Graphics driver (`runtime display`)
+
+```
+runtime display game            # the app's Wine graphics driver, this session, and whether Wine has winewayland
+runtime display game wayland    # auto | x11 | wayland (the app must be stopped)
+```
+
+`auto` removes the setting, so Wine picks its own driver (X11/XWayland). Wayland is experimental in Wine 10.0 and
+opt-in per app: `wayland` is refused without a Wayland session or without `winewayland` in the Wine build.
 
 ## Dependencies (`runtime deps`)
 

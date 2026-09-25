@@ -1,5 +1,6 @@
 mod analyze;
 mod deps;
+mod display;
 mod doctor;
 mod graphics;
 mod install;
@@ -109,6 +110,15 @@ enum Cmd {
     /// that needs it; the packages it needs itself still install. `runtime deps list` shows the manifest,
     /// `runtime deps cache [--clear]` the download cache. Exit code 1 when anything failed or was skipped.
     Deps(deps::DepsArgs),
+    /// Show or set the Wine graphics driver of an app (`auto` is Wine's own choice; `wayland` is experimental in
+    /// Wine 10.0 and needs a Wayland session and a Wine built with it). Setting needs the app to be stopped.
+    Display {
+        /// An app id from `runtime list`
+        app: String,
+        /// The driver to set; without it the current one is shown
+        #[arg(value_parser = ["auto", "x11", "wayland"])]
+        choice: Option<String>,
+    },
     /// Show what the host's graphics stack offers (`runtime graphics info`)
     #[command(subcommand)]
     Graphics(GraphicsCmd),
@@ -181,6 +191,7 @@ fn main() -> ExitCode {
         Cmd::Uninstall { app } => uninstall::run(&app).map(|()| 0),
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
         Cmd::Deps(args) => deps::run(args),
+        Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };
     match result {
