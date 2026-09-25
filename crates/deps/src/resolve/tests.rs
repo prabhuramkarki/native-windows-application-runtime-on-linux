@@ -63,6 +63,16 @@ fn ids(plan: &Plan) -> Vec<&str> {
     plan.entries.iter().map(|e| e.package.as_str()).collect()
 }
 
+/// The dependency shapes these tests need (a consent-gated package, and one package requiring another), which the
+/// real bundled manifest does not have: it has no `requires` edge at all since VKD3D-Proton was left out.
+fn graph() -> Manifest {
+    manifest(vec![
+        pkg("dxvk", &[], &["d3d9", "d3d10core", "d3d11", "dxgi"], false),
+        pkg("vkd3d-proton", &["dxvk"], &["d3d12"], false),
+        pkg("vcrun2022", &[], &["vcruntime140", "msvcp140"], true),
+    ])
+}
+
 fn none() -> InstalledSet {
     InstalledSet::default()
 }
@@ -90,12 +100,7 @@ fn import_names_are_normalised_and_deduped() {
 
 #[test]
 fn consent_needed_for_proprietary_package() {
-    let plan = resolve(
-        &imports(&["VCRUNTIME140.dll", "msvcp140.dll"]),
-        &none(),
-        &[],
-        Manifest::bundled(),
-    );
+    let plan = resolve(&imports(&["VCRUNTIME140.dll", "msvcp140.dll"]), &none(), &[], &graph());
     assert_eq!(
         plan.entries,
         [entry("vcrun2022", Action::Install, ConsentState::Needed)]
@@ -104,7 +109,7 @@ fn consent_needed_for_proprietary_package() {
 
 #[test]
 fn already_installed_exact_match() {
-    let m = Manifest::bundled();
+    let m = &graph();
     let dxvk = m.get("dxvk").unwrap();
     let installed = InstalledSet(vec![installed_ref(dxvk)]);
     let plan = resolve(&imports(&["d3d11.dll"]), &installed, &[], m);
@@ -157,7 +162,7 @@ fn installed_mismatch_replans_install() {
 
 #[test]
 fn dependencies_come_first() {
-    let plan = resolve(&imports(&["d3d12.dll"]), &none(), &[], Manifest::bundled());
+    let plan = resolve(&imports(&["d3d12.dll"]), &none(), &[], &graph());
     assert_eq!(ids(&plan), ["dxvk", "vkd3d-proton"]);
     assert!(plan.entries.iter().all(|e| e.action == Action::Install));
 
@@ -206,8 +211,8 @@ fn denied_blocks_it_and_its_dependents_only() {
     assert_eq!(by_id("other").action, Action::Install);
     assert_eq!(by_id("side").action, Action::Install);
 
-    // Denying on the bundled manifest: dxvk denied blocks vkd3d-proton too.
-    let plan = resolve(&imports(&["d3d12.dll"]), &none(), &["dxvk".into()], Manifest::bundled());
+    // Denying on the dxvk/vkd3d graph: dxvk denied blocks vkd3d-proton too.
+    let plan = resolve(&imports(&["d3d12.dll"]), &none(), &["dxvk".into()], &graph());
     assert_eq!(ids(&plan), ["dxvk", "vkd3d-proton"]);
     assert!(plan.entries.iter().all(|e| matches!(e.action, Action::Blocked { .. })));
     assert_eq!(plan.entries[0].consent, ConsentState::Denied);
@@ -218,7 +223,7 @@ fn denied_blocks_it_and_its_dependents_only() {
 fn installed_dependent_of_denied_package_stays_installed() {
     // dxvk denied and not installed: blocked. vkd3d-proton installed exactly: nothing to download, so it stays
     // AlreadyInstalled rather than being blocked by something below it.
-    let m = Manifest::bundled();
+    let m = &graph();
     let vk = m.get("vkd3d-proton").unwrap();
     let plan = resolve(
         &imports(&["d3d12"]),
@@ -241,7 +246,7 @@ fn installed_dependent_of_denied_package_stays_installed() {
 
 #[test]
 fn denied_but_installed_is_already_installed() {
-    let m = Manifest::bundled();
+    let m = &graph();
     let vc = m.get("vcrun2022").unwrap();
     let plan = resolve(
         &imports(&["vcruntime140.dll"]),
@@ -329,10 +334,7 @@ fn unknown_imports_yield_nothing() {
 fn extra_capabilities_are_honoured() {
     let facts = caps(&["d3d12"]);
     assert_eq!(required_capabilities(&facts), ["d3d12"]);
-    assert_eq!(
-        ids(&resolve(&facts, &none(), &[], Manifest::bundled())),
-        ["dxvk", "vkd3d-proton"]
-    );
+    assert_eq!(ids(&resolve(&facts, &none(), &[], &graph())), ["dxvk", "vkd3d-proton"]);
     let both = Facts {
         imports: vec!["msvcp140.dll".into()],
         extra_capabilities: vec!["d3d9".into(), "d3d9".into()],
@@ -349,7 +351,7 @@ fn smallest_provider_id_wins() {
 #[test]
 fn output_is_deterministic() {
     let names = ["d3d12.dll", "VCRUNTIME140.dll", "d3d9.dll", "kernel32.dll", "dxgi"];
-    let m = Manifest::bundled();
+    let m = &graph();
     let first = resolve(&imports(&names), &none(), &[], m);
     assert_eq!(first, resolve(&imports(&names), &none(), &[], m));
     assert_eq!(ids(&first), ["dxvk", "vcrun2022", "vkd3d-proton"]);
@@ -463,7 +465,7 @@ impl Rng {
 
 #[test]
 fn random_facts_keep_plan_invariants() {
-    let m = Manifest::bundled();
+    let m = &graph();
     let mut pool: Vec<String> = crate::capabilities::TABLE
         .iter()
         .flat_map(|(k, _)| [k.to_string(), format!("{}.DLL", k.to_ascii_uppercase())])
@@ -511,7 +513,7 @@ fn random_facts_keep_plan_invariants() {
                 );
             }
             assert!(placed.insert(e.package.as_str()), "round {round}: {} twice", e.package);
-            // Reference model over the acyclic bundled graph, checked in both directions.
+            // Reference model over the acyclic test graph, checked in both directions.
             let exact = installed.0.contains(&installed_ref(p));
             let is_denied = denied.contains(&e.package);
             let dep_blocked = p.requires.iter().any(|r| blocked.contains(r.as_str()));

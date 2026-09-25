@@ -560,6 +560,30 @@ fn bundled_manifest_invariants() {
     }
 }
 
+/// Task 8: only verified pins ship. A placeholder (size 1, a hash made of one repeated digit or zeros plus a short
+/// counter, a PLACEHOLDER comment, an unversioned aka.ms redirect) fails this.
+#[test]
+fn bundled_manifest_has_no_placeholder_pins() {
+    let text = include_str!("../../packages.toml");
+    assert!(!text.contains("PLACEHOLDER"), "placeholder comment in packages.toml");
+    for p in &Manifest::bundled().packages {
+        assert!(p.size > 1024, "{}: size {} looks like a placeholder", p.id, p.size);
+        let distinct: HashSet<u8> = p.sha256.bytes().collect();
+        assert!(distinct.len() > 4, "{}: sha256 {} looks synthetic", p.id, p.sha256);
+        assert!(
+            !p.sha256.starts_with("00000000"),
+            "{}: sha256 {} looks synthetic",
+            p.id,
+            p.sha256
+        );
+        assert!(
+            !p.url.contains("aka.ms/"),
+            "{}: pin the final url, not a redirect",
+            p.id
+        );
+    }
+}
+
 /// Deterministic xorshift64 so failures reproduce.
 struct Rng(u64);
 impl Rng {
