@@ -609,7 +609,7 @@ fn registry_marker_present_min(
 /// opened with `O_NOFOLLOW` (a symlink is an error, never followed: this read also runs for `deps`, the install
 /// hint and `doctor`, outside any sandbox), `O_NONBLOCK` (a FIFO cannot hang the open), and its size is checked on
 /// the open file against [`MAX_MARKER_HIVE_BYTES`] before anything is read (a huge sparse file costs nothing).
-fn read_hive(prefix: &Path, file: &str) -> Result<Option<WineReg>, InstallerPkgError> {
+pub(crate) fn read_hive(prefix: &Path, file: &str) -> Result<Option<WineReg>, InstallerPkgError> {
     let err = |why: String| InstallerPkgError::Registry(format!("{file}: {}", bounded(&why)));
     match fs::symlink_metadata(prefix) {
         Ok(m) if m.file_type().is_dir() => {}

@@ -41,6 +41,16 @@ runtime remove tool
 check texts) may change, do not parse them. Strings from files are escaped in human output; in JSON,
 sanitise before displaying.
 
+## Graphics driver (`runtime display`)
+
+```
+runtime display game            # the app's Wine graphics driver, this session, and whether Wine has winewayland
+runtime display game wayland    # auto | x11 | wayland (the app must be stopped)
+```
+
+`auto` removes the setting, so Wine picks its own driver (X11/XWayland). Wayland is experimental in Wine 10.0 and
+opt-in per app: `wayland` is refused without a Wayland session or without `winewayland` in the Wine build.
+
 ## Dependencies (`runtime deps`)
 
 ```sh

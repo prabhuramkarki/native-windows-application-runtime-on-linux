@@ -7,34 +7,96 @@
 //!
 //! The CALLER bounds the read: pass bytes that came from a bounded reader (`rt_installer::read_reg_file` reads a
 //! path with a size cap, metadata before open). `WineReg::parse` itself only refuses input over 4 GiB.
-use rt_core::{GraphicsDriver, driver_from_value};
+use crate::install_archive::{ArchiveError, reg};
+use crate::install_installer::read_hive;
+use rt_core::{AppEnv, CompatBackend, DRIVERS_KEY, GraphicsDriver, Launcher, driver_from_value};
 use rt_installer::{RegValue, WineReg};
 
-const DRIVERS_KEY: &str = r"Software\Wine\Drivers";
+/// The key as it is spelled in `user.reg` (no hive prefix).
+const HIVE_KEY: &str = r"Software\Wine\Drivers";
+
+#[derive(Debug, thiserror::Error)]
+pub enum WineConfigError {
+    #[error("{0:?} is not a driver this runtime sets (only auto, x11 and wayland)")]
+    NotSettable(String),
+    #[error("setting the Wine graphics driver failed: {0}")]
+    Registry(String),
+}
 
 /// The `Graphics` value of `HKCU\Software\Wine\Drivers` in `user_reg`. A missing key or value is `Auto`; a
 /// string (`REG_SZ` or `str(2)`) goes through [`driver_from_value`]; a dword is `Custom("non-string value")`.
 /// Key and value names match case-insensitively; if several spellings of the key or value exist, the last in
 /// the parser's (sorted) order wins. `Err`: the parser refused the input (its text is fixed, never file content).
 pub fn read_graphics_driver(user_reg: &[u8]) -> Result<GraphicsDriver, String> {
-    let reg = WineReg::parse(user_reg).map_err(|e| e.to_string())?;
+    Ok(driver_in(&WineReg::parse(user_reg).map_err(|e| e.to_string())?))
+}
+
+/// The graphics driver of the prefix's `user.reg`, read with the no-follow, regular-file-only, size-capped hive
+/// reader. A missing `user.reg` is `Auto`; a symlink, an oversized or an unparsable file is `Err` (fixed text).
+pub fn read_graphics_driver_from_prefix(env: &AppEnv) -> Result<GraphicsDriver, String> {
+    match read_hive(&env.prefix(), "user.reg").map_err(|e| e.to_string())? {
+        Some(reg) => Ok(driver_in(&reg)),
+        None => Ok(GraphicsDriver::Auto),
+    }
+}
+
+fn driver_in(reg: &WineReg) -> GraphicsDriver {
     let value = reg
         .keys
         .iter()
-        .filter(|(k, _)| k.eq_ignore_ascii_case(DRIVERS_KEY))
+        .filter(|(k, _)| k.eq_ignore_ascii_case(HIVE_KEY))
         .flat_map(|(_, key)| key.values.iter())
         .rfind(|(n, _)| n.eq_ignore_ascii_case("Graphics"))
         .map(|(_, v)| v);
-    Ok(match value {
+    match value {
         None => GraphicsDriver::Auto,
         Some(RegValue::Str(s) | RegValue::Default(s)) => driver_from_value(Some(s)),
         Some(RegValue::Dword(_)) => GraphicsDriver::Custom("non-string value".into()),
-    })
+    }
+}
+
+/// Sets the app's graphics driver: `Auto` deletes the `Graphics` value (Wine then picks), `X11`/`Wayland` write
+/// it. `Custom` is never written. A failed delete is fine if `reg query` then says the value is not there.
+pub fn set_graphics_driver(
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    d: &GraphicsDriver,
+) -> Result<(), WineConfigError> {
+    let fail = |what: &str, detail: String| WineConfigError::Registry(format!("{what}: {detail}"));
+    let run = |args: &[&str]| {
+        reg(args, env, backend, launcher, None).map_err(|e| match e {
+            ArchiveError::Registry(m) => WineConfigError::Registry(m),
+            other => WineConfigError::Registry(other.to_string()),
+        })
+    };
+    match d {
+        GraphicsDriver::Custom(s) => Err(WineConfigError::NotSettable(s.clone())),
+        GraphicsDriver::Auto => {
+            let (ok, detail) = run(&["delete", DRIVERS_KEY, "/v", "Graphics", "/f"])?;
+            if ok || !run(&["query", DRIVERS_KEY, "/v", "Graphics"])?.0 {
+                Ok(())
+            } else {
+                Err(fail("reg delete Graphics", detail))
+            }
+        }
+        GraphicsDriver::X11 | GraphicsDriver::Wayland => {
+            let (ok, detail) = run(&["add", DRIVERS_KEY, "/v", "Graphics", "/d", d.as_str(), "/f"])?;
+            if ok {
+                Ok(())
+            } else {
+                Err(fail("reg add Graphics", detail))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rt_core::{AppId, Call, FakeBackend, Store};
+    use std::fs;
+    use std::os::unix::fs::symlink;
 
     fn file(body: &str) -> Vec<u8> {
         format!("WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1\n\n#arch=win64\n\n{body}")
@@ -158,6 +220,127 @@ mod tests {
         }
         for n in 0..good.len() {
             let _ = read_graphics_driver(&good[..n]);
+        }
+    }
+
+    fn app() -> (tempfile::TempDir, AppEnv) {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = Store::new(tmp.path().join("apps"))
+            .unwrap()
+            .create(&AppId::parse("app").unwrap())
+            .unwrap();
+        fs::create_dir_all(env.drive_c().join("windows/system32")).unwrap();
+        fs::write(env.drive_c().join("windows/system32/reg.exe"), b"MZ").unwrap();
+        (tmp, env)
+    }
+
+    fn argv(b: &FakeBackend) -> Vec<Vec<String>> {
+        b.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Command { args, .. } => Some(args.iter().map(|a| a.to_string_lossy().into_owned()).collect()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn launcher() -> Launcher {
+        Launcher::with_host_env([("PATH", "/usr/bin:/bin")])
+    }
+
+    fn set(b: &FakeBackend, env: &AppEnv, d: &GraphicsDriver) -> Result<(), WineConfigError> {
+        set_graphics_driver(env, b, &launcher(), d)
+    }
+
+    fn v(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn set_builds_the_exact_reg_argv() {
+        let (_t, env) = app();
+        let b = FakeBackend::new();
+        set(&b, &env, &GraphicsDriver::X11).unwrap();
+        set(&b, &env, &GraphicsDriver::Wayland).unwrap();
+        set(&b, &env, &GraphicsDriver::Auto).unwrap();
+        let k = r"HKCU\Software\Wine\Drivers";
+        assert_eq!(
+            argv(&b),
+            [
+                v(&["add", k, "/v", "Graphics", "/d", "x11", "/f"]),
+                v(&["add", k, "/v", "Graphics", "/d", "wayland", "/f"]),
+                v(&["delete", k, "/v", "Graphics", "/f"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_is_never_written() {
+        let (_t, env) = app();
+        let b = FakeBackend::new();
+        let e = set(&b, &env, &custom("x11,wayland")).unwrap_err();
+        assert!(matches!(e, WineConfigError::NotSettable(_)), "{e}");
+        assert!(argv(&b).is_empty());
+    }
+
+    #[test]
+    fn a_failing_reg_is_an_error_naming_the_value() {
+        let (_t, env) = app();
+        let b = FakeBackend::with_script("exit 5");
+        let e = set(&b, &env, &GraphicsDriver::Wayland).unwrap_err().to_string();
+        assert!(e.contains("Graphics") && e.contains("add"), "{e}");
+        // delete fails and the query also says it is absent: fine; delete fails and it is still there: error
+        set(&FakeBackend::with_script("exit 1"), &env, &GraphicsDriver::Auto).unwrap();
+        let b = FakeBackend::with_script(r#"[ "$1" = delete ] && exit 1; exit 0"#);
+        let e = set(&b, &env, &GraphicsDriver::Auto).unwrap_err().to_string();
+        assert!(e.contains("Graphics"), "{e}");
+    }
+
+    #[test]
+    fn prefix_read_missing_symlink_oversized_and_hostile() {
+        let (_t, env) = app();
+        let p = env.prefix();
+        assert_eq!(read_graphics_driver_from_prefix(&env), Ok(GraphicsDriver::Auto));
+        fs::write(p.join("user.reg"), drivers("\"Graphics\"=\"wayland\"")).unwrap();
+        assert_eq!(read_graphics_driver_from_prefix(&env), Ok(GraphicsDriver::Wayland));
+        fs::remove_file(p.join("user.reg")).unwrap();
+        // a symlink is an error, never followed
+        let target = p.join("elsewhere");
+        fs::write(&target, drivers("\"Graphics\"=\"wayland\"")).unwrap();
+        symlink(&target, p.join("user.reg")).unwrap();
+        assert!(read_graphics_driver_from_prefix(&env).unwrap_err().contains("symlink"));
+        fs::remove_file(p.join("user.reg")).unwrap();
+        // a directory is not a hive; a sparse oversized file is refused unread
+        fs::create_dir(p.join("user.reg")).unwrap();
+        assert_eq!(read_graphics_driver_from_prefix(&env), Ok(GraphicsDriver::Auto));
+        fs::remove_dir(p.join("user.reg")).unwrap();
+        let f = fs::File::create(p.join("user.reg")).unwrap();
+        f.set_len(crate::install_installer::MAX_MARKER_HIVE_BYTES + 1).unwrap();
+        assert!(read_graphics_driver_from_prefix(&env).unwrap_err().contains("cap"));
+        // hostile bytes: no panic, some answer
+        fs::write(p.join("user.reg"), [0xffu8, b'[', b'\\', 0, b'\n', b'"'].repeat(500)).unwrap();
+        let _ = read_graphics_driver_from_prefix(&env);
+    }
+
+    #[test]
+    #[ignore = "needs Wine 10"]
+    fn e2e_real_wine_display_driver() {
+        let launcher = Launcher::new();
+        let backend = crate::real_wine_backend(&launcher);
+        let tmp = tempfile::tempdir().unwrap(); // never ~/.wine; and no stub reg.exe, Wine's own is used
+        let env = Store::new(tmp.path().join("apps"))
+            .unwrap()
+            .create(&AppId::parse("e2e").unwrap())
+            .unwrap();
+        backend.prepare(&env).unwrap();
+        for (want, expect) in [
+            (GraphicsDriver::Wayland, GraphicsDriver::Wayland),
+            (GraphicsDriver::Auto, GraphicsDriver::Auto),
+            (GraphicsDriver::X11, GraphicsDriver::X11),
+        ] {
+            set_graphics_driver(&env, &backend, &launcher, &want).unwrap();
+            backend.stop(&env).unwrap(); // the registry is flushed to user.reg when the server exits
+            assert_eq!(read_graphics_driver_from_prefix(&env), Ok(expect));
         }
     }
 }

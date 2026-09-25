@@ -82,7 +82,7 @@ pub(crate) fn cache_dir() -> Result<PathBuf, CmdError> {
     Ok(rt_core::data_root()?.join("deps-cache"))
 }
 
-fn app_env(store: &Store, arg: &str) -> Result<AppEnv, CmdError> {
+pub(crate) fn app_env(store: &Store, arg: &str) -> Result<AppEnv, CmdError> {
     let id = AppId::parse(arg).map_err(|e| {
         format!(
             "{:?} is not a valid app id ({e}); `deps` takes an id from `runtime list`, never a path",
