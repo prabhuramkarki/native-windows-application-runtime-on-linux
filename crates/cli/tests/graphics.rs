@@ -25,6 +25,7 @@ fn has_loader() -> bool {
 /// besides the basic tools the script itself needs.
 fn info(script: &str) -> Option<(Output, Duration)> {
     if !has_loader() {
+        eprintln!("skipped: no libvulkan");
         return None;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -72,4 +73,14 @@ fn a_flood_of_output_is_capped_and_is_unknown() {
     assert!(took < Duration::from_secs(15), "took {took:?}");
     assert!(so.contains("unknown"), "{so}");
     assert!(so.len() < 4096, "{}", so.len());
+}
+
+#[test]
+fn a_descendant_in_its_own_session_holding_stdout_does_not_hang() {
+    let Some((out, took)) = info("setsid sleep 30 &\nsleep 30") else {
+        return;
+    };
+    let so = String::from_utf8_lossy(&out.stdout);
+    assert!(took < Duration::from_secs(15), "took {took:?}");
+    assert!(so.contains("unknown"), "{so}");
 }
