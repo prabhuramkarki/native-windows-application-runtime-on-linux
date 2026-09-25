@@ -19,6 +19,7 @@ sha2.workspace = true
 ureq.workspace = true
 libc.workspace = true
 flate2.workspace = true
+ruzstd.workspace = true
 
 [dev-dependencies]
 runtime-core = { path = "../core", features = ["testing"] }

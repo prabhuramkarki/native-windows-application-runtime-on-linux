@@ -630,6 +630,7 @@ fn bundled_manifest_invariants() {
             let ext = match format {
                 ArchiveFormat::Zip => ".zip",
                 ArchiveFormat::TarGz => ".tar.gz",
+                ArchiveFormat::TarZst => ".tar.zst",
             };
             assert!(p.url.ends_with(ext), "{}", p.id);
         }
@@ -791,8 +792,20 @@ fn archive_format_parsed_and_checked() {
     let tgz = text.replacen("base.tar.gz", "base.TGZ?x=1#y", 1);
     Manifest::parse(&tgz).unwrap();
     Manifest::parse(&valid_with("base.zip", "base.zip?v=1")).unwrap();
+    let zst = valid_with("format = \"zip\"", "format = \"tar.zst\"").replacen(
+        "example.org/base.zip",
+        "example.org/base.tar.zst",
+        1,
+    );
+    assert!(matches!(
+        Manifest::parse(&zst).unwrap().get("base").unwrap().install,
+        Install::Archive {
+            format: ArchiveFormat::TarZst,
+            ..
+        }
+    ));
 
-    for f in ["tar.zst", "ZIP", "tar", "", "7z"] {
+    for f in ["tar.zstd", "tzst", "TAR.ZST", "ZIP", "tar", "", "7z"] {
         let e = err(&valid_with("format = \"zip\"", &format!("format = \"{f}\"")));
         assert!(matches!(e, ManifestError::UnsupportedFormat { .. }), "{f:?}: {e:?}");
     }
@@ -805,6 +818,9 @@ fn archive_format_parsed_and_checked() {
         ("tar.gz", "https://example.org/base.zip"),
         ("tar.gz", "https://example.org/base.tar.zst"),
         ("tar.gz", "https://example.org/base.gz"),
+        ("tar.zst", "https://example.org/base.tar.gz"),
+        ("tar.zst", "https://example.org/base.zst"),
+        ("zip", "https://example.org/base.tar.zst"),
     ] {
         let text = valid_with("format = \"zip\"", &format!("format = \"{fmt}\"")).replacen(
             "https://example.org/base.zip",

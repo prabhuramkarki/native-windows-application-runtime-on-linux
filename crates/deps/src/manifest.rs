@@ -70,13 +70,15 @@ pub enum Install {
     },
 }
 
-/// Supported archive containers. There is intentionally no zstd (`.tar.zst`) support.
+/// Supported archive containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     /// `format = "zip"`, url ending `.zip`.
     Zip,
     /// `format = "tar.gz"`, url ending `.tar.gz` or `.tgz`.
     TarGz,
+    /// `format = "tar.zst"`, url ending `.tar.zst`.
+    TarZst,
 }
 
 /// Copy `from` (a path inside the archive; ending in `/`, every file below that directory) to `to` (a path
@@ -128,7 +130,7 @@ pub enum ManifestError {
     BadLicence { id: String, licence: String },
     #[error("package {0:?}: a {PROPRIETARY:?} licence needs requires_consent = true")]
     BadConsent(String),
-    #[error("package {id:?}: unsupported archive format {format:?} (zip or tar.gz)")]
+    #[error("package {id:?}: unsupported archive format {format:?} (zip, tar.gz or tar.zst)")]
     UnsupportedFormat { id: String, format: String },
     #[error("package {id:?}: url {url:?} does not end with the extension of its {format:?} format")]
     FormatMismatch {
@@ -394,6 +396,7 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
         let exts: &[&str] = match format {
             ArchiveFormat::Zip => &[".zip"],
             ArchiveFormat::TarGz => &[".tar.gz", ".tgz"],
+            ArchiveFormat::TarZst => &[".tar.zst"],
         };
         if !exts.iter().any(|e| path.ends_with(e)) {
             return Err(ManifestError::FormatMismatch {
@@ -516,6 +519,7 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
             let format = match format.as_str() {
                 "zip" => ArchiveFormat::Zip,
                 "tar.gz" => ArchiveFormat::TarGz,
+                "tar.zst" => ArchiveFormat::TarZst,
                 _ => {
                     return Err(ManifestError::UnsupportedFormat {
                         id: id.to_owned(),
