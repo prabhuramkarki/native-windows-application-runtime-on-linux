@@ -48,6 +48,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         Some((store, Target::Installed(id))) => Facts::app(store, id),
         Some((_, Target::File(path))) => Facts::file(path),
     };
+    let vulkan = crate::graphics::probe();
     let report = doctor(DoctorInput {
         subject: facts.subject,
         host_arch: std::env::consts::ARCH,
@@ -74,6 +75,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             .as_ref()
             .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
         prefix_root: facts.prefix_root.as_deref(),
+        vulkan: Some(&vulkan),
     });
     crate::emit(&if as_json {
         render_json(&report)?
