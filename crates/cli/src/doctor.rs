@@ -25,8 +25,8 @@ use crate::safe::{json_safe, safe};
 use backend_wine::harden::{HardenError, audit_prefix};
 use pe::PeInfo;
 use rt_core::doctor::{
-    Area, DoctorInput, FsProbe, HostFs, ListResult, MAX_LISTING, PeState, PrefixAudit, PrefixState, Report, Status,
-    Subject, Verdict, doctor,
+    Area, D3dFamily, D3dRoute, DoctorInput, FsProbe, HostFs, ListResult, MAX_LISTING, PeState, PrefixAudit,
+    PrefixState, Report, Status, Subject, Verdict, doctor,
 };
 use rt_core::{AppId, CompatBackend, GraphicsDriver, Input, Launcher, Store, Target};
 use rt_deps::wine_config::read_graphics_driver_from_prefix;
@@ -85,6 +85,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             Ok(d) => Ok(d.clone()),
             Err(e) => Err(e.as_str()),
         }),
+        d3d_routes: facts.d3d_routes.as_deref(),
     });
     crate::emit(&if as_json {
         render_json(&report)?
@@ -125,6 +126,9 @@ struct Facts {
     notes: Vec<String>,
     /// Installed apps only: the Wine graphics driver setting, or why `user.reg` could not be read.
     graphics_driver: Option<Result<GraphicsDriver, String>>,
+    /// Installed apps whose program was analysed: the predicted Direct3D route per imported family. A file target
+    /// has none: nothing is recorded as installed for it, so there is nothing to predict from.
+    d3d_routes: Option<Vec<(D3dFamily, D3dRoute)>>,
 }
 
 impl Facts {
@@ -140,6 +144,7 @@ impl Facts {
             hint: None,
             notes: vec![],
             graphics_driver: None,
+            d3d_routes: None,
         }
     }
 
@@ -171,7 +176,12 @@ impl Facts {
                     &crate::graphics::verdict_for,
                 );
                 rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
+                let d3d_routes = match &pe {
+                    Pe::Analysed(info) => Some(d3d_routes(id.as_str(), info, &plan)),
+                    _ => None,
+                };
                 Facts {
+                    d3d_routes,
                     subject: Subject::App {
                         id: id.to_string(),
                         name: Some(p.metadata.name.clone()),
@@ -209,6 +219,63 @@ impl Facts {
                 }
             }
         }
+    }
+}
+
+/// The Direct3D families `info` imports (sorted, once each) and the route each is predicted to take, from the
+/// plan already made for the hint and the recorded packages (never from prefix files). The host's Vulkan is asked
+/// through the shared, once-probed `verdict_for`, and only for an installed provider (a plan entry that would be
+/// installed is already `Blocked` when Vulkan is unusable).
+fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFamily, D3dRoute)> {
+    let mut families: Vec<D3dFamily> = info
+        .imports
+        .iter()
+        .filter_map(|i| match rt_deps::capability_for(&i.dll)? {
+            "d3d8" => Some(D3dFamily::D3d8),
+            "d3d9" => Some(D3dFamily::D3d9),
+            "d3d10core" => Some(D3dFamily::D3d10),
+            "d3d11" => Some(D3dFamily::D3d11),
+            "d3d12" => Some(D3dFamily::D3d12),
+            _ => None,
+        })
+        .collect();
+    families.sort();
+    families.dedup();
+    families
+        .into_iter()
+        .map(|f| {
+            let (pkg, label, route) = match f {
+                D3dFamily::D3d12 => ("vkd3d-proton", "vkd3d-proton", D3dRoute::Vkd3dProton),
+                _ => ("dxvk", "DXVK", D3dRoute::Dxvk),
+            };
+            let builtin = |reason: String| D3dRoute::Wined3d { reason };
+            let entry = plan.plan.entries.iter().find(|e| e.package == pkg);
+            let route = match entry.map(|e| &e.action) {
+                None => builtin(format!("no package provides {}", family_name(f))),
+                Some(rt_deps::Action::Install) => {
+                    builtin(format!("{label} not installed: run `runtime deps {app} --install`"))
+                }
+                Some(rt_deps::Action::Blocked { reason }) => builtin(reason.clone()),
+                Some(rt_deps::Action::AlreadyInstalled) => {
+                    let min = rt_deps::Manifest::bundled().get(pkg).and_then(|p| p.min_vulkan);
+                    match crate::graphics::verdict_for(min) {
+                        rt_core::VulkanVerdict::Unusable(why) => builtin(format!("Vulkan unusable: {why}")),
+                        _ => route,
+                    }
+                }
+            };
+            (f, route)
+        })
+        .collect()
+}
+
+fn family_name(f: D3dFamily) -> &'static str {
+    match f {
+        D3dFamily::D3d8 => "Direct3D 8",
+        D3dFamily::D3d9 => "Direct3D 9",
+        D3dFamily::D3d10 => "Direct3D 10",
+        D3dFamily::D3d11 => "Direct3D 11",
+        D3dFamily::D3d12 => "Direct3D 12",
     }
 }
 
