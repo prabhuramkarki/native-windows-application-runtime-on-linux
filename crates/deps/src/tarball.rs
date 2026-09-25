@@ -474,6 +474,7 @@ impl<R: Read> Stream<R> {
             };
             let next = match rest.fill_buf() {
                 Ok(b) => b.first().copied(),
+                Err(e) if zstd => return Err(classify_zst(&e)),
                 Err(e) => return Err(classify(e, rest.get_ref())),
             };
             match next {

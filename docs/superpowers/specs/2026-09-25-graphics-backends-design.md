@@ -14,10 +14,12 @@ Success criteria:
 1. `runtime graphics info` prints the host's Vulkan devices (name, type, driver, API version) or says clearly that
    Vulkan is missing or unknown. No writes, no network.
 2. `runtime deps <app>` plans `vkd3d-proton` for an app importing `d3d12.dll` and installs it on real Wine.
-3. When the probe says Vulkan is definitely unusable (no loader, or no device, or API version below the package's
-   `min_vulkan`), the plan marks `dxvk`/`vkd3d-proton` `blocked{reason}` with a one-line explanation; the app keeps
-   Wine's wined3d. An unknown probe (tool missing) never blocks.
-4. A D3D11 fixture renders through DXVK in the wine-e2e CI job (already the gate for 4A's archive install).
+3. When Vulkan is definitely unusable (only: no loader, or devices listed but none meets the package's
+   `min_vulkan`), the plan marks `dxvk`/`vkd3d-proton` `blocked{reason}` with a one-line explanation, and
+   `deps --install` does not install them; the app keeps Wine's wined3d. A probe that fails, times out or lists no
+   devices is Unknown and never blocks.
+4. The vkd3d/dxvk archive install path and the real manifest entries' paths/overrides are verified on real Wine in
+   CI with fixtures; a D3D11 rendering fixture and FPS smoke test move to sub-project 4E (compat matrix).
 
 ## 2. Decisions (with reasoning)
 
@@ -57,8 +59,9 @@ Non-goals: per-game tuning (`DXVK_HUD`, config files), shader-cache management, 
 - Hostile: zstd bomb/oversized-window/truncated/trailing/multi-frame; a hostile `vulkaninfo` (huge, non-UTF-8,
   hangs) is bounded by the runner.
 - Resolver: blocked/unblocked matrix for Usable/Unusable/Unknown x dxvk/vkd3d-proton; `d3d12` import plans it.
-- Real: the ignored real-net test re-fetches the new pin; wine-e2e installs vkd3d-proton archive on real Wine and
-  renders the D3D11 fixture (D3D12 rendering needs a GPU runner, so it is a manual check recorded for 4E).
+- Real: the ignored real-net test re-fetches the new pin; CI installs fixture archives with the real manifest
+  entries' paths and overrides on real Wine. Rendering (a D3D11 fixture, FPS smoke test, D3D12) needs a GPU runner
+  and moves to sub-project 4E (compat matrix).
 
 ## 5. Risks
 

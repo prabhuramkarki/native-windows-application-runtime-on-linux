@@ -413,6 +413,6 @@ git commit -m "feat(deps): bundle VKD3D-Proton for Direct3D 12; document graphic
 
 ## Self-Review
 
-- **Spec coverage:** criterion 1 (`graphics info`) -> Task 2; 2 (`vkd3d-proton` planned/installed) -> Tasks 4-5; 3 (blocked when Vulkan unusable, Unknown never blocks) -> Task 3; 4 (D3D11 fixture through DXVK in CI) -> already gated by 4A's wine-e2e; Task 5 Step 3 extends it. Components list: `zstd_tar` became a codec inside `tarball.rs` (one reader, not two); `min_vulkan` -> Task 3; doctor reuse -> Task 2. `--remove` dropped, with reasons, in the header and Task 5.
+- **Spec coverage:** criterion 1 (`graphics info`) -> Task 2; 2 (`vkd3d-proton` planned/installed) -> Tasks 4-5; 3 (blocked when Vulkan unusable, Unknown never blocks) -> Task 3; 4 (archive install path and real manifest entries verified with fixtures on real Wine in CI; rendering fixture moved to 4E) -> Task 5 Step 3. Components list: `zstd_tar` became a codec inside `tarball.rs` (one reader, not two); `min_vulkan` -> Task 3; doctor reuse -> Task 2. `--remove` dropped, with reasons, in the header and Task 5.
 - **Placeholders:** the only values left to fill are the ones that must come from a real download (`<ver>`, sha256, size, licence) and `ruzstd`'s real API; both are explicit steps with commands.
 - **Type consistency:** `VulkanVerdict`, `HostVulkan`, `host_verdict`, `block_for_vulkan`, the `&dyn Fn(Option<(u32, u32)>) -> VulkanVerdict` parameter, `Codec`/`walk_codec`, `ArchiveFormat::TarZst` are used with the same names throughout.
