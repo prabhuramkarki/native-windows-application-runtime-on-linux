@@ -1,4 +1,5 @@
 mod analyze;
+mod deps;
 mod doctor;
 mod install;
 mod list;
@@ -94,6 +95,13 @@ enum Cmd {
     /// regardless (takes an app id, never a path). An app with no recorded uninstaller (a portable-exe install,
     /// or one made before this existed) just has its environment removed, same as `runtime remove`.
     Uninstall { app: String },
+    /// Show what an app needs from the runtime's package manifest (DXVK, the VC++ runtime, ...), and install it.
+    /// `runtime deps <app>` only prints the plan (no network, no changes); `--install` downloads and installs it.
+    /// Consent-gated packages print their licence text and ask first; without a terminal, `--yes <pkg>` consents
+    /// for that package (the text is still printed). A package you do not consent to is skipped with everything
+    /// that needs it; the packages it needs itself still install. `runtime deps list` shows the manifest,
+    /// `runtime deps cache [--clear]` the download cache. Exit code 1 when anything failed or was skipped.
+    Deps(deps::DepsArgs),
     /// Show the newest log of an app (its last run's stderr)
     Logs {
         app: String,
@@ -162,6 +170,7 @@ fn main() -> ExitCode {
         Cmd::Remove { app } => remove::run(&app).map(|()| 0),
         Cmd::Uninstall { app } => uninstall::run(&app).map(|()| 0),
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
+        Cmd::Deps(args) => deps::run(args),
     };
     match result {
         Ok(code) => ExitCode::from(code),

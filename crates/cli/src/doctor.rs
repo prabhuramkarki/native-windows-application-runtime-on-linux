@@ -43,10 +43,10 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     };
     // The error as text: what `doctor` shows for a Wine that could not be found.
     let wine = backend_wine::WineBackend::discover_with(Launcher::new()).map_err(|e| e.to_string());
-    let facts = match found {
+    let facts = match &found {
         None => Facts::system(),
-        Some((store, Target::Installed(id))) => Facts::app(&store, &id),
-        Some((_, Target::File(path))) => Facts::file(&path),
+        Some((store, Target::Installed(id))) => Facts::app(store, id),
+        Some((_, Target::File(path))) => Facts::file(path),
     };
     let report = doctor(DoctorInput {
         subject: facts.subject,
@@ -80,6 +80,12 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     } else {
         render(&report)
     })?;
+    if let Some(h) = &facts.hint {
+        eprintln!("{h}");
+    }
+    for n in &facts.notes {
+        eprintln!("{n}");
+    }
     Ok(u8::from(report.verdict == Verdict::Fail))
 }
 
@@ -102,6 +108,10 @@ struct Facts {
     /// Installed apps only: [`backend_wine::check_app_home`], the check `run` makes, as text.
     app_home: Option<Result<(), String>>,
     prefix_root: Option<PathBuf>,
+    /// Installed apps only: the missing-dependency hint, planned from the PE facts above (no second read).
+    hint: Option<String>,
+    /// Installed apps only: installer packages already in the prefix, which the runtime did not install.
+    notes: Vec<String>,
 }
 
 impl Facts {
@@ -114,6 +124,8 @@ impl Facts {
             prefix: PrefixState::NotApplicable,
             app_home: None,
             prefix_root: None,
+            hint: None,
+            notes: vec![],
         }
     }
 
@@ -130,20 +142,32 @@ impl Facts {
     fn app(store: &Store, id: &AppId) -> Facts {
         let env = store.get(id).ok();
         match rt_core::resolve_program(store, id, backend_wine::BACKEND_ID) {
-            Ok(p) => Facts {
-                subject: Subject::App {
-                    id: id.to_string(),
-                    name: Some(p.metadata.name.clone()),
-                    version: p.metadata.version.clone(),
-                },
-                pe: read_pe(&p.exe),
-                program: Some(Ok(p.metadata.executable.clone())),
-                // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
-                app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
-                prefix: prefix_state(&p.env.prefix()),
-                app_home: Some(home_state(&p.env)),
-                prefix_root: Some(p.env.prefix()),
-            },
+            Ok(p) => {
+                let pe = read_pe(&p.exe);
+                let exe = match &pe {
+                    Pe::Analysed(info) => Ok(info.as_ref()),
+                    Pe::Unreadable(why) => Err(why.as_str()),
+                    Pe::Skipped | Pe::Archive => Err("not a PE file"),
+                };
+                let mut plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled());
+                rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
+                Facts {
+                    subject: Subject::App {
+                        id: id.to_string(),
+                        name: Some(p.metadata.name.clone()),
+                        version: p.metadata.version.clone(),
+                    },
+                    hint: crate::deps::hint_for(id.as_str(), &plan),
+                    notes: crate::deps::present_notes(&plan),
+                    pe,
+                    program: Some(Ok(p.metadata.executable.clone())),
+                    // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
+                    app_dir: Some(HostFs.list(&p.cwd, MAX_LISTING)),
+                    prefix: prefix_state(&p.env.prefix()),
+                    app_home: Some(home_state(&p.env)),
+                    prefix_root: Some(p.env.prefix()),
+                }
+            }
             // The program cannot be used, and that is the report: the name and the prefix are still shown.
             Err(e) => {
                 let md = env.as_ref().and_then(|env| store.read_metadata(env).ok());

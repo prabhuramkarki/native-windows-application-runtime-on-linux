@@ -560,14 +560,17 @@ mod tests {
     fn list_warns_on_wrong_schema_version() {
         let fx = Fx::new();
         let env = fx.store.create(&id("mid")).unwrap();
-        let text = serde_json::to_string(&sample("mid"))
-            .unwrap()
-            .replace("\"schemaVersion\":2", "\"schemaVersion\":3");
-        fs::write(env.metadata_path(), text).unwrap();
+        let mut md = serde_json::to_value(sample("mid")).unwrap();
+        md["schemaVersion"] = (u64::from(crate::meta::SCHEMA_VERSION) + 1).into();
+        fs::write(env.metadata_path(), serde_json::to_vec(&md).unwrap()).unwrap();
         assert_eq!(list_with_bad(&fx, "mid"), [ok("aaa"), warn("mid"), ok("zzz")]);
         let list = fx.store.list();
         let w = list[1].as_ref().unwrap_err();
-        assert!(matches!(w.error, StoreError::Meta(MetaError::SchemaVersion(3))), "{w}");
+        let future = u64::from(crate::meta::SCHEMA_VERSION) + 1;
+        assert!(
+            matches!(w.error, StoreError::Meta(MetaError::SchemaVersion(n)) if n == future),
+            "{w}"
+        );
     }
 
     #[test]

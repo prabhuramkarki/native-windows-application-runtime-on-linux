@@ -23,7 +23,8 @@ wixl -o "$out/hello.msi" tools/fixtures/hello.wxs
 command -v makensis >/dev/null || { echo "missing makensis: sudo apt install nsis" >&2; exit 1; }
 makensis -NOCD tools/fixtures/hello.nsi
 makensis -NOCD -DNOSHORTCUT tools/fixtures/hello.nsi
-for f in hello-nsis.exe hello-nsis-noshortcut.exe; do
+makensis -NOCD tools/fixtures/dep-installer.nsi
+for f in hello-nsis.exe hello-nsis-noshortcut.exe dep-installer.exe; do
   grep -qa NullsoftInst "$out/$f" || {
     echo "$f is missing the NullsoftInst marker" >&2
     exit 1
