@@ -134,7 +134,7 @@ struct Sc {
     vulkan: Option<crate::HostVulkan>,
     vulkan_min: Option<(u32, u32)>,
     wine_drivers: Option<Vec<String>>,
-    graphics_driver: Option<GraphicsDriver>,
+    graphics_driver: Option<Result<GraphicsDriver, String>>,
 }
 
 /// A system report on a good desktop.
@@ -214,7 +214,10 @@ impl Sc {
             vulkan: self.vulkan.as_ref(),
             vulkan_min: self.vulkan_min,
             wine_drivers: self.wine_drivers.as_deref(),
-            graphics_driver: self.graphics_driver.clone(),
+            graphics_driver: self
+                .graphics_driver
+                .as_ref()
+                .map(|r| r.clone().map_err(|e| &*Box::leak(e.into_boxed_str()))),
         })
     }
 }
@@ -649,7 +652,7 @@ fn a_wine_without_the_pulse_driver_is_a_warning_and_an_unlisted_one_is_not_verif
 fn graphics_of(host: Host, driver: GraphicsDriver, drivers: Option<Vec<String>>) -> Vec<Check> {
     let mut s = sc();
     s.host = host;
-    s.graphics_driver = Some(driver);
+    s.graphics_driver = Some(Ok(driver));
     s.wine_drivers = drivers;
     of(&s.run(), Area::Graphics).into_iter().cloned().collect()
 }
@@ -659,39 +662,53 @@ fn the_apps_graphics_setting_is_checked_against_the_session_and_wine() {
     let wl_host = || Host::desktop();
     let x_host = || Host::default().env("DISPLAY", ":0");
     let has_wl = names(&["winewayland.drv"]);
-    let extra = |cs: &[Check]| {
-        cs.iter()
-            .filter(|c| c.text.contains("graphics driver"))
-            .cloned()
-            .collect::<Vec<_>>()
+    // The one setting check of an app report (the session and Vulkan checks say "display"/"Vulkan").
+    let setting = |cs: Vec<Check>| {
+        let v: Vec<Check> = cs.into_iter().filter(|c| c.text.contains("graphics driver")).collect();
+        assert_eq!(v.len(), 1, "{v:#?}");
+        v[0].clone()
+    };
+    let expect = |c: Check, st: Status, word: &str| {
+        assert_eq!(c.status, st, "{}", c.text);
+        assert!(c.text.contains(word), "{}", c.text);
     };
     // Wayland: no socket
-    let cs = graphics_of(x_host(), GraphicsDriver::Wayland, has_wl.clone());
-    assert_eq!((extra(&cs).len(), extra(&cs)[0].status), (1, Status::Warn), "{cs:#?}");
+    let c = setting(graphics_of(x_host(), GraphicsDriver::Wayland, has_wl.clone()));
+    expect(c, Status::Warn, "no Wayland socket");
     // Wayland: socket, driver listed absent / present / not listed
-    let cs = graphics_of(wl_host(), GraphicsDriver::Wayland, names(&["winepulse.drv"]));
-    assert_eq!(extra(&cs).len(), 1, "{cs:#?}");
-    assert_eq!(extra(&cs)[0].status, Status::Warn);
-    assert!(extra(&cs)[0].text.contains("winewayland"));
-    assert!(extra(&graphics_of(wl_host(), GraphicsDriver::Wayland, has_wl)).is_empty());
-    assert!(extra(&graphics_of(wl_host(), GraphicsDriver::Wayland, None)).is_empty());
-    // X11 without DISPLAY
-    let cs = graphics_of(Host::default(), GraphicsDriver::X11, None);
-    assert_eq!(extra(&cs).len(), 1, "{cs:#?}");
-    assert_eq!(extra(&cs)[0].status, Status::Warn);
-    assert!(extra(&graphics_of(x_host(), GraphicsDriver::X11, None)).is_empty());
-    // Auto adds nothing, Custom warns (and is escaped)
-    assert!(extra(&graphics_of(Host::default(), GraphicsDriver::Auto, None)).is_empty());
+    let c = setting(graphics_of(
+        wl_host(),
+        GraphicsDriver::Wayland,
+        names(&["winepulse.drv"]),
+    ));
+    expect(c, Status::Warn, "winewayland");
+    let c = setting(graphics_of(wl_host(), GraphicsDriver::Wayland, has_wl));
+    expect(c, Status::Ok, "wayland (session: wayland socket)");
+    let c = setting(graphics_of(wl_host(), GraphicsDriver::Wayland, None));
+    expect(c, Status::Ok, "wayland");
+    // X11
+    let c = setting(graphics_of(Host::default(), GraphicsDriver::X11, None));
+    expect(c, Status::Warn, "DISPLAY is not set");
+    let c = setting(graphics_of(x_host(), GraphicsDriver::X11, None));
+    expect(c, Status::Ok, "x11 (session: DISPLAY)");
+    // Auto is shown, never a warning; Custom warns (and is escaped)
+    let c = setting(graphics_of(Host::default(), GraphicsDriver::Auto, None));
+    expect(c, Status::Ok, "auto (session: none)");
     let cs = graphics_of(
         wl_host(),
         GraphicsDriver::Custom("x11,wayland\x1b]0;x\x07".into()),
         None,
     );
-    let c = &extra(&cs)[0];
-    assert_eq!(c.status, Status::Warn);
-    assert!(c.text.contains("custom graphics driver setting"), "{}", c.text);
+    let c = setting(cs);
     assert_tame(&c.text);
     assert!(c.text.chars().count() <= 300);
+    expect(c, Status::Warn, "custom graphics driver setting");
+    // the read failed: a warning that says so, with the reason cleaned
+    let mut s = sc();
+    s.graphics_driver = Some(Err("user.reg is a symlink\x1b]0;x\x07".into()));
+    let c = setting(of(&s.run(), Area::Graphics).into_iter().cloned().collect());
+    assert_tame(&c.text);
+    expect(c, Status::Warn, "not verified: user.reg is a symlink");
     // no setting (system report): nothing extra
     assert_eq!(of(&sc().run(), Area::Graphics).len(), 2);
 }

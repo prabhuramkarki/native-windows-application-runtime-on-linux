@@ -2479,7 +2479,46 @@ fn display_with_a_symlinked_or_hostile_user_reg_fails_or_says_auto_without_hangi
 }
 
 #[test]
-fn display_set_is_refused_while_the_app_runs_and_writes_nothing() {
+fn display_set_is_refused_while_a_wineserver_runs_for_the_prefix_and_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    let prefix = display_app(&r);
+    // A process named `wineserver` whose WINEPREFIX is the app's prefix (what `wineservers_for` looks for).
+    let exe = r.root.join("fake-ws/wineserver");
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, "#!/bin/sh\nread _\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = Command::new(&exe);
+    cmd.env_clear()
+        .env("WINEPREFIX", &prefix)
+        .stdin(std::process::Stdio::piped());
+    let mut server = (0..500)
+        .find_map(|_| match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                None
+            }
+            x => Some(x.unwrap()),
+        })
+        .expect("spawn the fake wineserver");
+    let o = r.rt(&["display", "dapp", "x11"]);
+    let _ = server.kill();
+    let _ = server.wait();
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("appears to be running") && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!prefix.join("user.reg").exists() && !reg_ran(&r));
+    // once it is gone the same command works
+    assert_ok(&r.rt(&["display", "dapp", "x11"]));
+}
+
+/// The shared lock is what `runtime run` holds only while it starts an app; it keeps another runtime command's
+/// exclusive lock out, but a live app is refused by the wineserver check (the test above).
+#[test]
+fn display_set_is_refused_while_another_runtime_command_holds_the_app_lock() {
     let r = rig();
     let prefix = display_app(&r);
     let store = rt_core::Store::new(r.apps()).unwrap();
@@ -2554,5 +2593,16 @@ fn doctor_of_an_app_checks_its_graphics_driver_setting_and_keeps_the_areas() {
     assert!(lines_with(&out, "winewayland")[0].contains("[warn]"), "{out}");
     r.wine_dlls(&["winewayland.drv"]);
     let out = s(&wayland(&r).args(["doctor", "dapp"]).output().unwrap().stdout);
-    assert!(lines_with(&out, "graphics driver").is_empty(), "{out}");
+    assert!(
+        lines_with(&out, "Wine graphics driver: wayland")[0].contains("[ok]"),
+        "{out}"
+    );
+    // an unreadable user.reg (a symlink) is reported, not dropped
+    fs::remove_file(prefix.join("user.reg")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", prefix.join("user.reg")).unwrap();
+    let out = s(&r.cmd().args(["doctor", "dapp"]).output().unwrap().stdout);
+    assert!(
+        lines_with(&out, "graphics driver setting not verified")[0].contains("[warn]"),
+        "{out}"
+    );
 }
