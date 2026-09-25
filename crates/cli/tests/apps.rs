@@ -2272,7 +2272,8 @@ fn display_app(r: &Rig) -> PathBuf {
     fs::create_dir_all(dir.join("runtime/home")).unwrap();
     fs::write(prefix.join("drive_c/windows/system32/reg.exe"), b"MZ").unwrap();
     r.hook(
-        r#"case "$2" in
+        r#"printf '%s\n' "$*" >> "$(dirname "$0")/../log/reg-argv.txt"
+case "$2" in
   add) printf 'WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers] 1\n"Graphics"="%s"\n\n' "$7" > "$WINEPREFIX/user.reg" ;;
   delete) rm -f "$WINEPREFIX/user.reg" ;;
 esac"#,
@@ -2301,6 +2302,14 @@ fn wayland(r: &Rig) -> Command {
 fn display_lines(o: &Output) -> Vec<String> {
     assert_ok(o);
     s(&o.stdout).lines().map(String::from).collect()
+}
+
+fn reg_argv(r: &Rig) -> Vec<String> {
+    fs::read_to_string(r.log.join("reg-argv.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split_once(' ').map_or(l, |x| x.1).to_owned())
+        .collect()
 }
 
 fn reg_ran(r: &Rig) -> bool {
@@ -2335,8 +2344,11 @@ fn display_wayland_is_refused_without_a_session_and_writes_nothing() {
     let r = rig();
     let prefix = display_app(&r);
     r.wine_dlls(&["winewayland.drv"]);
+    user_reg(&prefix, "\"Graphics\"=\"x11,wayland\"");
+    let before = fs::read(prefix.join("user.reg")).unwrap();
     let err = assert_fails(&r.rt(&["display", "dapp", "wayland"]));
     assert!(err.contains("no Wayland session"), "{err}");
+    assert_eq!(fs::read(prefix.join("user.reg")).unwrap(), before);
     // WAYLAND_DISPLAY set but no socket: still no session
     let o = r
         .cmd()
@@ -2346,7 +2358,8 @@ fn display_wayland_is_refused_without_a_session_and_writes_nothing() {
         .output()
         .unwrap();
     assert!(assert_fails(&o).contains("no Wayland session"));
-    assert!(!prefix.join("user.reg").exists() && !reg_ran(&r));
+    assert_eq!(fs::read(prefix.join("user.reg")).unwrap(), before);
+    assert!(!reg_ran(&r));
 }
 
 #[test]
@@ -2377,6 +2390,14 @@ fn display_wayland_sets_and_rereads_and_auto_and_x11_follow() {
     );
     assert_ok(&r.rt(&["display", "dapp", "auto"]));
     assert!(!prefix.join("user.reg").exists());
+    let k = r"HKCU\Software\Wine\Drivers";
+    assert_eq!(
+        reg_argv(&r),
+        [
+            format!("add {k} /v Graphics /d wayland /f"),
+            format!("delete {k} /v Graphics /f")
+        ]
+    );
     // x11 without DISPLAY warns and still sets
     let o = r.rt(&["display", "dapp", "x11"]);
     assert_ok(&o);
@@ -2452,4 +2473,24 @@ fn display_rejects_bad_ids_unknown_apps_and_unknown_choices() {
         "{err}"
     );
     assert!(!reg_ran(&r));
+}
+
+#[test]
+fn display_set_is_refused_for_a_symlinked_user_reg_or_prefix() {
+    let r = rig();
+    let prefix = display_app(&r);
+    let target = prefix.join("real.reg");
+    fs::write(&target, b"untouched").unwrap();
+    symlink(&target, prefix.join("user.reg")).unwrap();
+    let err = assert_fails(&r.rt(&["display", "dapp", "x11"]));
+    assert!(err.contains("symlink") && err.contains("nothing was changed"), "{err}");
+    assert_eq!(fs::read(&target).unwrap(), b"untouched");
+    assert!(!reg_ran(&r));
+    // the prefix directory itself a symlink
+    fs::remove_file(prefix.join("user.reg")).unwrap();
+    let moved = prefix.with_file_name("prefix-real");
+    fs::rename(&prefix, &moved).unwrap();
+    symlink(&moved, &prefix).unwrap();
+    assert_fails(&r.rt(&["display", "dapp", "x11"]));
+    assert!(!reg_ran(&r) && !moved.join("user.reg").exists());
 }
