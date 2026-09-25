@@ -51,6 +51,22 @@ runtime display game wayland    # auto | x11 | wayland (the app must be stopped)
 `auto` removes the setting, so Wine picks its own driver (X11/XWayland). Wayland is experimental in Wine 10.0 and
 opt-in per app: `wayland` is refused without a Wayland session or without `winewayland` in the Wine build.
 
+## Permissions (`runtime permissions`)
+
+```
+runtime permissions game                                  # the app's profile (permissions.toml) and its source
+runtime permissions game --set network=allow --set gpu=off
+runtime permissions game --set fs+=/home/me/saves:rw      # grant a host directory (ro | rw); fs-=<dir> removes it
+runtime permissions game --reset                          # back to the default; --json for scripts
+```
+
+The default is no network, no host directories, and display, audio and gpu on. The profile is stored in the app's
+own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute
+path; symlinks are resolved and the target is judged. `$HOME`, `/`, the runtime's data directory, `~/.ssh`,
+`~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.password-store` (and anything containing or
+inside them), `/proc`, `/sys`, `/dev` and `/run/user` are always refused. (The run sandbox that enforces the profile
+arrives with the next tasks of Phase 5A.)
+
 ## Dependencies (`runtime deps`)
 
 ```sh

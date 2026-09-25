@@ -7,6 +7,7 @@ mod graphics;
 mod install;
 mod list;
 mod logs;
+mod permissions;
 mod remove;
 mod run;
 mod safe;
@@ -120,6 +121,24 @@ enum Cmd {
         #[arg(value_parser = ["auto", "x11", "wayland"])]
         choice: Option<String>,
     },
+    /// Show or change what an app's sandbox may reach (`permissions.toml`): network (default deny), display, audio
+    /// and gpu (default on) and host directories (default none). `--set network=allow`, `--set gpu=off`,
+    /// `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir` (repeatable; all are checked before anything is written);
+    /// `--reset` returns to the default. Changing needs the app to be stopped. `$HOME`, `/`, the runtime's data
+    /// directory and secret directories (`~/.ssh`, `~/.gnupg`, ...) can never be granted.
+    Permissions {
+        /// An app id from `runtime list`
+        app: String,
+        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir
+        #[arg(long = "set", value_name = "EXPR")]
+        set: Vec<String>,
+        /// Delete the app's permissions.toml (back to the default)
+        #[arg(long)]
+        reset: bool,
+        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}]}
+        #[arg(long)]
+        json: bool,
+    },
     /// Show what the host's graphics stack offers (`runtime graphics info`)
     #[command(subcommand)]
     Graphics(GraphicsCmd),
@@ -201,6 +220,7 @@ fn main() -> ExitCode {
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
         Cmd::Deps(args) => deps::run(args),
         Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
+        Cmd::Permissions { app, set, reset, json } => permissions::run(&app, &set, reset, json).map(|()| 0),
         Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };
