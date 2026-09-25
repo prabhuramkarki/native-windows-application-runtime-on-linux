@@ -33,7 +33,9 @@ fn fx(body: &[u8]) -> Fx {
         .unwrap()
         .create(&AppId::parse("t").unwrap())
         .unwrap();
-    fs::create_dir_all(env.drive_c()).unwrap();
+    // A non-MSI installer is started by the prefix's explorer.exe; the fake backend runs it as the shell script.
+    fs::create_dir_all(env.drive_c().join("windows")).unwrap();
+    fs::write(env.drive_c().join(EXPLORER_RELATIVE), "fake explorer").unwrap();
     let cache_dir = tmp.path().join("cache");
     fs::create_dir(&cache_dir).unwrap();
     let cache = cache_dir.join(sha(body));
@@ -58,6 +60,10 @@ impl Fx {
         ]
         .iter()
         .any(|d| fs::read_dir(self.c(d)).is_ok_and(|mut r| r.next().is_some()))
+    }
+    /// Nothing was staged: no `windows/temp` (any case) was created.
+    fn nothing_staged(&self) -> bool {
+        !self.c("windows/Temp").exists() && !self.c("windows/temp").exists()
     }
     fn write_reg(&self, file: &str, text: &str) {
         fs::write(self.env.prefix().join(file), text).unwrap();
@@ -196,8 +202,9 @@ fn a_file_marker_already_present_refuses_without_running_anything() {
 #[test]
 fn a_file_marker_is_found_case_insensitively_as_wine_does() {
     let f = fx(BODY);
-    fs::create_dir_all(f.c("Windows/System32")).unwrap();
-    fs::write(f.c("Windows/System32/DepMarker.DLL"), "foreign").unwrap();
+    // `windows` itself exists already (fx puts explorer.exe there); the rest differs in case.
+    fs::create_dir_all(f.c("windows/System32")).unwrap();
+    fs::write(f.c("windows/System32/DepMarker.DLL"), "foreign").unwrap();
     let p = pkg_for(BODY, &["/S"], file_marker());
     let err = run_with(&f, &p, &backend(MAKE_MARKER), Path::new(NO_RUN_BWRAP)).unwrap_err();
     assert!(matches!(err, InstallerPkgError::MarkerAlreadyPresent), "{err:?}");
@@ -446,6 +453,9 @@ fn hostile_registry_bytes_never_panic_and_echo_nothing_unbounded() {
 /// Records what the installer saw: its own path, its args, its network namespace and a copy of its bytes.
 const RECORD: &str =
     "printf '%s\\n' \"$0\" \"$@\" > argv.txt; cp \"$0\" staged-copy.bin; readlink /proc/self/ns/net > netns.txt";
+/// The same for a non-MSI installer, where `$0` is explorer.exe: the staged copy is the file at the staging path.
+const RECORD_STAGED: &str = "printf '%s\\n' \"$0\" \"$@\" > argv.txt; cp windows/*emp/rt-deps/testpkg/testpkg.exe \
+     staged-copy.bin; readlink /proc/self/ns/net > netns.txt";
 
 #[test]
 fn the_installer_runs_offline_in_the_sandbox_from_a_verified_staged_copy() {
@@ -453,7 +463,7 @@ fn the_installer_runs_offline_in_the_sandbox_from_a_verified_staged_copy() {
     let f = fx(BODY);
     let before = fs::metadata(&f.cache).unwrap();
     let p = pkg_for(BODY, &["/S", "/D=C:\\x y", "$(touch pwned)"], file_marker());
-    let b = backend(&format!("{RECORD}; {MAKE_MARKER}"));
+    let b = backend(&format!("{RECORD_STAGED}; {MAKE_MARKER}"));
     let got = run_with(&f, &p, &b, &bwrap).unwrap();
     assert!(got.staged_removed);
 
@@ -467,32 +477,35 @@ fn the_installer_runs_offline_in_the_sandbox_from_a_verified_staged_copy() {
         "the installer shared the host network"
     );
 
-    // It ran the staged copy inside drive_c (never the cache file), with each arg as one argv element.
+    // The prefix's explorer.exe started the staged copy inside drive_c (never the cache file) on the null
+    // desktop, with each arg as one argv element.
     let argv = fs::read_to_string(f.c("argv.txt")).unwrap();
     let lines: Vec<&str> = argv.lines().collect();
-    let staged = lines[0];
-    assert!(
-        Path::new(staged).starts_with(f.env.drive_c()),
-        "ran {staged}, not a copy inside drive_c"
+    assert_eq!(Path::new(lines[0]), f.c(EXPLORER_RELATIVE));
+    let staged_win = "C:\\windows\\temp\\rt-deps\\testpkg\\testpkg.exe";
+    assert_eq!(
+        &lines[1..],
+        [
+            "/desktop=rt-deps,800x600,null",
+            staged_win,
+            "/S",
+            "/D=C:\\x y",
+            "$(touch pwned)"
+        ]
     );
-    assert!(
-        staged
-            .to_ascii_lowercase()
-            .ends_with("/windows/temp/rt-deps/testpkg/testpkg.exe"),
-        "{staged}"
-    );
-    assert_eq!(&lines[1..], ["/S", "/D=C:\\x y", "$(touch pwned)"]);
     assert!(!f.c("pwned").exists());
+    let staged = resolve_under(&f.env.drive_c(), &WinPath::parse(staged_win).unwrap());
+    assert!(matches!(staged, Err(ResolveError::NotFound)), "{staged:?}");
     let calls = b.calls();
-    let Some(Call::Command { exe, cwd, .. }) = calls.iter().find(|c| matches!(c, Call::Command { .. })) else {
+    let Some(Call::Command { exe, cwd, args, .. }) = calls.iter().find(|c| matches!(c, Call::Command { .. })) else {
         panic!("{calls:?}")
     };
-    assert!(exe.starts_with(f.env.drive_c()) && exe != &f.cache, "{exe:?}");
+    assert_eq!(exe, &f.c(EXPLORER_RELATIVE));
+    assert_eq!(args.len(), 5);
     assert_eq!(cwd, &f.env.drive_c());
 
     // The copy it ran is byte-identical to the verified package, and it is gone afterwards.
     assert_eq!(sha(&fs::read(f.c("staged-copy.bin")).unwrap()), p.sha256);
-    assert!(!Path::new(staged).exists());
     assert!(!f.staging_left());
 
     // The cache file is untouched: bytes, mode and mtime.
@@ -553,7 +566,7 @@ fn a_staged_file_left_by_a_killed_run_is_replaced() {
     fs::create_dir_all(f.c("windows/Temp/rt-deps/testpkg")).unwrap();
     fs::write(f.c("windows/Temp/rt-deps/testpkg/testpkg.exe"), "stale half copy").unwrap();
     let p = pkg_for(BODY, &["/S"], file_marker());
-    let got = run_with(&f, &p, &backend(&format!("{RECORD}; {MAKE_MARKER}")), &bwrap).unwrap();
+    let got = run_with(&f, &p, &backend(&format!("{RECORD_STAGED}; {MAKE_MARKER}")), &bwrap).unwrap();
     assert!(got.marker_confirmed);
     assert_eq!(fs::read(f.c("staged-copy.bin")).unwrap(), BODY);
     assert!(!f.staging_left());
@@ -619,7 +632,7 @@ fn no_bwrap_is_a_typed_error_before_anything_is_staged() {
     .unwrap_err();
     assert!(matches!(err, InstallerPkgError::BwrapNotFound), "{err:?}");
     assert!(!f.ran());
-    assert!(!f.c("windows").exists(), "something was staged");
+    assert!(f.nothing_staged(), "something was staged");
 }
 
 #[test]
@@ -652,7 +665,7 @@ fn a_hand_built_package_with_a_bad_id_or_hash_is_refused() {
         assert!(matches!(err, InstallerPkgError::BadPackage(_)), "{id}: {err:?}");
     }
     assert!(!f.ran());
-    assert!(!f.c("windows").exists());
+    assert!(f.nothing_staged());
 }
 
 // ------------------------------------------------------------------------------------------------ deadline
@@ -751,6 +764,24 @@ fn an_msi_without_msiexec_in_the_prefix_is_a_typed_error() {
 }
 
 #[test]
+fn an_exe_installer_without_explorer_in_the_prefix_is_a_typed_error() {
+    for kind in ["missing", "dir", "symlink"] {
+        let f = fx(BODY);
+        fs::remove_file(f.c(EXPLORER_RELATIVE)).unwrap();
+        match kind {
+            "dir" => fs::create_dir(f.c(EXPLORER_RELATIVE)).unwrap(),
+            "symlink" => symlink("/bin/sh", f.c(EXPLORER_RELATIVE)).unwrap(),
+            _ => {}
+        }
+        let p = pkg_for(BODY, &["/S"], file_marker());
+        let err = run_with(&f, &p, &backend(MAKE_MARKER), Path::new(NO_RUN_BWRAP)).unwrap_err();
+        assert!(matches!(err, InstallerPkgError::ExplorerMissing), "{kind}: {err:?}");
+        assert!(!f.ran());
+        assert!(!f.staging_left());
+    }
+}
+
+#[test]
 fn msi_detection_is_by_magic_or_url_extension() {
     let mut ole = OLE.to_vec();
     ole.push(0);
@@ -835,6 +866,228 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
         eprintln!("{marker:?}: system.reg section:\n{section}");
         backend.stop(&env).unwrap();
     }
+}
+
+/// A fresh real Wine 10.0 prefix in a scratch store, the fixture `name` as a verified cache file, and a package for
+/// it (id `depfixture`).
+struct RealWine {
+    _tmp: tempfile::TempDir,
+    launcher: Launcher,
+    backend: backend_wine::WineBackend,
+    env: AppEnv,
+    cache: PathBuf,
+    body: Vec<u8>,
+}
+
+fn real_wine(fixture: &str) -> RealWine {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/build")
+        .join(fixture);
+    let body = fs::read(&path).expect("fixture missing: run sh tools/build-fixtures.sh");
+    let launcher = Launcher::new();
+    let backend = backend_wine::WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("e2e").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    backend.stop(&env).unwrap();
+    let cache = tmp.path().join(sha(&body));
+    fs::write(&cache, &body).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o400)).unwrap();
+    RealWine {
+        _tmp: tmp,
+        launcher,
+        backend,
+        env,
+        cache,
+        body,
+    }
+}
+
+impl RealWine {
+    fn install(
+        &self,
+        args: &[&str],
+        marker: Marker,
+        deadline: Duration,
+    ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
+        let mut p = pkg_for(&self.body, args, marker);
+        p.id = "depfixture".into();
+        let bwrap = rt_installer::find_bwrap_on_path().expect("bwrap must be installed");
+        install_with(
+            &p,
+            &self.cache,
+            &self.env,
+            &self.backend,
+            &self.launcher,
+            Some(bwrap),
+            deadline,
+        )
+    }
+
+    /// No wineserver of this prefix is left (the settle wait ran inside the sandbox, or the sandbox was killed).
+    fn assert_no_wineserver(&self) {
+        let t = std::time::Instant::now();
+        loop {
+            let left = crate::orchestrate::wineservers_for(&self.env.prefix()).unwrap();
+            if left.is_empty() {
+                return;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "wineserver left: {left:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn staging_empty(&self) -> bool {
+        fs::read_dir(self.env.drive_c().join("windows/temp/rt-deps"))
+            .map(|mut r| r.next().is_none())
+            .unwrap_or(true)
+    }
+}
+
+/// Real Wine: an exe installer runs through `explorer.exe /desktop=...,null`. Its arguments arrive exactly (spaces,
+/// quotes, backslashes, as rebuilt by Wine's Windows quoting), and its exit status is NOT seen (explorer exits 0),
+/// so a failing installer is reported by its missing marker. `fs64.exe write <text>` writes C:\runtime-test.txt;
+/// `fs64.exe stat <path>` exits 3 for a missing path.
+#[test]
+#[ignore = "needs Wine, bwrap and the mingw fixtures"]
+fn e2e_real_wine_null_desktop_passes_args_exactly_and_judges_by_marker() {
+    let text = r#"a b  "q" c:\x\ \\y\ %PATH% $(touch pwned)"#;
+    let w = real_wine("fs64.exe");
+    let got = w
+        .install(
+            &["write", text],
+            Marker::File("runtime-test.txt".into()),
+            INSTALLER_DEADLINE,
+        )
+        .unwrap();
+    assert!(got.marker_confirmed && got.staged_removed, "{got:?}");
+    assert!(got.warnings.is_empty(), "{got:?}");
+    assert_eq!(
+        fs::read_to_string(w.env.drive_c().join("runtime-test.txt")).unwrap(),
+        text
+    );
+    assert!(!w.env.drive_c().join("pwned").exists());
+    assert!(w.staging_empty());
+    w.assert_no_wineserver();
+    // The prefix's graphics driver setting is untouched (the null driver was for that run only).
+    let user_reg = fs::read_to_string(w.env.prefix().join("user.reg")).unwrap();
+    assert!(
+        !user_reg.contains("\"Graphics\""),
+        "the run changed the prefix's driver"
+    );
+
+    let w = real_wine("fs64.exe");
+    let err = w
+        .install(
+            &["stat", r"C:\nope"],
+            Marker::File("runtime-test.txt".into()),
+            INSTALLER_DEADLINE,
+        )
+        .unwrap_err();
+    assert!(matches!(err, InstallerPkgError::MarkerMissing), "{err:?}");
+    assert!(w.staging_empty());
+    w.assert_no_wineserver();
+}
+
+/// Real Wine: an exe installer that never finishes (`gui64.exe` waits on a message box nobody can click on the
+/// null desktop) is killed at the deadline, the staged copy is removed and no wineserver is left.
+#[test]
+#[ignore = "needs Wine, bwrap and the mingw fixtures"]
+fn e2e_real_wine_hanging_installer_on_the_null_desktop_times_out_and_is_cleaned_up() {
+    let w = real_wine("gui64.exe");
+    let t = std::time::Instant::now();
+    let err = w
+        .install(&["/S"], Marker::File("never.txt".into()), Duration::from_secs(20))
+        .unwrap_err();
+    eprintln!("hanging installer: {err:?} after {:?}", t.elapsed());
+    assert!(matches!(err, InstallerPkgError::TimedOut { secs: 20 }), "{err:?}");
+    assert!(t.elapsed() < Duration::from_secs(40), "{:?}", t.elapsed());
+    assert!(w.staging_empty());
+    w.assert_no_wineserver();
+}
+
+/// The BUNDLED vcrun2022, downloaded for real and installed by `install_installer_pkg` into a fresh real Wine 10.0
+/// prefix: its registry marker is absent before and present after, every name it `provides` is then a native
+/// (non-Wine-builtin) DLL in `system32`, and no wineserver is left. It then reports which copy Wine actually loads
+/// for each DLL (`rundll32 <dll>,x` with `WINEDEBUG=+loaddll`). Needs network, Wine and bwrap, so it is NOT
+/// selected by CI's `e2e_real_wine` filter: `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs network, Wine and bwrap"]
+fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
+    use backend_wine::WineBackend;
+    use rt_core::RunOpts;
+    let vc = crate::Manifest::bundled().get("vcrun2022").expect("bundled vcrun2022");
+    let Install::Installer { marker, .. } = &vc.install else {
+        panic!("vcrun2022 is not an installer package")
+    };
+    assert!(matches!(marker, Marker::RegistryValue { .. }), "{marker:?}");
+    let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
+    let file = fetch::fetch(vc, &tmp.path().join("cache"), &fetch::FetchOpts::default()).unwrap();
+    let launcher = Launcher::new();
+    let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("vcrun").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    backend.stop(&env).unwrap();
+    assert!(!marker_present(&env, marker).unwrap(), "marker in a fresh prefix");
+    let t = std::time::Instant::now();
+    let got = install_installer_pkg(vc, &file, &env, &backend, &launcher).unwrap();
+    eprintln!("vcrun2022: {got:?} in {:?}", t.elapsed());
+    assert!(got.marker_confirmed && got.staged_removed);
+    assert!(marker_present(&env, marker).unwrap(), "marker absent after the run");
+    assert!(
+        crate::orchestrate::wineservers_for(&env.prefix()).unwrap().is_empty(),
+        "wineserver left"
+    );
+    let sys = fs::read_to_string(env.prefix().join("system.reg")).unwrap();
+    for section in sys
+        .split("\n\n")
+        .filter(|s| s.to_ascii_lowercase().contains("vc\\\\runtimes\\\\x64]"))
+    {
+        eprintln!("system.reg:\n{section}");
+    }
+    for name in &vc.provides {
+        let p = env.drive_c().join(format!("windows/system32/{name}.dll"));
+        let bytes = fs::read(&p).unwrap_or_default();
+        let builtin = bytes.windows(16).any(|w| w == b"Wine builtin DLL");
+        eprintln!("{name}.dll: {} bytes, Wine builtin: {builtin}", bytes.len());
+        assert!(!bytes.is_empty() && !builtin, "{name}.dll is not the redistributable's");
+    }
+    // Which copy does Wine load, without any DllOverrides entry and with `<name>=n,b`? Reported, not asserted
+    // (the Task 8b report records the result: Wine 10.0 prefers its own builtin where it has one).
+    let rundll32 = env.drive_c().join("windows/system32/rundll32.exe");
+    for name in &vc.provides {
+        let mut how = Vec::new();
+        for overrides in [None, Some(format!("{name}=n,b"))] {
+            let arg = OsString::from(format!("{name}.dll,rtDepsProbe"));
+            let mut cmd = backend
+                .command(&env, &rundll32, &env.drive_c(), &[arg], &RunOpts::default())
+                .unwrap();
+            cmd.env("WINEDEBUG", "+loaddll");
+            if let Some(o) = &overrides {
+                cmd.env("WINEDLLOVERRIDES", o);
+            }
+            let out = launcher
+                .run_helper(backend.settle(cmd), Duration::from_secs(120))
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.output).into_owned();
+            let needle = format!("\\\\system32\\\\{name}.dll\"");
+            how.push(
+                text.lines()
+                    .find(|l| l.contains("Loaded") && l.to_ascii_lowercase().contains(&needle))
+                    .and_then(|l| l.rsplit(": ").next())
+                    .unwrap_or("not loaded")
+                    .to_owned(),
+            );
+        }
+        eprintln!("LOADS {name}.dll: no override: {}; with {name}=n,b: {}", how[0], how[1]);
+    }
+    backend.stop(&env).unwrap();
 }
 
 #[test]

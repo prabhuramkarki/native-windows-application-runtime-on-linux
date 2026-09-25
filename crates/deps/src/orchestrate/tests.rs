@@ -135,6 +135,12 @@ impl Rig {
         let store = Store::new(tmp.path().join("apps")).unwrap();
         let env = store.create(&AppId::parse("app").unwrap()).unwrap();
         fs::create_dir_all(env.drive_c().join("windows/system32")).unwrap();
+        // Installer packages are started by the prefix's explorer.exe (the fake backend runs its script instead).
+        fs::write(
+            env.drive_c().join(crate::install_installer::EXPLORER_RELATIVE),
+            b"fake explorer",
+        )
+        .unwrap();
         store.write_metadata(&env, &md()).unwrap();
         let files = tmp.path().join("files");
         fs::create_dir(&files).unwrap();

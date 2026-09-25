@@ -7,8 +7,7 @@
 /// `(import, capability)`, strictly sorted by import (a test checks), so lookup is a binary search.
 pub const TABLE: &[(&str, &str)] = &[
     // Visual C++ 2015-2022 redistributable DLLs (what the x64 Minimum and Additional runtime MSIs of `vc_redist`
-    // 14.44 install): Wine's builtins, where they exist, are partial. No bundled package provides them yet (the
-    // redistributable cannot run in the display-less installer sandbox), so they resolve to `unsatisfied`.
+    // 14.44 install): Wine's builtins, where they exist, are partial. Provided by the bundled `vcrun2022`.
     ("concrt140", "concrt140"),
     // DXVK 2.x/3.x ships no d3d10.dll/d3d10_1.dll; Wine's builtin d3d10 and d3d10_1 sit on d3d10core, which DXVK
     // replaces, so both need DXVK's d3d10core.
@@ -80,28 +79,8 @@ mod tests {
     #[test]
     fn table_and_bundled_provides_agree() {
         let m = Manifest::bundled();
-        // Known gaps (Task 8 report): no bundled .NET; VKD3D-Proton ships only .tar.zst; the VC++ redistributable
-        // cannot run in the display-less installer sandbox yet. Listed so a plan reports them as unsatisfied.
-        let unprovided = [
-            "dotnet",
-            "d3d12",
-            "concrt140",
-            "mfc140",
-            "mfc140u",
-            "mfcm140",
-            "mfcm140u",
-            "msvcp140",
-            "msvcp140_1",
-            "msvcp140_2",
-            "msvcp140_atomic_wait",
-            "msvcp140_codecvt_ids",
-            "vcamp140",
-            "vccorlib140",
-            "vcomp140",
-            "vcruntime140",
-            "vcruntime140_1",
-            "vcruntime140_threads",
-        ];
+        // Known gaps (Task 8 report): no bundled .NET; VKD3D-Proton ships only .tar.zst.
+        let unprovided = ["dotnet", "d3d12"];
         for (_, cap) in TABLE.iter().filter(|(_, c)| !unprovided.contains(c)) {
             assert!(
                 m.packages.iter().any(|p| p.provides.iter().any(|x| x == cap)),

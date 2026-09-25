@@ -45,9 +45,18 @@ user accepted the licence shown in full), checks the pinned sha256 and size, and
 | Package | Version | Licence | Source url | sha256 | Size (bytes) |
 |---|---|---|---|---|---|
 | DXVK (`dxvk`) | 3.1.1 | Zlib | https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz | `40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608` | 18041512 |
+| Microsoft Visual C++ 2015-2022 Redistributable x64 (`vcrun2022`) | 14.44.35211 | Microsoft proprietary, redistributable (`proprietary-redistributable`; consent required) | https://download.visualstudio.microsoft.com/download/pr/bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe | `cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b` | 25635768 |
 
-Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) are installed. Not bundled yet: VKD3D-Proton (`.tar.zst` only),
-the Microsoft Visual C++ 2015-2022 redistributable (proprietary, redistributable; would need consent; its installer
-cannot run in the display-less installer sandbox yet) and `d3dcompiler_47` (no verifiable redistributable source).
+Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) are installed. The VC++ redistributable is Microsoft's own
+installer, run offline in the installer sandbox on Wine's null-driver desktop; it installs the x64 runtime DLLs into
+the prefix's `system32`. **Known gap:** installer packages set no DLL overrides, and Wine 10.0 keeps loading its OWN
+builtin copy of every DLL it implements (vcruntime140, vcruntime140_1, msvcp140, msvcp140_1, msvcp140_2,
+msvcp140_atomic_wait, msvcp140_codecvt_ids, concrt140, vcomp140) even after the native copies are installed; only the
+DLLs Wine has no builtin for (mfc140, mfc140u, vcamp140, vccorlib140, vcruntime140_threads) are loaded from the
+redistributable, and mfcm140/mfcm140u did not load at all. With a `<name>=native,builtin` override Wine loads the
+native copy of all 16 (checked with `rundll32 <dll>,x` and `WINEDEBUG=+loaddll` in the ignored test
+`real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker`). So today vcrun2022 installs the files but, for most
+of its DLLs, does not change what an app gets. Not bundled yet: VKD3D-Proton (`.tar.zst` only) and `d3dcompiler_47` (no verifiable
+redistributable source).
 
 Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).

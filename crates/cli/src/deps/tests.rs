@@ -294,6 +294,7 @@ fn the_manifest_listing() {
          consent): provides vcruntime140\n  gdep 1.0 (MIT): provides msvcp140; requires gated\n"
     );
     assert!(format_manifest(Manifest::bundled()).contains("dxvk"));
+    assert!(format_manifest(Manifest::bundled()).contains("vcrun2022"));
 }
 
 // ------------------------------------------------------------------------------------------------ usage
