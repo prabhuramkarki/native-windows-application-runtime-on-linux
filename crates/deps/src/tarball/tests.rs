@@ -123,9 +123,14 @@ type Taken = Vec<(TarEntry, Vec<u8>)>;
 
 /// Takes every entry and reads it to the end.
 fn collect(gz: &[u8], limits: &TarLimits) -> Result<Taken, TarError> {
+    collect_codec(Codec::Gzip, gz, limits)
+}
+
+fn collect_codec(codec: Codec, input: &[u8], limits: &TarLimits) -> Result<Taken, TarError> {
     let mut out = Vec::new();
-    walk(
-        gz,
+    walk_codec(
+        codec,
+        input,
         limits,
         |_| Selection::Take,
         |e, r| {
@@ -1112,8 +1117,8 @@ fn zero_entry_gz(n: u64, name: &str) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-fn walk_counting(input: &[u8], l: &TarLimits, sel: Selection) -> (Result<u64, TarError>, u64) {
-    let mut s = Stream::new(input, l);
+fn walk_counting(codec: Codec, input: &[u8], l: &TarLimits, sel: Selection) -> (Result<u64, TarError>, u64) {
+    let mut s = Stream::new(codec, input, l);
     // a sink with a huge buffer: the reader must still hand out at most one chunk per read
     let mut big = vec![0u8; 8 << 20];
     let r = walk_stream(
@@ -1140,7 +1145,7 @@ fn gzip_bomb_aborts_at_total_cap_with_bounded_work() {
         ..lim()
     };
     for sel in [Selection::Take, Selection::Skip] {
-        let (r, total) = walk_counting(&input, &l, sel);
+        let (r, total) = walk_counting(Codec::Gzip, &input, &l, sel);
         assert!(matches!(r, Err(TarError::TooLarge)), "{r:?}");
         assert!(total <= cap + CHUNK as u64, "read {total} decompressed bytes");
     }
@@ -1155,7 +1160,7 @@ fn ratio_guard_trips_after_the_floor() {
         max_compressed_bytes: 1 << 30,
         ..lim()
     };
-    let (r, total) = walk_counting(&input, &l, Selection::Skip);
+    let (r, total) = walk_counting(Codec::Gzip, &input, &l, Selection::Skip);
     assert!(matches!(r, Err(TarError::RatioExceeded)), "{r:?}");
     assert!(total > l.ratio_floor);
     assert!(total < 4 << 20, "tripped late: {total}");
@@ -1164,7 +1169,7 @@ fn ratio_guard_trips_after_the_floor() {
         max_ratio: 100_000,
         ..l
     };
-    assert!(walk_counting(&input, &relaxed, Selection::Skip).0.is_ok());
+    assert!(walk_counting(Codec::Gzip, &input, &relaxed, Selection::Skip).0.is_ok());
 }
 
 #[test]
@@ -1186,7 +1191,7 @@ fn skip_streams_a_large_entry_without_buffering() {
         ..lim()
     };
     let t = std::time::Instant::now();
-    let mut s = Stream::new(&input[..], &l);
+    let mut s = Stream::new(Codec::Gzip, &input[..], &l);
     let mut seen = Vec::new();
     let r = walk_stream(
         &mut s,
@@ -1203,6 +1208,229 @@ fn skip_streams_a_large_entry_without_buffering() {
     assert!(t.elapsed().as_secs() < 20);
 }
 
+// ---------- zstd ----------
+
+fn zst(tar: &[u8]) -> Vec<u8> {
+    ruzstd::encoding::compress_to_vec(tar, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
+fn collect_zst(input: &[u8], limits: &TarLimits) -> Result<Taken, TarError> {
+    collect_codec(Codec::Zstd, input, limits)
+}
+
+/// A hand-made zstd frame header: no single segment, no checksum, no dictionary, window descriptor `wd`
+/// (`window = (1 << (10 + (wd >> 3))) * (8 + (wd & 7)) / 8`).
+fn zst_header(wd: u8) -> Vec<u8> {
+    vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, wd]
+}
+
+/// A zstd block: `typ` 0 is raw (`body` is the data), 1 is RLE (`body` is the one byte repeated `size` times).
+fn zst_block(last: bool, typ: u32, size: u32, body: &[u8]) -> Vec<u8> {
+    let h = (size << 3) | (typ << 1) | u32::from(last);
+    [&h.to_le_bytes()[..3], body].concat()
+}
+
+/// A tar holding one `n`-byte file of zeros, as one zstd frame (1 MiB window) of RLE blocks, built without holding
+/// the zeros: 512 MiB takes about 16 KiB.
+fn zero_entry_zst(n: u64, name: &str) -> Vec<u8> {
+    let mut f = zst_header(0x50);
+    f.extend(zst_block(false, 0, 512, &header(name.as_bytes(), b'0', n)));
+    let mut left = n + padding(n) + 1024;
+    while left > 0 {
+        let k = left.min(128 << 10);
+        left -= k;
+        f.extend(zst_block(left == 0, 1, k as u32, &[0]));
+    }
+    f
+}
+
+fn two_files() -> Vec<u8> {
+    Tar::default()
+        .dir("d/")
+        .file("d/a.dll", b"hello")
+        .file("b.bin", &(0..3000u32).map(|i| (i * 7) as u8).collect::<Vec<_>>())
+        .end()
+}
+
+#[test]
+fn zstd_archive_is_read_byte_exact() {
+    let tar = two_files();
+    let got = collect_zst(&zst(&tar), &lim()).unwrap();
+    assert_eq!(paths(&got), ["d", "d/a.dll", "b.bin"]);
+    assert_eq!(got[1].1, b"hello");
+    assert_eq!(got[2].1, (0..3000u32).map(|i| (i * 7) as u8).collect::<Vec<_>>());
+    // gzip input is not zstd
+    assert!(matches!(collect_zst(&gz(&tar), &lim()), Err(TarError::Zstd(_))));
+}
+
+#[test]
+fn zstd_bomb_aborts_at_total_cap_with_bounded_work() {
+    let input = zero_entry_zst(512 << 20, "bomb");
+    assert!(input.len() < 20 << 10, "{}", input.len());
+    let cap = 4 << 20;
+    let l = TarLimits {
+        max_total_bytes: cap,
+        max_entry_bytes: 1 << 30,
+        ..lim()
+    };
+    for sel in [Selection::Take, Selection::Skip] {
+        let (r, total) = walk_counting(Codec::Zstd, &input, &l, sel);
+        assert!(matches!(r, Err(TarError::TooLarge | TarError::RatioExceeded)), "{r:?}");
+        assert!(total <= cap + CHUNK as u64, "read {total} decompressed bytes");
+    }
+    // with the total cap out of the way, the ratio guard trips right after its floor
+    let l = TarLimits {
+        max_total_bytes: 1 << 30,
+        ..l
+    };
+    let (r, total) = walk_counting(Codec::Zstd, &input, &l, Selection::Skip);
+    assert!(matches!(r, Err(TarError::RatioExceeded)), "{r:?}");
+    assert!(total < l.ratio_floor + 2 * CHUNK as u64, "tripped late: {total}");
+}
+
+#[test]
+fn zstd_window_over_the_cap_is_refused_before_allocating() {
+    let tar = Tar::default().file("a", b"x").end();
+    let frame = |wd: u8| [zst_header(wd), zst_block(true, 0, tar.len() as u32, &tar)].concat();
+    let l = TarLimits {
+        max_zstd_window: 64 << 20,
+        ..lim()
+    };
+    // exactly the cap (exponent 16) is fine
+    assert_eq!(paths(&collect_zst(&frame(16 << 3), &l).unwrap()), ["a"]);
+    // 64 MiB + 1/8 and 1 GiB are refused
+    let t = std::time::Instant::now();
+    for wd in [(16 << 3) | 1, 20 << 3] {
+        let r = collect_zst(&frame(wd), &l);
+        assert!(matches!(r, Err(TarError::Zstd(_))), "{wd:#x}: {r:?}");
+    }
+    assert!(t.elapsed().as_secs() < 1);
+    // the cap is a TarLimits field, not a constant
+    let small = TarLimits {
+        max_zstd_window: 1 << 20,
+        ..lim()
+    };
+    assert!(matches!(collect_zst(&frame(16 << 3), &small), Err(TarError::Zstd(_))));
+}
+
+#[test]
+fn zstd_truncated_anywhere_is_truncated() {
+    let input = zst(&two_files());
+    for cut in 0..input.len() {
+        let r = collect_zst(&input[..cut], &lim());
+        assert!(matches!(r, Err(TarError::Truncated)), "cut at {cut}: {r:?}");
+    }
+}
+
+#[test]
+fn zstd_trailing_garbage_rejected() {
+    let mut input = zst(&two_files());
+    input.extend((0..100u8).map(|i| i.wrapping_mul(37) | 1));
+    assert!(matches!(collect_zst(&input, &lim()), Err(TarError::TrailingGarbage)));
+}
+
+#[test]
+fn zstd_second_frame_rejected() {
+    let tar = two_files();
+    // split inside the tar and at its very end: the second frame is refused either way
+    for at in [1024, tar.len()] {
+        let input = [zst(&tar[..at]), zst(&tar[at..])].concat();
+        let r = collect_zst(&input, &lim());
+        assert!(matches!(r, Err(TarError::TooManyFrames)), "{at}: {r:?}");
+    }
+}
+
+#[test]
+fn zstd_skippable_frame_rejected() {
+    let mut input = vec![0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+    input.extend(zst(&two_files()));
+    assert!(matches!(collect_zst(&input, &lim()), Err(TarError::Zstd(_))));
+}
+
+#[test]
+fn zstd_compressed_input_over_cap_rejected() {
+    let input = zst(&two_files());
+    let l = TarLimits {
+        max_compressed_bytes: input.len() as u64 - 1,
+        ..lim()
+    };
+    assert!(matches!(collect_zst(&input, &l), Err(TarError::CompressedTooLarge)));
+    let l = TarLimits {
+        max_compressed_bytes: input.len() as u64,
+        ..lim()
+    };
+    assert!(collect_zst(&input, &l).is_ok());
+}
+
+#[test]
+fn zstd_source_io_error_is_io() {
+    struct Failing;
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "nope"))
+        }
+    }
+    let r = walk_codec(Codec::Zstd, Failing, &lim(), |_| Selection::Take, |_, _| Ok(()));
+    assert!(
+        matches!(&r, Err(TarError::Io(e)) if e.kind() == io::ErrorKind::PermissionDenied),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn zstd_error_under_the_sink_wins_even_if_the_sink_keeps_reading() {
+    // 512-byte raw blocks in a 1 KiB window, cut inside b.bin's data: the decoder fails while the sink reads it
+    let mut input = zst_header(0);
+    for b in two_files().chunks(512) {
+        input.extend(zst_block(false, 0, 512, b));
+    }
+    let cut = &input[..6 + 8 * 515 + 100];
+    let mut sunk = Vec::new();
+    let r = walk_codec(
+        Codec::Zstd,
+        cut,
+        &lim(),
+        |_| Selection::Take,
+        |e, r| {
+            sunk.push(e.path.clone());
+            let mut buf = [0u8; 4096];
+            for _ in 0..3 {
+                let _ = r.read(&mut buf);
+            }
+            Ok(())
+        },
+    );
+    assert!(matches!(r, Err(TarError::Truncated)), "{r:?}");
+    assert_eq!(sunk, ["d", "d/a.dll", "b.bin"]);
+}
+
+#[test]
+fn zstd_mutations_never_panic() {
+    let input = zst(&two_files());
+    let (mut oks, mut errs) = (0u32, 0u32);
+    for step in [13, 7, 3] {
+        for at in (0..input.len()).step_by(step) {
+            for bit in [0x01, 0x80, 0xff] {
+                let mut m = input.clone();
+                m[at] ^= bit;
+                match collect_zst(&m, &lim()) {
+                    Ok(_) => oks += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+        }
+    }
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for _ in 0..2000 {
+        let mut m = input.clone();
+        mutate(&mut m, &mut rng);
+        let _ = collect_zst(&m, &lim());
+        let noise: Vec<u8> = (0..rng.below(4096)).map(|_| rng.next() as u8).collect();
+        let _ = collect_zst(&[&input[..6], &noise].concat(), &lim());
+    }
+    assert!(errs > 100, "ok {oks} err {errs}");
+}
+
 // ---------- limits ----------
 
 #[test]
@@ -1214,6 +1442,7 @@ fn for_package_defaults() {
     assert_eq!(l.max_name_len, 512);
     assert_eq!(l.max_entry_bytes, 512 << 20);
     assert_eq!(l.max_gzip_members, 1);
+    assert_eq!(l.max_zstd_window, 64 << 20);
     assert_eq!(TarLimits::for_package(1 << 40).max_total_bytes, 2 << 30);
     assert_eq!(TarLimits::for_package(10).max_total_bytes, l.ratio_floor);
     assert_eq!(TarLimits::for_package(u64::MAX).max_total_bytes, 2 << 30);
@@ -1372,4 +1601,25 @@ fn system_tar_golden_archives() {
     let input = std::fs::read(&out).unwrap();
     let got = collect(&input, &TarLimits::for_package(input.len() as u64)).unwrap();
     assert!(paths(&got).contains(&"README.md"), "{:?}", paths(&got));
+    // the same through the host `zstd` (real compressed blocks and a content checksum), when it is installed
+    let out = dir.path().join("dot.tar.zst");
+    let st = Command::new("tar")
+        .args(["--zstd", "-cf"])
+        .arg(&out)
+        .arg("-C")
+        .arg(src.join("dxvk-2.4"))
+        .arg(".")
+        .output()
+        .unwrap();
+    if !st.status.success() {
+        eprintln!(
+            "SKIPPED the tar.zst golden archive: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        return;
+    }
+    let input = std::fs::read(&out).unwrap();
+    let got = collect_zst(&input, &TarLimits::for_package(input.len() as u64)).unwrap();
+    let (_, data) = got.iter().find(|(e, _)| e.path == "README.md").unwrap();
+    assert_eq!(data, &vec![b'r'; 3000]);
 }

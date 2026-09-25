@@ -1,13 +1,14 @@
-//! A bounded, streaming reader for hostile `.tar.gz` package archives.
+//! A bounded, streaming reader for hostile `.tar.gz` and `.tar.zst` package archives.
 //!
 //! The package's sha256 is verified before this runs, but the archive is still treated as hostile: nothing in it
 //! is trusted. [`walk`] reads the archive ONCE, front to back, and never writes anything itself: for every entry
 //! it asks `select` whether the caller wants it and, for [`Selection::Take`], hands `sink` a reader limited to
 //! exactly the entry's size. Everything else is discarded while streaming. Memory is one 512-byte header block,
-//! one [`CHUNK`] discard buffer, the gzip decoder's own state (its 32 KiB window and an input buffer of [`CHUNK`])
-//! and at most one extended-header payload (capped, see below).
+//! one [`CHUNK`] discard buffer, the decoder's own state (an input buffer of [`CHUNK`], plus gzip's 32 KiB window or
+//! zstd's window of at most [`TarLimits::max_zstd_window`]) and at most one extended-header payload (capped, see
+//! below). [`walk`] reads gzip; [`walk_codec`] picks the [`Codec`].
 //!
-//! **Gzip layer.** Decompressed bytes are counted as they stream and the walk stops at
+//! **Compression layer.** Decompressed bytes are counted as they stream and the walk stops at
 //! [`TarLimits::max_total_bytes`] (headers and padding count too), whatever the stream would still produce. Each
 //! single read from the decoder is at most [`CHUNK`] bytes, so the work done past the cap is at most one chunk.
 //! Compressed bytes are counted on the input side and capped at [`TarLimits::max_compressed_bytes`]. Once more
@@ -17,6 +18,17 @@
 //! checks the CRC and length trailer; bytes after a member start another member only up to
 //! [`TarLimits::max_gzip_members`] (default 1): past the cap, a gzip magic byte is [`TarError::TooManyMembers`]
 //! and anything else is [`TarError::TrailingGarbage`]. A stream that ends early is [`TarError::Truncated`].
+//!
+//! **Zstd.** Decoded by `ruzstd`'s `StreamingDecoder` (pure Rust) reading through the same counted input, so the
+//! caps and the ratio guard above apply unchanged. `ruzstd` checks the frame header's window size (for a
+//! single-segment frame, its content size) against the limit it is given BEFORE allocating the window, so a frame
+//! declaring more than [`TarLimits::max_zstd_window`] is [`TarError::Zstd`] without allocating it. The decoder
+//! holds back one window of output until the frame ends, so it may decode up to one window plus one 128 KiB block
+//! beyond what was counted: bounded by that cap, not by the stream. Exactly one frame is read: after it, no input
+//! is the end, a zstd magic first byte is [`TarError::TooManyFrames`] and anything else is
+//! [`TarError::TrailingGarbage`]. Skippable frames (and dictionary frames) are refused as [`TarError::Zstd`], an
+//! input that ends inside the frame is [`TarError::Truncated`]. The content checksum, when present, is read but not
+//! verified (ruzstd never verifies it; the package's sha256 already covers the bytes).
 //!
 //! **Tar layer.** Only POSIX ustar (`ustar\0` `00`) and GNU (`ustar  \0`) headers are accepted (old v7 headers
 //! without magic are refused). Every header's checksum is verified; both the unsigned and the historic signed
@@ -53,6 +65,8 @@
 //! No input panics: arithmetic is checked or saturating and header fields are read through `.get()`.
 
 use flate2::bufread::GzDecoder;
+use ruzstd::decoding::errors::FrameDecoderError;
+use ruzstd::decoding::{FrameDecoder, StreamingDecoder};
 use std::io::{self, BufRead, BufReader, Read};
 use std::ops::Range;
 
@@ -83,6 +97,8 @@ pub struct TarLimits {
     pub ratio_floor: u64,
     /// Most gzip members (concatenated gzip streams).
     pub max_gzip_members: usize,
+    /// Largest zstd window (the decoder allocates it up front).
+    pub max_zstd_window: u64,
     /// Most zero bytes accepted after the two end-of-archive blocks.
     pub trailing_allowance: usize,
 }
@@ -102,9 +118,17 @@ impl TarLimits {
             max_ratio,
             ratio_floor,
             max_gzip_members: 1,
+            max_zstd_window: 64 * MIB,
             trailing_allowance: 10240,
         }
     }
+}
+
+/// The compression around the tar stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    Gzip,
+    Zstd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +160,8 @@ pub enum Selection {
 pub enum TarError {
     #[error("corrupt gzip data: {0}")]
     Gzip(String),
+    #[error("corrupt zstd data: {0}")]
+    Zstd(String),
     #[error("the archive is truncated")]
     Truncated,
     #[error("malformed tar header: {0}")]
@@ -162,6 +188,8 @@ pub enum TarError {
     TrailingGarbage,
     #[error("the archive has too many gzip members")]
     TooManyMembers,
+    #[error("the archive has more than one zstd frame")]
+    TooManyFrames,
     #[error(transparent)]
     Io(#[from] io::Error),
     /// For `sink` to report its own failures.
@@ -169,17 +197,28 @@ pub enum TarError {
     Callback(Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// [`walk_codec`] for gzip.
+pub fn walk<R: Read>(
+    src: R,
+    limits: &TarLimits,
+    select: impl FnMut(&TarEntry) -> Selection,
+    sink: impl FnMut(&TarEntry, &mut dyn Read) -> Result<(), TarError>,
+) -> Result<u64, TarError> {
+    walk_codec(Codec::Gzip, src, limits, select, sink)
+}
+
 /// Streams the archive once. `select` sees every reported entry (see the module docs for what is reported); for
 /// [`Selection::Take`] `sink` gets a reader that yields exactly `size` bytes and then EOF. Whatever `sink` leaves
 /// unread is discarded. If the archive fails while `sink` reads, `sink` sees an I/O error and the archive's
 /// error is returned, whatever `sink` returned. Returns the number of file and directory entries.
-pub fn walk<R: Read>(
+pub fn walk_codec<R: Read>(
+    codec: Codec,
     src: R,
     limits: &TarLimits,
     mut select: impl FnMut(&TarEntry) -> Selection,
     mut sink: impl FnMut(&TarEntry, &mut dyn Read) -> Result<(), TarError>,
 ) -> Result<u64, TarError> {
-    walk_stream(&mut Stream::new(src, limits), limits, &mut select, &mut sink)
+    walk_stream(&mut Stream::new(codec, src, limits), limits, &mut select, &mut sink)
 }
 
 fn walk_stream<R: Read>(
@@ -316,16 +355,32 @@ impl<R: Read> Read for Counted<R> {
         let got = self.inner.read(buf)?;
         self.n = self.n.saturating_add(got as u64);
         if self.n > self.max {
-            return Err(io::Error::other("compressed input over its cap"));
+            return Err(io::Error::other(OverCap));
         }
         Ok(got)
     }
 }
 
-/// The decompressed byte stream across gzip members, with the gzip-side caps.
+/// [`Counted`]'s error, recognised under the zstd decoder's error chain (which only lends it out by reference).
+#[derive(Debug, thiserror::Error)]
+#[error("compressed input over its cap")]
+struct OverCap;
+
+type Input<R> = BufReader<Counted<R>>;
+
+enum Dec<R: Read> {
+    Gz(GzDecoder<Input<R>>),
+    /// A zstd frame whose header is read by the first [`Stream::read`], so that its errors are typed there.
+    ZstHeader(Input<R>),
+    /// Boxed: the frame decoder's state is several hundred bytes.
+    Zst(Box<StreamingDecoder<Input<R>, FrameDecoder>>),
+    /// The last member or frame ended at the end of the input (or the stream already failed).
+    Done,
+}
+
+/// The decompressed byte stream across gzip members or in one zstd frame, with the compression-side caps.
 struct Stream<R: Read> {
-    /// `None` once the last member ended at the end of the input.
-    dec: Option<GzDecoder<BufReader<Counted<R>>>>,
+    dec: Dec<R>,
     members: usize,
     /// Decompressed bytes returned so far.
     total: u64,
@@ -333,25 +388,31 @@ struct Stream<R: Read> {
     max_ratio: u64,
     ratio_floor: u64,
     max_members: usize,
+    max_window: u64,
     /// The (first) typed error behind an I/O error handed to `sink`.
     failed: Option<TarError>,
 }
 
 impl<R: Read> Stream<R> {
-    fn new(src: R, l: &TarLimits) -> Self {
+    fn new(codec: Codec, src: R, l: &TarLimits) -> Self {
         let counted = Counted {
             inner: src,
             n: 0,
             max: l.max_compressed_bytes,
         };
+        let input = BufReader::with_capacity(CHUNK, counted);
         Stream {
-            dec: Some(GzDecoder::new(BufReader::with_capacity(CHUNK, counted))),
+            dec: match codec {
+                Codec::Gzip => Dec::Gz(GzDecoder::new(input)),
+                Codec::Zstd => Dec::ZstHeader(input),
+            },
             members: 1,
             total: 0,
             max_total: l.max_total_bytes,
             max_ratio: l.max_ratio,
             ratio_floor: l.ratio_floor,
             max_members: l.max_gzip_members,
+            max_window: l.max_zstd_window,
             failed: None,
         }
     }
@@ -364,33 +425,66 @@ impl<R: Read> Stream<R> {
             return Ok(0);
         }
         loop {
-            let Some(dec) = self.dec.as_mut() else { return Ok(0) };
-            match dec.read(buf) {
-                Ok(0) => {}
-                Ok(n) => {
+            if matches!(self.dec, Dec::ZstHeader(_))
+                && let Dec::ZstHeader(input) = std::mem::replace(&mut self.dec, Dec::Done)
+            {
+                // `ruzstd` refuses a window over the cap before allocating it.
+                let dec =
+                    StreamingDecoder::new_with_max_window_size(input, self.max_window).map_err(|e| classify_zst(&e))?;
+                self.dec = Dec::Zst(Box::new(dec));
+            }
+            let (got, input) = match &mut self.dec {
+                Dec::Gz(dec) => (
+                    dec.read(buf).map_err(|e| classify(e, dec.get_ref().get_ref())),
+                    dec.get_ref(),
+                ),
+                Dec::Zst(dec) => (dec.read(buf).map_err(|e| classify_zst(&e)), dec.get_ref()),
+                Dec::ZstHeader(_) | Dec::Done => return Ok(0),
+            };
+            let got = match got {
+                Ok(n) => n,
+                Err(e) => {
+                    // A failed zstd decoder is never polled again (a `sink` may keep reading after an error).
+                    if matches!(self.dec, Dec::Zst(_)) {
+                        self.dec = Dec::Done;
+                    }
+                    return Err(e);
+                }
+            };
+            match got {
+                0 => {}
+                n => {
                     self.total = self.total.saturating_add(n as u64);
                     if self.total > self.max_total {
                         return Err(TarError::TooLarge);
                     }
                     // Compressed bytes the decoder has consumed (read-ahead still in the buffer excluded).
-                    let input = dec.get_ref();
                     let compressed = input.get_ref().n.saturating_sub(input.buffer().len() as u64);
                     if self.total > self.ratio_floor && self.total > compressed.saturating_mul(self.max_ratio) {
                         return Err(TarError::RatioExceeded);
                     }
                     return Ok(n);
                 }
-                Err(e) => return Err(classify(e, dec.get_ref().get_ref())),
             }
-            // The member ended (its CRC and length checked by the decoder): is there more input?
-            let Some(dec) = self.dec.take() else { return Ok(0) };
-            let mut rest = dec.into_inner();
+            // The member or frame ended (the gzip decoder checked its CRC and length): is there more input?
+            let (mut rest, zstd) = match std::mem::replace(&mut self.dec, Dec::Done) {
+                Dec::Gz(dec) => (dec.into_inner(), false),
+                Dec::Zst(dec) => (dec.into_inner(), true),
+                Dec::ZstHeader(_) | Dec::Done => return Ok(0),
+            };
             let next = match rest.fill_buf() {
                 Ok(b) => b.first().copied(),
                 Err(e) => return Err(classify(e, rest.get_ref())),
             };
             match next {
                 None => return Ok(0),
+                Some(first) if zstd => {
+                    return Err(if first == 0x28 {
+                        TarError::TooManyFrames
+                    } else {
+                        TarError::TrailingGarbage
+                    });
+                }
                 Some(first) if self.members >= self.max_members => {
                     return Err(if first == 0x1f {
                         TarError::TooManyMembers
@@ -400,7 +494,7 @@ impl<R: Read> Stream<R> {
                 }
                 Some(_) => {
                     self.members = self.members.saturating_add(1);
-                    self.dec = Some(GzDecoder::new(rest));
+                    self.dec = Dec::Gz(GzDecoder::new(rest));
                 }
             }
         }
@@ -424,6 +518,28 @@ fn classify<R>(e: io::Error, input: &Counted<R>) -> TarError {
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => TarError::Gzip(e.to_string()),
         _ => TarError::Io(e),
     }
+}
+
+/// A zstd error: the first I/O error in its chain decides (our cap, an early end, or the source's own failure);
+/// without one, the data is corrupt. `StreamingDecoder::read` wraps the decoder's error in an `io::Error`, whose
+/// `source()` skips the wrapped error itself, so that one is unwrapped with `get_ref`.
+fn classify_zst(e: &(dyn std::error::Error + 'static)) -> TarError {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<io::Error>() {
+            return match io.get_ref() {
+                Some(inner) if inner.is::<FrameDecoderError>() => {
+                    cur = Some(inner);
+                    continue;
+                }
+                Some(inner) if inner.is::<OverCap>() => TarError::CompressedTooLarge,
+                _ if io.kind() == io::ErrorKind::UnexpectedEof => TarError::Truncated,
+                _ => TarError::Io(io::Error::new(io.kind(), io.to_string())),
+            };
+        }
+        cur = err.source();
+    }
+    TarError::Zstd(e.to_string())
 }
 
 /// Fills `buf` as far as the stream goes; returns how much was read.
