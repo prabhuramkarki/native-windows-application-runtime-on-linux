@@ -57,8 +57,8 @@ recorded. For `vcrun2022` the marker is the build number the redistributable wri
 | VKD3D-Proton (`vkd3d-proton`) | 3.0.1 | LGPL-2.1-or-later | https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.0.1/vkd3d-proton-3.0.1.tar.zst | `3cf2315522af5e43605ef6d3c41dad91387040bf97199934f3f7ab76caaa2f0c` | 5163266 |
 | Microsoft Visual C++ 2015-2022 Redistributable x64 (`vcrun2022`) | 14.44.35211 | Microsoft proprietary, redistributable (`proprietary-redistributable`; consent required) | https://download.visualstudio.microsoft.com/download/pr/bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe | `cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b` | 25635768 |
 
-Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) and VKD3D-Proton's (d3d12, d3d12core) are installed. The VC++ redistributable is Microsoft's own
-installer, run offline in the installer sandbox on Wine's null-driver desktop; it installs the x64 runtime DLLs into
+Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) and VKD3D-Proton's (d3d12, d3d12core) are
+installed. The VC++ redistributable is Microsoft's own installer, run offline in the installer sandbox on Wine's null-driver desktop; it installs the x64 runtime DLLs into
 the prefix's `system32`. Wine 10.0 has builtins of most of them (vcruntime140, vcruntime140_1, msvcp140, msvcp140_1,
 msvcp140_2, msvcp140_atomic_wait, msvcp140_codecvt_ids, concrt140, vcomp140) and keeps loading those unless told
 otherwise, so after the installer succeeds the runtime sets a `native,builtin` DLL override for each of the 16 DLLs
@@ -68,6 +68,7 @@ the package provides (as winetricks does). Verified by the ignored test
 mfcm140/mfcm140u, the MFC C++/CLI support DLLs, which import `mscoree.dll` (.NET) and load in no form in a runtime
 prefix (no .NET package; an app that needs them imports `mscoree` itself and is told `dotnet` is unavailable). What
 is NOT done: the overrides are not removed again (there is no removal of dependency packages yet), 32-bit (x86)
-copies are not installed, and only the x64 redistributable is pinned. Not bundled yet: `d3dcompiler_47` (no verifiable redistributable source).
+copies are not installed, and only the x64 redistributable is pinned. Not bundled yet: `d3dcompiler_47` (no
+verifiable redistributable source).
 
 Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).

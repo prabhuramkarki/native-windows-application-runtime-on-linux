@@ -66,7 +66,8 @@ fn ids(plan: &Plan) -> Vec<&str> {
 }
 
 /// The dependency shapes these tests need (a consent-gated package, and one package requiring another), which the
-/// real bundled manifest does not have: it has one `requires` edge (vkd3d-proton -> dxvk) but no consent-gated package next to it.
+/// real bundled manifest does not have: it has one `requires` edge (vkd3d-proton -> dxvk) but no consent-gated
+/// package next to it.
 fn graph() -> Manifest {
     manifest(vec![
         pkg("dxvk", &[], &["d3d9", "d3d10core", "d3d11", "dxgi"], false),
@@ -606,6 +607,21 @@ fn an_already_installed_package_is_never_blocked() {
     let mut plan = resolve(&caps(&["d3d11"]), &installed, &[], &m);
     block_for_vulkan(&mut plan, &m, &unusable);
     assert_eq!(action_of(&plan, "dxvk"), &Action::AlreadyInstalled);
+}
+
+#[test]
+fn bundled_d3d12_plan_blocks_dxvk_and_vkd3d_proton_when_vulkan_is_unusable() {
+    let m = Manifest::bundled();
+    let mut plan = resolve(&imports(&["D3D12.dll"]), &none(), &[], m);
+    block_for_vulkan(&mut plan, m, &unusable);
+    assert_eq!(ids(&plan), ["dxvk", "vkd3d-proton"]);
+    for id in ["dxvk", "vkd3d-proton"] {
+        let Action::Blocked { reason } = action_of(&plan, id) else {
+            panic!("{id}: {plan:?}")
+        };
+        assert!(reason.contains("Vulkan") || reason.contains("dxvk"), "{id}: {reason}");
+    }
+    assert!(plan.unsatisfied.is_empty(), "{plan:?}");
 }
 
 #[test]

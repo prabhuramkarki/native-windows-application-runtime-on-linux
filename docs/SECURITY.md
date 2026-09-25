@@ -372,7 +372,7 @@ version. The prompt shows the package id, version, licence LABEL, url, size and 
 `metadata.json` stores a hash of exactly that text, so a different version, url or hash means earlier consent does not
 count. A bare `--yes` is rejected; `--yes <pkg>` must name a consent-gated package of the plan, and its text is still
 printed. With no terminal and no `--yes`, the answer is no. A denied package, and everything that needs it, is skipped
-and never downloaded. Permissive packages (DXVK) need no consent but still need an explicit `--install`.
+and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent but still need an explicit `--install`.
 
 **What is NOT verified, or not prevented** (read this before trusting a package install):
 - **The vendor installer's behaviour.** The sha256 pin proves which file was staged, nothing about what it does. The
