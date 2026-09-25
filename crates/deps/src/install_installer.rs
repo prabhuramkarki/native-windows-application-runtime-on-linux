@@ -68,6 +68,11 @@
 //! a string (`"..."`, `str(2):`) or `dword:` are seen; a value stored as `hex...:` (REG_BINARY, REG_MULTI_SZ,
 //! REG_QWORD) is not modelled by the parser and reads as absent (a false "missing", never a false "present"). A
 //! hive that cannot be read, or that has more keys than the parser keeps, is an error, not "absent".
+//! With `min_dword` the value must also be a DWORD of at least that much, in EVERY check (before the run, after it,
+//! and the orchestrator's checks before consent and download): an older version's value (e.g. the VC++ 2015
+//! redistributable's build number under the same key) is "absent", so the installer runs and upgrades in place, and
+//! only the new value confirms success. The hive is read by [`read_hive`]: no symlink followed, at most
+//! [`MAX_MARKER_HIVE_BYTES`], size checked before reading.
 //!
 //! **No rollback of the installer's effects.** The vendor installer is opaque code; nothing here can know what it
 //! changed, so nothing is undone on failure except the staged copy. A failed or killed run may leave partial
@@ -89,7 +94,7 @@ use crate::fetch;
 use crate::install_archive::{self, open_archive};
 use crate::manifest::{self, Install, Kind, MAX_LIST_LEN, MAX_PACKAGE_SIZE, MAX_TEXT_LEN, Marker, Package, clip};
 use rt_core::{AppEnv, CompatBackend, Launcher, ResolveError, WinPath, join_new, resolve_under};
-use rt_installer::{MSIEXEC_RELATIVE, SandboxOpts, find_bwrap_on_path, read_reg_file, run_sandboxed, stage_file};
+use rt_installer::{MSIEXEC_RELATIVE, RegValue, SandboxOpts, WineReg, find_bwrap_on_path, run_sandboxed, stage_file};
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
@@ -108,6 +113,10 @@ pub const STAGING_DIR: &str = r"C:\windows\temp\rt-deps";
 pub const EXPLORER_RELATIVE: &str = "windows/explorer.exe";
 /// `explorer.exe /desktop=` argument: a fixed desktop name, a size, and Wine's `null` graphics driver.
 pub const NULL_DESKTOP: &str = "rt-deps,800x600,null";
+/// Largest prefix hive read for a marker. A real Wine 10.0 win64 `system.reg` with the VC++ redistributable
+/// installed measured 3,243,297 bytes (`user.reg` 78,808); 64 MiB is a ~20x margin that still keeps a hostile
+/// hive from making `deps`/`doctor`/the install hint allocate gigabytes (Phase 3's own reader allows 4 GiB).
+pub const MAX_MARKER_HIVE_BYTES: u64 = 64 * 1024 * 1024;
 /// OLE2 compound-file magic (an `.msi`).
 const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Longest error text built from something outside this crate (a path, an OS error, a registry file's name).
@@ -333,8 +342,11 @@ fn check_package(pkg: &Package) -> Result<Checked<'_>, InstallerPkgError> {
         Marker::File(p) => {
             marker_winpath(p).map_err(|why| bad_package(pkg, &why))?;
         }
-        Marker::RegistryValue { key, name } => {
+        Marker::RegistryValue { key, name, min_dword } => {
             parse_key(key).map_err(|why| bad_package(pkg, &why))?;
+            if min_dword.is_some() && name.is_empty() {
+                return Err(bad_package(pkg, "min_dword needs a named (DWORD) value"));
+            }
             if name.len() > MAX_TEXT_LEN || name.chars().any(char::is_control) {
                 return Err(bad_package(
                     pkg,
@@ -533,12 +545,26 @@ fn marker_present(env: &AppEnv, marker: &Marker) -> Result<bool, InstallerPkgErr
                 Err(e) => Err(InstallerPkgError::Marker(format!("{:?}: {e}", clip(p)))),
             }
         }
-        Marker::RegistryValue { key, name } => registry_marker_present(&env.prefix(), key, name),
+        Marker::RegistryValue { key, name, min_dword } => {
+            registry_marker_present_min(&env.prefix(), key, name, *min_dword)
+        }
     }
 }
 
-/// Whether value `name` of `key` exists in the prefix's registry files. See the module docs for the lookup rules.
+/// [`registry_marker_present_min`] without a minimum (tests).
+#[cfg(test)]
 fn registry_marker_present(prefix: &Path, key: &str, name: &str) -> Result<bool, InstallerPkgError> {
+    registry_marker_present_min(prefix, key, name, None)
+}
+
+/// Whether value `name` of `key` exists in the prefix's registry files (and, with `min`, is a DWORD >= `min`). See
+/// the module docs for the lookup rules.
+fn registry_marker_present_min(
+    prefix: &Path,
+    key: &str,
+    name: &str,
+    min: Option<u32>,
+) -> Result<bool, InstallerPkgError> {
     let (file, rel) = parse_key(key).map_err(InstallerPkgError::BadPackage)?;
     let mut candidates = vec![rel.to_lowercase()];
     if file == "system.reg"
@@ -549,22 +575,71 @@ fn registry_marker_present(prefix: &Path, key: &str, name: &str) -> Result<bool,
     {
         candidates.push(format!("software\\wow6432node\\{}", rest.to_lowercase()));
     }
-    let reg = match read_reg_file(&prefix.join(file)) {
-        Ok(Some(reg)) => reg,
-        Ok(None) => return Ok(false),
-        Err(why) => return Err(InstallerPkgError::Registry(format!("{file}: {}", bounded(&why)))),
+    let reg = match read_hive(prefix, file)? {
+        Some(reg) => reg,
+        None => return Ok(false),
     };
     let name = name.to_lowercase();
-    let found = reg
-        .keys
-        .iter()
-        .any(|(k, v)| candidates.contains(&k.to_lowercase()) && v.values.keys().any(|n| n.to_lowercase() == name));
+    let satisfies = |v: &RegValue| match (min, v) {
+        (None, _) => true,
+        (Some(min), RegValue::Dword(d)) => *d >= min,
+        (Some(_), _) => false,
+    };
+    let found = reg.keys.iter().any(|(k, v)| {
+        candidates.contains(&k.to_lowercase())
+            && v.values
+                .iter()
+                .any(|(n, val)| n.to_lowercase() == name && satisfies(val))
+    });
     if !found && reg.truncated {
         return Err(InstallerPkgError::Registry(format!(
             "{file} has more keys than are read; the marker cannot be checked"
         )));
     }
     Ok(found)
+}
+
+/// A prefix hive (`system.reg`/`user.reg`) read for a marker: `None` if it does not exist (or is a directory or
+/// other non-regular file, which Wine never writes). The prefix directory must be a real directory and the hive is
+/// opened with `O_NOFOLLOW` (a symlink is an error, never followed: this read also runs for `deps`, the install
+/// hint and `doctor`, outside any sandbox), `O_NONBLOCK` (a FIFO cannot hang the open), and its size is checked on
+/// the open file against [`MAX_MARKER_HIVE_BYTES`] before anything is read (a huge sparse file costs nothing).
+fn read_hive(prefix: &Path, file: &str) -> Result<Option<WineReg>, InstallerPkgError> {
+    let err = |why: String| InstallerPkgError::Registry(format!("{file}: {}", bounded(&why)));
+    match fs::symlink_metadata(prefix) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(_) => return Err(err("the prefix is not a plain directory".into())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(err(e.to_string())),
+    }
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(prefix.join(file))
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(err("is a symlink: not followed".into())),
+        Err(e) => return Err(err(e.to_string())),
+    };
+    let meta = f.metadata().map_err(|e| err(e.to_string()))?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_MARKER_HIVE_BYTES {
+        return Err(err(format!(
+            "{} bytes, over the {MAX_MARKER_HIVE_BYTES}-byte cap for a marker read: not read",
+            meta.len()
+        )));
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_MARKER_HIVE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| err(e.to_string()))?;
+    if bytes.len() as u64 > MAX_MARKER_HIVE_BYTES {
+        return Err(err("grew past the cap while being read".into()));
+    }
+    WineReg::parse(&bytes).map(Some).map_err(|e| err(e.to_string()))
 }
 
 /// `e` as text without control characters, at most [`MAX_MESSAGE`] bytes.

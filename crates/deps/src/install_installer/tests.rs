@@ -98,6 +98,7 @@ fn reg_marker(key: &str, name: &str) -> Marker {
     Marker::RegistryValue {
         key: key.into(),
         name: name.into(),
+        min_dword: None,
     }
 }
 
@@ -375,6 +376,122 @@ fn registry_lookup_semantics() {
     // No hive files at all (a fresh fake prefix): absent, not an error.
     let empty = tempfile::tempdir().unwrap();
     assert!(!registry_marker_present(empty.path(), "HKLM\\Software\\A", "V").unwrap());
+}
+
+/// `[<key>]` with value `name` = dword `v` (Wine spells DWORDs as 8 lowercase hex digits).
+fn reg_dword(key: &str, name: &str, v: u32) -> String {
+    format!("{REG_HEAD}[{key}] 1790095421\n#time=1dd4ab1864fafa4\n\"{name}\"=dword:{v:08x}\n\n")
+}
+
+const VC_KEY_WRITTEN: &str = "Software\\\\Microsoft\\\\VisualStudio\\\\14.0\\\\VC\\\\Runtimes\\\\X64";
+const VC_KEY: &str = r"HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64";
+
+fn bld_marker(min: u32) -> Marker {
+    Marker::RegistryValue {
+        key: VC_KEY.into(),
+        name: "Bld".into(),
+        min_dword: Some(min),
+    }
+}
+
+#[test]
+fn a_min_dword_marker_counts_an_older_value_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let at = |text: String, min: Option<u32>| {
+        fs::write(tmp.path().join("system.reg"), text).unwrap();
+        registry_marker_present_min(tmp.path(), VC_KEY, "Bld", min).unwrap()
+    };
+    // VC++ 2015 (14.0.23026) wrote the same key: older build, absent; this build or newer, present.
+    assert!(!at(reg_dword(VC_KEY_WRITTEN, "Bld", 23026), Some(35211)));
+    assert!(!at(reg_dword(VC_KEY_WRITTEN, "Bld", 35210), Some(35211)));
+    assert!(at(reg_dword(VC_KEY_WRITTEN, "Bld", 35211), Some(35211)));
+    assert!(at(reg_dword(VC_KEY_WRITTEN, "Bld", 40000), Some(35211)));
+    // Without a minimum any value counts, as before.
+    assert!(at(reg_dword(VC_KEY_WRITTEN, "Bld", 23026), None));
+    // A string value (or another value of the key) never satisfies a minimum.
+    let text = format!("{REG_HEAD}[{VC_KEY_WRITTEN}] 1\n\"Bld\"=\"99999\"\n\"Other\"=dword:00099999\n\n");
+    assert!(!at(text.clone(), Some(1)));
+    assert!(at(text, None));
+    // The 32-bit view counts too, with the same rule.
+    let wow = "Software\\\\Wow6432Node\\\\Microsoft\\\\VisualStudio\\\\14.0\\\\VC\\\\Runtimes\\\\X64";
+    assert!(!at(reg_dword(wow, "Bld", 23026), Some(35211)));
+    assert!(at(reg_dword(wow, "Bld", 35211), Some(35211)));
+}
+
+#[test]
+fn an_older_value_of_a_min_dword_marker_does_not_refuse_the_install_and_success_needs_the_new_one() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    // The prefix has VC++ 2015's key (Bld 23026): not "already present", so the installer runs.
+    let f = fx(BODY);
+    f.write_reg("system.reg", &reg_dword(VC_KEY_WRITTEN, "Bld", 23026));
+    let upgrade = format!(
+        "printf '%s' '{}' > ../system.reg",
+        reg_dword(VC_KEY_WRITTEN, "Bld", 35211)
+    );
+    let p = pkg_for(BODY, &["/S"], bld_marker(35211));
+    let got = run_with(&f, &p, &backend(&upgrade), &bwrap).unwrap();
+    assert!(got.marker_confirmed && f.ran());
+    // An installer that leaves the older value is not confirmed.
+    let f = fx(BODY);
+    f.write_reg("system.reg", &reg_dword(VC_KEY_WRITTEN, "Bld", 23026));
+    let err = run_with(&f, &p, &backend("exit 0"), &bwrap).unwrap_err();
+    assert!(matches!(err, InstallerPkgError::MarkerMissing), "{err:?}");
+    assert!(f.ran());
+    // This build already there: refused without running, as any present marker.
+    let f = fx(BODY);
+    f.write_reg("system.reg", &reg_dword(VC_KEY_WRITTEN, "Bld", 35211));
+    let err = run_with(&f, &p, &backend(MAKE_MARKER), Path::new(NO_RUN_BWRAP)).unwrap_err();
+    assert!(matches!(err, InstallerPkgError::MarkerAlreadyPresent), "{err:?}");
+    assert!(!f.ran());
+}
+
+#[test]
+fn a_symlinked_or_fifo_hive_is_never_followed_or_waited_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.reg");
+    fs::write(&outside, reg_with("Software\\\\A", "V")).unwrap();
+    let prefix = tmp.path().join("prefix");
+    fs::create_dir(&prefix).unwrap();
+    symlink(&outside, prefix.join("system.reg")).unwrap();
+    let err = registry_marker_present(&prefix, "HKLM\\Software\\A", "V").unwrap_err();
+    assert!(
+        matches!(&err, InstallerPkgError::Registry(m) if m.contains("symlink")),
+        "{err:?}"
+    );
+    // A symlinked prefix directory is refused too.
+    fs::remove_file(prefix.join("system.reg")).unwrap();
+    fs::write(prefix.join("system.reg"), reg_with("Software\\\\A", "V")).unwrap();
+    let link = tmp.path().join("linked-prefix");
+    symlink(&prefix, &link).unwrap();
+    let err = registry_marker_present(&link, "HKLM\\Software\\A", "V").unwrap_err();
+    assert!(matches!(err, InstallerPkgError::Registry(_)), "{err:?}");
+    assert!(registry_marker_present(&prefix, "HKLM\\Software\\A", "V").unwrap());
+    // A FIFO neither hangs the open nor counts as a hive.
+    fs::remove_file(prefix.join("system.reg")).unwrap();
+    let fifo = std::ffi::CString::new(prefix.join("system.reg").to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo on a NUL-terminated path we own.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let t = std::time::Instant::now();
+    assert!(!registry_marker_present(&prefix, "HKLM\\Software\\A", "V").unwrap());
+    assert!(t.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn an_oversized_hive_is_refused_before_it_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Sparse: its size is over the cap but it occupies no disk, and it must not be read into memory.
+    let f = fs::File::create(tmp.path().join("system.reg")).unwrap();
+    f.set_len(MAX_MARKER_HIVE_BYTES + 1).unwrap();
+    let t = std::time::Instant::now();
+    let err = registry_marker_present(tmp.path(), "HKLM\\Software\\A", "V").unwrap_err();
+    assert!(
+        matches!(&err, InstallerPkgError::Registry(m) if m.contains("cap for a marker read: not read")),
+        "{err:?}"
+    );
+    assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+    // A hive under the cap is read (this one parses as nothing): the cap is a bound, not a failure.
+    f.set_len(4096).unwrap();
+    assert!(!registry_marker_present(tmp.path(), "HKLM\\Software\\A", "V").unwrap());
 }
 
 #[test]
@@ -1137,7 +1254,10 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
     let Install::Installer { marker, .. } = &vc.install else {
         panic!("vcrun2022 is not an installer package")
     };
-    assert!(matches!(marker, Marker::RegistryValue { .. }), "{marker:?}");
+    assert!(
+        matches!(marker, Marker::RegistryValue { name, min_dword: Some(35211), .. } if name == "Bld"),
+        "{marker:?}"
+    );
     let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
     let file = fetch::fetch(vc, &tmp.path().join("cache"), &fetch::FetchOpts::default()).unwrap();
     let launcher = Launcher::new();
@@ -1164,7 +1284,18 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
         .filter(|s| s.to_ascii_lowercase().contains("vc\\\\runtimes\\\\x64]"))
     {
         eprintln!("system.reg:\n{section}");
+        // The real installer writes the build number as a DWORD >= min_dword (14.44.35211: 0x898b).
+        assert!(section.contains("\"Bld\"=dword:0000898b"), "{section}");
     }
+    let sizes: Vec<u64> = ["system.reg", "user.reg"]
+        .iter()
+        .map(|f| fs::metadata(env.prefix().join(f)).unwrap().len())
+        .collect();
+    eprintln!(
+        "hive sizes after the install: system.reg {} bytes, user.reg {} bytes",
+        sizes[0], sizes[1]
+    );
+    assert!(sizes.iter().all(|s| s * 8 < MAX_MARKER_HIVE_BYTES), "{sizes:?}");
     for name in &vc.provides {
         let p = env.drive_c().join(format!("windows/system32/{name}.dll"));
         let bytes = fs::read(&p).unwrap_or_default();

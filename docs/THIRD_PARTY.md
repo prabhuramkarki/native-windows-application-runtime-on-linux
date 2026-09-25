@@ -45,7 +45,10 @@ that shows the package, version, licence LABEL (e.g. `proprietary-redistributabl
 shown), download url, size and sha256. For an installer package the prompt also says plainly that running the
 vendor's silent installer accepts the vendor's own licence terms (its EULA) on the user's behalf and that those terms
 are not displayed; the user reads them at the vendor. An installer package whose marker is already in the prefix
-(typically put there by the app's own installer) is not downloaded, not prompted for and not recorded.
+at this version or newer (typically put there by the app's own installer) is not downloaded, not prompted for and not
+recorded. For `vcrun2022` the marker is the build number the redistributable writes
+(`HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64`, `Bld`, a DWORD of at least 35211): an older
+2015-2019 runtime under the same key (fewer DLLs) does not count, so the installer still runs and upgrades it.
 
 | Package | Version | Licence | Source url | sha256 | Size (bytes) |
 |---|---|---|---|---|---|
