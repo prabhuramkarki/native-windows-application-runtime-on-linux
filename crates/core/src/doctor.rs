@@ -676,7 +676,12 @@ fn vulkan(input: &DoctorInput<'_>, out: &mut Out) {
     if let Some(h) = input.vulkan {
         match host_verdict(h, input.vulkan_min) {
             VulkanVerdict::Usable => {
-                let n = h.devices.len();
+                // Only the devices that meet the bundled minimum count as usable.
+                let n = h
+                    .devices
+                    .iter()
+                    .filter(|d| input.vulkan_min.is_none_or(|m| d.api >= m))
+                    .count();
                 let s = if n == 1 { "" } else { "s" };
                 return out.add(Area::Graphics, Status::Ok, format!("Vulkan: {n} device{s} usable"));
             }

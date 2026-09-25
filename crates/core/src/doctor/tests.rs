@@ -422,6 +422,19 @@ fn vulkan_verdicts_from_the_runner() {
 }
 
 #[test]
+fn only_devices_meeting_the_minimum_are_counted_as_usable() {
+    let mut s = sc();
+    s.vulkan = Some(crate::HostVulkan {
+        tool_found: true,
+        loader_found: true,
+        devices: vec![dev((1, 1)), dev((1, 3)), dev((1, 4))],
+    });
+    s.vulkan_min = Some((1, 3));
+    let c = one(&s.run(), Area::Graphics, "Vulkan").clone();
+    assert!(c.text.contains("2 devices usable"), "{}", c.text);
+}
+
+#[test]
 fn a_device_below_the_bundled_minimum_is_a_warning() {
     let mut s = sc();
     s.vulkan = Some(crate::HostVulkan {

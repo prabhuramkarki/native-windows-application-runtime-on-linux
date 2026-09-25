@@ -58,7 +58,7 @@ pub fn parse_vulkaninfo_summary(text: &str) -> Vec<VulkanDevice> {
         }) = cur
         {
             out.push(VulkanDevice {
-                name,
+                name: if name.is_empty() { "unnamed device".into() } else { name },
                 device_type,
                 api,
                 driver,
@@ -87,7 +87,7 @@ pub fn parse_vulkaninfo_summary(text: &str) -> Vec<VulkanDevice> {
         };
         let v = v.trim();
         match k.trim() {
-            "apiVersion" => c.api = parse_api(v),
+            "apiVersion" => c.api = parse_api(v).or(c.api), // a bad repeat must not erase a good value
             "deviceType" => c.device_type = clean(v, MAX_FIELD),
             "deviceName" => c.name = clean(v, MAX_FIELD),
             "driverName" => c.driver = clean(v, MAX_FIELD),
@@ -144,6 +144,14 @@ pub fn host_verdict(h: &HostVulkan, min: Option<(u32, u32)>) -> VulkanVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_repeated_api_line_keeps_the_good_one_and_a_nameless_device_is_named() {
+        let d = parse_vulkaninfo_summary("GPU0:\n\tapiVersion = 1.3.1\n\tapiVersion = junk\n\tdeviceName = \x1b\n");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].api, (1, 3));
+        assert_eq!(d[0].name, "unnamed device");
+    }
 
     #[test]
     fn no_loader_is_unusable() {

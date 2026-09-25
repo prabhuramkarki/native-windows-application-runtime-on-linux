@@ -69,7 +69,7 @@ Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
   the pin's download is re-verified weekly by `verify-pins`; installing the real downloaded package on Wine is a
   manual `--ignored real_net_*` run. `runtime graphics info` shows what
   the host offers (Vulkan loader, devices and API versions, from a bounded `vulkaninfo` run), and `deps` marks
-  `dxvk` and `vkd3d-proton` as blocked, with the reason, when Vulkan is unusable.
+  `dxvk` and `vkd3d-proton` as blocked, with the reason, when Vulkan is unusable (and `deps --install` skips them).
 - **VC++ 2015-2022 redistributable x64 14.44.35211** (Microsoft, consent): Microsoft's installer, run offline in the
   installer sandbox on a one-run null-driver desktop; success is its registry marker; 16 DLL overrides set after.
 

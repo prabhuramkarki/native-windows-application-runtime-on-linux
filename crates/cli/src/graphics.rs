@@ -89,23 +89,36 @@ fn run_tool(program: &OsStr, timeout: Duration) -> Option<String> {
         });
     }
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    loop {
         if too_big.load(Ordering::SeqCst) || Instant::now() >= deadline {
             kill(&mut child);
             return None;
         }
-        match child.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => {
-                kill(&mut child);
-                return None;
-            }
+        // Exit is noticed without reaping (WNOWAIT), so the group id stays ours until after the kill below.
+        // SAFETY: waitid on our own child with a zeroed siginfo it fills in.
+        let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pgid as libc::id_t,
+                &mut si,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r != 0 {
+            kill(&mut child);
+            return None;
         }
-    };
-    // Reaped; end what is left of the group, then give the reader a bounded moment to reach EOF.
+        // SAFETY: si_pid reads the field waitid filled in (0 while the child still runs).
+        if unsafe { si.si_pid() } != 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Exited but not yet reaped, so its pgid cannot be recycled: end what is left of the group, then reap.
     // SAFETY: as above.
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let Ok(status) = child.wait() else { return None };
     if done_rx.recv_timeout(DRAIN).is_err() {
         return None; // something still holds the pipe: the output may be incomplete
     }
@@ -146,14 +159,20 @@ fn probe() -> HostVulkan {
 }
 
 pub fn info() -> Result<u8, CmdError> {
-    crate::emit(&format_info(host(), rt_deps::Manifest::bundled().max_min_vulkan()))?;
+    let needs: Vec<(&str, (u32, u32))> = rt_deps::Manifest::bundled()
+        .packages
+        .iter()
+        .filter_map(|p| Some((p.id.as_str(), p.min_vulkan?)))
+        .collect();
+    crate::emit(&format_info(host(), &needs))?;
     Ok(0)
 }
 
-/// The report for `h`; `need` is the highest Vulkan version a bundled package requires, if any does.
-fn format_info(h: &HostVulkan, need: Option<(u32, u32)>) -> String {
+/// The report for `h`; `needs` is each bundled package's minimum Vulkan version. The host counts as usable when
+/// it meets the smallest of them (a package with a higher minimum is listed as not met).
+fn format_info(h: &HostVulkan, needs: &[(&str, (u32, u32))]) -> String {
     let mut out = String::new();
-    match host_verdict(h, None) {
+    match host_verdict(h, needs.iter().map(|n| n.1).min()) {
         VulkanVerdict::Usable => {
             out.push_str("Vulkan: usable\n");
             for (i, d) in h.devices.iter().enumerate() {
@@ -166,8 +185,13 @@ fn format_info(h: &HostVulkan, need: Option<(u32, u32)>) -> String {
                 } else {
                     safe(&kind.to_lowercase())
                 };
+                let driver = if d.driver.is_empty() {
+                    String::new()
+                } else {
+                    format!("   driver {}", safe(&d.driver))
+                };
                 out.push_str(&format!(
-                    "  GPU{i}  {}   Vulkan {}.{}   {soft}\n",
+                    "  GPU{i}  {}   Vulkan {}.{}   {soft}{driver}\n",
                     safe(&d.name),
                     d.api.0,
                     d.api.1
@@ -175,12 +199,24 @@ fn format_info(h: &HostVulkan, need: Option<(u32, u32)>) -> String {
             }
         }
         VulkanVerdict::Unusable(why) => out.push_str(&format!("Vulkan: unusable  ({})\n", safe(&why))),
+        VulkanVerdict::Unknown if !h.tool_found => out.push_str(
+            "Vulkan: unknown  (could not read the Vulkan device list: vulkaninfo is missing, failed or timed out; the Vulkan loader is present)\n",
+        ),
         VulkanVerdict::Unknown => {
-            out.push_str("Vulkan: unknown  (vulkaninfo not available; the loader is present)\n");
+            out.push_str("Vulkan: unknown  (could not read the Vulkan device list: vulkaninfo listed no devices)\n");
         }
     }
-    if let Some((major, minor)) = need {
-        out.push_str(&format!("DXVK and VKD3D-Proton need Vulkan {major}.{minor}.\n"));
+    if !needs.is_empty() {
+        out.push_str("Vulkan needed by bundled packages:\n");
+        for (id, (major, minor)) in needs {
+            let state = match host_verdict(h, Some((*major, *minor))) {
+                VulkanVerdict::Usable => "met",
+                VulkanVerdict::Unusable(_) => "not met",
+                VulkanVerdict::Unknown => "unknown",
+            };
+            out.push_str(&format!("  {} {major}.{minor}+: {state}\n", safe(id)));
+        }
+        out.push_str("DXVK 3.x upstream recommends Vulkan 1.4; older AMD GCN cards work without it.\n");
     }
     out
 }
@@ -213,14 +249,42 @@ mod tests {
     }
 
     #[test]
-    fn info_names_the_needed_version_only_when_a_package_has_one() {
+    fn info_lists_each_packages_minimum_and_whether_it_is_met() {
+        let dev = |api| rt_core::VulkanDevice {
+            name: "gpu".into(),
+            device_type: "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU".into(),
+            api,
+            driver: "drv".into(),
+        };
         let h = HostVulkan {
+            tool_found: true,
+            loader_found: true,
+            devices: vec![dev((1, 2))],
+        };
+        let out = format_info(&h, &[("dxvk", (1, 3)), ("old", (1, 1))]);
+        // Usable by the smallest minimum, with the driver shown; the higher one is reported as not met.
+        assert!(out.starts_with("Vulkan: usable\n"), "{out}");
+        assert!(
+            out.contains("driver drv") && out.contains("  dxvk 1.3+: not met\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  old 1.1+: met\n") && out.contains("recommends Vulkan 1.4"),
+            "{out}"
+        );
+        assert!(!format_info(&h, &[]).contains("needed by"));
+    }
+
+    #[test]
+    fn unknown_says_why_the_list_could_not_be_read() {
+        let mut h = HostVulkan {
             tool_found: false,
             loader_found: true,
             devices: vec![],
         };
-        assert!(format_info(&h, Some((1, 3))).ends_with("DXVK and VKD3D-Proton need Vulkan 1.3.\n"));
-        assert!(!format_info(&h, None).contains("need Vulkan"));
+        assert!(format_info(&h, &[]).contains("missing, failed or timed out"));
+        h.tool_found = true;
+        assert!(format_info(&h, &[]).contains("listed no devices"));
     }
 
     #[test]
