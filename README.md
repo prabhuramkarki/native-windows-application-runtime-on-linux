@@ -89,6 +89,16 @@ package upgrades (a newer pinned version is refused: recreate the app) and no re
 the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
 left alone: the runtime neither installs it nor sets its DLL overrides (`deps` and `doctor` say so).
 
+**Rendering check (manual only).** `real_net_wine_d3d11_renders_via_dxvk` downloads and installs the bundled DXVK
+into a fresh prefix and runs `tools/fixtures/d3d11.c` (`d3d11_64.exe`): an offscreen D3D11 device (no window, no
+swapchain) clears a 64x64 target and reads one pixel back. It passes only when the pixel is right, the program exits
+0, system32's `d3d11.dll` is byte-identical to DXVK's and DXVK's own log shows it created its Vulkan device on the
+adapter the program reports. `DXVK_FILTER_DEVICE_NAME=<name>` picks the Vulkan device. It proves that DXVK 3.1.1
+renders on that Wine, driver and GPU; it does not prove any real app or game works, and its `frame ms` (CPU time to
+submit 100 clears) is printed, never asserted. No CI runner has a GPU, so it runs by hand only and its results go
+into the matrix below as `manual:` records. It needs a display session: headless, Wine 10.0's winevulkan cannot
+create a Vulkan instance. x86_64 only, like the bundled DXVK (32-bit Direct3D stays on Wine's wined3d).
+
 ## Compatibility (`runtime compat`)
 
 `runtime compat [--json]` prints the compatibility matrix: only what was really run (a CI job or a dated manual
@@ -128,6 +138,8 @@ RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-deps --lib -- --ignored e2e_real_w
                                         # dependency engine on real Wine + bwrap (local HTTPS server, no internet)
 cargo test -p runtime-deps --lib -- --ignored real_net --nocapture
                                         # re-downloads the bundled pins (internet; weekly in CI, verify-pins.yml)
+cargo test -p runtime-deps --lib -- --ignored real_net_wine_d3d11 --test-threads=1 --nocapture
+                                        # D3D11 render through DXVK on real Wine (internet, Vulkan device, display)
 RUNTIME_SAMPLES=dir1:dir2 cargo test -p runtime-pe -- --ignored --nocapture
                                         # PE oracle: compares every PE under those dirs with file(1)
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
