@@ -20,9 +20,11 @@ Success criteria:
 1. `doctor <app>` for a managed (.NET) program warns that it needs a .NET runtime and that the runtime bundles none
    (Wine's own Mono is not verified by doctor), instead of reporting its native imports as if that settled it.
 2. `doctor <app>` reports the Direct3D route per API family the app imports (D3D8/9/10/11 and D3D12): DXVK (or
-   VKD3D-Proton) when the package is installed for the app AND the host Vulkan verdict is not Unusable, Wine's
-   built-in wined3d/vkd3d otherwise with the reason (package not installed: run `runtime deps`; Vulkan unusable:
-   <reason>; package blocked), and nothing for families the app does not import.
+   VKD3D-Proton) when the package is installed for the app AND the host Vulkan verdict is not Unusable; a
+   `Fail` (not a built-in route: the installed DLLs win and the app cannot create a device) when it is installed
+   and Vulkan is Unusable; otherwise Wine's built-in wined3d/vkd3d with the reason: a warning when the user can
+   act (package not installed: run `runtime deps`; package blocked), plain `ok` when built-in is simply the working
+   route (32-bit app: the packages are 64-bit only; no package provides the family). Nothing for families the app does not import.
 3. `runtime compat` prints the compatibility matrix from bundled machine-readable records; `docs/COMPAT.md` is the
    same rendering and a test fails when they drift. A record cannot claim `works` or `partial` without evidence.
 4. A tiny D3D11 fixture renders offscreen through DXVK on real Wine and verifies a pixel and reports a frame time;
@@ -45,7 +47,7 @@ Non-goals: benchmarks with thresholds, per-app compatibility scraping, a .NET/Mo
 
 - `crates/core/src/doctor.rs`: `DoctorInput` gains `d3d_routes: Option<&[D3dRoute]>` (typed, computed by the CLI from
   the plan/state/Vulkan verdict; `None` for a system report) and uses the existing `PeInfo.dotnet` flag for the .NET
-  check. New pure `enum D3dRoute { Dxvk{family}, Vkd3dProton, Wined3d{family, reason: String} }`, rendered by one
+  check. New pure `enum D3dRoute { Dxvk, Vkd3dProton, Wined3d{reason, actionable}, Broken{reason} }` per family, rendered by one
   new check per imported family, bounded and escaped like the rest of doctor.
 - `crates/cli/src/doctor.rs`: builds `d3d_routes` from `rt_deps::plan_for_pe` entries and the Vulkan verdict.
 - `crates/cli/src/compat.rs` + `crates/cli/compat.toml`: strict parser (deny unknown fields, size caps, status/evidence

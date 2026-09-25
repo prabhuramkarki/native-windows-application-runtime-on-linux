@@ -121,7 +121,7 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 - **Run-by-path installs every time.** `runtime run some.exe` creates a *new* app on each invocation
   (`some-2`, `some-3`, ...) with its own prefix. Use `install` once and `run <id>` afterwards.
 - **.NET, Mono and Gecko are disabled** by `WINEDLLOVERRIDES=winemenubuilder.exe=d;mscoree=d;mshtml=d`, so .NET
-  and HTML-embedding programs fail until Phase 4 provides a dependency mechanism. `doctor` warns about .NET.
+  and HTML-embedding programs fail until a .NET package exists (not planned in Phase 4). `doctor` warns about .NET.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
 
 ## Installer sandbox (Phase 3 Task 5)
