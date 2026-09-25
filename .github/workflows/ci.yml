@@ -36,8 +36,9 @@ jobs:
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
-  # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
-  # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
+  # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: no display. The GUI
+  # fixture gui64.exe runs only as the dependency engine's "hanging installer" (its message box waits on Wine's
+  # null-driver desktop until the 20 s deadline kills the sandbox); the other fixtures are console programs.
   # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on
   # Linux only). ubuntu-latest may ship Wine 9 (`wineserver64`, no new WoW64): the tests then skip their 32-bit
   # steps with a `SKIPPED 32-bit` message. `continue-on-error` keeps a failure here from blocking a pull request
@@ -70,10 +71,12 @@ jobs:
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
-      # The dependency engine's real-Wine tests (Phase 4A Tasks 5/6: archive install + DLL override via reg.exe,
-      # sandboxed NSIS installer with file and registry markers; fixtures `exports64.dll`/`dep-installer.exe` come
-      # from `tools/build-fixtures.sh` above). The `e2e_real_wine` filter keeps out the other ignored tests of this
-      # crate: `real_download_smoke` needs the internet and `probe_real_wine_*` only prints a finding.
+      # The dependency engine's real-Wine tests (Phase 4A Tasks 5/6/8: archive install + DLL override via reg.exe,
+      # sandboxed NSIS installer with file and registry markers, exe installers on the null-driver desktop: exact
+      # arguments, marker-only failure, deadline kill; fixtures `exports64.dll`/`dep-installer.exe`/`fs64.exe`/
+      # `gui64.exe` come from `tools/build-fixtures.sh` above). The `e2e_real_wine` filter keeps out the other
+      # ignored tests of this crate, which need the internet: `real_download_smoke` and every `real_net_*` test
+      # (they download the bundled packages; not run in CI).
       - run: cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1 --nocapture
         env:
           RUNTIME_REQUIRE_BWRAP: "1"

@@ -52,6 +52,12 @@
 //!    symlink anywhere) right before each removal: the installer may have swapped part of it for a symlink to a
 //!    host directory, and cleanup must never follow that out of the prefix. What cannot be removed safely is left
 //!    in place, with a warning.
+//! 9. Only after the marker is confirmed, the package's `dll_overrides` are set to `native,builtin` with Wine's
+//!    `reg.exe` (the same settled, bounded helper as archive packages, outside the sandbox). Without them Wine keeps
+//!    loading its own builtin DLL of the same name even though the installer put the native one in `system32`
+//!    (seen for real with the VC++ redistributable on Wine 10.0). If one cannot be set, the ones already set are
+//!    deleted again, newest first, and the result is [`InstallerPkgError::DllOverride`] (the caller records
+//!    nothing; the installer's own changes stay, as for any failure after it ran).
 //!
 //! **Registry markers.** `HKLM\...` is looked up in `<prefix>/system.reg`, `HKCU\...` in `<prefix>/user.reg`
 //! (Wine's text format, parsed by [`rt_installer::read_reg_file`] with its size, line and key bounds). Keys and
@@ -69,11 +75,18 @@
 //! so and recommend recreating the environment. Nothing is recorded here: the caller records the package only
 //! after `Ok`.
 //!
+//! **What the pin proves.** The sha256 proves which file was staged and started, nothing more. The marker is the
+//! installer's own claim (a hostile installer can write it and exit), and the programs the prefix itself provides
+//! are not pinned: `explorer.exe` (which starts every non-MSI installer), `msiexec.exe` and `reg.exe` are whatever
+//! is in the prefix. A native program planted there (by an earlier app in the same prefix) runs instead of Wine's
+//! and could write the marker without running the installer. Same residual as the marker itself; the sandbox
+//! bounds what either can touch.
+//!
 //! **Not covered** (as for the archive installer): a process that can write inside `drive_c` while this runs could
 //! swap a checked path for a symlink between check and use. Callers install only while no Windows program runs in
 //! the prefix; Phase 5's sandbox is the real boundary.
 use crate::fetch;
-use crate::install_archive::open_archive;
+use crate::install_archive::{self, open_archive};
 use crate::manifest::{self, Install, Kind, MAX_LIST_LEN, MAX_PACKAGE_SIZE, MAX_TEXT_LEN, Marker, Package, clip};
 use rt_core::{AppEnv, CompatBackend, Launcher, ResolveError, WinPath, join_new, resolve_under};
 use rt_installer::{MSIEXEC_RELATIVE, SandboxOpts, find_bwrap_on_path, read_reg_file, run_sandboxed, stage_file};
@@ -116,8 +129,8 @@ pub enum InstallerPkgError {
     #[error("the package's marker is already present in this prefix; the installer was not run")]
     MarkerAlreadyPresent,
     #[error(
-        "the installer exited successfully but its marker is missing: the install FAILED and may have left \
-         partial changes in the prefix"
+        "the installer finished but its marker is missing: the install FAILED and may have left partial changes \
+         in the prefix (the exit status of an exe installer is not visible through the desktop wrapper)"
     )]
     MarkerMissing,
     #[error(
@@ -140,6 +153,11 @@ pub enum InstallerPkgError {
     MsiExecMissing,
     #[error("explorer.exe is missing from this prefix's windows directory")]
     ExplorerMissing,
+    #[error(
+        "the installer succeeded but setting its dll overrides failed ({0}); the installer's own changes stay in the \
+         prefix"
+    )]
+    DllOverride(String),
     #[error("cannot check the marker file: {0}")]
     Marker(String),
 }
@@ -186,7 +204,7 @@ fn install_with(
     bwrap: Option<PathBuf>,
     deadline: Duration,
 ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
-    let (silent_args, marker) = check_package(pkg)?;
+    let (silent_args, marker, overrides) = check_package(pkg)?;
     let bwrap = bwrap.ok_or(InstallerPkgError::BwrapNotFound)?;
 
     let stage_err = |e: &dyn Display| InstallerPkgError::Stage(bounded(e));
@@ -260,6 +278,7 @@ fn install_with(
             if let Err(why) = &removed {
                 warnings.push(format!("the staged installer copy was not removed: {why}"));
             }
+            set_overrides(overrides, env, backend, launcher)?;
             Ok(InstallerPkgInstalled {
                 marker_confirmed: true,
                 warnings,
@@ -271,16 +290,35 @@ fn install_with(
     }
 }
 
+/// Whether `pkg`'s marker is in `env`'s prefix now, the package validated as for an install. The orchestrator asks
+/// this before any download or consent prompt (Ruling 15). Reads only: a file lookup, or the bounded hive parse.
+pub fn marker_already_present(pkg: &Package, env: &AppEnv) -> Result<bool, InstallerPkgError> {
+    let (_, marker, _) = check_package(pkg)?;
+    marker_present(env, marker)
+}
+
 // ------------------------------------------------------------------------------------------------ validation
 
 fn bad_package(pkg: &Package, why: &str) -> InstallerPkgError {
     InstallerPkgError::BadPackage(format!("package {:?}: {why}", clip(&pkg.id)))
 }
 
-fn check_package(pkg: &Package) -> Result<(&[String], &Marker), InstallerPkgError> {
-    let (Kind::Installer, Install::Installer { silent_args, marker }) = (pkg.kind, &pkg.install) else {
+type Checked<'a> = (&'a [String], &'a Marker, &'a [String]);
+
+fn check_package(pkg: &Package) -> Result<Checked<'_>, InstallerPkgError> {
+    let (
+        Kind::Installer,
+        Install::Installer {
+            silent_args,
+            marker,
+            dll_overrides,
+        },
+    ) = (pkg.kind, &pkg.install)
+    else {
         return Err(InstallerPkgError::NotInstallerKind);
     };
+    install_archive::check_overrides(dll_overrides, Some(&pkg.provides))
+        .map_err(|e| bad_package(pkg, &e.to_string()))?;
     if !manifest::valid_id(&pkg.id) {
         return Err(bad_package(pkg, "invalid id"));
     }
@@ -305,7 +343,38 @@ fn check_package(pkg: &Package) -> Result<(&[String], &Marker), InstallerPkgErro
             }
         }
     }
-    Ok((silent_args, marker))
+    Ok((silent_args, marker, dll_overrides))
+}
+
+/// Sets each DLL override (`native,builtin`, through the same settled `reg.exe` as archive packages). If one
+/// fails, the ones already set are deleted again, newest first, and the install fails: the vendor installer's own
+/// changes stay (they cannot be undone), and nothing is recorded by the caller.
+fn set_overrides(
+    names: &[String],
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+) -> Result<(), InstallerPkgError> {
+    for (i, name) in names.iter().enumerate() {
+        if let Err(e) = install_archive::set_override(name, env, backend, launcher) {
+            // Delete the failed one too: a `reg add` that fails may still have written it.
+            let undo: Vec<String> = names[..=i]
+                .iter()
+                .rev()
+                .filter_map(|n| install_archive::delete_override(n, env, backend, launcher).err())
+                .map(|e| bounded(&e))
+                .collect();
+            let mut why = format!("{name}: {}", bounded(&e));
+            if !undo.is_empty() {
+                why.push_str(&format!(
+                    "; removing the overrides already set also failed: {}",
+                    undo.join("; ")
+                ));
+            }
+            return Err(InstallerPkgError::DllOverride(bounded(&why)));
+        }
+    }
+    Ok(())
 }
 
 /// At most [`MAX_LIST_LEN`] arguments, each non-empty, at most [`MAX_TEXT_LEN`] bytes, no control characters (NUL

@@ -87,6 +87,7 @@ fn valid_manifest_parses() {
         Install::Installer {
             silent_args: vec!["/install".into(), "/quiet".into(), "/norestart".into()],
             marker: Marker::File("windows/system32/vcruntime140.dll".into()),
+            dll_overrides: vec![],
         }
     );
     assert!(m.get("missing").is_none());
@@ -385,8 +386,7 @@ fn kind_install_mismatch_rejected() {
         // Archive with a marker, or without dll_overrides.
         ("dll_overrides = []", format!("dll_overrides = []\n{marker}")),
         ("dll_overrides = []", String::new()),
-        // Installer with archive fields.
-        (marker, format!("{marker}\ndll_overrides = []")),
+        // Installer with archive fields (dll_overrides is shared, see installer_dll_overrides_are_optional...).
         (marker, format!("{marker}\nextract = [{{ from = \"a\", to = \"b\" }}]")),
         // Archive without format, installer with one.
         ("format = \"zip\"\n", String::new()),
@@ -455,6 +455,49 @@ fn dll_override_must_be_provided() {
     assert!(matches!(err(&text), ManifestError::BadDllOverride { .. }));
     let ok = valid_with("dll_overrides = []", "dll_overrides = [\"base\"]");
     Manifest::parse(&ok).unwrap();
+}
+
+#[test]
+fn a_url_naming_a_sha256_must_name_the_packages() {
+    let upper = HASH.to_ascii_uppercase();
+    let url = |seg: &str| format!(r#"url = "https://download.example.com/pr/{seg}/vc_redist.x64.exe""#);
+    let from = r#"url = "https://download.example.com/vc_redist.x64.exe""#;
+    // The same hash, in either case, is fine.
+    for seg in [HASH, upper.as_str()] {
+        Manifest::parse(&valid_with(from, &url(seg))).unwrap();
+    }
+    // Any other 64-hex segment is not.
+    let other = "de".repeat(32);
+    let e = err(&valid_with(from, &url(&other)));
+    assert!(
+        matches!(&e, ManifestError::BadUrl { id, reason, .. } if id == "vcrun" && reason.contains("sha256")),
+        "{e:?}"
+    );
+    // Not 64 hex characters: not a hash, not checked.
+    for seg in [&other[..63], &format!("{}x", &other[..63]), &format!("{other}0")] {
+        Manifest::parse(&valid_with(from, &url(seg))).unwrap();
+    }
+}
+
+#[test]
+fn installer_dll_overrides_are_optional_and_must_be_provided() {
+    let marker = r#"marker = { file = "windows/system32/vcruntime140.dll" }"#;
+    let ok = valid_with(marker, &format!("{marker}\ndll_overrides = [\"vcruntime140.dll\"]"));
+    let m = Manifest::parse(&ok).unwrap();
+    let Install::Installer { dll_overrides, .. } = &m.get("vcrun").unwrap().install else {
+        panic!("installer expected")
+    };
+    assert_eq!(dll_overrides, &["vcruntime140.dll"]);
+    let empty = valid_with(marker, &format!("{marker}\ndll_overrides = []"));
+    Manifest::parse(&empty).unwrap();
+    for name in ["msvcp140", "base"] {
+        let bad = valid_with(marker, &format!("{marker}\ndll_overrides = [\"{name}\"]"));
+        let e = err(&bad);
+        assert!(
+            matches!(&e, ManifestError::BadDllOverride { id, .. } if id == "vcrun"),
+            "{name}: {e:?}"
+        );
+    }
 }
 
 #[test]
@@ -577,11 +620,40 @@ fn bundled_manifest_has_no_placeholder_pins() {
             p.sha256
         );
         assert!(
+            !repeats_short_unit(&p.sha256),
+            "{}: sha256 {} is a repeated pattern",
+            p.id,
+            p.sha256
+        );
+        assert!(
             !p.url.contains("aka.ms/"),
             "{}: pin the final url, not a redirect",
             p.id
         );
     }
+}
+
+/// `s` is one unit of at most 8 characters repeated (`deadbeef` x 8, `ab` x 32, ...), possibly cut short.
+fn repeats_short_unit(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=8).any(|n| b.iter().enumerate().all(|(i, c)| *c == b[i % n]))
+}
+
+#[test]
+fn repeated_short_units_are_recognised() {
+    for yes in [
+        "deadbeef".repeat(8),
+        "ab".repeat(32),
+        "0".repeat(64),
+        "abcdefg".repeat(10)[..64].to_owned(),
+    ] {
+        assert!(repeats_short_unit(&yes), "{yes}");
+    }
+    assert!(!repeats_short_unit(
+        "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
+    ));
+    assert!(!repeats_short_unit(&("abcdefgh".repeat(7) + "abcdefg0")));
+    assert!(!repeats_short_unit(&"abcdefghi".repeat(8)[..64]));
 }
 
 /// Deterministic xorshift64 so failures reproduce.

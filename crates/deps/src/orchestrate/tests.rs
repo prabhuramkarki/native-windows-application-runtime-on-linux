@@ -102,6 +102,7 @@ fn installer(id: &str, provides: &[&str]) -> (Package, Vec<u8>) {
         install: Install::Installer {
             silent_args: vec!["/S".into()],
             marker: Marker::File(format!("windows/system32/{id}-marker.dll")),
+            dll_overrides: vec![],
         },
     };
     (pkg, body)
@@ -548,6 +549,19 @@ fn consent_text_shows_every_field_and_changes_with_each() {
 }
 
 #[test]
+fn consent_text_of_an_installer_says_the_vendor_eula_is_accepted_unseen() {
+    let (archive_pkg, _) = archive("gated", true, &[], &[]);
+    assert!(!consent_text(&archive_pkg).contains("EULA"));
+    let (vc, _) = installer("vc", &["vcruntime140"]);
+    let t = consent_text(&vc);
+    assert!(
+        t.contains("accepts the vendor's own licence terms (its EULA) on your behalf")
+            && t.contains("not displayed here"),
+        "{t}"
+    );
+}
+
+#[test]
 fn consent_text_escapes_what_could_drive_a_terminal() {
     let (mut p, _) = archive("gated", true, &[], &[]);
     p.licence = "MIT\u{202e}\x1b[31m".into();
@@ -745,26 +759,80 @@ fn have_bwrap() -> bool {
     }
 }
 
+/// A consent-gated installer package `vc` (provides vcruntime140) and an archive `gdep` that requires it.
+fn gated_installer_and_dependent() -> Rig {
+    let (mut vc, body) = installer("vc", &["vcruntime140"]);
+    vc.licence = manifest::PROPRIETARY.into();
+    vc.requires_consent = true;
+    Rig::new(vec![(vc, body), archive("gdep", false, &["vc"], &["msvcp140"])])
+}
+
 #[test]
-fn a_marker_already_present_is_never_recorded_and_says_recreate() {
-    if !have_bwrap() {
-        return;
-    }
-    let r = Rig::new(vec![installer("vc", &["vcruntime140"])]);
-    fs::write(r.c("windows/system32/vc-marker.dll"), b"from elsewhere").unwrap();
-    let rep = run(
-        &r,
-        &r.plan(&["vcruntime140"]),
-        &FakeFetcher::default(),
-        &Answers::default(),
+fn an_installer_whose_marker_is_present_is_skipped_before_any_prompt_or_download() {
+    let r = gated_installer_and_dependent();
+    fs::write(
+        r.c("windows/system32/vc-marker.dll"),
+        b"put there by the app's own installer",
     )
     .unwrap();
-    let why = reason(&rep.failed, "vc");
-    assert!(
-        why.contains("the prefix already contains this component from outside the runtime; recreate the environment"),
-        "{why}"
-    );
-    assert!(r.recorded().is_empty());
+    let f = FakeFetcher::default();
+    let a = Answers {
+        never: vec!["vc"],
+        ..Answers::default()
+    };
+    let rep = run(&r, &r.plan(&["vcruntime140.dll", "msvcp140.dll"]), &f, &a).unwrap();
+    assert!(a.asked().is_empty(), "prompted: {:?}", a.asked());
+    assert_eq!(f.calls(), ["gdep"], "the present installer was downloaded");
+    assert_eq!(reason(&rep.skipped, "vc"), MARKER_PRESENT);
+    assert!(!MARKER_PRESENT.contains("recreate"));
+    // What needs it proceeds: the component is there.
+    assert_eq!(rep.completed, ["gdep"]);
+    assert!(rep.failed.is_empty(), "{rep:?}");
+    assert_eq!(r.recorded(), ["gdep"], "a present installer was recorded as ours");
+}
+
+#[test]
+fn an_installer_marker_that_appears_before_its_download_skips_it_at_install_time() {
+    // `vc` requires `first`; `first`'s download puts vc's marker in place (as a racing app installer could): vc
+    // was decided (and consented) while absent, but the check right before its download sees it.
+    let (mut vc, body) = installer("vc", &["vcruntime140"]);
+    vc.requires = vec!["first".into()];
+    let r = Rig::new(vec![(vc, body), archive("first", false, &[], &["d3d11"])]);
+    let marker = r.c("windows/system32/vc-marker.dll");
+    let f = FakeFetcher {
+        hook: Some(Box::new(move |p: &Package| {
+            if p.id == "first" {
+                fs::write(&marker, b"late").unwrap();
+            }
+        })),
+        ..FakeFetcher::default()
+    };
+    let rep = run(&r, &r.plan(&["vcruntime140.dll"]), &f, &Answers::default()).unwrap();
+    assert_eq!(f.calls(), ["first"]);
+    assert_eq!(reason(&rep.skipped, "vc"), MARKER_PRESENT);
+    assert_eq!(rep.completed, ["first"]);
+    assert_eq!(r.recorded(), ["first"]);
+}
+
+#[test]
+fn the_plan_drops_an_installer_whose_marker_is_present_with_a_warning() {
+    let r = gated_installer_and_dependent();
+    let imports = ["vcruntime140.dll", "msvcp140.dll"];
+    let mut app = r.plan(&imports);
+    drop_present_installers(&r.env, &r.manifest, &mut app);
+    assert_eq!(app.plan.entries.len(), 2, "nothing present yet: {app:?}");
+    fs::write(r.c("windows/system32/vc-marker.dll"), b"x").unwrap();
+    let mut app = r.plan(&imports);
+    drop_present_installers(&r.env, &r.manifest, &mut app);
+    let left: Vec<&str> = app.plan.entries.iter().map(|e| e.package.as_str()).collect();
+    assert_eq!(left, ["gdep"]);
+    assert_eq!(app.warnings, [format!("vc: {MARKER_PRESENT}")]);
+    // An unreadable marker (a directory where the file marker belongs) keeps the entry: the run reports it.
+    fs::remove_file(r.c("windows/system32/vc-marker.dll")).unwrap();
+    fs::create_dir(r.c("windows/system32/vc-marker.dll")).unwrap();
+    let mut app = r.plan(&imports);
+    drop_present_installers(&r.env, &r.manifest, &mut app);
+    assert_eq!(app.plan.entries.len(), 2);
 }
 
 #[test]

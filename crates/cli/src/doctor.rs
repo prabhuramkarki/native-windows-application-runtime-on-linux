@@ -143,7 +143,8 @@ impl Facts {
                     Pe::Unreadable(why) => Err(why.as_str()),
                     Pe::Skipped | Pe::Archive => Err("not a PE file"),
                 };
-                let plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled());
+                let mut plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled());
+                rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
                 Facts {
                     subject: Subject::App {
                         id: id.to_string(),

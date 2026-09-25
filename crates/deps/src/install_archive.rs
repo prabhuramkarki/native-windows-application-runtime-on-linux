@@ -374,7 +374,7 @@ fn valid_override(s: &str) -> bool {
 }
 
 /// Every name valid and unique; with `provides`, every name also in it.
-fn check_overrides(names: &[String], provides: Option<&[String]>) -> Result<(), ArchiveError> {
+pub(crate) fn check_overrides(names: &[String], provides: Option<&[String]>) -> Result<(), ArchiveError> {
     if names.len() > MAX_LIST_LEN {
         return Err(ArchiveError::BadOverrideName(format!("({} names)", names.len())));
     }
@@ -1074,7 +1074,7 @@ fn reg(
     Ok((out.status.success(), clip(&detail)))
 }
 
-fn set_override(
+pub(crate) fn set_override(
     name: &str,
     env: &AppEnv,
     backend: &dyn CompatBackend,
@@ -1094,7 +1094,7 @@ fn set_override(
 }
 
 /// Deletes the override; a failed delete is fine if `reg query` then says the value does not exist.
-fn delete_override(
+pub(crate) fn delete_override(
     name: &str,
     env: &AppEnv,
     backend: &dyn CompatBackend,
