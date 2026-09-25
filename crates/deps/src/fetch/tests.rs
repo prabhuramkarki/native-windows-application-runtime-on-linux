@@ -959,3 +959,58 @@ fn stall_cap_picks_tightest_bound_and_fails_once_expired() {
         Err(ureq::Error::Timeout(UTimeout::Global))
     ));
 }
+
+/// The total deadline grows with the package: `total_deadline` plus one second per `MIN_RATE` bytes (so a slow but
+/// steady link still finishes a big package), capped at `MAX_TOTAL_DEADLINE`; tiny test bodies add nothing.
+#[test]
+fn the_total_deadline_scales_with_the_package_size_up_to_a_cap() {
+    let o = FetchOpts::default();
+    assert_eq!(MIN_RATE, 32 * 1024);
+    assert_eq!(total_deadline_for(&o, 1), Duration::from_secs(300));
+    assert_eq!(total_deadline_for(&o, MIN_RATE - 1), Duration::from_secs(300));
+    assert_eq!(total_deadline_for(&o, 10 * MIN_RATE), Duration::from_secs(310));
+    // The bundled vcrun2022 (25 635 768 bytes): 300 + 782 s, i.e. about 23.7 KB/s over the whole download.
+    assert_eq!(total_deadline_for(&o, 25_635_768), Duration::from_secs(1082));
+    assert_eq!(total_deadline_for(&o, u64::MAX), MAX_TOTAL_DEADLINE);
+    assert_eq!(MAX_TOTAL_DEADLINE, Duration::from_secs(3600));
+    // The tests' short deadlines stay what they are (small bodies), and a caller's own longer deadline is kept.
+    assert_eq!(total_deadline_for(&opts(), 4096), opts().total_deadline);
+    let long = FetchOpts {
+        total_deadline: Duration::from_secs(7200),
+        ..o
+    };
+    assert_eq!(total_deadline_for(&long, 1), Duration::from_secs(7200));
+}
+
+/// The scaled deadline is what the fetch really uses: headers 1.5 s late are past a 1 s base deadline, but a package of
+/// 3 × `MIN_RATE` bytes gets 1 + 3 s and succeeds; the same delay on a tiny package times out.
+#[test]
+fn a_bigger_package_really_gets_the_longer_deadline() {
+    let o = FetchOpts {
+        total_deadline: Duration::from_secs(1),
+        stall_timeout: Duration::from_secs(3),
+        ..opts()
+    };
+    let big = body(3 * MIN_RATE as usize);
+    let small = body(10);
+    let s = Server::start(vec![
+        (
+            "/big",
+            Reply::SlowHeaders {
+                body: big.clone(),
+                delay: Duration::from_millis(1500),
+            },
+        ),
+        (
+            "/small",
+            Reply::SlowHeaders {
+                body: small.clone(),
+                delay: Duration::from_millis(1500),
+            },
+        ),
+    ]);
+    let e = env();
+    get_with(&s, &e, &pkg_for(s.url("/big"), &big), &o).expect("the big package had 4 s");
+    let got = get_with(&s, &e, &pkg_for(s.url("/small"), &small), &o);
+    assert!(matches!(got, Err(FetchError::Timeout)), "{got:?}");
+}
