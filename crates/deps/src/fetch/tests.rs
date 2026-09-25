@@ -887,6 +887,33 @@ fn real_download_smoke() {
     assert_eq!(fs::metadata(path).unwrap().len(), SMOKE_SIZE);
 }
 
+/// Every BUNDLED package, re-downloaded from its pinned url through the real fetcher (`NetFetcher`, default safe
+/// options) into a temporary cache: hash and size must still match. Real network; not run in CI by default.
+/// `cargo test -p runtime-deps --lib real_net_bundled_packages -- --ignored --nocapture`
+#[test]
+#[ignore = "needs network"]
+fn real_net_bundled_packages_refetch_and_match() {
+    use crate::orchestrate::{Fetcher, NetFetcher};
+    let e = env();
+    for p in &crate::Manifest::bundled().packages {
+        let t = Instant::now();
+        let path = NetFetcher
+            .fetch(p, &e.cache)
+            .unwrap_or_else(|err| panic!("{}: {err}", p.id));
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, p.size, "{}", p.id);
+        assert_eq!(sha(&bytes), p.sha256, "{}", p.id);
+        eprintln!(
+            "{} {}: {} bytes, sha256 {} in {:?}",
+            p.id,
+            p.version,
+            p.size,
+            p.sha256,
+            t.elapsed()
+        );
+    }
+}
+
 /// rust-lang/rust's MIT licence text at the 1.80.0 tag (1023 bytes), pinned 2026-09-24.
 const SMOKE_URL: &str = "https://raw.githubusercontent.com/rust-lang/rust/1.80.0/LICENSE-MIT";
 const SMOKE_SHA256: &str = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3";

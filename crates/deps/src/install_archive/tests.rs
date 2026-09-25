@@ -1701,6 +1701,57 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
     }
 }
 
+/// The BUNDLED dxvk, downloaded for real and installed into a fresh real Wine 10.0 prefix: the real upstream
+/// tarball passes the bounded tar reader, every declared DLL lands (replacing Wine's builtin placeholder) with its
+/// override set, and removal restores the placeholders. Needs network, so CI's `e2e_real_wine` filter skips it:
+/// `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs network and Wine"]
+fn real_net_wine_bundled_dxvk_installs_and_removes() {
+    use backend_wine::WineBackend;
+    let p = crate::Manifest::bundled().get("dxvk").expect("bundled dxvk");
+    let Install::Archive { extract, .. } = &p.install else {
+        panic!("dxvk is not an archive package")
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let file = crate::fetch::fetch(p, &tmp.path().join("cache"), &crate::fetch::FetchOpts::default()).unwrap();
+    let launcher = Launcher::new();
+    let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("dxvk").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    backend.stop(&env).unwrap();
+    let before: Vec<Vec<u8>> = extract
+        .iter()
+        .map(|e| fs::read(env.drive_c().join(&e.to)).unwrap())
+        .collect();
+    let done = install_archive(p, &file, &env, &backend, &launcher).unwrap();
+    eprintln!("dxvk: {done:?}");
+    assert_eq!(done.overrides, p.provides);
+    assert_eq!(done.files.len(), extract.len());
+    for (e, old) in extract.iter().zip(&before) {
+        let now = fs::read(env.drive_c().join(&e.to)).unwrap();
+        assert!(now != *old && now.starts_with(b"MZ"), "{} not replaced", e.to);
+    }
+    backend.stop(&env).unwrap();
+    let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
+    for name in &p.provides {
+        assert!(user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")), "{name}");
+    }
+    remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
+    for (e, old) in extract.iter().zip(&before) {
+        assert_eq!(
+            fs::read(env.drive_c().join(&e.to)).unwrap(),
+            *old,
+            "{} not restored",
+            e.to
+        );
+    }
+    backend.stop(&env).unwrap();
+}
+
 // ------------------------------------------------------------------------------------------------ interrupted installs
 
 /// Runs `install` and simulates SIGKILL after `steps` steps (a panic that skips every rollback): 0 = right after the

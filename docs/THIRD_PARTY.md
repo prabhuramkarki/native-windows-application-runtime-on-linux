@@ -30,10 +30,24 @@ This table lists direct dependencies only (every `[dependencies]` and `[dev-depe
 | Component | Licence | Phase | Notes |
 |---|---|---|---|
 | Wine | LGPL-2.1-or-later | 2 | Invoked as a subprocess; keep the process boundary. |
-| DXVK | zlib | 4 | Downloaded with user consent. |
-| VKD3D-Proton | LGPL-2.1 | 4 | Downloaded with user consent. |
+| DXVK | zlib | 4 | Downloaded on request, see below. |
+| VKD3D-Proton | LGPL-2.1 | 4 | Not bundled yet: upstream ships only `.tar.zst`, which the dependency engine deliberately does not read. |
 | FEX-Emu, Box64 | MIT | 9 | CPU translation backends. |
 | Mesa | MIT | - | System dependency. |
 | mingw-w64 | GPL (compiler), permissive (runtime and headers) | 2 | Test-fixture builds only (`tools/build-fixtures.sh`); its output is never shipped and it is not needed to run the program. |
+
+## Dependency packages (downloaded at the user's request, never redistributed)
+
+`crates/deps/packages.toml` pins these. The project ships none of their bytes: `runtime deps <app> --install` downloads a
+package from its upstream url only when the user asks (and, for a package marked `requires_consent`, only after the
+user accepted the licence shown in full), checks the pinned sha256 and size, and installs it into that app's prefix.
+
+| Package | Version | Licence | Source url | sha256 | Size (bytes) |
+|---|---|---|---|---|---|
+| DXVK (`dxvk`) | 3.1.1 | Zlib | https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz | `40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608` | 18041512 |
+
+Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) are installed. Not bundled yet: VKD3D-Proton (`.tar.zst` only),
+the Microsoft Visual C++ 2015-2022 redistributable (proprietary, redistributable; would need consent; its installer
+cannot run in the display-less installer sandbox yet) and `d3dcompiler_47` (no verifiable redistributable source).
 
 Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).

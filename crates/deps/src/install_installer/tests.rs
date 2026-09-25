@@ -837,46 +837,6 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
     }
 }
 
-/// Task 1 review I-3: is the bundled placeholder vcrun2022 marker already in a FRESH prefix? Prints the finding.
-#[test]
-#[ignore = "needs Wine"]
-fn probe_real_wine_fresh_prefix_bundled_vcrun_marker() {
-    use backend_wine::WineBackend;
-    let launcher = Launcher::new();
-    let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
-    let tmp = tempfile::tempdir().unwrap();
-    let env = Store::new(tmp.path().join("apps"))
-        .unwrap()
-        .create(&AppId::parse("fresh").unwrap())
-        .unwrap();
-    backend.prepare(&env).unwrap();
-    let vc = crate::Manifest::bundled().get("vcrun2022").expect("bundled vcrun2022");
-    let Install::Installer { marker, .. } = &vc.install else {
-        panic!("vcrun2022 is not an installer package")
-    };
-    let present = marker_present(&env, marker);
-    eprintln!("FINDING: bundled vcrun2022 marker {marker:?} in a fresh prefix: {present:?}");
-    if let Marker::File(rel) = marker {
-        let p = env.drive_c().join(rel);
-        let m = fs::symlink_metadata(&p);
-        eprintln!(
-            "FINDING: {} -> {:?}",
-            p.display(),
-            m.as_ref().map(|m| (m.len(), m.file_type()))
-        );
-        if let Ok(bytes) = fs::read(&p) {
-            let builtin = bytes
-                .windows(b"Wine builtin DLL".len())
-                .any(|w| w == b"Wine builtin DLL");
-            eprintln!(
-                "FINDING: size {} bytes, contains \"Wine builtin DLL\": {builtin}",
-                bytes.len()
-            );
-        }
-    }
-    backend.stop(&env).unwrap();
-}
-
 #[test]
 fn a_hive_with_more_keys_than_are_read_is_an_error_when_the_marker_is_not_among_them() {
     let tmp = tempfile::tempdir().unwrap();

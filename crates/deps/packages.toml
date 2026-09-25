@@ -1,66 +1,36 @@
 # Bundled dependency manifest. Every entry is checked by `Manifest::parse` and by the
-# `bundled_manifest_invariants` test, so an invalid file cannot ship.
+# `bundled_manifest_invariants` / `bundled_manifest_has_no_placeholder_pins` tests, so an invalid file cannot ship.
 #
-# PLACEHOLDER PINS: the urls, sha256 values and sizes below are synthetic and do NOT match any real
-# download. Task 8 replaces them with verified pins; until then nothing here can install successfully
-# (a fetch would fail the hash check).
+# Every pin below (url, sha256, size) was verified by downloading the artifact on 2026-09-25 (Task 8); the
+# ignored test `real_net_bundled_packages_refetch_and_match` re-downloads each one through the real fetcher.
+# Nothing here is redistributed by the project: a package is downloaded from its upstream url only when the
+# user asks for it (and, for a consent-gated package, accepts its licence).
 
+# DXVK 3.1.1 (Direct3D 8/9/10/11 on Vulkan), upstream release tarball. Only the x64 DLLs are installed (the prefix
+# is win64; 32-bit apps are a known gap). The sha256 equals GitHub's asset digest for this release.
 [[package]]
 id = "dxvk"
-version = "2.5.3"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000001"  # PLACEHOLDER
-size = 1                                                                      # PLACEHOLDER
+version = "3.1.1"
+sha256 = "40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608"
+size = 18041512
 licence = "Zlib"
-url = "https://github.com/doitsujin/dxvk/releases/download/v2.5.3/dxvk-2.5.3.tar.gz"  # PLACEHOLDER
+url = "https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz"
 kind = "archive"
 requires_consent = false
 requires = []
-provides = ["d3d9", "d3d10core", "d3d11", "dxgi"]
+provides = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"]
 
 [package.install]
 format = "tar.gz"
 extract = [
-    { from = "x64/d3d9.dll", to = "windows/system32/d3d9.dll" },
-    { from = "x64/d3d10core.dll", to = "windows/system32/d3d10core.dll" },
-    { from = "x64/d3d11.dll", to = "windows/system32/d3d11.dll" },
-    { from = "x64/dxgi.dll", to = "windows/system32/dxgi.dll" },
+    { from = "dxvk-3.1.1/x64/d3d8.dll", to = "windows/system32/d3d8.dll" },
+    { from = "dxvk-3.1.1/x64/d3d9.dll", to = "windows/system32/d3d9.dll" },
+    { from = "dxvk-3.1.1/x64/d3d10core.dll", to = "windows/system32/d3d10core.dll" },
+    { from = "dxvk-3.1.1/x64/d3d11.dll", to = "windows/system32/d3d11.dll" },
+    { from = "dxvk-3.1.1/x64/dxgi.dll", to = "windows/system32/dxgi.dll" },
 ]
-dll_overrides = ["d3d9", "d3d10core", "d3d11", "dxgi"]
+dll_overrides = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"]
 
-[[package]]
-id = "vkd3d-proton"
-version = "2.14.1"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000002"  # PLACEHOLDER
-size = 1                                                                      # PLACEHOLDER
-licence = "LGPL-2.1-or-later"
-# PLACEHOLDER: upstream ships .tar.zst, which is deliberately unsupported; Task 8 must pin a zip/tar.gz source
-# or drop this package.
-url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v2.14.1/vkd3d-proton-2.14.1.tar.gz"
-kind = "archive"
-requires_consent = false
-requires = ["dxvk"]  # synthetic edge (d3d12 via dxgi), to exercise dependency ordering
-provides = ["d3d12", "d3d12core"]
-
-[package.install]
-format = "tar.gz"
-extract = [
-    { from = "x64/d3d12.dll", to = "windows/system32/d3d12.dll" },
-    { from = "x64/d3d12core.dll", to = "windows/system32/d3d12core.dll" },
-]
-dll_overrides = ["d3d12", "d3d12core"]
-
-[[package]]
-id = "vcrun2022"
-version = "14.40.33810"
-sha256 = "0000000000000000000000000000000000000000000000000000000000000003"  # PLACEHOLDER
-size = 1                                                                      # PLACEHOLDER
-licence = "proprietary-redistributable"
-url = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
-kind = "installer"
-requires_consent = true
-requires = []
-provides = ["concrt140", "msvcp140", "msvcp140_1", "msvcp140_2", "vcruntime140", "vcruntime140_1"]
-
-[package.install]
-silent_args = ["/install", "/quiet", "/norestart"]
-marker = { file = "windows/system32/vcruntime140.dll" }
+# Not bundled yet (known gap, see the Task 8 report): the Visual C++ 2015-2022 redistributable (vcrun2022). Its pin
+# and registry marker were verified, but the vendor's Burn bootstrapper exits 0x7e ("Failed to create window") in
+# the installer sandbox, which has no display and so no Wine graphics driver.
