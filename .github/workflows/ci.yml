@@ -76,7 +76,11 @@ jobs:
       # arguments, marker-only failure, deadline kill; fixtures `exports64.dll`/`dep-installer.exe`/`fs64.exe`/
       # `gui64.exe` come from `tools/build-fixtures.sh` above). The `e2e_real_wine` filter keeps out the other
       # ignored tests of this crate, which need the internet: `real_download_smoke` and every `real_net_*` test
-      # (they download the bundled packages; not run in CI).
+      # (they download the bundled packages; the weekly `verify-pins.yml` workflow re-fetches the pins instead).
+      # The filter also selects the orchestrator-level e2e (`orchestrate::tests::e2e::e2e_real_wine_*`: consent,
+      # denied/tampered downloads against the local HTTPS test server, second run, killed-install discard, app
+      # removal). These tests check the Wine version first and FAIL up front with a clear message on Wine < 10
+      # (they were verified on Wine 10.0 only; ubuntu-latest may ship 9.x, hence continue-on-error above).
       - run: cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1 --nocapture
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
