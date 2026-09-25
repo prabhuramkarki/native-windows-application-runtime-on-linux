@@ -83,6 +83,9 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     if let Some(h) = &facts.hint {
         eprintln!("{h}");
     }
+    for n in &facts.notes {
+        eprintln!("{n}");
+    }
     Ok(u8::from(report.verdict == Verdict::Fail))
 }
 
@@ -107,6 +110,8 @@ struct Facts {
     prefix_root: Option<PathBuf>,
     /// Installed apps only: the missing-dependency hint, planned from the PE facts above (no second read).
     hint: Option<String>,
+    /// Installed apps only: installer packages already in the prefix, which the runtime did not install.
+    notes: Vec<String>,
 }
 
 impl Facts {
@@ -120,6 +125,7 @@ impl Facts {
             app_home: None,
             prefix_root: None,
             hint: None,
+            notes: vec![],
         }
     }
 
@@ -152,6 +158,7 @@ impl Facts {
                         version: p.metadata.version.clone(),
                     },
                     hint: crate::deps::hint_for(id.as_str(), &plan),
+                    notes: crate::deps::present_notes(&plan),
                     pe,
                     program: Some(Ok(p.metadata.executable.clone())),
                     // Kept as it is: a directory that could not be read (or was cut) is reported by `doctor`.
