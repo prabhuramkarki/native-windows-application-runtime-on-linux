@@ -101,7 +101,7 @@ fn rig_with(wineserver_body: &str) -> Rig {
             "if [ -d \"$WINEPREFIX\" ]; then E=yes; else E=no; fi\necho \"wineserver $* WINEPREFIX=$WINEPREFIX exists=$E\" >> @LOG@/calls.txt\n{wineserver_body}"
         )),
     );
-    // A GPU that meets DXVK's minimum, so plans do not depend on the host's real Vulkan (only on its loader).
+    // A GPU that meets DXVK's minimum (`cmd` also says the loader is present): plans do not depend on the host.
     script(&bin.join("vulkaninfo"), &vulkaninfo_body(1, 3));
     Rig {
         _t: t,
@@ -134,6 +134,7 @@ impl Rig {
                 },
             )
             .env("RUNTIME_WINESERVER", self.bin.join("wineserver"))
+            .env("RUNTIME_VULKAN_LOADER", "present")
             .env("SECRET", "hunter2")
             .stdin(Stdio::null());
         c
@@ -2055,22 +2056,41 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     assert_eq!(s(&o.stdout), "Nothing to discard for dxvk.\n");
 }
 
-#[test]
-fn deps_shows_a_vulkan_only_package_as_blocked_when_vulkan_is_too_old() {
-    let r = rig();
-    // Only a Vulkan 1.1 GPU: DXVK (min 1.3) cannot work. Without the loader the host is unusable all the same.
-    script(&r.bin.join("vulkaninfo"), &vulkaninfo_body(1, 1));
-    let (id, _) = install_d3d11(&r);
+/// `runtime deps <app>` for an app importing d3d11 with the given loader override; asserts nothing was written.
+fn deps_output_with_loader(r: &Rig, loader: &str) -> String {
+    let (id, _) = install_d3d11(r);
     let (tree, calls) = (r.tree(), r.calls());
-    let o = r.rt(&["deps", &id]);
+    let o = r
+        .cmd()
+        .env("RUNTIME_VULKAN_LOADER", loader)
+        .args(["deps", &id])
+        .output()
+        .unwrap();
     assert_ok(&o);
+    assert_eq!((r.tree(), r.calls()), (tree, calls), "nothing written, no network");
     let out = s(&o.stdout);
+    assert!(!out.contains("): to install"), "{out}");
+    out
+}
+
+#[test]
+fn deps_shows_dxvk_blocked_when_the_vulkan_loader_is_absent() {
+    let out = deps_output_with_loader(&rig(), "absent");
     assert!(
-        out.contains("blocked") && out.contains("Wine's built-in Direct3D"),
+        out.contains("blocked") && out.contains("loader") && out.contains("Wine's built-in Direct3D"),
         "{out}"
     );
-    assert!(!out.contains("): to install"), "{out}");
-    assert_eq!((r.tree(), r.calls()), (tree, calls), "nothing written, no network");
+}
+
+#[test]
+fn deps_shows_dxvk_blocked_when_the_only_gpu_is_vulkan_1_1() {
+    let r = rig();
+    script(&r.bin.join("vulkaninfo"), &vulkaninfo_body(1, 1));
+    let out = deps_output_with_loader(&r, "present");
+    assert!(
+        out.contains("no Vulkan device supports API 1.3 (best is 1.1)") && out.contains("Wine's built-in Direct3D"),
+        "{out}"
+    );
 }
 
 #[test]

@@ -127,10 +127,21 @@ pub(crate) fn verdict_for(min: Option<(u32, u32)>) -> VulkanVerdict {
     host_verdict(host(), min)
 }
 
+/// `RUNTIME_VULKAN_LOADER=present|absent` overrides the loader lookup (for tests); anything else is no override.
+fn loader_override(v: Option<&OsStr>) -> Option<bool> {
+    match v?.to_str()? {
+        "present" => Some(true),
+        "absent" => Some(false),
+        _ => None,
+    }
+}
+
 fn probe() -> HostVulkan {
-    let loader = VULKAN_DIRS
-        .iter()
-        .any(|d| HostFs.exists(&Path::new(d).join("libvulkan.so.1")));
+    let loader = loader_override(std::env::var_os("RUNTIME_VULKAN_LOADER").as_deref()).unwrap_or_else(|| {
+        VULKAN_DIRS
+            .iter()
+            .any(|d| HostFs.exists(&Path::new(d).join("libvulkan.so.1")))
+    });
     probe_host(&run_vulkaninfo, loader)
 }
 
@@ -189,6 +200,17 @@ mod tests {
         run_tool(tool.as_os_str(), timeout)
     }
     const T: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn the_loader_override_takes_only_present_or_absent() {
+        let o = |s: &str| loader_override(Some(OsStr::new(s)));
+        assert_eq!(o("present"), Some(true));
+        assert_eq!(o("absent"), Some(false));
+        for v in ["", "Present", "1", "yes", "present "] {
+            assert_eq!(o(v), None, "{v:?}");
+        }
+        assert_eq!(loader_override(None), None);
+    }
 
     #[test]
     fn info_names_the_needed_version_only_when_a_package_has_one() {

@@ -470,7 +470,8 @@ pub(crate) fn hint_for(app: &str, plan: &AppPlan) -> Option<String> {
         .plan
         .entries
         .iter()
-        .filter(|e| e.action != Action::AlreadyInstalled)
+        // A Blocked entry is not something `deps --install` can fix, so it is not "missing".
+        .filter(|e| e.action == Action::Install)
         .count();
     let noun = if n == 1 { "dependency" } else { "dependencies" };
     (n > 0).then(|| format!("hint: {n} {noun} missing: run `runtime deps {}`", safe(app)))

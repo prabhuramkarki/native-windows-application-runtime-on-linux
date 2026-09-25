@@ -237,9 +237,9 @@ pub fn block_for_vulkan(
                 ),
             };
             blocked.insert(e.package.clone());
-        } else if p.requires.iter().any(|r| blocked.contains(r)) {
+        } else if let Some(blocker) = p.requires.iter().find(|r| blocked.contains(*r)) {
             e.action = Action::Blocked {
-                reason: "needs a package that is blocked (Vulkan is unusable)".into(),
+                reason: format!("needs {}, which is blocked (Vulkan is unusable)", clip(blocker)),
             };
             blocked.insert(e.package.clone());
         }
