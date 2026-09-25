@@ -16,9 +16,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("d3d10core", "d3d10core"),
     // Direct3D 11 and 9 and DXGI: provided by DXVK.
     ("d3d11", "d3d11"),
-    // Direct3D 12: VKD3D-Proton would provide it, but it ships only .tar.zst (unsupported), so no bundled package
-    // provides `d3d12` yet and it resolves to nothing, like `dotnet`.
+    // Direct3D 12: provided by VKD3D-Proton (which requires DXVK for DXGI).
     ("d3d12", "d3d12"),
+    ("d3d12core", "d3d12core"),
     // Direct3D 8 (DXVK 2.4+ ships d3d8 on top of its d3d9).
     ("d3d8", "d3d8"),
     ("d3d9", "d3d9"),
@@ -79,8 +79,8 @@ mod tests {
     #[test]
     fn table_and_bundled_provides_agree() {
         let m = Manifest::bundled();
-        // Known gaps (Task 8 report): no bundled .NET; VKD3D-Proton ships only .tar.zst.
-        let unprovided = ["dotnet", "d3d12"];
+        // Known gap (Task 8 report): no bundled .NET.
+        let unprovided = ["dotnet"];
         for (_, cap) in TABLE.iter().filter(|(_, c)| !unprovided.contains(c)) {
             assert!(
                 m.packages.iter().any(|p| p.provides.iter().any(|x| x == cap)),
@@ -100,6 +100,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn d3d12_resolves_to_vkd3d_proton_after_dxvk() {
+        use crate::resolve::{Action, Facts, InstalledSet, resolve};
+        assert_eq!(capability_for("d3d12.dll"), Some("d3d12"));
+        assert_eq!(capability_for("D3D12Core.dll"), Some("d3d12core"));
+        let m = Manifest::bundled();
+        let owner = m.packages.iter().find(|p| p.provides.iter().any(|c| c == "d3d12"));
+        assert_eq!(owner.map(|p| p.id.as_str()), Some("vkd3d-proton"));
+        let facts = Facts {
+            imports: vec!["D3D12.dll".into()],
+            extra_capabilities: vec![],
+        };
+        let plan = resolve(&facts, &InstalledSet::default(), &[], m);
+        let ids: Vec<_> = plan.entries.iter().map(|e| e.package.as_str()).collect();
+        assert_eq!(ids, ["dxvk", "vkd3d-proton"]);
+        assert!(plan.entries.iter().all(|e| e.action == Action::Install), "{plan:?}");
+        assert!(plan.unsatisfied.is_empty(), "{plan:?}");
     }
 
     #[test]

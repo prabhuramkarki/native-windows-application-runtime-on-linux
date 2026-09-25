@@ -1,5 +1,5 @@
-//! Installs an `archive` package: copies the files its manifest entry declares from a hash-verified zip or tar.gz
-//! into the app's `drive_c`, sets its DLL overrides, and undoes all of that on failure or on removal.
+//! Installs an `archive` package: copies the files its manifest entry declares from a hash-verified zip, tar.gz or
+//! tar.zst into the app's `drive_c`, sets its DLL overrides, and undoes all of that on failure or on removal.
 //!
 //! The archive's hash was verified by `fetch`, but its CONTENTS are treated as hostile: names, sizes, modes and
 //! counts come from the zip planner ([`rt_core::unzip::open`]) and the bounded tar reader ([`crate::tarball`]),
@@ -16,7 +16,7 @@
 //!   missing must not report success). A file selected by two `extract` entries, and two files mapped to the
 //!   same destination (compared case-insensitively, as Wine does; this includes a selected path that occurs twice
 //!   in the archive) are [`ArchiveError::Destination`]. All of this is decided BEFORE anything is written: a zip
-//!   is planned from its central directory, a tar.gz is read twice (a first pass that writes nothing validates the
+//!   is planned from its central directory, a tarball is read twice (a first pass that writes nothing validates the
 //!   whole archive and lists its files; the second pass writes, and must see the same file list).
 //! * Everything not selected is never written.
 //!
@@ -100,7 +100,7 @@
 //! runs could swap a checked directory for a symlink. Callers install only while no Windows program runs in the
 //! prefix; Phase 5's sandbox is the real boundary.
 use crate::manifest::{self, ArchiveFormat, Extract, Install, Kind, MAX_LIST_LEN, MAX_PACKAGE_SIZE, Package, clip};
-use crate::tarball::{self, Selection, TarEntryKind, TarError, TarLimits};
+use crate::tarball::{self, Codec, Selection, TarEntryKind, TarError, TarLimits};
 use rt_core::unzip;
 use rt_core::{AppEnv, CompatBackend, Detail, Launcher, ResolveError, RunOpts, WinPath, join_new, resolve_under};
 use rt_installer::{SandboxOpts, run_sandboxed};
@@ -155,7 +155,7 @@ pub struct ArchiveInstalled {
 pub enum ArchiveError {
     #[error("unusable zip archive: {0}")]
     Zip(String),
-    #[error("unusable tar.gz archive: {0}")]
+    #[error("unusable tar archive: {0}")]
     Tar(#[source] TarError),
     #[error("extract entry {0:?} matches no file in the archive")]
     NoMatch(String),
@@ -201,7 +201,8 @@ pub fn install_archive(
     let result = (|| {
         match format {
             ArchiveFormat::Zip => install_zip(&src, pkg.size, extract, &mut ledger)?,
-            ArchiveFormat::TarGz => install_tar(&src, pkg.size, extract, &mut ledger)?,
+            ArchiveFormat::TarGz => install_tarball(Codec::Gzip, &src, pkg.size, extract, &mut ledger)?,
+            ArchiveFormat::TarZst => install_tarball(Codec::Zstd, &src, pkg.size, extract, &mut ledger)?,
         }
         for name in overrides {
             // Recorded first: a `reg add` that fails may still have written the value, and deleting an absent
@@ -517,13 +518,20 @@ fn install_zip(src: &File, size: u64, extract: &[Extract], ledger: &mut Ledger) 
     Ok(())
 }
 
-fn install_tar(src: &File, size: u64, extract: &[Extract], ledger: &mut Ledger) -> Result<(), ArchiveError> {
+fn install_tarball(
+    codec: Codec,
+    src: &File,
+    size: u64,
+    extract: &[Extract],
+    ledger: &mut Ledger,
+) -> Result<(), ArchiveError> {
     let limits = TarLimits::for_package(size);
     let rewind = || (&*src).seek(SeekFrom::Start(0));
     // Pass 1: validate the whole archive and list its files; nothing is written.
     let mut files = Vec::new();
     rewind()?;
-    tarball::walk(
+    tarball::walk_codec(
+        codec,
         src,
         &limits,
         |e| {
@@ -541,7 +549,8 @@ fn install_tar(src: &File, size: u64, extract: &[Extract], ledger: &mut Ledger) 
     let (next, current, changed) = (Cell::new(0usize), Cell::new(0usize), Cell::new(false));
     let mut written = 0usize;
     let mut failure = None;
-    let walked = tarball::walk(
+    let walked = tarball::walk_codec(
+        codec,
         src,
         &limits,
         |e| {

@@ -74,6 +74,8 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             .as_ref()
             .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
         prefix_root: facts.prefix_root.as_deref(),
+        vulkan: Some(crate::graphics::host()),
+        vulkan_min: rt_deps::Manifest::bundled().max_min_vulkan(),
     });
     crate::emit(&if as_json {
         render_json(&report)?
@@ -149,7 +151,12 @@ impl Facts {
                     Pe::Unreadable(why) => Err(why.as_str()),
                     Pe::Skipped | Pe::Archive => Err("not a PE file"),
                 };
-                let mut plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled());
+                let mut plan = rt_deps::plan_for_pe(
+                    &p.metadata,
+                    exe,
+                    rt_deps::Manifest::bundled(),
+                    &crate::graphics::verdict_for,
+                );
                 rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
                 Facts {
                     subject: Subject::App {

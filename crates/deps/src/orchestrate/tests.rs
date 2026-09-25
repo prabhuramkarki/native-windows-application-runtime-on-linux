@@ -74,6 +74,7 @@ fn archive(id: &str, gated: bool, requires: &[&str], provides: &[&str]) -> (Pack
         requires_consent: gated,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format: ArchiveFormat::Zip,
             extract: vec![Extract {
@@ -99,6 +100,7 @@ fn installer(id: &str, provides: &[&str]) -> (Package, Vec<u8>) {
         requires_consent: false,
         requires: vec![],
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Installer {
             silent_args: vec!["/S".into()],
             marker: Marker::File(format!("windows/system32/{id}-marker.dll")),
@@ -255,6 +257,7 @@ fn run_with(r: &Rig, app: &AppPlan, f: &FakeFetcher, a: &Answers, b: &FakeBacken
         fetcher: f,
         consent: a,
         now,
+        vulkan: &|_| VulkanVerdict::Unknown,
     };
     install_plan(&o, app)
 }
@@ -289,6 +292,49 @@ fn text_hash(p: &Package) -> String {
 }
 
 // ------------------------------------------------------------------------------------------------ consent
+
+#[test]
+fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable_one() {
+    let (mut vk, vk_body) = archive("vk", false, &[], &["d3d11"]);
+    vk.min_vulkan = Some((1, 3));
+    let (other, other_body) = archive("other", false, &[], &["x"]);
+    let r = Rig::new(vec![(vk, vk_body), (other, other_body)]);
+    let facts = Facts {
+        imports: vec![],
+        extra_capabilities: vec!["d3d11".into(), "x".into()],
+    };
+    let unusable = |_: Option<(u32, u32)>| VulkanVerdict::Unusable("no device".into());
+    let mut plan = resolve(&facts, &state::installed_set(&r.md()), &[], &r.manifest);
+    block_for_vulkan(&mut plan, &r.manifest, &unusable);
+    let app = AppPlan {
+        facts,
+        plan,
+        warnings: vec![],
+    };
+    let (f, a, l, b) = (
+        FakeFetcher::default(),
+        Answers::default(),
+        launcher(),
+        FakeBackend::new(),
+    );
+    let o = Orchestrator {
+        manifest: &r.manifest,
+        cache_dir: &r.tmp.path().join("files"),
+        env: &r.env,
+        store: &r.store,
+        backend: &b,
+        launcher: &l,
+        fetcher: &f,
+        consent: &a,
+        now,
+        vulkan: &unusable,
+    };
+    let rep = install_plan(&o, &app).unwrap();
+    assert_eq!(f.calls(), ["other"], "something Vulkan-blocked was downloaded");
+    assert_eq!(rep.completed, ["other"], "{rep:?}");
+    assert_eq!(r.recorded(), ["other"]);
+    assert!(!r.c("windows/system32/vk.dll").exists());
+}
 
 #[test]
 fn without_consent_a_gated_package_is_never_fetched_and_the_rest_still_installs() {
@@ -1212,7 +1258,7 @@ fn a_d3d11_import_plans_dxvk_without_warnings_for_a_64_bit_app() {
             .any(|i| i.dll.eq_ignore_ascii_case("d3d11.dll"))
     );
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries.len(), 1);
     assert_eq!(app.plan.entries[0].package, "dxvk");
     assert_eq!(app.plan.entries[0].action, Action::Install);
@@ -1223,7 +1269,7 @@ fn a_d3d11_import_plans_dxvk_without_warnings_for_a_64_bit_app() {
 fn a_32_bit_app_gets_the_x64_only_warning() {
     let exe = patch_import(fixture("hello32.exe"), "msvcrt.dll", "d3d11.dll");
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries[0].package, "dxvk");
     assert!(
         app.warnings
@@ -1239,7 +1285,9 @@ fn a_32_bit_d3d8_app_gets_the_x64_only_warning_too() {
     let exe = patch_import(fixture("hello32.exe"), "msvcrt.dll", "d3d8.dll");
     let r = app_with_exe(Some(&exe));
     let (d8, _) = archive("dxvk8", false, &[], &["d3d8"]);
-    let app = plan_for_app(&r.env, &r.md(), &Manifest { packages: vec![d8] });
+    let app = plan_for_app(&r.env, &r.md(), &Manifest { packages: vec![d8] }, &|_| {
+        VulkanVerdict::Unknown
+    });
     assert_eq!(app.plan.entries[0].package, "dxvk8");
     assert!(
         app.warnings
@@ -1254,7 +1302,7 @@ fn a_32_bit_d3d8_app_gets_the_x64_only_warning_too() {
 fn an_unsatisfied_capability_is_a_warning() {
     let exe = patch_import(fixture("hello64.exe"), "KERNEL32.dll", "mscoree.dll");
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert!(app.plan.entries.is_empty());
     assert!(app.warnings.iter().any(|w| w.contains("dotnet")), "{:?}", app.warnings);
 }
@@ -1279,7 +1327,7 @@ fn an_unreadable_executable_is_a_warning_and_an_empty_plan() {
     for (i, setup) in cases.iter().enumerate() {
         let r = app_with_exe(None);
         setup(&r);
-        let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+        let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
         assert!(app.plan.entries.is_empty(), "case {i}: {:?}", app.plan);
         assert_eq!(app.facts, Facts::default(), "case {i}");
         assert!(
@@ -1310,7 +1358,7 @@ fn installed_packages_come_from_metadata() {
         },
     )
     .unwrap();
-    let app = plan_for_app(&r.env, &md, &m);
+    let app = plan_for_app(&r.env, &md, &m, &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries[0].action, Action::AlreadyInstalled);
 }
 
@@ -1457,6 +1505,7 @@ fn execute_never_fetches_a_gated_install_without_consent() {
         fetcher: &f,
         consent: &a,
         now,
+        vulkan: &|_| VulkanVerdict::Unknown,
     };
     let plan = Plan {
         entries: vec![PlanEntry {

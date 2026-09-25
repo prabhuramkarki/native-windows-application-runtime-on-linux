@@ -36,6 +36,7 @@ fn archive(id: &str, gated: bool, requires: &[&str], provides: &[&str]) -> (Pack
         requires_consent: gated,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format: ArchiveFormat::Zip,
             extract: vec![Extract {
@@ -123,6 +124,7 @@ impl Rig {
             fetcher: f,
             consent,
             now: || 1_900_000_000,
+            vulkan: &|_| rt_core::VulkanVerdict::Unknown,
         };
         install_report(&o, app).unwrap()
     }
@@ -550,6 +552,37 @@ fn patch_import(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
 }
 
 #[test]
+fn a_blocked_entry_is_not_counted_as_missing_in_the_hint() {
+    let e = |package: &str, action| rt_deps::PlanEntry {
+        package: package.into(),
+        action,
+        consent: rt_deps::ConsentState::NotNeeded,
+    };
+    let mut plan = AppPlan {
+        facts: rt_deps::Facts::default(),
+        plan: rt_deps::Plan {
+            entries: vec![
+                e(
+                    "dxvk",
+                    Action::Blocked {
+                        reason: "Vulkan is unusable".into(),
+                    },
+                ),
+                e("vcrun2022", Action::Install),
+            ],
+            unsatisfied: vec![],
+        },
+        warnings: vec![],
+    };
+    assert_eq!(
+        hint_for("app", &plan).as_deref(),
+        Some("hint: 1 dependency missing: run `runtime deps app`")
+    );
+    plan.plan.entries.remove(1);
+    assert_eq!(hint_for("app", &plan), None);
+}
+
+#[test]
 fn the_hint_is_one_line_and_only_when_something_is_missing() {
     let r = three();
     let md = r.store.read_metadata(&r.env).unwrap();
@@ -566,7 +599,7 @@ fn the_hint_is_one_line_and_only_when_something_is_missing() {
     assert_eq!(h, "hint: 3 dependencies missing: run `runtime deps app`");
     // Installed: no hint.
     let (text, _) = r.install(
-        &rt_deps::plan_for_app(&r.env, &md, &r.manifest),
+        &rt_deps::plan_for_app(&r.env, &md, &r.manifest, &|_| rt_core::VulkanVerdict::Unknown),
         &FakeFetcher::default(),
         &consent(&strings(&["gated"]), &Shared::default(), None),
     );
@@ -575,7 +608,7 @@ fn the_hint_is_one_line_and_only_when_something_is_missing() {
     assert_eq!(missing_hint(&r.env, &md, &r.manifest), None);
     // A second --install finds everything there: full success, not "skipped".
     let (text, code) = r.install(
-        &rt_deps::plan_for_app(&r.env, &md, &r.manifest),
+        &rt_deps::plan_for_app(&r.env, &md, &r.manifest, &|_| rt_core::VulkanVerdict::Unknown),
         &FakeFetcher::default(),
         &consent(&[], &Shared::default(), None),
     );

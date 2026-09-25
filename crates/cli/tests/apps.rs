@@ -67,6 +67,13 @@ fn script(path: &Path, body: &str) {
     }
 }
 
+/// A `vulkaninfo --summary` body that lists one GPU with the given API version.
+fn vulkaninfo_body(major: u32, minor: u32) -> String {
+    format!(
+        "printf 'GPU0:\\n\\tapiVersion = {major}.{minor}.0\\n\\tdriverVersion = 1\\n\\tdeviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\n\\tdeviceName = fake\\n\\tdriverName = fake\\n'"
+    )
+}
+
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/build")
@@ -94,6 +101,8 @@ fn rig_with(wineserver_body: &str) -> Rig {
             "if [ -d \"$WINEPREFIX\" ]; then E=yes; else E=no; fi\necho \"wineserver $* WINEPREFIX=$WINEPREFIX exists=$E\" >> @LOG@/calls.txt\n{wineserver_body}"
         )),
     );
+    // A GPU that meets DXVK's minimum (`cmd` also says the loader is present): plans do not depend on the host.
+    script(&bin.join("vulkaninfo"), &vulkaninfo_body(1, 3));
     Rig {
         _t: t,
         root,
@@ -114,7 +123,7 @@ impl Rig {
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_runtime"));
         c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("RUNTIME_DATA_DIR", &self.data)
             .env(
                 "RUNTIME_WINE",
@@ -125,6 +134,7 @@ impl Rig {
                 },
             )
             .env("RUNTIME_WINESERVER", self.bin.join("wineserver"))
+            .env("RUNTIME_VULKAN_LOADER", "present")
             .env("SECRET", "hunter2")
             .stdin(Stdio::null());
         c
@@ -2044,6 +2054,75 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     let o = r.rt(&["deps", &id, "--discard-interrupted", "dxvk"]);
     assert_ok(&o);
     assert_eq!(s(&o.stdout), "Nothing to discard for dxvk.\n");
+}
+
+/// `runtime deps <app>` for an app importing d3d11 with the given loader override; asserts nothing was written.
+fn deps_output_with_loader(r: &Rig, loader: &str) -> String {
+    let (id, _) = install_d3d11(r);
+    let (tree, calls) = (r.tree(), r.calls());
+    let o = r
+        .cmd()
+        .env("RUNTIME_VULKAN_LOADER", loader)
+        .args(["deps", &id])
+        .output()
+        .unwrap();
+    assert_ok(&o);
+    assert_eq!((r.tree(), r.calls()), (tree, calls), "nothing written, no network");
+    let out = s(&o.stdout);
+    assert!(!out.contains("): to install"), "{out}");
+    out
+}
+
+#[test]
+fn deps_shows_dxvk_blocked_when_the_vulkan_loader_is_absent() {
+    let out = deps_output_with_loader(&rig(), "absent");
+    assert!(
+        out.contains("blocked") && out.contains("loader") && out.contains("Wine's built-in Direct3D"),
+        "{out}"
+    );
+}
+
+#[test]
+fn deps_install_does_not_install_a_package_blocked_for_vulkan() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let o = r
+        .cmd()
+        .env("RUNTIME_VULKAN_LOADER", "absent")
+        .args(["deps", &id, "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a skipped package is exit 1: {}",
+        s(&o.stdout)
+    );
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("skipped:   dxvk: Vulkan is unusable") && out.contains("0 installed"),
+        "{out}"
+    );
+    assert!(
+        !r.data
+            .join("apps")
+            .join(&id)
+            .join("prefix/drive_c/windows/system32/d3d11.dll")
+            .exists(),
+        "dxvk was installed on a host without Vulkan"
+    );
+    assert!(!r.data.join("deps-cache").exists(), "something was downloaded");
+}
+
+#[test]
+fn deps_shows_dxvk_blocked_when_the_only_gpu_is_vulkan_1_1() {
+    let r = rig();
+    script(&r.bin.join("vulkaninfo"), &vulkaninfo_body(1, 1));
+    let out = deps_output_with_loader(&r, "present");
+    assert!(
+        out.contains("no Vulkan device supports API 1.3 (best is 1.1)") && out.contains("Wine's built-in Direct3D"),
+        "{out}"
+    );
 }
 
 #[test]
