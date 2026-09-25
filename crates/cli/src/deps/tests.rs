@@ -551,6 +551,37 @@ fn patch_import(mut bytes: Vec<u8>, from: &str, to: &str) -> Vec<u8> {
 }
 
 #[test]
+fn a_blocked_entry_is_not_counted_as_missing_in_the_hint() {
+    let e = |package: &str, action| rt_deps::PlanEntry {
+        package: package.into(),
+        action,
+        consent: rt_deps::ConsentState::NotNeeded,
+    };
+    let mut plan = AppPlan {
+        facts: rt_deps::Facts::default(),
+        plan: rt_deps::Plan {
+            entries: vec![
+                e(
+                    "dxvk",
+                    Action::Blocked {
+                        reason: "Vulkan is unusable".into(),
+                    },
+                ),
+                e("vcrun2022", Action::Install),
+            ],
+            unsatisfied: vec![],
+        },
+        warnings: vec![],
+    };
+    assert_eq!(
+        hint_for("app", &plan).as_deref(),
+        Some("hint: 1 dependency missing: run `runtime deps app`")
+    );
+    plan.plan.entries.remove(1);
+    assert_eq!(hint_for("app", &plan), None);
+}
+
+#[test]
 fn the_hint_is_one_line_and_only_when_something_is_missing() {
     let r = three();
     let md = r.store.read_metadata(&r.env).unwrap();

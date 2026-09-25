@@ -897,6 +897,9 @@ fn min_vulkan_rejects_junk() {
         "+1.3",
         "1.",
         ".3",
+        "12345.1",
+        "1.3\n",
+        "1.3\t",
     ] {
         let e = err(&with_min_vulkan(&format!("min_vulkan = {v:?}")));
         assert!(matches!(e, ManifestError::BadMinVulkan { .. }), "{v}: {e:?}");

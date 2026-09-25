@@ -620,7 +620,7 @@ fn a_package_requiring_a_blocked_one_is_blocked_too() {
     let Action::Blocked { reason } = action_of(&plan, "vkd3d-proton") else {
         panic!("{plan:?}")
     };
-    assert!(reason.contains("Vulkan is unusable"), "{reason}");
+    assert_eq!(reason, "needs dxvk, which is blocked (Vulkan is unusable)");
     assert!(plan.unsatisfied.is_empty(), "blocked, not unsatisfied");
 }
 

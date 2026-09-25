@@ -80,6 +80,8 @@ left alone: the runtime neither installs it nor sets its DLL overrides (`deps` a
   Ubuntu 24.04's Wine 9 is reported to use `/usr/lib/wine/wineserver64`, which is searched too but was not
   verified here). Override both with `RUNTIME_WINE=/abs/path/to/wine` and
   `RUNTIME_WINESERVER=/abs/path/to/wineserver` (a wrong value is an error, not a fallback).
+  `RUNTIME_VULKAN_LOADER=present|absent` overrides the Vulkan loader lookup (used by the tests; any other
+  value, or unset, means the real lookup).
 - Stable Rust 1.88 or newer to build (`cargo build`).
 - mingw-w64 (`apt install mingw-w64`) only to build the test fixtures, never to use the program.
 

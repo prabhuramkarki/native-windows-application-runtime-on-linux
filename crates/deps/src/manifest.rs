@@ -422,8 +422,13 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
 /// `major.minor`, each 1 to 4 ASCII digits (so no sign, space or overflow).
 fn parse_min_vulkan(s: &str) -> Option<(u32, u32)> {
     let (a, b) = s.split_once('.')?;
-    let num =
-        |t: &str| (matches!(t.len(), 1..=4) && t.bytes().all(|c| c.is_ascii_digit())).then(|| t.parse::<u32>().ok())?;
+    let num = |t: &str| {
+        if matches!(t.len(), 1..=4) && t.bytes().all(|c| c.is_ascii_digit()) {
+            t.parse::<u32>().ok()
+        } else {
+            None
+        }
+    };
     Some((num(a)?, num(b)?))
 }
 
