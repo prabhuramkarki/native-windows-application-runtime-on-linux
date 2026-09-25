@@ -2880,3 +2880,254 @@ fn doctor_of_an_app_checks_its_graphics_driver_setting_and_keeps_the_areas() {
         "{out}"
     );
 }
+
+// ================================================================ permissions
+
+/// An app `papp` and a `$HOME` (`home/`, with a `.ssh` and an ordinary `share/` directory) for `HOME`.
+fn perm_app(r: &Rig) -> (PathBuf, PathBuf) {
+    let app = r.plant("papp", "P");
+    let home = r.root.join("home");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(home.join("share")).unwrap();
+    (app, home)
+}
+
+fn perm(r: &Rig, home: &Path, args: &[&str]) -> Output {
+    r.cmd()
+        .env("HOME", home)
+        .arg("permissions")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// A process named `wineserver` for `prefix` (what `wineservers_for` looks for); kill it when done.
+fn fake_wineserver(r: &Rig, prefix: &Path) -> std::process::Child {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = r.root.join("fake-ws/wineserver");
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, "#!/bin/sh\nread _\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = Command::new(&exe);
+    cmd.env_clear().env("WINEPREFIX", prefix).stdin(Stdio::piped());
+    (0..500)
+        .find_map(|_| match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                None
+            }
+            x => Some(x.unwrap()),
+        })
+        .expect("spawn the fake wineserver")
+}
+
+#[test]
+fn permissions_shows_the_default_and_where_it_came_from() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let o = perm(&r, &home, &["papp"]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.starts_with("version = 1\nnetwork = \"deny\"\ndisplay = true\naudio = true\ngpu = true\n"),
+        "{out}"
+    );
+    assert!(out.ends_with("source: default\n"), "{out}");
+    assert!(!app.join("permissions.toml").exists());
+}
+
+#[test]
+fn permissions_set_writes_once_and_shows_the_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let share = home.join("share");
+    let o = perm(
+        &r,
+        &home,
+        &[
+            "papp",
+            "--set",
+            "network=allow",
+            "--set",
+            "gpu=off",
+            "--set",
+            &format!("fs+={}:rw", share.display()),
+        ],
+    );
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("network = \"allow\"") && out.contains("gpu = false") && out.contains("access = \"rw\""),
+        "{out}"
+    );
+    assert!(out.ends_with("source: permissions.toml\n"), "{out}");
+    let file = app.join("permissions.toml");
+    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o600);
+    let shown = s(&perm(&r, &home, &["papp"]).stdout);
+    assert_eq!(shown, out);
+    // removal, and only the app root holds the file (no temp file left)
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", &format!("fs-={}", share.display())],
+    ));
+    assert!(!fs::read_to_string(&file).unwrap().contains("filesystem"));
+    assert!(
+        fs::read_dir(&app)
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp-"))
+    );
+}
+
+#[test]
+fn permissions_set_with_a_bad_expression_or_grant_refuses_all_and_writes_nothing() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    for bad in ["net=allow", "fs+=rel:ro", "fs+=/x:rx", "network=maybe"] {
+        let o = perm(&r, &home, &["papp", "--set", "gpu=off", "--set", bad]);
+        let err = assert_fails(&o);
+        assert!(err.contains("nothing was changed"), "{bad}: {err}");
+        assert!(!app.join("permissions.toml").exists(), "{bad}");
+    }
+    let err = assert_fails(&perm(&r, &home, &["papp", "--set", "net=allow"]));
+    assert!(err.contains("network=allow|deny") && err.contains("fs+="), "{err}");
+    // secrets, $HOME, `/`, and the runtime's data directory are never granted
+    for (dir, why) in [
+        (home.join(".ssh"), "~/.ssh"),
+        (home.clone(), "home directory"),
+        (PathBuf::from("/"), "`/`"),
+        (r.data.clone(), "data directory"),
+        (r.data.join("apps/papp/prefix"), "data directory"),
+    ] {
+        let err = assert_fails(&perm(
+            &r,
+            &home,
+            &["papp", "--set", &format!("fs+={}:ro", dir.display())],
+        ));
+        assert!(
+            err.contains(why) && err.contains("nothing was changed"),
+            "{dir:?}: {err}"
+        );
+        assert!(!app.join("permissions.toml").exists(), "{dir:?}");
+    }
+    assert!(
+        !fs::read_dir(&app)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains("permissions"))
+    );
+}
+
+#[test]
+fn permissions_set_is_refused_while_a_wineserver_runs_and_reset_too() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    assert_ok(&perm(&r, &home, &["papp", "--set", "gpu=off"]));
+    let before = fs::read_to_string(app.join("permissions.toml")).unwrap();
+    let mut server = fake_wineserver(&r, &app.join("prefix"));
+    let set = perm(&r, &home, &["papp", "--set", "network=allow"]);
+    let reset = perm(&r, &home, &["papp", "--reset"]);
+    let _ = server.kill();
+    let _ = server.wait();
+    for o in [&set, &reset] {
+        let err = assert_fails(o);
+        assert!(
+            err.contains("appears to be running") && err.contains("nothing was changed"),
+            "{err}"
+        );
+    }
+    assert_eq!(fs::read_to_string(app.join("permissions.toml")).unwrap(), before);
+    // reading is fine meanwhile, and once it is gone the change works
+    assert_ok(&perm(&r, &home, &["papp", "--set", "network=allow"]));
+}
+
+#[test]
+fn permissions_set_is_refused_while_another_runtime_command_holds_the_app_lock() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse("papp").unwrap()).unwrap();
+    let _running = rt_deps::lock_app_shared(&env).unwrap();
+    assert!(assert_fails(&perm(&r, &home, &["papp", "--set", "gpu=off"])).contains("papp"));
+    assert!(!app.join("permissions.toml").exists());
+}
+
+#[test]
+fn permissions_reset_deletes_the_file_and_json_parses_back() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let share = home.join("share");
+    assert_ok(&perm(
+        &r,
+        &home,
+        &[
+            "papp",
+            "--set",
+            "audio=off",
+            "--set",
+            &format!("fs+={}:ro", share.display()),
+        ],
+    ));
+    let o = perm(&r, &home, &["papp", "--json"]);
+    assert_ok(&o);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["network"], "deny");
+    assert_eq!(
+        (v["display"].as_bool(), v["audio"].as_bool(), v["gpu"].as_bool()),
+        (Some(true), Some(false), Some(true))
+    );
+    assert_eq!(v["filesystem"][0]["path"], share.to_str().unwrap());
+    assert_eq!(v["filesystem"][0]["access"], "ro");
+    assert_ok(&perm(&r, &home, &["papp", "--reset"]));
+    assert!(!app.join("permissions.toml").exists());
+    let v: serde_json::Value = serde_json::from_slice(&perm(&r, &home, &["papp", "--json"]).stdout).unwrap();
+    assert_eq!(v["filesystem"], serde_json::json!([]));
+    assert_ok(&perm(&r, &home, &["papp", "--reset"])); // no file: fine
+    assert!(assert_fails(&perm(&r, &home, &["papp", "--reset", "--set", "gpu=off"])).contains("cannot be combined"));
+}
+
+#[test]
+fn permissions_refuses_a_symlinked_or_oversized_file_and_writes_nothing() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let victim = r.root.join("victim");
+    fs::write(&victim, "keep").unwrap();
+    let f = app.join("permissions.toml");
+    std::os::unix::fs::symlink(&victim, &f).unwrap();
+    for args in [vec!["papp"], vec!["papp", "--set", "gpu=off"]] {
+        let err = assert_fails(&perm(&r, &home, &args));
+        assert!(err.contains("not a plain file"), "{err}");
+    }
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    fs::remove_file(&f).unwrap();
+    let big = format!("version = 1\n#{}\n", "x".repeat(1 << 20));
+    fs::write(&f, &big).unwrap();
+    let err = assert_fails(&perm(&r, &home, &["papp", "--set", "gpu=off"]));
+    assert!(err.contains("larger than"), "{err}");
+    assert_eq!(fs::read_to_string(&f).unwrap(), big);
+    // a hostile file's text is escaped on the way out
+    fs::write(&f, "version = 1\nnetwork = \"\\u001b[2J\"\n").unwrap();
+    let o = perm(&r, &home, &["papp"]);
+    assert!(!o.stderr.contains(&0x1b) && !o.stdout.contains(&0x1b));
+    assert_fails(&o);
+}
+
+#[test]
+fn permissions_rejects_bad_ids_and_unknown_apps() {
+    let r = rig();
+    let (_, home) = perm_app(&r);
+    for bad in ["../x", "/etc", "a/b", ".."] {
+        let err = assert_fails(&perm(&r, &home, &[bad]));
+        assert!(err.contains("not a valid app id"), "{err}");
+        assert_fails(&perm(&r, &home, &[bad, "--set", "gpu=off"]));
+    }
+    assert!(assert_fails(&perm(&r, &home, &["nope"])).contains("no app named"));
+    // without an absolute HOME nothing can be judged
+    let o = r
+        .cmd()
+        .env("HOME", "relative")
+        .args(["permissions", "papp"])
+        .output()
+        .unwrap();
+    assert!(assert_fails(&o).contains("HOME"));
+}
