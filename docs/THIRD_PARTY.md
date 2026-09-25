@@ -39,8 +39,13 @@ This table lists direct dependencies only (every `[dependencies]` and `[dev-depe
 ## Dependency packages (downloaded at the user's request, never redistributed)
 
 `crates/deps/packages.toml` pins these. The project ships none of their bytes: `runtime deps <app> --install` downloads a
-package from its upstream url only when the user asks (and, for a package marked `requires_consent`, only after the
-user accepted the licence shown in full), checks the pinned sha256 and size, and installs it into that app's prefix.
+package from its upstream url only when the user asks and checks the pinned sha256 and size before installing it into
+that app's prefix. A package marked `requires_consent` is downloaded only after the user answered yes to a prompt
+that shows the package, version, licence LABEL (e.g. `proprietary-redistributable`; the licence text itself is not
+shown), download url, size and sha256. For an installer package the prompt also says plainly that running the
+vendor's silent installer accepts the vendor's own licence terms (its EULA) on the user's behalf and that those terms
+are not displayed; the user reads them at the vendor. An installer package whose marker is already in the prefix
+(typically put there by the app's own installer) is not downloaded, not prompted for and not recorded.
 
 | Package | Version | Licence | Source url | sha256 | Size (bytes) |
 |---|---|---|---|---|---|
@@ -49,14 +54,16 @@ user accepted the licence shown in full), checks the pinned sha256 and size, and
 
 Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) are installed. The VC++ redistributable is Microsoft's own
 installer, run offline in the installer sandbox on Wine's null-driver desktop; it installs the x64 runtime DLLs into
-the prefix's `system32`. **Known gap:** installer packages set no DLL overrides, and Wine 10.0 keeps loading its OWN
-builtin copy of every DLL it implements (vcruntime140, vcruntime140_1, msvcp140, msvcp140_1, msvcp140_2,
-msvcp140_atomic_wait, msvcp140_codecvt_ids, concrt140, vcomp140) even after the native copies are installed; only the
-DLLs Wine has no builtin for (mfc140, mfc140u, vcamp140, vccorlib140, vcruntime140_threads) are loaded from the
-redistributable, and mfcm140/mfcm140u did not load at all. With a `<name>=native,builtin` override Wine loads the
-native copy of all 16 (checked with `rundll32 <dll>,x` and `WINEDEBUG=+loaddll` in the ignored test
-`real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker`). So today vcrun2022 installs the files but, for most
-of its DLLs, does not change what an app gets. Not bundled yet: VKD3D-Proton (`.tar.zst` only) and `d3dcompiler_47` (no verifiable
-redistributable source).
+the prefix's `system32`. Wine 10.0 has builtins of most of them (vcruntime140, vcruntime140_1, msvcp140, msvcp140_1,
+msvcp140_2, msvcp140_atomic_wait, msvcp140_codecvt_ids, concrt140, vcomp140) and keeps loading those unless told
+otherwise, so after the installer succeeds the runtime sets a `native,builtin` DLL override for each of the 16 DLLs
+the package provides (as winetricks does). Verified by the ignored test
+`real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker`, which loads each DLL by name with
+`rundll32 <name>.dll,rtDepsProbe` under `WINEDEBUG=+loaddll`: all load the redistributable's native copy, except
+mfcm140/mfcm140u, the MFC C++/CLI support DLLs, which import `mscoree.dll` (.NET) and load in no form in a runtime
+prefix (no .NET package; an app that needs them imports `mscoree` itself and is told `dotnet` is unavailable). What
+is NOT done: the overrides are not removed again (there is no removal of dependency packages yet), 32-bit (x86)
+copies are not installed, and only the x64 redistributable is pinned. Not bundled yet: VKD3D-Proton (`.tar.zst` only)
+and `d3dcompiler_47` (no verifiable redistributable source).
 
 Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).

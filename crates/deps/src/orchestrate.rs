@@ -14,6 +14,9 @@
 //!      or it would be `AlreadyInstalled`) is refused without a prompt: the kept install journal and an installer's
 //!      marker would make the new version fail anyway, after a wasted download. The user recreates the
 //!      environment to get the new version.
+//!    - an INSTALLER package whose marker is already in the prefix (typically the app's own installer put the
+//!      component there) is skipped with [`MARKER_PRESENT`] (Ruling 15): never asked about, never downloaded,
+//!      never recorded as installed by the runtime (Ruling 11e). What needs it proceeds, the component is there.
 //!    - a consent-gated package asks the [`ConsentProvider`]. Recorded consent would count only for the same
 //!      version AND the same [`consent_text`] hash ([`reusable_consent`]), but with upgrades refused that path is
 //!      unreachable today: consent lives on the install record, any record refuses the package, and
@@ -22,7 +25,8 @@
 //!    `Blocked` (and reported as skipped, a refused upgrade with its own reason) and nothing is downloaded for
 //!    them. What a denied package itself NEEDS still installs (spec §4: only the denied package and its dependents
 //!    are blocked).
-//! 5. Packages install in plan order: busy re-check, fetch, install, then record (read, `state::record`, atomic
+//! 5. Packages install in plan order: busy re-check, the installer marker check again (right before the download),
+//!    fetch, install, then record (read, `state::record`, atomic
 //!    write) after EACH success. The first failure stops the run; the rest are skipped.
 //!
 //! Library code prints nothing; every report string is one line, bounded, with control and format characters
@@ -59,8 +63,10 @@ const MAX_ENVIRON: u64 = 1 << 20;
 const X64_ONLY_CAPS: &[&str] = &["d3d9", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
 const VENDOR_PARTIAL: &str =
     "vendor installers can leave partial changes in the prefix; if the app misbehaves, recreate the environment";
-const MARKER_PRESENT: &str =
-    "the prefix already contains this component from outside the runtime; recreate the environment";
+/// The skip reason of an installer package whose marker is already in the prefix (Ruling 15). Also what
+/// [`plan_for_app`] warns instead of planning it, so the hint does not keep asking for it.
+pub const MARKER_PRESENT: &str =
+    "already present in the prefix (probably installed by the app's own installer); nothing to do";
 
 /// Where downloads come from. [`NetFetcher`] is the real one; tests inject fakes.
 pub trait Fetcher {
@@ -178,13 +184,21 @@ fn line(s: &str) -> String {
 
 /// Exactly what a consent prompt shows, and what a consent record's `licence_text_sha256` hashes: any change of
 /// id, version, licence, url, size or sha256 changes it, so earlier consent no longer counts. Manifest values are
-/// validated, but escaped anyway so the text is safe to print as it is.
+/// validated, but escaped anyway so the text is safe to print as it is. The licence is shown as its LABEL only
+/// (the manifest carries no licence text); for an installer package the text says plainly that running the
+/// vendor's silent installer accepts the vendor's licence terms on the user's behalf without showing them.
 pub fn consent_text(pkg: &Package) -> String {
+    let installer = if pkg.kind == Kind::Installer {
+        " The vendor's installer runs silently: running it accepts the vendor's own licence terms (its EULA) on \
+         your behalf, and those terms are not displayed here; read them at the vendor before answering yes."
+    } else {
+        ""
+    };
     format!(
         "Package: {}\nVersion: {}\nLicence: {}\nDownload: {}\nSize: {} bytes\nSHA-256: {}\n\
          This package is not free software or needs your consent to its licence. Answering yes gives your \
          consent to download it from the address above and install it into this app's Wine prefix under that \
-         licence.",
+         licence.{installer}",
         esc(&pkg.id),
         esc(&pkg.version),
         esc(&pkg.licence),
@@ -217,7 +231,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// regular file, a FIFO, a symlink, not a PE, over the size cap) gives a warning and a plan without imports.
 /// Delay-load imports are included (a missed need is worse than an unused package).
 pub fn plan_for_app(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> AppPlan {
-    plan_for_pe(md, read_exe(env, md).as_ref().map_err(String::as_str), manifest)
+    let mut plan = plan_for_pe(md, read_exe(env, md).as_ref().map_err(String::as_str), manifest);
+    drop_present_installers(env, manifest, &mut plan);
+    plan
+}
+
+/// Takes out of the plan every installer package (to install) whose marker is already in `env`'s prefix, with a
+/// warning instead, so `deps`, the install hint and `doctor` stop asking for something the prefix has. Only reads
+/// the marker (a file lookup or the bounded registry parse); a marker that cannot be read keeps the entry (the
+/// install run checks again under its lock). The resolver stays pure: this is a fact about the prefix.
+pub fn drop_present_installers(env: &AppEnv, manifest: &Manifest, app: &mut AppPlan) {
+    let present = |e: &crate::resolve::PlanEntry| {
+        e.action == Action::Install
+            && manifest.get(&e.package).is_some_and(|p| {
+                p.kind == Kind::Installer && install_installer::marker_already_present(p, env).unwrap_or(false)
+            })
+    };
+    let (gone, kept): (Vec<_>, Vec<_>) = app.plan.entries.drain(..).partition(|e| present(e));
+    app.plan.entries = kept;
+    for e in gone {
+        app.warnings.push(line(&format!("{}: {MARKER_PRESENT}", e.package)));
+    }
 }
 
 /// [`plan_for_app`] for a caller that already analysed the app's executable (`doctor`), so it is not read twice.
@@ -447,6 +481,8 @@ struct Decisions {
     consents: HashMap<String, ConsentRecord>,
     /// Refused upgrades and the reason reported for them.
     refused: HashMap<String, String>,
+    /// Installer packages whose marker is already in the prefix: skipped with [`MARKER_PRESENT`].
+    present: HashSet<String>,
 }
 
 fn upgrade_reason(installed: &str, planned: &str) -> String {
@@ -486,6 +522,12 @@ fn decide(o: &Orchestrator, md: &Metadata, plan: &Plan) -> Decisions {
             out.insert(&e.package);
             continue;
         }
+        // Before any prompt (and so before any download): the component may be there already. An unreadable
+        // marker is left to the install step, which reports it.
+        if pkg.kind == Kind::Installer && install_installer::marker_already_present(pkg, o.env).unwrap_or(false) {
+            d.present.insert(pkg.id.clone());
+            continue;
+        }
         if !pkg.requires_consent {
             continue;
         }
@@ -521,11 +563,13 @@ fn execute(o: &Orchestrator, plan: &Plan, d: &Decisions, recorded: &[DependencyR
                 let why = d.refused.get(&id).unwrap_or(reason);
                 report.skipped.push((id, line(why)));
             }
+            Action::Install if d.present.contains(&id) => report.skipped.push((id, MARKER_PRESENT.into())),
             Action::Install if stopped => report
                 .skipped
                 .push((id, "not attempted: an earlier package failed".into())),
             Action::Install => match install_one(o, &e.package, &d.consents, recorded) {
-                Ok(warnings) => {
+                Ok(None) => report.skipped.push((id, MARKER_PRESENT.into())),
+                Ok(Some(warnings)) => {
                     report.warnings.extend(warnings.iter().map(|w| (id.clone(), line(w))));
                     report.completed.push(id);
                 }
@@ -539,13 +583,14 @@ fn execute(o: &Orchestrator, plan: &Plan, d: &Decisions, recorded: &[DependencyR
     report
 }
 
-/// Fetch, install and record one package; the error is the report reason.
+/// Fetch, install and record one package; the error is the report reason. `Ok(None)`: an installer package whose
+/// marker is already in the prefix (nothing fetched, run or recorded).
 fn install_one(
     o: &Orchestrator,
     id: &str,
     consents: &HashMap<String, ConsentRecord>,
     recorded: &[DependencyRecord],
-) -> Result<Vec<String>, String> {
+) -> Result<Option<Vec<String>>, String> {
     let pkg = o.manifest.get(id).ok_or("not in the manifest")?;
     // Defence in depth: `decide` already refused every recorded package (no upgrades, Ruling 13).
     if let Some(rec) = recorded.iter().find(|r| r.id == pkg.id) {
@@ -561,6 +606,10 @@ fn install_one(
     }
     // Before the download (saves it) and again right before installing: an app may start while it downloads.
     not_busy_now(o)?;
+    // Under the lock, the prefix idle: an installer whose marker is there already has nothing to do (Ruling 15).
+    if pkg.kind == Kind::Installer && install_installer::marker_already_present(pkg, o.env).map_err(installer_reason)? {
+        return Ok(None);
+    }
     let file = o
         .fetcher
         .fetch(pkg, o.cache_dir)
@@ -570,15 +619,18 @@ fn install_one(
         Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
             .map(|_| Vec::new())
             .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?,
-        Kind::Installer => install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher)
-            .map(|done| {
+        Kind::Installer => match install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher) {
+            Ok(done) => {
                 let mut w = done.warnings;
                 if !done.staged_removed {
                     w.push("the staged installer copy could not be removed from windows\\temp".into());
                 }
                 w
-            })
-            .map_err(installer_reason)?,
+            }
+            // Present by now although it was not a moment ago: still nothing of ours to record.
+            Err(InstallerPkgError::MarkerAlreadyPresent) => return Ok(None),
+            Err(e) => return Err(installer_reason(e)),
+        },
     };
     record(o, pkg, consent).map_err(|e| {
         format!(
@@ -586,7 +638,7 @@ fn install_one(
              again may be refused: recreate the environment if that happens"
         )
     })?;
-    Ok(warnings)
+    Ok(Some(warnings))
 }
 
 /// No `wineserver` serves the prefix at this moment; the error is the report reason (nothing was installed).
@@ -649,7 +701,8 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::Registry(_)
         | E::Io(_)
         | E::TimedOut { .. }
-        | E::Marker(_) => format!("{}; {VENDOR_PARTIAL}", line(&e.to_string())),
+        | E::Marker(_)
+        | E::DllOverride(_) => format!("{}; {VENDOR_PARTIAL}", line(&e.to_string())),
     }
 }
 

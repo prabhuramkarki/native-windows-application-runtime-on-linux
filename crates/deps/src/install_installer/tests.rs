@@ -85,6 +85,7 @@ fn pkg_for(body: &[u8], silent_args: &[&str], marker: Marker) -> Package {
         install: Install::Installer {
             silent_args: silent_args.iter().map(|s| (*s).to_owned()).collect(),
             marker,
+            dll_overrides: vec![],
         },
     }
 }
@@ -781,6 +782,119 @@ fn an_exe_installer_without_explorer_in_the_prefix_is_a_typed_error() {
     }
 }
 
+// ------------------------------------------------------------------------------------------------ dll overrides
+
+/// `pkg_for` with `provides` and `dll_overrides`.
+fn pkg_with_overrides(silent_args: &[&str], provides: &[&str], overrides: &[&str]) -> Package {
+    let mut p = pkg_for(BODY, silent_args, file_marker());
+    p.provides = provides.iter().map(|s| (*s).to_owned()).collect();
+    if let Install::Installer { dll_overrides, .. } = &mut p.install {
+        *dll_overrides = overrides.iter().map(|s| (*s).to_owned()).collect();
+    }
+    p
+}
+
+/// `reg.exe` exists in the prefix (the override helper resolves it); `script` answers for it (`$0` ends in
+/// `reg.exe`, `$1` is add/delete/query, `$4` the value name) and otherwise runs the installer's `MAKE_MARKER`.
+fn reg_backend(f: &Fx, reg_script: &str, installer: &str) -> FakeBackend {
+    fs::create_dir_all(f.c("windows/system32")).unwrap();
+    fs::write(f.c("windows/system32/reg.exe"), "fake reg").unwrap();
+    backend(&format!("case \"$0\" in *reg.exe) {reg_script};; esac; {installer}"))
+}
+
+/// Each `reg.exe` call as `verb name`, in order.
+fn reg_calls(b: &FakeBackend) -> Vec<String> {
+    b.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Command { exe, args, .. } if exe.ends_with("windows/system32/reg.exe") => {
+                assert_eq!(args[1], OVERRIDES_KEY_TEST);
+                Some(format!("{} {}", args[0].to_string_lossy(), args[3].to_string_lossy()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+const OVERRIDES_KEY_TEST: &str = r"HKCU\Software\Wine\DllOverrides";
+
+#[test]
+fn dll_overrides_are_set_after_the_marker_is_confirmed() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let b = reg_backend(&f, "exit 0", MAKE_MARKER);
+    let p = pkg_with_overrides(&["/S"], &["vcruntime140", "msvcp140"], &["vcruntime140", "msvcp140"]);
+    let got = run_with(&f, &p, &b, &bwrap).unwrap();
+    assert!(got.marker_confirmed);
+    assert_eq!(reg_calls(&b), ["add vcruntime140", "add msvcp140"]);
+    // The installer ran first, then the overrides; every reg.exe call is `add ... /d native,builtin /f`.
+    let calls = b.calls();
+    let cmds: Vec<&Call> = calls.iter().filter(|c| matches!(c, Call::Command { .. })).collect();
+    assert!(matches!(cmds[0], Call::Command { exe, .. } if exe.ends_with(EXPLORER_RELATIVE)));
+    for c in &cmds[1..] {
+        let Call::Command { args, .. } = c else { unreachable!() };
+        assert_eq!(args[4..], ["/d", "native,builtin", "/f"].map(OsString::from));
+    }
+}
+
+#[test]
+fn dll_overrides_are_not_set_when_the_marker_is_missing() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let b = reg_backend(&f, "exit 0", "true");
+    let p = pkg_with_overrides(&["/S"], &["vcruntime140"], &["vcruntime140"]);
+    let err = run_with(&f, &p, &b, &bwrap).unwrap_err();
+    assert!(matches!(err, InstallerPkgError::MarkerMissing), "{err:?}");
+    assert!(reg_calls(&b).is_empty());
+}
+
+#[test]
+fn a_failing_dll_override_removes_the_ones_set_newest_first_and_fails() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let b = reg_backend(&f, r#"[ "$1" = add ] && [ "$4" = b ] && exit 1; exit 0"#, MAKE_MARKER);
+    let p = pkg_with_overrides(&["/S"], &["a", "b", "c"], &["a", "b", "c"]);
+    let err = run_with(&f, &p, &b, &bwrap).unwrap_err();
+    assert!(
+        matches!(&err, InstallerPkgError::DllOverride(m) if m.contains("b:")),
+        "{err:?}"
+    );
+    assert_eq!(reg_calls(&b), ["add a", "add b", "delete b", "delete a"]);
+    assert!(!f.staging_left());
+    // And if removing them fails too (delete fails, query says the value is still there), the error says so.
+    let f = fx(BODY);
+    let b = reg_backend(
+        &f,
+        r#"[ "$1" = add ] && [ "$4" = b ] && exit 1; [ "$1" = delete ] && exit 1; exit 0"#,
+        MAKE_MARKER,
+    );
+    let err = run_with(&f, &p, &b, &bwrap).unwrap_err();
+    assert!(
+        matches!(&err, InstallerPkgError::DllOverride(m) if m.contains("removing the overrides already set also failed")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn bad_dll_overrides_are_refused_before_anything_runs() {
+    for (provides, overrides) in [
+        (&["a"][..], &["b"][..]),
+        (&["a;calc"], &["a;calc"]),
+        (&["A"], &["A"]),
+        (&["a"], &["a", "a"]),
+    ] {
+        let f = fx(BODY);
+        let b = reg_backend(&f, "exit 0", MAKE_MARKER);
+        let p = pkg_with_overrides(&["/S"], provides, overrides);
+        let err = run_with(&f, &p, &b, Path::new(NO_RUN_BWRAP)).unwrap_err();
+        assert!(
+            matches!(err, InstallerPkgError::BadPackage(_)),
+            "{overrides:?}: {err:?}"
+        );
+        assert!(!f.ran() && f.nothing_staged() && b.calls().is_empty());
+    }
+}
+
 #[test]
 fn msi_detection_is_by_magic_or_url_extension() {
     let mut ole = OLE.to_vec();
@@ -1058,34 +1172,56 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
         eprintln!("{name}.dll: {} bytes, Wine builtin: {builtin}", bytes.len());
         assert!(!bytes.is_empty() && !builtin, "{name}.dll is not the redistributable's");
     }
-    // Which copy does Wine load, without any DllOverrides entry and with `<name>=n,b`? Reported, not asserted
-    // (the Task 8b report records the result: Wine 10.0 prefers its own builtin where it has one).
+    // Every provided DLL now loads as the native copy (the overrides were set), except the two that need .NET (see
+    // below): `rundll32 <dll>,rtDepsProbe` under `WINEDEBUG=+loaddll` loads the DLL by name, as an app's import
+    // would (the missing `rtDepsProbe` entry point only makes rundll32 fail AFTER the load).
+    let Install::Installer { dll_overrides, .. } = &vc.install else {
+        unreachable!()
+    };
+    assert_eq!(dll_overrides, &vc.provides);
+    let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
     let rundll32 = env.drive_c().join("windows/system32/rundll32.exe");
     for name in &vc.provides {
-        let mut how = Vec::new();
-        for overrides in [None, Some(format!("{name}=n,b"))] {
-            let arg = OsString::from(format!("{name}.dll,rtDepsProbe"));
-            let mut cmd = backend
-                .command(&env, &rundll32, &env.drive_c(), &[arg], &RunOpts::default())
-                .unwrap();
-            cmd.env("WINEDEBUG", "+loaddll");
-            if let Some(o) = &overrides {
-                cmd.env("WINEDLLOVERRIDES", o);
-            }
-            let out = launcher
-                .run_helper(backend.settle(cmd), Duration::from_secs(120))
-                .unwrap();
-            let text = String::from_utf8_lossy(&out.output).into_owned();
-            let needle = format!("\\\\system32\\\\{name}.dll\"");
-            how.push(
-                text.lines()
-                    .find(|l| l.contains("Loaded") && l.to_ascii_lowercase().contains(&needle))
-                    .and_then(|l| l.rsplit(": ").next())
-                    .unwrap_or("not loaded")
-                    .to_owned(),
+        assert!(
+            user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")),
+            "{name} override missing"
+        );
+        let arg = OsString::from(format!("{name}.dll,rtDepsProbe"));
+        let mut cmd = backend
+            .command(&env, &rundll32, &env.drive_c(), &[arg], &RunOpts::default())
+            .unwrap();
+        cmd.env("WINEDEBUG", "+loaddll");
+        let out = launcher
+            .run_helper(backend.settle(cmd), Duration::from_secs(120))
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.output).into_owned();
+        let needle = format!("\\\\system32\\\\{name}.dll\"");
+        let how = text
+            .lines()
+            .find(|l| l.contains("Loaded") && l.to_ascii_lowercase().contains(&needle))
+            .and_then(|l| l.rsplit(": ").next())
+            .unwrap_or("not loaded");
+        eprintln!("LOADS {name}.dll: {how}");
+        let relevant: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("err:") || l.to_ascii_lowercase().contains(name.as_str()))
+            .take(20)
+            .collect();
+        if name.starts_with("mfcm140") {
+            // The MFC managed-code (C++/CLI) support DLLs import mscoree.dll, the .NET loader, which runtime
+            // prefixes do not have (no .NET package; Wine Mono is disabled): they load in NO form, native or
+            // builtin. An app that uses them imports mscoree too, which the plan reports as unsatisfied `dotnet`.
+            assert!(
+                how == "not loaded"
+                    && relevant
+                        .iter()
+                        .any(|l| l.contains("mscoree.dll") && l.contains("not found")),
+                "{name}.dll: {how}:\n{}",
+                relevant.join("\n")
             );
+            continue;
         }
-        eprintln!("LOADS {name}.dll: no override: {}; with {name}=n,b: {}", how[0], how[1]);
+        assert_eq!(how, "native", "{name}.dll:\n{}", relevant.join("\n"));
     }
     backend.stop(&env).unwrap();
 }

@@ -21,6 +21,7 @@ fn pkg(id: &str, requires: &[&str], provides: &[&str], consent: bool) -> Package
         install: Install::Installer {
             silent_args: vec![],
             marker: Marker::File(format!("{id}.marker")),
+            dll_overrides: vec![],
         },
     }
 }

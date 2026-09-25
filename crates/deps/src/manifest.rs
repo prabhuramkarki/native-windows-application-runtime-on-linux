@@ -58,9 +58,13 @@ pub enum Install {
         extract: Vec<Extract>,
         dll_overrides: Vec<String>,
     },
+    /// A vendor installer run with `silent_args`, confirmed by `marker`; after it succeeded, `dll_overrides`
+    /// (optional in the TOML, names from the package's `provides`) are set to `native,builtin` so Wine loads the
+    /// installed DLLs instead of its own builtins of the same name.
     Installer {
         silent_args: Vec<String>,
         marker: Marker,
+        dll_overrides: Vec<String>,
     },
 }
 
@@ -330,6 +334,18 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
             sha256: clip(&raw.sha256),
         });
     }
+    // A url that names a sha256 (a 64-hex path segment, as Microsoft's download urls do) must name this one: a pin
+    // copied from another package, or an invented hash, cannot pass.
+    let path = raw.url.split(['?', '#']).next().unwrap_or_default();
+    if path.split('/').any(|seg| {
+        seg.len() == 64 && seg.bytes().all(|b| b.is_ascii_hexdigit()) && !seg.eq_ignore_ascii_case(&raw.sha256)
+    }) {
+        return Err(ManifestError::BadUrl {
+            id,
+            url: clip(&raw.url),
+            reason: "its path names a sha256 other than the package's",
+        });
+    }
     if raw.size == 0 || raw.size > MAX_PACKAGE_SIZE {
         return Err(ManifestError::BadSize { id, size: raw.size });
     }
@@ -478,14 +494,7 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
                 path("extract.from", e.from.strip_suffix('/').unwrap_or(&e.from))?;
                 path("extract.to", &e.to)?;
             }
-            for name in &dll_overrides {
-                if !provides.contains(name) {
-                    return Err(ManifestError::BadDllOverride {
-                        id: id.to_owned(),
-                        name: clip(name),
-                    });
-                }
-            }
+            check_dll_overrides(id, &dll_overrides, provides)?;
             Ok(Install::Archive {
                 format,
                 extract,
@@ -497,11 +506,13 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
             RawInstall {
                 format: None,
                 extract: None,
-                dll_overrides: None,
+                dll_overrides,
                 silent_args: Some(silent_args),
                 marker: Some(marker),
             },
         ) => {
+            let dll_overrides = dll_overrides.unwrap_or_default();
+            check_dll_overrides(id, &dll_overrides, provides)?;
             if silent_args.len() > MAX_LIST_LEN {
                 return Err(bad("too many silent_args"));
             }
@@ -530,12 +541,29 @@ fn install(id: &str, kind: Kind, raw: RawInstall, provides: &[String]) -> Result
                     }
                 }
             }
-            Ok(Install::Installer { silent_args, marker })
+            Ok(Install::Installer {
+                silent_args,
+                marker,
+                dll_overrides,
+            })
         }
         (Kind::Archive, _) => Err(bad(
             "archive needs format, extract and dll_overrides, and no installer fields",
         )),
-        (Kind::Installer, _) => Err(bad("installer needs silent_args and marker, and no archive fields")),
+        (Kind::Installer, _) => Err(bad(
+            "installer needs silent_args and marker (dll_overrides optional), and no format or extract",
+        )),
+    }
+}
+
+/// Every DLL override names a DLL from the package's `provides` (same rule for archives and installers).
+fn check_dll_overrides(id: &str, names: &[String], provides: &[String]) -> Result<(), ManifestError> {
+    match names.iter().find(|n| !provides.contains(n)) {
+        Some(name) => Err(ManifestError::BadDllOverride {
+            id: id.to_owned(),
+            name: clip(name),
+        }),
+        None => Ok(()),
     }
 }
 

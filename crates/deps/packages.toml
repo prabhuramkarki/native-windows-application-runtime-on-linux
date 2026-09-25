@@ -74,4 +74,24 @@ provides = [
 
 [package.install]
 silent_args = ["/install", "/quiet", "/norestart"]
+# Without these Wine 10.0 keeps loading its own builtin vcruntime140, msvcp140*, concrt140 and vcomp140 even
+# though the native copies are installed (checked with WINEDEBUG=+loaddll); winetricks sets the same overrides.
+dll_overrides = [
+    "concrt140",
+    "mfc140",
+    "mfc140u",
+    "mfcm140",
+    "mfcm140u",
+    "msvcp140",
+    "msvcp140_1",
+    "msvcp140_2",
+    "msvcp140_atomic_wait",
+    "msvcp140_codecvt_ids",
+    "vcamp140",
+    "vccorlib140",
+    "vcomp140",
+    "vcruntime140",
+    "vcruntime140_1",
+    "vcruntime140_threads",
+]
 marker = { registry_value = { key = 'HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64', name = "Installed" } }

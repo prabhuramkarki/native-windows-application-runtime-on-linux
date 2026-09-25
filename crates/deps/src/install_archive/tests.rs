@@ -1077,6 +1077,7 @@ fn unusable_packages_and_archive_paths_are_refused() {
     p.install = Install::Installer {
         silent_args: vec![],
         marker: crate::manifest::Marker::File("x".into()),
+        dll_overrides: vec![],
     };
     p.kind = Kind::Installer;
     cases.push(("install", p));
