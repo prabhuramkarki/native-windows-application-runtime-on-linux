@@ -123,4 +123,47 @@ mod tests {
             assert_eq!(capability_for(name), None, "{name:?}");
         }
     }
+
+    /// Spec §5 fuzz of the import-to-capability lookup: 20k mutated import names (table names with bytes flipped,
+    /// cut, repeated or replaced by multi-byte characters) never panic, and a hit is always exactly a table entry's
+    /// capability for a name that normalises to its key.
+    #[test]
+    fn mutated_import_names_never_panic_and_only_hit_real_keys() {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n.max(1) as u64) as usize
+        };
+        let pieces = [
+            "\u{e9}", "\u{130}", "\u{212a}", ".", "dll", ".DLL", "\0", "\u{202e}", "ǅ", "ß",
+        ];
+        for i in 0..20_000 {
+            let (key, _) = TABLE[next(TABLE.len())];
+            let mut name = if next(2) == 0 {
+                format!("{key}.dll")
+            } else {
+                key.to_ascii_uppercase()
+            };
+            for _ in 0..next(4) {
+                let at = next(name.len() + 1);
+                let at = (0..=at).rev().find(|&i| name.is_char_boundary(i)).unwrap();
+                match next(4) {
+                    0 => name.insert_str(at, pieces[next(pieces.len())]),
+                    1 => name.truncate(at),
+                    2 => name = name.repeat(1 + next(40)),
+                    _ => name.insert(at, char::from(next(128) as u8)),
+                }
+            }
+            let got = std::panic::catch_unwind(|| capability_for(&name));
+            let got = got.unwrap_or_else(|_| panic!("iteration {i} panicked on {name:?}"));
+            if let Some(c) = got {
+                let lower = name.to_ascii_lowercase();
+                let base = lower.strip_suffix(".dll").unwrap_or(&lower);
+                let hit = TABLE.iter().find(|(k, _)| *k == base);
+                assert_eq!(hit.map(|(_, c)| *c), Some(c), "iteration {i}: {name:?} gave {c}");
+            }
+        }
+    }
 }

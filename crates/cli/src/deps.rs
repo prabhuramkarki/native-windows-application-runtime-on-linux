@@ -493,8 +493,8 @@ pub(crate) fn lock_or_refuse(env: &AppEnv, shared: bool, what: &str) -> Result<O
     };
     match got {
         Ok(lock) => Ok(Some(lock)),
-        // Nobody can lock such a file, so no dependency install can be running either.
-        Err(e @ DepsError::LockFileUnusable(_)) => {
+        // Nobody can lock such a file (or on such a file system), so no dependency install can be running either.
+        Err(e) if e.nobody_can_lock() => {
             warn(&format!("could not take this app's lock ({e}); continuing without it"));
             Ok(None)
         }
