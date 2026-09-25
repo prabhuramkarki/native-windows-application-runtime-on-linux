@@ -135,6 +135,7 @@ struct Sc {
     vulkan_min: Option<(u32, u32)>,
     wine_drivers: Option<Vec<String>>,
     graphics_driver: Option<Result<GraphicsDriver, String>>,
+    d3d_routes: Option<Vec<(D3dFamily, D3dRoute)>>,
 }
 
 /// A system report on a good desktop.
@@ -154,6 +155,7 @@ fn sc() -> Sc {
         vulkan_min: None,
         wine_drivers: None,
         graphics_driver: None,
+        d3d_routes: None,
     }
 }
 
@@ -218,6 +220,7 @@ impl Sc {
                 .graphics_driver
                 .as_ref()
                 .map(|r| r.clone().map_err(|e| &*Box::leak(e.into_boxed_str()))),
+            d3d_routes: self.d3d_routes.as_deref(),
         })
     }
 }
@@ -358,6 +361,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         vulkan_min: None,
         wine_drivers: None,
         graphics_driver: None,
+        d3d_routes: None,
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -386,6 +390,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         vulkan_min: None,
         wine_drivers: None,
         graphics_driver: None,
+        d3d_routes: None,
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
@@ -877,13 +882,17 @@ fn a_file_that_cannot_be_analysed_fails_with_escaped_text() {
 }
 
 #[test]
-fn dotnet_and_installers_are_warnings_that_name_their_phase() {
+fn dotnet_and_installers_are_warnings_that_name_what_is_missing() {
     let mut s = app(vec![]);
     s.info().dotnet = true;
     let r = s.run();
     let c = one(&r, Area::Runtime, ".NET");
     assert_eq!(c.status, Status::Warn);
-    assert!(c.text.contains("Mono") && c.text.contains("Phase 4"), "{}", c.text);
+    assert!(
+        c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
+        "{}",
+        c.text
+    );
     assert_eq!(r.verdict, Verdict::MayFail);
 
     for (kind, label) in [
@@ -1896,6 +1905,7 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         vulkan_min: None,
         wine_drivers: None,
         graphics_driver: None,
+        d3d_routes: None,
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);
@@ -1906,4 +1916,205 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
     );
     assert_ne!(r.verdict, Verdict::Fail, "{:#?}", r.checks);
     assert!(r.checks.iter().all(|c| c.status != Status::Fail), "{:#?}", r.checks);
+}
+
+#[test]
+fn a_managed_program_warns_that_no_dotnet_runtime_is_bundled_and_a_native_one_does_not() {
+    let mut s = app(vec![]);
+    s.info().dotnet = true;
+    let r = s.run();
+    let c = one(&r, Area::Runtime, ".NET");
+    assert_eq!(c.status, Status::Warn);
+    assert!(
+        c.text.contains(".NET") && c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
+        "{}",
+        c.text
+    );
+    let r = app(vec![]).run();
+    assert!(
+        of(&r, Area::Runtime).iter().all(|c| !c.text.contains(".NET")),
+        "{:#?}",
+        r.checks
+    );
+}
+
+fn routes_of(r: &Report) -> Vec<&Check> {
+    of(r, Area::Graphics)
+        .into_iter()
+        .filter(|c| c.text.starts_with("Direct3D"))
+        .collect()
+}
+
+#[test]
+fn each_predicted_direct3d_route_is_one_graphics_check() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![
+        (D3dFamily::D3d11, D3dRoute::Dxvk),
+        (
+            D3dFamily::D3d12,
+            D3dRoute::Wined3d {
+                reason: "Vulkan unusable: x".into(),
+                actionable: true,
+            },
+        ),
+    ]);
+    let r = s.run();
+    let c = routes_of(&r);
+    assert_eq!(c.len(), 2, "{:#?}", r.checks);
+    assert_eq!((c[0].status, c[0].text.as_str()), (Status::Ok, "Direct3D 11: DXVK"));
+    assert_eq!(
+        (c[1].status, c[1].text.as_str()),
+        (Status::Warn, "Direct3D 12: Wine's built-in vkd3d (Vulkan unusable: x)")
+    );
+    s.d3d_routes = Some(vec![(D3dFamily::D3d12, D3dRoute::Vkd3dProton)]);
+    assert_eq!(routes_of(&s.run())[0].text, "Direct3D 12: vkd3d-proton");
+    for none in [None, Some(vec![])] {
+        s.d3d_routes = none;
+        assert!(routes_of(&s.run()).is_empty());
+    }
+}
+
+#[test]
+fn d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in_never_dxvk() {
+    let mut s = app(vec![]);
+    let why = "Vulkan unusable: no loader";
+    s.d3d_routes = Some(vec![
+        (
+            D3dFamily::D3d11,
+            D3dRoute::Wined3d {
+                reason: why.into(),
+                actionable: true,
+            },
+        ),
+        (
+            D3dFamily::D3d12,
+            D3dRoute::Wined3d {
+                reason: why.into(),
+                actionable: true,
+            },
+        ),
+    ]);
+    let r = s.run();
+    let c = routes_of(&r);
+    assert_eq!(c.len(), 2);
+    for c in c {
+        assert_eq!(c.status, Status::Warn);
+        assert!(
+            c.text.contains("built-in") && c.text.contains(why) && !c.text.contains("DXVK"),
+            "{}",
+            c.text
+        );
+    }
+}
+
+#[test]
+fn a_dxvk_route_says_vulkan_is_not_verified_only_when_the_probe_was_unknown() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![
+        (D3dFamily::D3d11, D3dRoute::Dxvk),
+        (D3dFamily::D3d12, D3dRoute::Vkd3dProton),
+    ]);
+    s.vulkan = Some(crate::HostVulkan {
+        tool_found: true,
+        loader_found: true,
+        devices: vec![],
+    });
+    let r = s.run();
+    for c in routes_of(&r) {
+        assert_eq!(c.status, Status::Ok);
+        assert!(c.text.contains("Vulkan not verified"), "{}", c.text);
+    }
+    s.vulkan = None;
+    assert!(routes_of(&s.run()).iter().all(|c| !c.text.contains("not verified")));
+}
+
+#[test]
+fn a_hostile_or_long_route_reason_is_cleaned_and_bounded() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![(
+        D3dFamily::D3d9,
+        D3dRoute::Wined3d {
+            reason: format!("bad\x1b]0;x\x07\u{202e} {}", "y".repeat(900)),
+            actionable: true,
+        },
+    )]);
+    let r = s.run();
+    let c = routes_of(&r);
+    assert_tame(&c[0].text);
+    assert!(c[0].text.chars().count() <= 300, "{}", c[0].text.chars().count());
+    s.d3d_routes = Some(vec![(D3dFamily::D3d8, D3dRoute::Dxvk); 50]);
+    assert_eq!(routes_of(&s.run()).len(), 5, "the number of route checks is bounded");
+}
+
+#[test]
+fn an_installed_provider_on_an_unusable_vulkan_is_a_failure_that_says_so() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![
+        (
+            D3dFamily::D3d11,
+            D3dRoute::Broken {
+                reason: "no loader".into(),
+            },
+        ),
+        (
+            D3dFamily::D3d12,
+            D3dRoute::Broken {
+                reason: format!("x\x1b[1m\u{202e}{}", "z".repeat(900)),
+            },
+        ),
+    ]);
+    let r = s.run();
+    let c = routes_of(&r);
+    assert_eq!(c.len(), 2);
+    assert!(c.iter().all(|c| c.status == Status::Fail));
+    assert!(
+        c[0].text
+            .contains("DXVK is installed but Vulkan is unusable (no loader)"),
+        "{}",
+        c[0].text
+    );
+    assert!(c[0].text.contains("fail to create a Direct3D device"), "{}", c[0].text);
+    assert!(c[1].text.contains("vkd3d-proton is installed"), "{}", c[1].text);
+    for c in c {
+        assert_tame(&c.text);
+        assert!(c.text.chars().count() <= 300, "{}", c.text.chars().count());
+    }
+    assert_eq!(r.verdict, Verdict::Fail);
+}
+
+#[test]
+fn a_non_actionable_built_in_route_is_ok_and_keeps_the_verdict_good() {
+    let mut s = app(vec![]);
+    s.d3d_routes = Some(vec![(
+        D3dFamily::D3d11,
+        D3dRoute::Wined3d {
+            reason: "DXVK covers 64-bit only".into(),
+            actionable: false,
+        },
+    )]);
+    let base = s.run().verdict;
+    s.d3d_routes = None;
+    assert_eq!(base, s.run().verdict, "the route adds nothing to the verdict");
+    assert_eq!(
+        routes_of(&{
+            s.d3d_routes = Some(vec![(
+                D3dFamily::D3d11,
+                D3dRoute::Wined3d {
+                    reason: "r".into(),
+                    actionable: false,
+                },
+            )]);
+            s.run()
+        })[0]
+            .status,
+        Status::Ok
+    );
+    s.d3d_routes = Some(vec![(
+        D3dFamily::D3d11,
+        D3dRoute::Wined3d {
+            reason: "r".into(),
+            actionable: true,
+        },
+    )]);
+    assert_eq!(routes_of(&s.run())[0].status, Status::Warn);
 }

@@ -62,7 +62,7 @@ const MAX_REASON: usize = 400;
 /// Most bytes of `/proc/<pid>/environ` examined (a `WINEPREFIX` past this is not seen).
 const MAX_ENVIRON: u64 = 1 << 20;
 /// Packages that replace Direct3D DLLs and are extracted for 64-bit only (Task 2 limitation).
-const X64_ONLY_CAPS: &[&str] = &["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
+pub const X64_ONLY_CAPS: &[&str] = &["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
 const VENDOR_PARTIAL: &str =
     "vendor installers can leave partial changes in the prefix; if the app misbehaves, recreate the environment";
 /// The skip reason of an installer package whose marker is already in the prefix (Ruling 15). Also what

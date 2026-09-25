@@ -2026,6 +2026,280 @@ fn doctor_calls_a_prefix_without_drive_c_incomplete() {
     assert!(!out.contains("cannot be examined"), "{out}");
 }
 
+/// The roadmap's "deliberately broken environment": a symlinked `drive_c` is a failing verdict, in JSON too, and
+/// names the checks. (A missing executable and a missing or symlinked home are covered by
+/// `doctor_of_an_app_without_its_home_fails_and_agrees_with_run`; a missing `drive_c` is only the warning
+/// `doctor_calls_a_prefix_without_drive_c_incomplete` asserts.)
+#[test]
+fn doctor_of_an_app_whose_drive_c_is_a_symlink_fails_and_names_the_prefix() {
+    let r = rig();
+    let id = r.install();
+    let drive_c = r.apps().join(&id).join("prefix/drive_c");
+    fs::rename(&drive_c, r.root.join("elsewhere")).unwrap();
+    symlink(r.root.join("elsewhere"), &drive_c).unwrap();
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(lines_with(&out, "cannot be examined")[0].contains("[FAIL]"), "{out}");
+    assert!(out.contains("Application cannot run"), "{out}");
+    let j: serde_json::Value =
+        serde_json::from_slice(&r.desktop().args(["doctor", &id, "--json"]).output().unwrap().stdout).unwrap();
+    assert_eq!(j["verdict"], "fail");
+    assert!(
+        j["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["area"] == "prefix" && c["status"] == "fail")
+    );
+}
+
+// ================================================================ doctor: .NET and the Direct3D route
+
+/// Records the bundled package `pkg` as installed for `id` (as `deps --install` would), without downloading.
+fn record_installed(r: &Rig, id: &str, pkg: &str) {
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse(id).unwrap()).unwrap();
+    let mut md = store.read_metadata(&env).unwrap();
+    let p = rt_deps::Manifest::bundled().get(pkg).unwrap();
+    rt_deps::record(
+        &mut md,
+        rt_core::DependencyRecord {
+            id: p.id.clone(),
+            version: p.version.clone(),
+            sha256: p.sha256.clone(),
+            installed_at: 1,
+            consent: None,
+        },
+    )
+    .unwrap();
+    store.write_metadata(&env, &md).unwrap();
+}
+
+fn route_lines(out: &str) -> Vec<&str> {
+    lines_with(out, "Direct3D ")
+}
+
+#[test]
+fn doctor_predicts_the_built_in_route_when_dxvk_is_not_installed() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let o = r.desktop().args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    let l = route_lines(&out);
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("[warn]")
+            && l[0].contains("Direct3D 11")
+            && l[0].contains("built-in")
+            && l[0].contains("runtime deps"),
+        "{out}"
+    );
+    assert!(!l[0].contains("DXVK is"), "{out}");
+}
+
+#[test]
+fn doctor_predicts_dxvk_when_it_is_recorded_and_vulkan_is_usable_and_built_in_when_it_is_not() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    record_installed(&r, &id, "dxvk");
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = route_lines(&out);
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(l[0].contains("[ok]") && l[0].contains("Direct3D 11: DXVK"), "{out}");
+    let out = s(&r
+        .desktop()
+        .env("RUNTIME_VULKAN_LOADER", "absent")
+        .args(["doctor", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    let l = route_lines(&out);
+    assert_eq!(l.len(), 1, "{out}");
+    // installed + Vulkan unusable: DXVK's DLLs still win, so the app fails: a failing check, not "built-in"
+    assert!(
+        l[0].contains("[FAIL]")
+            && l[0].contains("DXVK is installed but Vulkan is unusable")
+            && l[0].contains("fail to create a Direct3D device"),
+        "{out}"
+    );
+    assert!(out.contains("Application cannot run"), "{out}");
+    // JSON: the areas stay `graphics` and `runtime`
+    let j: serde_json::Value =
+        serde_json::from_slice(&r.desktop().args(["doctor", &id, "--json"]).output().unwrap().stdout).unwrap();
+    let d3d: Vec<&serde_json::Value> = j["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["text"].as_str().unwrap().starts_with("Direct3D"))
+        .collect();
+    assert_eq!(d3d.len(), 1);
+    assert_eq!(d3d[0]["area"], "graphics");
+}
+
+#[test]
+fn doctor_says_vulkan_is_not_verified_when_the_probe_lists_nothing() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    record_installed(&r, &id, "dxvk");
+    script(&r.bin.join("vulkaninfo"), "echo nothing useful");
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = route_lines(&out);
+    assert!(
+        l.len() == 1 && l[0].contains("DXVK") && l[0].contains("Vulkan not verified"),
+        "{out}"
+    );
+}
+
+#[test]
+fn doctor_d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in() {
+    let r = rig();
+    // two imports patched to d3d12.dll and d3d11.dll
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(12)
+        .position(|w| w.eq_ignore_ascii_case(b"kernel32.dll"))
+        .expect("import");
+    bytes[at..at + 12].copy_from_slice(b"d3d12.dll\0\0\0");
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .expect("import");
+    bytes[at..at + 11].copy_from_slice(b"d3d11.dll\0\0");
+    let p = r.input("both.exe", &bytes);
+    let out2 = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&out2);
+    let id2 = installed_id(&out2);
+    let out = s(&r
+        .desktop()
+        .env("RUNTIME_VULKAN_LOADER", "absent")
+        .args(["doctor", &id2])
+        .output()
+        .unwrap()
+        .stdout);
+    let l = route_lines(&out);
+    assert_eq!(l.len(), 2, "{out}");
+    assert!(
+        l.iter()
+            .all(|x| x.contains("built-in") && x.contains("Vulkan") && !x.contains("DXVK")),
+        "{out}"
+    );
+}
+
+#[test]
+fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded() {
+    let r = rig();
+    r.wine_dlls(&[
+        "kernel32.dll",
+        "msvcrt.dll",
+        "d3d11.dll",
+        "winepulse.drv",
+        "winewayland.drv",
+    ]);
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .unwrap();
+    bytes[at..at + 11].copy_from_slice(b"d3d11.dll\0\0");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    bytes[pe + 4..pe + 6].copy_from_slice(&0x014Cu16.to_le_bytes()); // machine: i386
+    let p = r.input("x86.exe", &bytes);
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let id = installed_id(&o);
+    let want = |out: &str, why: &str| {
+        let l = route_lines(out);
+        assert!(
+            l.len() == 1
+                && l[0].contains("[ok]")
+                && l[0].contains("built-in")
+                && l[0].contains(why)
+                && !l[0].contains("DXVK:"),
+            "{out}"
+        );
+    };
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    want(&out, "64-bit only");
+    record_installed(&r, &id, "dxvk");
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    want(&out, "DXVK covers 64-bit only");
+    // nothing to act on: the whole report is as good as the rest of it (a 32-bit app is not "may fail")
+    assert!(out.contains("Looks good."), "{out}");
+}
+
+#[test]
+fn doctor_reports_one_direct3d_10_line_for_all_d3d10_imports() {
+    let r = rig();
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    for (from, to) in [
+        (&b"kernel32.dll"[..], &b"d3d10_1.dll\0"[..]),
+        (b"msvcrt.dll\0", b"D3D10.DLL\0\0"),
+    ] {
+        let at = bytes
+            .windows(from.len())
+            .position(|w| w.eq_ignore_ascii_case(from))
+            .unwrap();
+        bytes[at..at + to.len()].copy_from_slice(to);
+    }
+    let p = r.input("d10.exe", &bytes);
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let out = s(&r.desktop().args(["doctor", &installed_id(&o)]).output().unwrap().stdout);
+    assert_eq!(route_lines(&out).len(), 1, "{out}");
+    assert!(route_lines(&out)[0].contains("Direct3D 10"), "{out}");
+}
+
+#[test]
+fn doctor_of_a_file_or_the_system_predicts_no_direct3d_route() {
+    let r = rig();
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .unwrap();
+    bytes[at..at + 11].copy_from_slice(b"d3d11.dll\0\0");
+    let f = r.input("g.exe", &bytes);
+    let out = s(&r.desktop().arg("doctor").arg(&f).output().unwrap().stdout);
+    assert!(route_lines(&out).is_empty(), "{out}");
+    let out = s(&r.desktop().arg("doctor").output().unwrap().stdout);
+    assert!(route_lines(&out).is_empty(), "{out}");
+}
+
+#[test]
+fn doctor_warns_about_a_managed_program_and_not_about_a_native_one() {
+    let r = rig();
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    // a CLR header: data directory 14 (opt + 112 + 14 * 8 in a PE32+ header) gets a non-zero RVA and size
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let dir = pe + 24 + 112 + 14 * 8;
+    bytes[dir..dir + 4].copy_from_slice(&0x2008u32.to_le_bytes());
+    bytes[dir + 4..dir + 8].copy_from_slice(&72u32.to_le_bytes());
+    let p = r.input("managed.exe", &bytes);
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let id = installed_id(&o);
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = lines_with(&out, ".NET");
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("[warn]") && l[0].contains("no .NET runtime is bundled") && l[0].contains("mscoree=d"),
+        "{out}"
+    );
+    let j: serde_json::Value =
+        serde_json::from_slice(&r.desktop().args(["doctor", &id, "--json"]).output().unwrap().stdout).unwrap();
+    assert!(
+        j["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["area"] == "runtime" && c["text"].as_str().unwrap().contains(".NET"))
+    );
+    let native = r.install();
+    let out = s(&r.desktop().args(["doctor", &native]).output().unwrap().stdout);
+    assert!(lines_with(&out, ".NET").is_empty(), "{out}");
+}
+
 // ================================================================ deps
 
 /// Holds `id`'s dependency lock exclusively, as a running `runtime deps <id> --install` does.
