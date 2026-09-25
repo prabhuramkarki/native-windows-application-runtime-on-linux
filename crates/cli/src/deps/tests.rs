@@ -734,3 +734,21 @@ fn the_rest_of_an_over_long_answer_is_never_the_next_answer() {
     assert!(!consent(&[], &Shared::default(), Some(long_yes)).confirm(&p, "T"));
     assert!(consent(&[], &Shared::default(), Some("y")).confirm(&p, "T"));
 }
+
+#[test]
+fn doctor_notes_each_installer_already_in_the_prefix_and_nothing_else() {
+    let plan = AppPlan {
+        facts: rt_deps::Facts::default(),
+        plan: rt_deps::Plan::default(),
+        warnings: vec![
+            format!("vcrun2022: {}", rt_deps::MARKER_PRESENT),
+            "the app needs \"dotnet\", which no available package provides".into(),
+            format!("x\u{1b}[31m: {}", rt_deps::MARKER_PRESENT),
+        ],
+    };
+    let notes = present_notes(&plan);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(notes[0], format!("note: vcrun2022: {}", rt_deps::MARKER_PRESENT));
+    assert!(notes[0].contains("did not set its DLL overrides"));
+    assert!(!notes[1].contains('\u{1b}'), "unsanitised: {:?}", notes[1]);
+}

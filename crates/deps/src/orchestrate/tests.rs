@@ -784,7 +784,8 @@ fn an_installer_whose_marker_is_present_is_skipped_before_any_prompt_or_download
     assert!(a.asked().is_empty(), "prompted: {:?}", a.asked());
     assert_eq!(f.calls(), ["gdep"], "the present installer was downloaded");
     assert_eq!(reason(&rep.skipped, "vc"), MARKER_PRESENT);
-    assert!(!MARKER_PRESENT.contains("recreate"));
+    // Ruling 18: says plainly that the runtime set none of its overrides, and how to get the runtime's install.
+    assert!(MARKER_PRESENT.contains("did not set its DLL overrides") && MARKER_PRESENT.contains("recreate"));
     // What needs it proceeds: the component is there.
     assert_eq!(rep.completed, ["gdep"]);
     assert!(rep.failed.is_empty(), "{rep:?}");
@@ -1228,6 +1229,22 @@ fn a_32_bit_app_gets_the_x64_only_warning() {
         app.warnings
             .iter()
             .any(|w| w.contains("64-bit only") && w.contains("builtin")),
+        "{:?}",
+        app.warnings
+    );
+}
+
+#[test]
+fn a_32_bit_d3d8_app_gets_the_x64_only_warning_too() {
+    let exe = patch_import(fixture("hello32.exe"), "msvcrt.dll", "d3d8.dll");
+    let r = app_with_exe(Some(&exe));
+    let (d8, _) = archive("dxvk8", false, &[], &["d3d8"]);
+    let app = plan_for_app(&r.env, &r.md(), &Manifest { packages: vec![d8] });
+    assert_eq!(app.plan.entries[0].package, "dxvk8");
+    assert!(
+        app.warnings
+            .iter()
+            .any(|w| w.contains("dxvk8") && w.contains("64-bit only")),
         "{:?}",
         app.warnings
     );

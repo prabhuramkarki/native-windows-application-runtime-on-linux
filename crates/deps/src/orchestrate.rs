@@ -16,7 +16,9 @@
 //!      environment to get the new version.
 //!    - an INSTALLER package whose marker is already in the prefix (typically the app's own installer put the
 //!      component there) is skipped with [`MARKER_PRESENT`] (Ruling 15): never asked about, never downloaded,
-//!      never recorded as installed by the runtime (Ruling 11e). What needs it proceeds, the component is there.
+//!      never recorded as installed by the runtime (Ruling 11e). What needs it proceeds. The component's files are
+//!      there, but NOT the package's DLL overrides (Ruling 18): Wine may keep loading its builtin copies, and the
+//!      only way to get the runtime's install today is to recreate the environment.
 //!    - a consent-gated package asks the [`ConsentProvider`]. Recorded consent would count only for the same
 //!      version AND the same [`consent_text`] hash ([`reusable_consent`]), but with upgrades refused that path is
 //!      unreachable today: consent lives on the install record, any record refuses the package, and
@@ -60,13 +62,14 @@ const MAX_REASON: usize = 400;
 /// Most bytes of `/proc/<pid>/environ` examined (a `WINEPREFIX` past this is not seen).
 const MAX_ENVIRON: u64 = 1 << 20;
 /// Packages that replace Direct3D DLLs and are extracted for 64-bit only (Task 2 limitation).
-const X64_ONLY_CAPS: &[&str] = &["d3d9", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
+const X64_ONLY_CAPS: &[&str] = &["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
 const VENDOR_PARTIAL: &str =
     "vendor installers can leave partial changes in the prefix; if the app misbehaves, recreate the environment";
 /// The skip reason of an installer package whose marker is already in the prefix (Ruling 15). Also what
 /// [`plan_for_app`] warns instead of planning it, so the hint does not keep asking for it.
-pub const MARKER_PRESENT: &str = "already present in the prefix at this version or newer (probably installed by the \
-                                  app's own installer); nothing to do";
+pub const MARKER_PRESENT: &str = "present in the prefix (probably from the app's own installer); the runtime did not \
+                                  install it and did not set its DLL overrides, so Wine may still load its builtin \
+                                  copies; recreate the environment to let the runtime install it";
 
 /// Where downloads come from. [`NetFetcher`] is the real one; tests inject fakes.
 pub trait Fetcher {

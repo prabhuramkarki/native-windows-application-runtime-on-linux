@@ -473,6 +473,16 @@ pub(crate) fn hint_for(app: &str, plan: &AppPlan) -> Option<String> {
     (n > 0).then(|| format!("hint: {n} {noun} missing: run `runtime deps {}`", safe(app)))
 }
 
+/// One `note:` line per installer package the plan dropped because its marker is already in the prefix (Ruling
+/// 18): the runtime did not install it and set none of its DLL overrides. `doctor` prints these under the hint.
+pub(crate) fn present_notes(plan: &AppPlan) -> Vec<String> {
+    plan.warnings
+        .iter()
+        .filter(|w| w.ends_with(rt_deps::MARKER_PRESENT))
+        .map(|w| format!("note: {}", safe(w)))
+        .collect()
+}
+
 /// Best effort: prints [`missing_hint`] for an installed app on stderr (stdout may belong to a program).
 pub(crate) fn print_hint(store: &Store, id: &AppId) {
     let Ok(env) = store.get(id) else { return };
