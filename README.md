@@ -2,12 +2,13 @@
 
 A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
 
-**Status: Phase 3, an early MVP, and app runs are NOT sandboxed.** Windows programs run as your Linux user, with
+**Status: Phase 4A (dependency engine), an early MVP, and app runs are NOT sandboxed.** Windows programs run as your Linux user, with
 your network, GPU, audio and files; Wine can still reach the whole host (see
 [docs/SECURITY.md](docs/SECURITY.md) for what is and is not protected). Only run software you would run
 directly on your account. `.msi`/`.exe` installers now install through a `bwrap` sandbox (Phase 3) — narrower
 than a plain app run, but not a full boundary either, see SECURITY.md's "Installer sandbox" section — and
-`.NET` programs fail until Phase 4; the sandbox for ordinary app runs is Phase 5.
+`.NET` programs still fail (no .NET package yet); the sandbox for ordinary app runs is Phase 5. `runtime deps` is the
+only command that downloads anything, and only when asked (see below).
 
 ## Commands
 
@@ -24,6 +25,8 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 | `logs <app> [--lines N]` | Shows the end of the newest log (the app's stderr from its last run). |
 | `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, Vulkan, audio. Exit 1 when a check fails. |
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
+| `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
+| `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
 
 ```sh
 runtime install ~/Downloads/tool.exe --name tool
@@ -37,6 +40,35 @@ runtime remove tool
 `--json` output is the stable interface for `list`, `doctor` and `analyze`; free-form text fields (warnings,
 check texts) may change, do not parse them. Strings from files are escaped in human output; in JSON,
 sanitise before displaying.
+
+## Dependencies (`runtime deps`)
+
+```sh
+runtime deps game                      # the plan: what the app's imports need, what is installed, warnings
+runtime deps game --install            # download, verify and install it; consent-gated packages ask first
+runtime deps game --install --yes vcrun2022   # no terminal: consent to that one package (its text is printed)
+runtime deps game --discard-interrupted dxvk  # undo what a killed install left, then install again
+runtime deps list                      # the bundled manifest
+runtime deps cache --clear             # delete cached downloads
+```
+
+The plan comes from the app's PE imports (e.g. `d3d11.dll` needs DXVK, `msvcp140.dll` the VC++ runtime).
+`install`, `run` and `doctor` never download; `install` and `doctor` print a one-line hint when something is missing.
+Every download is pinned (https, exact size and sha256 from the manifest compiled into the binary) and cached in
+`<data>/deps-cache`. Packages with a proprietary licence need consent per package and version: the prompt shows the
+package, version, licence label, url, size and sha256, and for a vendor installer says that running it silently
+accepts the vendor's EULA, which is not shown. A bare `--yes` is refused. Exit code 1 when anything failed or was
+skipped. How downloads are verified and what is not: `docs/SECURITY.md`, "Dependency downloads".
+
+Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
+- **DXVK 3.1.1** (Zlib, no consent): d3d8, d3d9, d3d10core, d3d11 and dxgi, x64 DLLs with `native,builtin` overrides.
+- **VC++ 2015-2022 redistributable x64 14.44.35211** (Microsoft, consent): Microsoft's installer, run offline in the
+  installer sandbox on a one-run null-driver desktop; success is its registry marker; 16 DLL overrides set after.
+
+Known gaps: VKD3D-Proton (upstream ships only `.tar.zst`, not read), `d3dcompiler_47` (no verifiable redistributable
+source), .NET, Mono and Gecko (no packages; they stay disabled), 32-bit apps (x64 DLLs only; the plan warns), no
+package upgrades (a newer pinned version is refused: recreate the app) and no removal of a single package (removing
+the app removes everything).
 
 ## Requirements
 
@@ -64,6 +96,10 @@ tools/build-fixtures.sh                 # test .exe/.dll files into tests/fixtur
 cargo test --workspace                  # unit, hostile-input and hermetic CLI tests; no Wine needed
 cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
                                         # real-Wine end-to-end tests (minutes; needs Wine 10 and the fixtures)
+RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1
+                                        # dependency engine on real Wine + bwrap (local HTTPS server, no internet)
+cargo test -p runtime-deps --lib -- --ignored real_net --nocapture
+                                        # re-downloads the bundled pins (internet; weekly in CI, verify-pins.yml)
 RUNTIME_SAMPLES=dir1:dir2 cargo test -p runtime-pe -- --ignored --nocapture
                                         # PE oracle: compares every PE under those dirs with file(1)
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
@@ -84,6 +120,9 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/core`: app ids, data dir, Windows path handling, metadata and store, install/run services,
   `doctor`, the `CompatBackend` trait and the `Launcher` (the one place child processes are started).
 - `crates/backend-wine`: the system-Wine backend: discovery, prefix creation and hardening.
+- `crates/installer`, `crates/desktop`: installer pipeline and sandbox (Phase 3), desktop entries.
+- `crates/deps`: the dependency engine: bundled manifest, resolver, verified HTTPS fetch, archive and installer
+  package installers (Phase 4A).
 - `crates/cli`: the `runtime` binary, a thin front end over the above.
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
 
