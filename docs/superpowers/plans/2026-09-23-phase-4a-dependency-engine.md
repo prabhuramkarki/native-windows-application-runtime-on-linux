@@ -295,3 +295,101 @@ CLI: `runtime deps <app>`, `runtime deps <app> --install [--yes <pkg>]...`, `run
 ## Self-review against the spec
 
 Covered: manifest (Task 1), capability mapping and resolver (Task 2), fetch and hostile-server suite (Task 3), state and Metadata v3 with frozen-literal migration (Task 4), archive kind (Task 5), installer kind through the Phase 3 sandbox with marker confirmation (Task 6), consent flow, CLI and no-implicit-download guarantee (Task 7), real bundled manifest with verified pins (Task 8), real e2e, CI, docs (Task 9). Non-goals from the spec (graphics selection, audio/Wayland, full `doctor app`, compat matrix, managed Wine, remote/user manifests) have no tasks. Type names used across tasks (`Package`, `Kind`, `Plan`, `PlanEntry`, `Action`, `ConsentState`, `InstalledSet`, `DependencyRecord`, `ConsentRecord`, `ArchiveInstalled`, `InstallerPkgInstalled`, `Orchestrator`, `ConsentProvider`) are defined once in the task that produces them.
+
+---
+
+## Execution notes
+
+Written last, at the end of Task 9 (branch `phase-4-dependencies`, 35+ commits on `main`, not merged or pushed).
+
+### Built versus planned
+
+- **As planned:** the `runtime-deps` crate (`rt_deps`) with the bundled, pinned manifest and strict parser, the
+  capability table and pure resolver, the only network code (streaming, hash-verifying HTTPS fetch with a hostile
+  in-process TLS test server), `Metadata` schema v3 with frozen v1/v2 literals, the archive and installer package
+  installers, the orchestrator, `runtime deps` and the hints in `install`/`doctor`, the verified manifest, real-Wine
+  e2e, CI and docs.
+- **Beyond the plan:** a hand-rolled bounded `tar.gz` reader (Ruling 5; DXVK ships no zip), an intent journal in
+  `<app>/deps-backup` so a killed archive install is exactly undone (`--discard-interrupted`), a per-app `deps.lock`
+  plus a `/proc` busy-prefix check, `min_dword` version-aware registry markers, DLL overrides for installer packages,
+  a marker pre-check that skips components the app's own installer already put there, and a one-run null-driver
+  desktop (`explorer.exe /desktop=...,null`) without which WiX Burn installers cannot run headless.
+- **Different from the plan:** the Task 9 e2e lives in `crates/deps/src/orchestrate/tests/e2e.rs`, not
+  `crates/cli/tests/e2e_deps.rs`: the CLI cannot take a test manifest (on purpose), and the local HTTPS test server
+  and the crash hook are `#[cfg(test)]` items of the library. The fixtures are the existing `exports64.dll` (zipped in
+  the test) and `tools/fixtures/dep-installer.nsi`; no `tools/fixtures/dep-archive/` was needed. There is no
+  `cargo-fuzz` setup in the repository; fuzzing is in-test (seeded mutations under `catch_unwind`): the manifest
+  parser (10k inputs, Task 1) and, added in Task 9, the import-to-capability lookup (20k inputs).
+- **Not built:** VKD3D-Proton (`.tar.zst` only), `d3dcompiler_47` (no verifiable redistributable), .NET/Mono/Gecko,
+  32-bit DLLs, package upgrades and single-package removal (see "Ready for the next sub-project").
+
+### Rulings (one line each; full text in the SDD ledger)
+
+1. All implementers/reviewers ran on `opus` (Sonnet quota exhausted); final whole-branch review on `fable`.
+2. DLL overrides via the prefix's `reg.exe` through the settled backend helper (not a hand-written `user.reg`).
+3. Task 6 may only expose Phase 3 pipeline pieces (`installer::run`); Phase 3 behaviour and e2e unchanged (verified).
+4. Task 8 downloads real artifacts; anything unverifiable is left out and listed as a gap.
+5. Manifest `format = zip | tar.gz`; bounded hand-rolled tar reader over flate2; no zstd.
+6. Task 1 fix round covered consent-by-licence, destination uniqueness and the `format` field.
+7. `provides` are lowercase DLL base names; PE imports are normalised the same way.
+8. Resolver: an exact installed match wins over denial; `Plan.unsatisfied` lists capabilities nobody provides.
+9. Task 5 split into 5a (tar reader) and 5b (archive installer) after a lost session.
+10. `discard_interrupted` recovery API; `remove_archive` refuses an empty record.
+11. Consent hashes the exact `consent_text`; per-app `deps.lock`; refuse a busy prefix; no `--remove`; a marker
+    already present is never recorded as installed.
+12. Task 7 split into 7a (orchestrator library) and 7b (CLI).
+13. Upgrades of recorded packages are refused before any download; recreate the environment.
+14. Installer packages may declare `dll_overrides` (set `native,builtin` after the marker is confirmed).
+15. An installer whose marker is already in the prefix is skipped before any prompt or download, never recorded.
+16. Registry markers may carry `min_dword`: an older build counts as absent (vcrun2022 `Bld >= 35211`).
+
+### Verification record (numbers from real runs)
+
+- **Workspace gate at the end of Task 9:** `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean; `RUNTIME_REQUIRE_BWRAP=1 RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE=1 cargo test
+  --workspace`: 1322 passed, 0 failed, 21 ignored (`rt_deps` lib: 350 passed, 10 ignored). `cargo deny check`:
+  advisories, bans, licenses, sources ok.
+- **Real Wine (Wine 10.0 Ubuntu 10.0~repack-12ubuntu1, bubblewrap 0.11.1):** CI's exact filter
+  `cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1` selects 6 tests (archive zip/tar.gz +
+  override, NSIS both marker kinds, null-desktop args and marker-only failure, hanging installer deadline, and the two
+  new orchestrator tests); run 3 times in a row: 6/6 passed each time (218 s, 152 s, 119 s). The orchestrator run
+  (consent-gated archive + sandboxed NSIS installer + denied package) took 3.6 to 4.6 s per run; the second run
+  0.005 s with zero requests.
+- **CI's other real-Wine step** (`cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1`):
+  9 passed (backend 2, CLI Wine 3, Phase 3 installers 4), no wineserver left.
+- **Earlier real runs (task reports):** vcrun2022 real download and install through the project path 6/6 (Task 8b,
+  and 6/6 again after each fix round, 13.5 to 14.2 s with 16 overrides); bundled DXVK real download, install and
+  byte-exact removal (Task 8); both pins re-fetched and matched (`real_net_bundled_packages_refetch_and_match`).
+- **Mutation checks (from the reports):** Task 1: 63 of 64 killed; Task 2: all killed (two rounds); Task 3: the
+  implementer's set plus 6 reviewer re-runs, all killed, one surviving deadline mutant fixed in round 2; Task 4: 22 of
+  22; Task 5a: 65 (63 killed, 2 equivalent); Task 5b: 72 (66 killed, 5 accepted survivors); Task 6: 19 of 19 plus 4 in
+  the fix round (2 equivalent); Task 7b: 22 plus 10 in the fix round (1 equivalent: `O_CLOEXEC`); Task 8/8b: 3 + 10
+  + 8, all killed. Task 9: 6 of 6 killed (the three lock-classification guards; the Wine version gate; the consent
+  gate and the cache rename, each disabled and caught by the real-Wine orchestrator e2e).
+
+### Deviations and notes
+
+- Commit trailers: several implementer sessions (Tasks 3, 5, 9) used their harness's accurate
+  `Co-Authored-By: Claude Opus 5.5 (1M context)` trailer instead of the plan's `Claude Sonnet 5`; to settle at merge.
+- The real-Wine tests now check the Wine version first and fail with a clear message on Wine < 10 (they were verified
+  on 10.0 only; CI's `ubuntu-latest` may ship 9.x, which is why `wine-e2e` stays `continue-on-error`).
+- A real SIGKILL of an in-process install is not practical in a test; the killed-install e2e uses Task 5's
+  `#[cfg(test)]` crash hook (a panic at a numbered point, so no rollback runs), on a real prefix, at the two points
+  where the prefix is affected (journal created; the DLL written over Wine's placeholder).
+- The CI `wine-e2e` job has still never run on a hosted runner.
+
+### Ready for the next sub-project (Phase 4B, graphics selection)
+
+- **Can rely on:** `rt_deps::plan_for_app`/`plan_for_pe` (imports to capabilities to packages, warnings for x86 and
+  unsatisfied needs), `install_plan` behind consent with per-app recorded state in `Metadata.dependencies`, DXVK 3.1.1
+  as an archive package with `native,builtin` overrides for d3d8/9/10core/11/dxgi, verified downloads in a shared
+  cache, and the no-download guarantee of `install`/`run`/`doctor`.
+- **Open limits:** x64 DLLs only; no VKD3D-Proton (needs a zstd decision or another source); no `d3dcompiler_47`; no
+  .NET/Mono/Gecko (still disabled in every prefix); marker-only success for exe installers (the explorer wrapper hides
+  the exit code); `explorer.exe`/`msiexec.exe`/`reg.exe` from the prefix are unpinned; path-based file operations must
+  move to `openat`/`renameat`/`unlinkat` before Phase 5 makes the prefix a boundary; the shared run lock is released
+  once an app has started.
+- **Follow-ups:** package upgrade (undo the old install from the kept journal under the lock, then install) and
+  single-package removal (including removing overrides, which today are never removed); a per-DLL override policy
+  (which DLLs a graphics selection turns on or off, per app, instead of a fixed `native,builtin` list per package);
+  the explorer null-desktop wrapper is a Wine behaviour worth re-checking on each Wine upgrade.
