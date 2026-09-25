@@ -18,6 +18,7 @@ fn pkg(id: &str, requires: &[&str], provides: &[&str], consent: bool) -> Package
         requires_consent: consent,
         requires: requires.iter().map(|s| s.to_string()).collect(),
         provides: provides.iter().map(|s| s.to_string()).collect(),
+        min_vulkan: None,
         install: Install::Installer {
             silent_args: vec![],
             marker: Marker::File(format!("{id}.marker")),
@@ -551,4 +552,100 @@ fn random_facts_keep_plan_invariants() {
             }
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------ block_for_vulkan
+
+fn pkg_vk(id: &str, requires: &[&str], provides: &[&str], min: (u32, u32)) -> Package {
+    Package {
+        min_vulkan: Some(min),
+        ..pkg(id, requires, provides, false)
+    }
+}
+
+fn action_of<'a>(plan: &'a Plan, id: &str) -> &'a Action {
+    &plan.entries.iter().find(|e| e.package == id).unwrap().action
+}
+
+fn unusable(_: Option<(u32, u32)>) -> VulkanVerdict {
+    VulkanVerdict::Unusable("no device".into())
+}
+
+#[test]
+fn unusable_vulkan_blocks_install_entries_that_need_it() {
+    let m = manifest(vec![
+        pkg_vk("dxvk", &[], &["d3d11"], (1, 3)),
+        pkg("other", &[], &["x"], false),
+    ]);
+    let mut plan = resolve(&caps(&["d3d11", "x"]), &none(), &[], &m);
+    block_for_vulkan(&mut plan, &m, &unusable);
+    assert_eq!(
+        action_of(&plan, "dxvk"),
+        &Action::Blocked {
+            reason: "Vulkan is unusable: no device; Wine's built-in Direct3D will be used".into()
+        }
+    );
+    assert_eq!(action_of(&plan, "other"), &Action::Install);
+}
+
+#[test]
+fn unknown_and_usable_change_nothing() {
+    for v in [VulkanVerdict::Usable, VulkanVerdict::Unknown] {
+        let m = manifest(vec![pkg_vk("dxvk", &[], &["d3d11"], (1, 3))]);
+        let mut plan = resolve(&caps(&["d3d11"]), &none(), &[], &m);
+        let before = plan.clone();
+        block_for_vulkan(&mut plan, &m, &|_| v.clone());
+        assert_eq!(plan, before);
+    }
+}
+
+#[test]
+fn an_already_installed_package_is_never_blocked() {
+    let m = manifest(vec![pkg_vk("dxvk", &[], &["d3d11"], (1, 3))]);
+    let installed = InstalledSet(vec![installed_ref(&m.packages[0])]);
+    let mut plan = resolve(&caps(&["d3d11"]), &installed, &[], &m);
+    block_for_vulkan(&mut plan, &m, &unusable);
+    assert_eq!(action_of(&plan, "dxvk"), &Action::AlreadyInstalled);
+}
+
+#[test]
+fn a_package_requiring_a_blocked_one_is_blocked_too() {
+    // vkd3d-proton has no minimum of its own here: it is blocked only because dxvk is.
+    let m = manifest(vec![
+        pkg_vk("dxvk", &[], &["d3d11"], (1, 3)),
+        pkg("vkd3d-proton", &["dxvk"], &["d3d12"], false),
+    ]);
+    let mut plan = resolve(&caps(&["d3d12"]), &none(), &[], &m);
+    block_for_vulkan(&mut plan, &m, &unusable);
+    let Action::Blocked { reason } = action_of(&plan, "vkd3d-proton") else {
+        panic!("{plan:?}")
+    };
+    assert!(reason.contains("Vulkan is unusable"), "{reason}");
+    assert!(plan.unsatisfied.is_empty(), "blocked, not unsatisfied");
+}
+
+#[test]
+fn the_verdict_closure_runs_once_per_distinct_minimum() {
+    let m = manifest(vec![
+        pkg_vk("a", &[], &["x"], (1, 3)),
+        pkg_vk("b", &[], &["y"], (1, 3)),
+        pkg_vk("c", &[], &["z"], (1, 1)),
+        pkg("d", &[], &["w"], false),
+    ]);
+    let mut plan = resolve(&caps(&["x", "y", "z", "w"]), &none(), &[], &m);
+    let calls = std::cell::RefCell::new(Vec::new());
+    block_for_vulkan(&mut plan, &m, &|min| {
+        calls.borrow_mut().push(min);
+        VulkanVerdict::Usable
+    });
+    let mut calls = calls.into_inner();
+    calls.sort();
+    assert_eq!(calls, [Some((1, 1)), Some((1, 3))]);
+}
+
+#[test]
+fn a_plan_with_no_vulkan_package_never_runs_the_closure() {
+    let m = manifest(vec![pkg("d", &[], &["w"], false)]);
+    let mut plan = resolve(&caps(&["w"]), &none(), &[], &m);
+    block_for_vulkan(&mut plan, &m, &|_| panic!("must not probe"));
 }

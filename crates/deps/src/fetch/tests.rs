@@ -25,6 +25,7 @@ fn pkg_for(url: String, content: &[u8]) -> Package {
         requires_consent: false,
         requires: vec![],
         provides: vec![],
+        min_vulkan: None,
         install: Install::Archive {
             format: ArchiveFormat::Zip,
             extract: vec![],

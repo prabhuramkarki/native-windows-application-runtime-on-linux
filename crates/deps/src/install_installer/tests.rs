@@ -82,6 +82,7 @@ fn pkg_for(body: &[u8], silent_args: &[&str], marker: Marker) -> Package {
         requires_consent: false,
         requires: vec![],
         provides: vec![],
+        min_vulkan: None,
         install: Install::Installer {
             silent_args: silent_args.iter().map(|s| (*s).to_owned()).collect(),
             marker,

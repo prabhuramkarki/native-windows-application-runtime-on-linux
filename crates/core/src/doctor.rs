@@ -189,6 +189,8 @@ pub struct DoctorInput<'a> {
     pub prefix_root: Option<&'a Path>,
     /// The host's Vulkan probe (`runtime graphics info`'s runner); `None` keeps the loader-file check alone.
     pub vulkan: Option<&'a HostVulkan>,
+    /// The highest Vulkan API version a bundled package needs (DXVK), if any: a device below it is not usable.
+    pub vulkan_min: Option<(u32, u32)>,
 }
 
 /// Names read from one directory listing at most.
@@ -672,7 +674,7 @@ fn wine(input: &DoctorInput<'_>, out: &mut Out) {
 
 fn vulkan(input: &DoctorInput<'_>, out: &mut Out) {
     if let Some(h) = input.vulkan {
-        match host_verdict(h, None) {
+        match host_verdict(h, input.vulkan_min) {
             VulkanVerdict::Usable => {
                 let n = h.devices.len();
                 let s = if n == 1 { "" } else { "s" };
