@@ -66,7 +66,7 @@ fn ids(plan: &Plan) -> Vec<&str> {
 }
 
 /// The dependency shapes these tests need (a consent-gated package, and one package requiring another), which the
-/// real bundled manifest does not have: it has no `requires` edge at all since VKD3D-Proton was left out.
+/// real bundled manifest does not have: it has one `requires` edge (vkd3d-proton -> dxvk) but no consent-gated package next to it.
 fn graph() -> Manifest {
     manifest(vec![
         pkg("dxvk", &[], &["d3d9", "d3d10core", "d3d11", "dxgi"], false),

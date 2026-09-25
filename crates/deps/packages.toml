@@ -33,6 +33,33 @@ extract = [
 ]
 dll_overrides = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"]
 
+# VKD3D-Proton 3.0.1 (Direct3D 12 on Vulkan), upstream release tarball (.tar.zst only, read by the bounded zstd
+# reader). Verified by downloading on 2026-09-26; the sha256 equals GitHub's asset digest for this release. Only the
+# x64 DLLs are installed (win64 prefix). Licence: the release's COPYING is the LGPL, "version 2.1 or (at your option)
+# any later version". The 4A consent model gives permissive/open archives false; nothing is linked or redistributed
+# (the DLLs are fetched from upstream on request), so no consent is required. It requires dxvk (DXGI, D3D11 on
+# Vulkan) and, like dxvk, needs Vulkan 1.3 to render; installing works on any host.
+[[package]]
+id = "vkd3d-proton"
+version = "3.0.1"
+sha256 = "3cf2315522af5e43605ef6d3c41dad91387040bf97199934f3f7ab76caaa2f0c"
+size = 5163266
+licence = "LGPL-2.1-or-later"
+url = "https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.0.1/vkd3d-proton-3.0.1.tar.zst"
+kind = "archive"
+requires_consent = false
+requires = ["dxvk"]
+min_vulkan = "1.3"
+provides = ["d3d12", "d3d12core"]
+
+[package.install]
+format = "tar.zst"
+extract = [
+    { from = "vkd3d-proton-3.0.1/x64/d3d12.dll", to = "windows/system32/d3d12.dll" },
+    { from = "vkd3d-proton-3.0.1/x64/d3d12core.dll", to = "windows/system32/d3d12core.dll" },
+]
+dll_overrides = ["d3d12", "d3d12core"]
+
 # Microsoft Visual C++ 2015-2022 Redistributable (x64) 14.44.35211. The url is the final, versioned
 # download.visualstudio.microsoft.com location that https://aka.ms/vs/17/release/vc_redist.x64.exe redirected to on
 # 2026-09-25 (its path embeds the file's sha256), so it does not move; if Microsoft removes it, the fetch fails
