@@ -321,14 +321,18 @@ mod tests {
     }
     #[test]
     fn a_descendant_in_its_own_session_cannot_hang_us() {
+        // The child must have left the tool's group before the tool goes on (else the group kill reaches it):
+        // it touches "$0.ready" from inside its new session; the wait is bounded (about 5 s).
+        let detach = "setsid sh -c ': > \"$0.ready\"; exec sleep 30' \"$0\" &\n\
+                      n=0; while [ ! -e \"$0.ready\" ] && [ $n -lt 500 ]; do n=$((n+1)); sleep 0.01; done";
         let t = Instant::now();
         // Holds stdout open from another session, so the group kill cannot reach it; the tool itself exits.
-        assert_eq!(run("setsid sleep 30 &\nprintf partial", T), None);
+        assert_eq!(run(&format!("{detach}\nprintf partial"), T), None);
         // Joining the reader would take the full 30 s of the stray `sleep`; the bound is far under that and
         // over the runner's own DRAIN, with generous slack for a loaded machine.
         assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
         let t = Instant::now();
-        assert_eq!(run("setsid sleep 30 &\nsleep 30", Duration::from_millis(300)), None);
+        assert_eq!(run(&format!("{detach}\nsleep 30"), Duration::from_millis(300)), None);
         // 300 ms timeout + DRAIN, plus slack, still well under 30 s.
         assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
     }

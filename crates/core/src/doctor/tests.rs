@@ -1,4 +1,5 @@
 use super::*;
+use crate::GraphicsDriver;
 use crate::fake::FakeBackend;
 use crate::{BackendError, backend::Detail};
 use pe::{Arch, Format, Import, ImportedFn, Installer, InstallerKind, Kind, Subsystem};
@@ -63,13 +64,13 @@ impl Host {
         self.errors.insert(p.into(), n);
         self
     }
-    /// A desktop with Wayland, PipeWire and Vulkan.
+    /// A desktop with Wayland, PulseAudio (pipewire-pulse) and Vulkan.
     fn desktop() -> Host {
         Host::default()
             .env("WAYLAND_DISPLAY", "wayland-0")
             .env("XDG_RUNTIME_DIR", "/run/user/1000")
             .file("/run/user/1000/wayland-0")
-            .file("/run/user/1000/pipewire-0")
+            .file("/run/user/1000/pulse/native")
             .file("/usr/lib/x86_64-linux-gnu/libvulkan.so.1")
     }
 }
@@ -132,6 +133,8 @@ struct Sc {
     prefix_root: Option<PathBuf>,
     vulkan: Option<crate::HostVulkan>,
     vulkan_min: Option<(u32, u32)>,
+    wine_drivers: Option<Vec<String>>,
+    graphics_driver: Option<Result<GraphicsDriver, String>>,
 }
 
 /// A system report on a good desktop.
@@ -149,6 +152,8 @@ fn sc() -> Sc {
         prefix_root: None,
         vulkan: None,
         vulkan_min: None,
+        wine_drivers: None,
+        graphics_driver: None,
     }
 }
 
@@ -208,6 +213,11 @@ impl Sc {
             prefix_root: self.prefix_root.as_deref(),
             vulkan: self.vulkan.as_ref(),
             vulkan_min: self.vulkan_min,
+            wine_drivers: self.wine_drivers.as_deref(),
+            graphics_driver: self
+                .graphics_driver
+                .as_ref()
+                .map(|r| r.clone().map_err(|e| &*Box::leak(e.into_boxed_str()))),
         })
     }
 }
@@ -346,6 +356,8 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         prefix_root: None,
         vulkan: None,
         vulkan_min: None,
+        wine_drivers: None,
+        graphics_driver: None,
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -372,6 +384,8 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         prefix_root: None,
         vulkan: None,
         vulkan_min: None,
+        wine_drivers: None,
+        graphics_driver: None,
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
@@ -574,23 +588,129 @@ fn a_hostile_display_value_is_escaped() {
     assert_tame(&c.text);
 }
 
-#[test]
-fn pipewire_is_a_socket_in_the_runtime_dir() {
-    let r = sc().run();
-    assert_eq!(of(&r, Area::Audio).len(), 1);
-    assert_eq!(of(&r, Area::Audio)[0].status, Status::Ok);
-    for host in [
-        Host::desktop(),
-        Host::default().env("XDG_RUNTIME_DIR", "run/user"), // relative: ignored
-        Host::default().file("/pipewire-0"),
-    ] {
-        let mut s = sc();
-        s.host = host;
-        s.host.files.remove(Path::new("/run/user/1000/pipewire-0"));
-        let c = &of(&s.run(), Area::Audio).into_iter().cloned().collect::<Vec<_>>()[0];
-        assert_eq!(c.status, Status::Warn, "{}", c.text);
-        assert!(c.text.contains("PipeWire"), "{}", c.text);
+fn names(n: &[&str]) -> Option<Vec<String>> {
+    Some(n.iter().map(|s| (*s).to_owned()).collect())
+}
+
+/// The audio check of a desktop where `sockets` (under `/run/user/1000`) exist and `drivers` were listed.
+fn audio_of(sockets: &[&str], drivers: Option<Vec<String>>) -> Check {
+    let mut s = sc();
+    s.host = Host::default().env("XDG_RUNTIME_DIR", "/run/user/1000");
+    for sock in sockets {
+        s.host = std::mem::take(&mut s.host).file(&format!("/run/user/1000/{sock}"));
     }
+    s.wine_drivers = drivers;
+    let r = s.run();
+    assert_eq!(of(&r, Area::Audio).len(), 1);
+    of(&r, Area::Audio)[0].clone()
+}
+
+#[test]
+fn audio_wants_the_pulse_compatible_socket() {
+    let all = names(&["winepulse.drv", "winealsa.drv"]);
+    let c = audio_of(&["pulse/native"], all.clone());
+    assert_eq!(c.status, Status::Ok, "{}", c.text);
+    assert!(c.text.contains("PulseAudio-compatible"), "{}", c.text);
+    // the desktop fixture is the pulse socket too
+    assert_eq!(of(&sc().run(), Area::Audio)[0].status, Status::Ok);
+    // PipeWire's own socket alone is not one Wine 10 can use
+    let c = audio_of(&["pipewire-0"], all.clone());
+    assert_eq!(c.status, Status::Warn, "{}", c.text);
+    assert!(
+        c.text.contains("PulseAudio-compatible") && c.text.contains("pipewire-pulse"),
+        "{}",
+        c.text
+    );
+    // no socket: ALSA only, or nothing
+    let c = audio_of(&[], names(&["winealsa.drv"]));
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.text.contains("ALSA only"), "{}", c.text);
+    let c = audio_of(&[], names(&[]));
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.text.contains("no audio path"), "{}", c.text);
+    // a relative runtime dir is ignored
+    let mut s = sc();
+    s.host = Host::default().env("XDG_RUNTIME_DIR", "run/user").file("/pulse/native");
+    assert_eq!(of(&s.run(), Area::Audio)[0].status, Status::Warn);
+}
+
+#[test]
+fn a_wine_without_the_pulse_driver_is_a_warning_and_an_unlisted_one_is_not_verified() {
+    let c = audio_of(&["pulse/native"], names(&[]));
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.text.contains("Wine build has no PulseAudio driver"), "{}", c.text);
+    for sockets in [&["pulse/native"][..], &["pipewire-0"], &[]] {
+        let c = audio_of(sockets, None);
+        assert!(c.text.contains("driver modules not verified"), "{}", c.text);
+        assert!(!c.text.contains("missing") && !c.text.contains("has no"), "{}", c.text);
+    }
+    assert_eq!(audio_of(&["pulse/native"], None).status, Status::Ok);
+    assert!(audio_of(&[], None).text.contains("no audio path"));
+}
+
+/// The Graphics checks of a system-report scenario with `driver` set, on `host`, with `drivers` listed.
+fn graphics_of(host: Host, driver: GraphicsDriver, drivers: Option<Vec<String>>) -> Vec<Check> {
+    let mut s = sc();
+    s.host = host;
+    s.graphics_driver = Some(Ok(driver));
+    s.wine_drivers = drivers;
+    of(&s.run(), Area::Graphics).into_iter().cloned().collect()
+}
+
+#[test]
+fn the_apps_graphics_setting_is_checked_against_the_session_and_wine() {
+    let wl_host = || Host::desktop();
+    let x_host = || Host::default().env("DISPLAY", ":0");
+    let has_wl = names(&["winewayland.drv"]);
+    // The one setting check of an app report (the session and Vulkan checks say "display"/"Vulkan").
+    let setting = |cs: Vec<Check>| {
+        let v: Vec<Check> = cs.into_iter().filter(|c| c.text.contains("graphics driver")).collect();
+        assert_eq!(v.len(), 1, "{v:#?}");
+        v[0].clone()
+    };
+    let expect = |c: Check, st: Status, word: &str| {
+        assert_eq!(c.status, st, "{}", c.text);
+        assert!(c.text.contains(word), "{}", c.text);
+    };
+    // Wayland: no socket
+    let c = setting(graphics_of(x_host(), GraphicsDriver::Wayland, has_wl.clone()));
+    expect(c, Status::Warn, "no Wayland socket");
+    // Wayland: socket, driver listed absent / present / not listed
+    let c = setting(graphics_of(
+        wl_host(),
+        GraphicsDriver::Wayland,
+        names(&["winepulse.drv"]),
+    ));
+    expect(c, Status::Warn, "winewayland");
+    let c = setting(graphics_of(wl_host(), GraphicsDriver::Wayland, has_wl));
+    expect(c, Status::Ok, "wayland (session: wayland socket)");
+    let c = setting(graphics_of(wl_host(), GraphicsDriver::Wayland, None));
+    expect(c, Status::Ok, "wayland");
+    // X11
+    let c = setting(graphics_of(Host::default(), GraphicsDriver::X11, None));
+    expect(c, Status::Warn, "DISPLAY is not set");
+    let c = setting(graphics_of(x_host(), GraphicsDriver::X11, None));
+    expect(c, Status::Ok, "x11 (session: DISPLAY)");
+    // Auto is shown, never a warning; Custom warns (and is escaped)
+    let c = setting(graphics_of(Host::default(), GraphicsDriver::Auto, None));
+    expect(c, Status::Ok, "auto (session: none)");
+    let cs = graphics_of(
+        wl_host(),
+        GraphicsDriver::Custom("x11,wayland\x1b]0;x\x07".into()),
+        None,
+    );
+    let c = setting(cs);
+    assert_tame(&c.text);
+    assert!(c.text.chars().count() <= 300);
+    expect(c, Status::Warn, "custom graphics driver setting");
+    // the read failed: a warning that says so, with the reason cleaned
+    let mut s = sc();
+    s.graphics_driver = Some(Err("user.reg is a symlink\x1b]0;x\x07".into()));
+    let c = setting(of(&s.run(), Area::Graphics).into_iter().cloned().collect());
+    assert_tame(&c.text);
+    expect(c, Status::Warn, "not verified: user.reg is a symlink");
+    // no setting (system report): nothing extra
+    assert_eq!(of(&sc().run(), Area::Graphics).len(), 2);
 }
 
 #[test]
@@ -1774,6 +1894,8 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         prefix_root: None,
         vulkan: None,
         vulkan_min: None,
+        wine_drivers: None,
+        graphics_driver: None,
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);

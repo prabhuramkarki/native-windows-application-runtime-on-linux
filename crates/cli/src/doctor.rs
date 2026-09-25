@@ -1,7 +1,9 @@
 //! `runtime doctor [<app|file>] [--json]`: a read-only health report.
 //!
-//! * no argument: the system checks (host architecture, Wine, Vulkan, display, audio);
-//! * an installed app id: those plus the app's program (PE facts, imports against Wine's DLLs, prefix state);
+//! * no argument: the system checks (host architecture, Wine, Vulkan, display, audio: the PulseAudio-compatible
+//!   socket Wine 10 uses);
+//! * an installed app id: those plus the app's program (PE facts, imports against Wine's DLLs, prefix state) and
+//!   its Wine graphics driver setting (read from the prefix's `user.reg`, as `runtime display` does);
 //! * a file (the target is classified like `run`'s: it contains `/` or ends in `.exe`/`.zip`): the same PE and
 //!   import checks on the file, which is NOT installed. Only Wine's own DLLs count for its imports (the file's
 //!   directory is not scanned: `runtime run <file>` copies just the file into a prefix).
@@ -26,7 +28,8 @@ use rt_core::doctor::{
     Area, DoctorInput, FsProbe, HostFs, ListResult, MAX_LISTING, PeState, PrefixAudit, PrefixState, Report, Status,
     Subject, Verdict, doctor,
 };
-use rt_core::{AppId, CompatBackend, Input, Launcher, Store, Target};
+use rt_core::{AppId, CompatBackend, GraphicsDriver, Input, Launcher, Store, Target};
+use rt_deps::wine_config::read_graphics_driver_from_prefix;
 use serde_json::json;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -43,6 +46,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
     };
     // The error as text: what `doctor` shows for a Wine that could not be found.
     let wine = backend_wine::WineBackend::discover_with(Launcher::new()).map_err(|e| e.to_string());
+    let wine_drivers = wine.as_ref().ok().and_then(|b| crate::display::wine_drivers(b));
     let facts = match &found {
         None => Facts::system(),
         Some((store, Target::Installed(id))) => Facts::app(store, id),
@@ -76,6 +80,11 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         prefix_root: facts.prefix_root.as_deref(),
         vulkan: Some(crate::graphics::host()),
         vulkan_min: rt_deps::Manifest::bundled().max_min_vulkan(),
+        wine_drivers: wine_drivers.as_deref(),
+        graphics_driver: facts.graphics_driver.as_ref().map(|r| match r {
+            Ok(d) => Ok(d.clone()),
+            Err(e) => Err(e.as_str()),
+        }),
     });
     crate::emit(&if as_json {
         render_json(&report)?
@@ -114,6 +123,8 @@ struct Facts {
     hint: Option<String>,
     /// Installed apps only: installer packages already in the prefix, which the runtime did not install.
     notes: Vec<String>,
+    /// Installed apps only: the Wine graphics driver setting, or why `user.reg` could not be read.
+    graphics_driver: Option<Result<GraphicsDriver, String>>,
 }
 
 impl Facts {
@@ -128,6 +139,7 @@ impl Facts {
             prefix_root: None,
             hint: None,
             notes: vec![],
+            graphics_driver: None,
         }
     }
 
@@ -143,6 +155,7 @@ impl Facts {
 
     fn app(store: &Store, id: &AppId) -> Facts {
         let env = store.get(id).ok();
+        let graphics_driver = env.as_ref().map(read_graphics_driver_from_prefix);
         match rt_core::resolve_program(store, id, backend_wine::BACKEND_ID) {
             Ok(p) => {
                 let pe = read_pe(&p.exe);
@@ -173,6 +186,7 @@ impl Facts {
                     prefix: prefix_state(&p.env.prefix()),
                     app_home: Some(home_state(&p.env)),
                     prefix_root: Some(p.env.prefix()),
+                    graphics_driver,
                 }
             }
             // The program cannot be used, and that is the report: the name and the prefix are still shown.
@@ -190,6 +204,7 @@ impl Facts {
                         .map_or(PrefixState::NotApplicable, |env| prefix_state(&env.prefix())),
                     app_home: env.as_ref().map(home_state),
                     prefix_root: env.map(|env| env.prefix()),
+                    graphics_driver,
                     ..Facts::system()
                 }
             }
