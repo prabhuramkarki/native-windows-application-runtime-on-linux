@@ -25,7 +25,7 @@ pub mod winpath;
 
 pub use backend::{BackendError, CompatBackend, Detail, RunOpts, allowed_env};
 pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
-pub use display::{DRIVERS_KEY, GraphicsDriver, read_graphics_driver};
+pub use display::{DRIVERS_KEY, GraphicsDriver, driver_from_value};
 #[cfg(any(test, feature = "testing"))]
 pub use fake::{Call, FakeBackend};
 pub use graphics::{
