@@ -20,8 +20,8 @@ const HEADER: &str = "\
 <!-- Generated from crates/cli/compat.toml; do not edit by hand. Regenerate with:
      cargo run -q -p runtime-cli -- compat > docs/COMPAT.md -->
 
-Each row is something that was really run: `ci:<job>` is a CI job that ran it, `manual:<date>` a person on that
-day. A program that is not listed has not been tested.
+Each row is something that was really run: `ci:<job>` is a CI job run that passed, `manual:<date>` was run by
+hand on that date on the recorded Wine and GPU. A program that is not listed has not been tested.
 
 ";
 
@@ -430,7 +430,7 @@ evidence = "ci:x"
     }
 
     #[test]
-    fn the_bundled_file_is_valid_and_every_result_names_its_ci_job() {
+    fn the_bundled_file_is_valid_and_every_record_has_evidence() {
         let c = bundled();
         assert!(!c.records.is_empty());
         for r in &c.records {

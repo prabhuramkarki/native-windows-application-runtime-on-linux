@@ -1,51 +1,55 @@
 # The compatibility matrix: what was really run, on which Wine, with what result. One [[record]] per observation.
-# Rules (checked by `Compat::parse`, and by a test on this very file): `evidence` is `ci:<job>` (a CI job that ran it)
-# or `manual:<YYYY-MM-DD>` and is required for works/partial/broken; `gpu` is required when `graphics = true`; no two
-# records share (app, version, wine, gpu). Add only what someone actually ran; do not guess.
+# Rules (checked by `Compat::parse`, and by a test on this very file): `evidence` is `ci:<job>` (a CI job run that
+# passed) or `manual:<YYYY-MM-DD>` (run by hand on that date on the recorded Wine/GPU) and is required for
+# works/partial/broken; `gpu` is required when `graphics = true`; no two records share (app, version, wine, gpu).
+# Add only what someone actually ran; do not guess.
 # After editing, regenerate the published table:
 #   cargo run -q -p runtime-cli -- compat > docs/COMPAT.md
 # (the test `compat_md_matches_records` fails until you do).
 
-# Everything below is run headlessly by the `wine-e2e` CI job (ubuntu:26.04, distro Wine 10.0, no GPU).
+# The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, no GPU) with the two test
+# commands of the `wine-e2e` CI job. That job is configured but has not yet run on a hosted runner, so none of them
+# claims `ci:`.
+
 
 [[record]]
 app = "hello64.exe (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "runtime install + run of a 64-bit console program: prints its greeting, exits 7 (e2e_mvp_loop)"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "runtime install + run of a 64-bit console program: prints its greeting, exits 7 (e2e_mvp_loop_install_list_run_logs_doctor_remove). Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
 
 [[record]]
 app = "hello32.exe (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "runtime run of a 32-bit (WoW64) console program: prints its greeting, exits 7; app recorded as x86"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "runtime run of a 32-bit (WoW64) console program: prints its greeting, exits 7; app recorded as x86. Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
 
 [[record]]
 app = "fs64.exe (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "file probe: an app reads back what it wrote, a second app's prefix does not see it, no Z: drive"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "file probe: an app reads back what it wrote and a second app's prefix does not see it (e2e_a_second_app_cannot_see_the_first_apps_files); no Z: drive (e2e_hardening_is_visible_from_inside_the_app). Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
 
 [[record]]
 app = "hello-nsis.exe (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "NSIS installer run silently: installs, .desktop entry, program auto-discovered and run (exit 7), uninstalled"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "NSIS installer run silently: installs, .desktop entry, program auto-discovered and run (exit 7); environment and .desktop entry removed by `runtime uninstall` (the NSIS uninstaller itself is not run). Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
 
 [[record]]
 app = "hello.msi (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "MSI installer run silently through msiexec: installs, .desktop entry, program run (exit 7), uninstalled"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "MSI installer run silently through msiexec: installs, .desktop entry, program run (exit 7), recorded msiexec uninstall run by `runtime uninstall` without warnings. Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
 
 [[record]]
 app = "exports64.dll in a zip/tar.gz package (fixture)"
 status = "works"
-wine = "10.0"
-evidence = "ci:wine-e2e"
-notes = "dependency archive install into system32, byte-identical, with a native,builtin DLL override set via reg.exe"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "dependency archive install into system32, byte-identical, with a native,builtin DLL override set via reg.exe. Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
