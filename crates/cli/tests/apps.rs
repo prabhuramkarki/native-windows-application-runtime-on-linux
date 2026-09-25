@@ -1443,12 +1443,12 @@ impl Rig {
         }
     }
 
-    /// The runtime as a desktop user sees it: display, PipeWire.
+    /// The runtime as a desktop user sees it: display, the PulseAudio-compatible socket (pipewire-pulse).
     fn desktop(&self) -> Command {
         let run = self.root.join("run");
-        fs::create_dir_all(&run).unwrap();
-        if !run.join("pipewire-0").exists() {
-            fs::write(run.join("pipewire-0"), b"").unwrap();
+        fs::create_dir_all(run.join("pulse")).unwrap();
+        if !run.join("pulse/native").exists() {
+            fs::write(run.join("pulse/native"), b"").unwrap();
         }
         let mut c = self.cmd();
         c.env("DISPLAY", ":0").env("XDG_RUNTIME_DIR", &run);
@@ -1459,7 +1459,7 @@ impl Rig {
 #[test]
 fn doctor_without_arguments_runs_the_system_checks_only_and_is_read_only() {
     let r = rig();
-    r.wine_dlls(&["kernel32.dll"]);
+    r.wine_dlls(&["kernel32.dll", "winepulse.drv"]);
     let _ = r.desktop(); // creates the runtime dir: part of the "before" state
     let before = snapshot(&r);
     let o = r.desktop().arg("doctor").output().unwrap();
@@ -1476,7 +1476,7 @@ fn doctor_without_arguments_runs_the_system_checks_only_and_is_read_only() {
     let wine = lines_with(&out, "Wine: wine-10.0 (Fake 1)");
     assert_eq!(wine.len(), 1, "{out}");
     assert!(wine[0].trim_start().starts_with("[ok]"), "{}", wine[0]);
-    assert!(lines_with(&out, "PipeWire")[0].contains("[ok]"), "{out}");
+    assert!(lines_with(&out, "PulseAudio-compatible")[0].contains("[ok]"), "{out}");
     assert!(lines_with(&out, "X11")[0].contains("[ok]"), "{out}");
     if cfg!(target_arch = "x86_64") {
         assert!(lines_with(&out, "host architecture")[0].contains("[ok]"), "{out}");
@@ -1497,8 +1497,43 @@ fn doctor_says_may_fail_without_a_display_or_pipewire() {
     let out = s(&o.stdout);
     assert_eq!(o.status.code(), Some(0), "warnings are not failures: {out}");
     assert!(lines_with(&out, "no display session")[0].contains("[warn]"), "{out}");
-    assert!(lines_with(&out, "PipeWire")[0].contains("[warn]"), "{out}");
+    assert!(lines_with(&out, "no audio path")[0].contains("[warn]"), "{out}");
     assert_eq!(out.lines().last().unwrap(), "Result: Application may fail to start.");
+}
+
+#[test]
+fn doctor_warns_when_only_the_pipewire_socket_exists_and_reports_the_wine_drivers() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll", "winepulse.drv"]);
+    let run = r.root.join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("pipewire-0"), b"").unwrap();
+    let o = r.cmd().env("XDG_RUNTIME_DIR", &run).arg("doctor").output().unwrap();
+    let out = s(&o.stdout);
+    let l = lines_with(&out, "pipewire-pulse");
+    assert!(l.len() == 1 && l[0].contains("[warn]"), "{out}");
+    assert!(!out.contains("not verified"), "the drivers were listed: {out}");
+    // With the pulse socket too: ok, and the same listed drivers.
+    fs::create_dir_all(run.join("pulse")).unwrap();
+    fs::write(run.join("pulse/native"), b"").unwrap();
+    let out = s(&r
+        .cmd()
+        .env("XDG_RUNTIME_DIR", &run)
+        .arg("doctor")
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(lines_with(&out, "PulseAudio-compatible")[0].contains("[ok]"), "{out}");
+    // Without the driver module in the listed directory: reported.
+    fs::remove_file(r.bin.join("x86_64-windows/winepulse.drv")).unwrap();
+    let out = s(&r
+        .cmd()
+        .env("XDG_RUNTIME_DIR", &run)
+        .arg("doctor")
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(lines_with(&out, "no PulseAudio driver")[0].contains("[warn]"), "{out}");
 }
 
 #[test]
@@ -2493,4 +2528,31 @@ fn display_set_is_refused_for_a_symlinked_user_reg_or_prefix() {
     symlink(&moved, &prefix).unwrap();
     assert_fails(&r.rt(&["display", "dapp", "x11"]));
     assert!(!reg_ran(&r) && !moved.join("user.reg").exists());
+}
+
+#[test]
+fn doctor_of_an_app_checks_its_graphics_driver_setting_and_keeps_the_areas() {
+    let r = rig();
+    let prefix = display_app(&r);
+    r.wine_dlls(&["kernel32.dll", "winepulse.drv"]);
+    user_reg(&prefix, "\"Graphics\"=\"wayland\"");
+    // wayland setting, no Wayland session: warned; the sections are unchanged
+    let o = r.cmd().args(["doctor", "dapp"]).output().unwrap();
+    let out = s(&o.stdout);
+    assert!(lines_with(&out, "set to wayland")[0].contains("[warn]"), "{out}");
+    let o = r.cmd().args(["doctor", "dapp", "--json"]).output().unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let areas: Vec<&str> = j["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["area"].as_str().unwrap())
+        .collect();
+    assert!(areas.contains(&"graphics") && areas.contains(&"audio"), "{areas:?}");
+    // a Wayland session, but this Wine has no winewayland.drv in a listed directory
+    let out = s(&wayland(&r).args(["doctor", "dapp"]).output().unwrap().stdout);
+    assert!(lines_with(&out, "winewayland")[0].contains("[warn]"), "{out}");
+    r.wine_dlls(&["winewayland.drv"]);
+    let out = s(&wayland(&r).args(["doctor", "dapp"]).output().unwrap().stdout);
+    assert!(lines_with(&out, "graphics driver").is_empty(), "{out}");
 }
