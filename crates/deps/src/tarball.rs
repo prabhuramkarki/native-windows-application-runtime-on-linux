@@ -97,7 +97,7 @@ pub struct TarLimits {
     pub ratio_floor: u64,
     /// Most gzip members (concatenated gzip streams).
     pub max_gzip_members: usize,
-    /// Largest zstd window (the decoder allocates it up front).
+    /// Largest zstd window: the most memory the decoder may hold for back-references.
     pub max_zstd_window: u64,
     /// Most zero bytes accepted after the two end-of-archive blocks.
     pub trailing_allowance: usize,

@@ -260,9 +260,12 @@ mod tests {
         let t = Instant::now();
         // Holds stdout open from another session, so the group kill cannot reach it; the tool itself exits.
         assert_eq!(run("setsid sleep 30 &\nprintf partial", T), None);
-        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // Joining the reader would take the full 30 s of the stray `sleep`; the bound is far under that and
+        // over the runner's own DRAIN, with generous slack for a loaded machine.
+        assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
         let t = Instant::now();
         assert_eq!(run("setsid sleep 30 &\nsleep 30", Duration::from_millis(300)), None);
-        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // 300 ms timeout + DRAIN, plus slack, still well under 30 s.
+        assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
     }
 }

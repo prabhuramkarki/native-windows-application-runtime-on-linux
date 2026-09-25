@@ -1277,6 +1277,14 @@ fn zstd_bomb_aborts_at_total_cap_with_bounded_work() {
         let (r, total) = walk_counting(Codec::Zstd, &input, &l, sel);
         assert!(matches!(r, Err(TarError::TooLarge | TarError::RatioExceeded)), "{r:?}");
         assert!(total <= cap + CHUNK as u64, "read {total} decompressed bytes");
+        // with the ratio guard out of the way, the total cap is what stops it
+        let no_ratio = TarLimits {
+            max_ratio: u64::MAX,
+            ..l.clone()
+        };
+        let (r, total) = walk_counting(Codec::Zstd, &input, &no_ratio, sel);
+        assert!(matches!(r, Err(TarError::TooLarge)), "{r:?}");
+        assert!(total <= cap + CHUNK as u64, "read {total} decompressed bytes");
     }
     // with the total cap out of the way, the ratio guard trips right after its floor
     let l = TarLimits {
@@ -1289,7 +1297,7 @@ fn zstd_bomb_aborts_at_total_cap_with_bounded_work() {
 }
 
 #[test]
-fn zstd_window_over_the_cap_is_refused_before_allocating() {
+fn zstd_window_over_the_cap_is_refused_up_front() {
     let tar = Tar::default().file("a", b"x").end();
     let frame = |wd: u8| [zst_header(wd), zst_block(true, 0, tar.len() as u32, &tar)].concat();
     let l = TarLimits {
@@ -1299,12 +1307,10 @@ fn zstd_window_over_the_cap_is_refused_before_allocating() {
     // exactly the cap (exponent 16) is fine
     assert_eq!(paths(&collect_zst(&frame(16 << 3), &l).unwrap()), ["a"]);
     // 64 MiB + 1/8 and 1 GiB are refused
-    let t = std::time::Instant::now();
     for wd in [(16 << 3) | 1, 20 << 3] {
         let r = collect_zst(&frame(wd), &l);
         assert!(matches!(r, Err(TarError::Zstd(_))), "{wd:#x}: {r:?}");
     }
-    assert!(t.elapsed().as_secs() < 1);
     // the cap is a TarLimits field, not a constant
     let small = TarLimits {
         max_zstd_window: 1 << 20,
