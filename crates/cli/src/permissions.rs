@@ -8,7 +8,7 @@
 use crate::CmdError;
 use crate::safe::{json_safe, safe, safe_lines};
 use rt_core::AppEnv;
-use rt_sandbox::{Access, GrantCtx, Network, Permissions, load_opt, reset, store};
+use rt_sandbox::{Access, GrantCtx, Network, Permissions, account_home, load_opt, load_opt_raw, reset, store};
 use std::path::PathBuf;
 
 fn ctx() -> Result<GrantCtx, CmdError> {
@@ -16,19 +16,35 @@ fn ctx() -> Result<GrantCtx, CmdError> {
         .map(PathBuf::from)
         .filter(|h| h.is_absolute())
         .ok_or("HOME is not set to an absolute path: cannot tell which directories are private")?;
+    // `$HOME` is the caller's word: the account's real home (password database) is protected too.
+    let extra_homes = account_home().into_iter().filter(|h| *h != home).collect();
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute());
     Ok(GrantCtx {
         home,
+        extra_homes,
         data_root: rt_core::data_root()?,
+        runtime_dir,
     })
 }
 
-/// The profile with every `--set` applied in order; nothing is written.
+/// A profile that cannot be read is fixed by deleting it.
+fn reset_hint(env: &AppEnv, e: rt_sandbox::PermError) -> CmdError {
+    format!("{e}; `runtime permissions {} --reset` deletes the profile", env.id()).into()
+}
+
+/// The profile with every `--set` applied in order; nothing is written. The stored profile is read WITHOUT
+/// checking its grants against the host, so `fs-=` can remove a grant whose directory is gone; what remains (and
+/// every added grant) is validated before it is returned.
 fn apply(env: &AppEnv, sets: &[String], ctx: &GrantCtx) -> Result<Permissions, CmdError> {
-    let mut p = load_opt(env.root(), ctx)?.unwrap_or_default();
+    let mut p = load_opt_raw(env.root())
+        .map_err(|e| reset_hint(env, e))?
+        .unwrap_or_default();
     for s in sets {
         p.apply_set(s, ctx)?;
     }
-    Ok(p)
+    p.validated(ctx).map_err(|e| reset_hint(env, e))
 }
 
 fn show(p: &Permissions, source: &str, json: bool) -> Result<(), CmdError> {
@@ -57,7 +73,7 @@ pub fn run(app: &str, sets: &[String], reset_it: bool, json: bool) -> Result<(),
     let env = crate::deps::app_env(&store_, app)?;
     let ctx = ctx()?;
     if sets.is_empty() && !reset_it {
-        let p = load_opt(env.root(), &ctx)?;
+        let p = load_opt(env.root(), &ctx).map_err(|e| reset_hint(&env, e))?;
         let source = if p.is_some() { "permissions.toml" } else { "default" };
         return show(&p.unwrap_or_default(), source, json);
     }

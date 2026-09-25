@@ -3,5 +3,6 @@
 pub mod permissions;
 
 pub use permissions::{
-    Access, FsGrant, GrantCtx, Network, PermError, Permissions, Refusal, load, load_opt, reset, store, validate_grant,
+    Access, FsGrant, GrantCtx, Network, PermError, Permissions, Refusal, account_home, load, load_opt, load_opt_raw,
+    reset, store, validate_grant, validate_grant_for,
 };

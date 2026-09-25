@@ -62,9 +62,11 @@ runtime permissions game --reset                          # back to the default;
 
 The default is no network, no host directories, and display, audio and gpu on. The profile is stored in the app's
 own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute
-path; symlinks are resolved and the target is judged. `$HOME`, `/`, the runtime's data directory, `~/.ssh`,
+directory (never a socket or file); symlinks are resolved and the target is judged. `$HOME`, `/`, the runtime's data directory, `~/.ssh`,
 `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.password-store` (and anything containing or
-inside them), `/proc`, `/sys`, `/dev` and `/run/user` are always refused. (The run sandbox that enforces the profile
+inside them, for `$HOME` and the account's real home), `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp` itself,
+`/tmp/.X11-unix` and `$XDG_RUNTIME_DIR` are always refused, and `rw` is refused on `/etc`, `/usr`, `/var`, `/opt` and
+the other system trees (`ro` is allowed). (The run sandbox that enforces the profile
 arrives with the next tasks of Phase 5A.)
 
 ## Dependencies (`runtime deps`)
