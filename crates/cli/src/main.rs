@@ -1,4 +1,5 @@
 mod analyze;
+mod compat;
 mod deps;
 mod display;
 mod doctor;
@@ -122,6 +123,14 @@ enum Cmd {
     /// Show what the host's graphics stack offers (`runtime graphics info`)
     #[command(subcommand)]
     Graphics(GraphicsCmd),
+    /// Show the compatibility matrix: what was really run, on which Wine, and how it went (needs no Wine or
+    /// network). The same table is `docs/COMPAT.md`.
+    Compat {
+        /// Machine-readable output: an array of {app, version, status, wine, gpu, graphics, evidence, notes}
+        /// (absent optional fields are null)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the newest log of an app (its last run's stderr)
     Logs {
         app: String,
@@ -192,6 +201,7 @@ fn main() -> ExitCode {
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
         Cmd::Deps(args) => deps::run(args),
         Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
+        Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };
     match result {

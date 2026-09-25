@@ -1,0 +1,51 @@
+# The compatibility matrix: what was really run, on which Wine, with what result. One [[record]] per observation.
+# Rules (checked by `Compat::parse`, and by a test on this very file): `evidence` is `ci:<job>` (a CI job that ran it)
+# or `manual:<YYYY-MM-DD>` and is required for works/partial/broken; `gpu` is required when `graphics = true`; no two
+# records share (app, version, wine, gpu). Add only what someone actually ran; do not guess.
+# After editing, regenerate the published table:
+#   cargo run -q -p runtime-cli -- compat > docs/COMPAT.md
+# (the test `compat_md_matches_records` fails until you do).
+
+# Everything below is run headlessly by the `wine-e2e` CI job (ubuntu:26.04, distro Wine 10.0, no GPU).
+
+[[record]]
+app = "hello64.exe (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "runtime install + run of a 64-bit console program: prints its greeting, exits 7 (e2e_mvp_loop)"
+
+[[record]]
+app = "hello32.exe (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "runtime run of a 32-bit (WoW64) console program: prints its greeting, exits 7; app recorded as x86"
+
+[[record]]
+app = "fs64.exe (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "file probe: an app reads back what it wrote, a second app's prefix does not see it, no Z: drive"
+
+[[record]]
+app = "hello-nsis.exe (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "NSIS installer run silently: installs, .desktop entry, program auto-discovered and run (exit 7), uninstalled"
+
+[[record]]
+app = "hello.msi (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "MSI installer run silently through msiexec: installs, .desktop entry, program run (exit 7), uninstalled"
+
+[[record]]
+app = "exports64.dll in a zip/tar.gz package (fixture)"
+status = "works"
+wine = "10.0"
+evidence = "ci:wine-e2e"
+notes = "dependency archive install into system32, byte-identical, with a native,builtin DLL override set via reg.exe"

@@ -89,6 +89,13 @@ package upgrades (a newer pinned version is refused: recreate the app) and no re
 the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
 left alone: the runtime neither installs it nor sets its DLL overrides (`deps` and `doctor` say so).
 
+## Compatibility (`runtime compat`)
+
+`runtime compat [--json]` prints the compatibility matrix: only what was really run (a CI job or a dated manual
+check), on which Wine, with what result; it needs no Wine, store or network. The same table is
+[docs/COMPAT.md](docs/COMPAT.md), generated from `crates/cli/compat.toml` (a test fails when they differ;
+regenerate with `cargo run -q -p runtime-cli -- compat > docs/COMPAT.md`).
+
 ## Requirements
 
 - Linux on x86-64 with **Wine 10** (`wine64` or `wine`, and `wineserver`; on Debian/Ubuntu `apt install wine`).
