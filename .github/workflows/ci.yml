@@ -36,27 +36,41 @@ jobs:
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
-  # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: only the console
-  # fixtures run (hello*.exe, fs*.exe); the GUI fixture gui64.exe opens a modal dialog and is never executed.
-  # NOTE: this job has NOT yet run on a real GitHub runner (written and checked locally against Wine 10.0 on
-  # Linux only). ubuntu-latest may ship Wine 9 (`wineserver64`, no new WoW64): the tests then skip their 32-bit
-  # steps with a `SKIPPED 32-bit` message. `continue-on-error` keeps a failure here from blocking a pull request
-  # until one green run on a real runner shows the job is stable; then remove it.
+  # Real-Wine end-to-end tests (`#[ignore]`d, so the `test` job never runs them). HEADLESS: no display. The GUI
+  # fixture gui64.exe runs only as the dependency engine's "hanging installer" (its message box waits on Wine's
+  # null-driver desktop until the 20 s deadline kills the sandbox); the other fixtures are console programs.
+  #
+  # THIS JOB HAS NEVER RUN ON A HOSTED RUNNER AND DOES NOT GATE ANYTHING (`continue-on-error`). Everything in it was
+  # verified only locally, on Ubuntu 26.04 with its own Wine 10.0 (10.0~repack-12ubuntu1) and bubblewrap 0.11.1.
+  # Remove `continue-on-error` only after green hosted runs show it is stable.
+  #
+  # Why a container: the real-Wine tests need Wine 10 (the dependency tests refuse anything older up front), and
+  # `ubuntu-latest` (24.04) ships Wine 9. WineHQ's own packages are NOT used on purpose: they install Wine under
+  # `/opt/wine-*`, which the installer sandbox does not bind (only `/usr`, `/bin`, `/lib*`, `/etc/alternatives`
+  # and the backend's DLL directories, see docs/SECURITY.md), so every sandboxed installer run would fail for a
+  # reason unrelated to the code under test. The job therefore runs in the Ubuntu 26.04 image, whose distro Wine
+  # 10 is exactly the packaging the tests were verified with. `--privileged` lets bubblewrap create its
+  # namespaces inside the container (unprivileged user namespaces are blocked by Docker's default seccomp
+  # profile). The container runs as root; that the real-Wine tests all behave the same as root is unverified.
   wine-e2e:
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 30
+    timeout-minutes: 45
+    container:
+      image: ubuntu:26.04
+      options: --privileged
     env:
       WINEDEBUG: "-all"
+      DEBIAN_FRONTEND: noninteractive
     steps:
+      # `git` and `curl`/`ca-certificates` for the checkout and toolchain actions, `build-essential` for ring's C
+      # code. Task 8's real-Wine installer e2e tests (`e2e_installers.rs`) need `nsis` (makensis) and `wixl` (a
+      # SEPARATE apt package from `msitools`) to build `hello.msi`/`hello-nsis.exe`/`hello-nsis-noshortcut.exe`,
+      # `bubblewrap` for the installer sandbox, and `desktop-file-utils` (`desktop-file-validate`) for the
+      # `.desktop`-entry checks, matching the `test` job's convention.
+      - run: apt-get update && apt-get install -y git curl ca-certificates build-essential mingw-w64 wine wine64 nsis msitools wixl bubblewrap desktop-file-utils
       - uses: actions/checkout@v4
-      # Task 8's real-Wine installer e2e tests (`e2e_installers.rs`) need `nsis` (makensis) and `wixl`
-      # (a SEPARATE apt package from `msitools` on this system's split, confirmed by this session's own
-      # install history and by `tools/build-fixtures.sh`'s own error hint: "sudo apt install msitools
-      # wixl") to build `hello.msi`/`hello-nsis.exe`/`hello-nsis-noshortcut.exe`, `bubblewrap` for the
-      # installer sandbox (`rt_installer::sandbox`), and `desktop-file-utils` (`desktop-file-validate`) for the
-      # `.desktop`-entry checks, matching the `test` job's already-established convention.
-      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64 nsis msitools wixl bubblewrap desktop-file-utils
+      - run: wine --version
       - uses: dtolnay/rust-toolchain@stable
       - run: tools/build-fixtures.sh
       # Only the crates with real-Wine tests: `--workspace --ignored` would also run the runtime-pe oracle tests,
@@ -67,6 +81,20 @@ jobs:
       # the `test` job's own convention (Tasks 6/7's fix rounds), so a runner missing either tool fails loudly
       # instead of the installer-pipeline/`.desktop` tests silently skip-and-passing.
       - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1 --nocapture
+        env:
+          RUNTIME_REQUIRE_BWRAP: "1"
+          RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
+      # The dependency engine's real-Wine tests (Phase 4A Tasks 5/6/8: archive install + DLL override via reg.exe,
+      # sandboxed NSIS installer with file and registry markers, exe installers on the null-driver desktop: exact
+      # arguments, marker-only failure, deadline kill; fixtures `exports64.dll`/`dep-installer.exe`/`fs64.exe`/
+      # `gui64.exe` come from `tools/build-fixtures.sh` above). The `e2e_real_wine` filter keeps out the other
+      # ignored tests of this crate, which need the internet: `real_download_smoke` and every `real_net_*` test
+      # (they download the bundled packages; the weekly `verify-pins.yml` workflow re-fetches the pins instead).
+      # The filter also selects the orchestrator-level e2e (`orchestrate::tests::e2e::e2e_real_wine_*`: consent,
+      # denied/tampered downloads against the local HTTPS test server, second run, killed-install discard, app
+      # removal, installer-registered service kept in the sandbox). These tests check the Wine version first and
+      # FAIL up front with a clear message on Wine < 10 (they were verified on Wine 10.0 only).
+      - run: cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1 --nocapture
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"

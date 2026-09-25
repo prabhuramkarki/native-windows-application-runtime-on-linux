@@ -194,16 +194,9 @@ impl Snapshot {
 /// silent (not every app has a `user.reg`, and a fresh env has neither); an oversized or unreadable one is
 /// reported as a warning on `registry`, never a panic and never a partial read of a huge file.
 fn read_hive(path: &Path, hive: &str, registry: &mut WineReg) {
-    let bytes = match read_capped(path) {
-        Ok(Some(bytes)) => bytes,
+    let parsed = match read_reg_file(path) {
+        Ok(Some(parsed)) => parsed,
         Ok(None) => return, // does not exist: fine, nothing to add
-        Err(why) => {
-            registry.warnings.push(format!("{}: {why}", path.display()));
-            return;
-        }
-    };
-    let parsed = match WineReg::parse(&bytes) {
-        Ok(parsed) => parsed,
         Err(why) => {
             registry.warnings.push(format!("{}: {why}", path.display()));
             return;
@@ -214,6 +207,16 @@ fn read_hive(path: &Path, hive: &str, registry: &mut WineReg) {
     }
     registry.warnings.extend(parsed.warnings);
     registry.truncated |= parsed.truncated;
+}
+
+/// One Wine `.reg` file (`system.reg`/`user.reg`), read with [`read_capped`]'s bounds and parsed with
+/// [`WineReg::parse`]; key paths are as the file spells them (no hive prefix). `Ok(None)`: it does not exist (or
+/// is not a regular file). `Err`: it exists but is too large or unreadable (the text names why, not the path).
+pub fn read_reg_file(path: &Path) -> Result<Option<WineReg>, String> {
+    match read_capped(path)? {
+        None => Ok(None),
+        Some(bytes) => WineReg::parse(&bytes).map(Some).map_err(|e| e.to_string()),
+    }
 }
 
 /// `Ok(Some(bytes))`: the file was read whole (at most [`MAX_REG_FILE_BYTES`]). `Ok(None)`: it does not exist.

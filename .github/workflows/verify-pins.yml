@@ -1,0 +1,18 @@
+name: verify-pins
+# Pin rot check: re-downloads every package in the BUNDLED manifest (crates/deps/packages.toml) through the real
+# fetcher and checks its pinned sha256 and size. Network only, no Wine. A failure means an upstream file moved or
+# changed: the runtime then refuses to install it (safe), and the manifest needs a release-time refresh.
+on:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, Monday 04:17 UTC
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  refetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p runtime-deps --lib -- --ignored real_net_bundled_packages_refetch_and_match --nocapture

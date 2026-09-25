@@ -9,6 +9,7 @@ mod lnk;
 mod msi;
 mod pipeline;
 mod reg;
+mod run;
 mod sandbox;
 mod snapshot;
 mod uninstall;
@@ -18,9 +19,11 @@ pub use family::{InstallerFamily, PlanError, Program, RunPlan, SilentFlags, plan
 pub use lnk::{LnkError, ShellLink};
 pub use msi::{MsiError, MsiInfo};
 pub use pipeline::{
-    INPUT_CAP, InstallOutcome, InstallerError, InstallerOpts, install_via_installer, looks_like_installer,
+    INPUT_CAP, InstallOutcome, InstallerError, InstallerOpts, MSIEXEC_RELATIVE, install_via_installer,
+    looks_like_installer,
 };
 pub use reg::{RegError, RegKey, RegValue, WineReg};
+pub use run::{run_sandboxed, stage_file};
 pub use sandbox::{InstallerSandbox, RO_BINDS, SandboxOpts, find_bwrap, find_bwrap_on_path};
-pub use snapshot::{InstallDiff, Snapshot, UninstallEntry};
+pub use snapshot::{InstallDiff, Snapshot, UninstallEntry, read_reg_file};
 pub use uninstall::{UninstallOutcome, uninstall};

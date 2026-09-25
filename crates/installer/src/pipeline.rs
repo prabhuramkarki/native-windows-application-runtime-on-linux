@@ -48,17 +48,21 @@ use crate::discover::{Candidate, RankResult, exe_in, rank};
 use crate::family::{self, PlanError, Program};
 use crate::lnk::ShellLink;
 use crate::msi::{MsiError, MsiInfo};
-use crate::sandbox::{InstallerSandbox, SandboxOpts, find_bwrap_on_path};
+use crate::run::{run_sandboxed, stage_file};
+use crate::sandbox::{SandboxOpts, find_bwrap_on_path};
 use crate::snapshot::{InstallDiff, Snapshot, UninstallEntry};
 use rt_core::{
-    AppEnv, AppId, BackendError, BackendInfo, CompatBackend, InstallerMeta, LaunchError, Launcher, LogSink,
-    MAX_FIELD_LEN, MAX_NAME_LEN, MetaError, Metadata, ResolveError, RunOpts, Store, StoreError, WinPath, WinPathError,
-    is_format, join_new, resolve_under, unique_id,
+    AppEnv, AppId, BackendError, BackendInfo, CompatBackend, InstallerMeta, LaunchError, Launcher, MAX_FIELD_LEN,
+    MAX_NAME_LEN, MetaError, Metadata, ResolveError, Store, StoreError, WinPath, WinPathError, is_format,
+    resolve_under, unique_id,
 };
+// Only the tests (`use super::*`) still name it; the run itself moved to `crate::run`.
+#[cfg(test)]
+use rt_core::RunOpts;
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 /// Largest installer file this pipeline reads whole into memory. Matches `rt_core::install::INPUT_CAP`
@@ -74,7 +78,7 @@ const INSTALLER_STAGING_DIR: &str = "C:\\Windows\\Temp\\rt-installer";
 /// `msiexec.exe`'s fixed location in every Wine prefix (verified for real: `WINEPREFIX=<tmp> WINEARCH=win64
 /// wine wineboot -u` on Wine 10.0/Ubuntu creates exactly this file). See Ruling 2 in the task brief. Also used
 /// by `crate::uninstall` (an `UninstallString` of `MsiExec.exe /X{GUID}` needs the same resolution).
-pub(crate) const MSIEXEC_RELATIVE: &str = "windows/system32/msiexec.exe";
+pub const MSIEXEC_RELATIVE: &str = "windows/system32/msiexec.exe";
 
 /// What the caller asked for. `silent`/`allow_network` default OFF ("default = show installer GUI", matching
 /// the task brief and this project's stance that Phase 3's target is offline-only installers).
@@ -364,31 +368,12 @@ fn single_component_file_name(path: &Path) -> Result<String, InstallerError> {
     }
 }
 
-/// Copies the installer file to [`INSTALLER_STAGING_DIR`] inside `drive_c`, the same containment-safe way Phase
-/// 2's `install::place` copies a portable exe: `join_new` (refuses a symlink at any existing component),
-/// `create_new` (never overwrites, never follows a symlink at the destination itself). Returns the placed file's
+/// Copies the installer file to [`INSTALLER_STAGING_DIR`] inside `drive_c` with [`crate::run::stage_file`] (the
+/// same containment-safe way Phase 2's `install::place` copies a portable exe). Returns the placed file's
 /// `WinPath`, which is what is actually run (never anything outside `drive_c`).
 fn place_installer_file(env: &AppEnv, path: &Path, bytes: &[u8]) -> Result<WinPath, InstallerError> {
     let file_name = single_component_file_name(path)?;
-    let drive_c = env.drive_c();
-    let dir = WinPath::parse(INSTALLER_STAGING_DIR).expect("INSTALLER_STAGING_DIR is a fixed, valid WinPath");
-    let dest_dir = join_new(&drive_c, &dir)?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(&dest_dir)
-        .map_err(io_err("cannot create the installer staging directory"))?;
-    let dest_winpath = WinPath::parse(&format!("{INSTALLER_STAGING_DIR}\\{file_name}"))?;
-    let dest = join_new(&drive_c, &dest_winpath)?;
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(&dest)
-        .map_err(io_err("cannot create the installer file"))?;
-    out.write_all(bytes)
-        .map_err(io_err("cannot write the installer file"))?;
-    Ok(dest_winpath)
+    stage_file(env, INSTALLER_STAGING_DIR, &file_name, &mut &bytes[..])
 }
 
 // ---------------------------------------------------------------- stage 6: run it, sandboxed
@@ -427,19 +412,10 @@ fn run_installer_process(
         allow_network: opts.allow_network,
         extra_ro_binds: backend.dll_dirs(),
     };
-    let sandboxed = launcher
-        .clone()
-        .with_sandbox(InstallerSandbox::new(bwrap).for_launcher(env.clone(), sandbox_opts));
-
-    let cmd = backend.command(env, &exe_unix, &drive_c, &args, &RunOpts::default())?;
-    // Wrapped BEFORE the sandbox sees it (`CompatBackend::settle`'s own docs): a `--unshare-pid` sandbox kills a
-    // lingering `wineserver` the instant its direct child exits, so the wait for it has to happen inside the
-    // same process tree, not as a follow-up call after `spawn`/`wait` returns.
-    let cmd = backend.settle(cmd);
-    let running = sandboxed.spawn(cmd, env, LogSink::LogOnly)?;
-    let status = running
-        .wait()
-        .map_err(io_err("cannot wait for the installer process"))?;
+    // No deadline (`None`): an interactive installer GUI may take as long as the user needs, so `Ok(None)`
+    // (deadline reached) cannot happen; mapped defensively rather than unwrapped.
+    let status = run_sandboxed(backend, launcher, env, &bwrap, &exe_unix, &args, sandbox_opts, None)?
+        .ok_or_else(|| io_err("cannot wait for the installer process")(io::ErrorKind::TimedOut.into()))?;
 
     let mut warnings = Vec::new();
     if !status.success() {

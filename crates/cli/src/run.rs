@@ -12,7 +12,7 @@ use crate::CmdError;
 use crate::SANDBOX_NOTE;
 use crate::install::report_on_stderr;
 use crate::safe::warn;
-use rt_core::{InstallOutcome, Launcher, RunAppError, RunOptions, RunOutcome, Started};
+use rt_core::{InstallOutcome, Launcher, RunAppError, RunOptions, RunOutcome, Started, Target};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -22,10 +22,20 @@ pub fn run(target: &str, args: &[OsString], debug: bool) -> Result<u8, CmdError>
     let store = crate::store()?;
     // An unknown id or a missing file is reported as that, not as a missing Wine: look for Wine only when the
     // target needs it.
-    rt_core::find_target(&store, target, Path::new("."))?;
+    let found = rt_core::find_target(&store, target, Path::new("."))?;
     let backend = crate::backend(&launcher)?;
+    // An installed app is started under a SHARED hold of its dependency lock: refused while a dependency install
+    // (or a removal) holds it exclusively, and an install cannot start until the app is running (then its
+    // running-wineserver check refuses). Dropped once the app is started: the fd is close-on-exec, so the app
+    // never inherits it. No missing-dependency hint here: it would read the whole executable on every start
+    // (`install` and `doctor` show it).
+    let deps_lock = match &found {
+        Target::Installed(id) => crate::deps::lock_or_refuse(&store.get(id)?, true, "start")?,
+        Target::File(_) => None,
+    };
     eprintln!("{SANDBOX_NOTE}");
     let started = rt_core::start(&store, &backend, &launcher, target, args, &RunOptions { debug })?;
+    drop(deps_lock);
     let outcome = report_and_wait(started, report_on_stderr)?;
     if outcome.log_write_failed {
         warn(&format!(

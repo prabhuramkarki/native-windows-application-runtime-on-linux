@@ -18,7 +18,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub(crate) mod text;
-pub(crate) mod unzip;
+pub mod unzip;
 pub mod winpath;
 
 pub use backend::{BackendError, CompatBackend, Detail, RunOpts, allowed_env};
@@ -29,7 +29,8 @@ pub use id::{AppId, IdError};
 pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, install, read_input};
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{
-    BackendInfo, InstallerMeta, MAX_FIELD_LEN, MAX_NAME_LEN, MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
+    BackendInfo, ConsentRecord, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN, MAX_NAME_LEN,
+    MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
 };
 pub use proc::{HelperOutput, RunError};
 pub use run::{

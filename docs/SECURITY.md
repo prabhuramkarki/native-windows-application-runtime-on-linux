@@ -310,6 +310,119 @@ through both together. Three things surfaced that were not previously visible:
   does not normalise doubled separators (`C:\App\\app.exe`) or 8.3 short names (`C:\PROGRA~1\...`), so such
   registry values match nothing.
 
+## Dependency downloads (Phase 4A)
+
+`runtime deps <app> --install` is the runtime's first network access and the only command that downloads anything
+(`crates/deps`, `rt_deps`). `install`, `run` and `doctor` never download; at most they print a one-line hint. They
+never call the fetch code (`missing_hint` takes no fetcher), although it is linked into the same binary.
+
+**Where the guarantees live.** The library pieces `fetch::fetch`, `install_archive::install_archive` and
+`install_installer::install_installer_pkg` are building blocks: they verify what they are given but ask for no
+consent and take no lock. The consent guarantee, the lock, the busy-prefix check and the recording are
+`orchestrate::install_plan`'s and the CLI's (`runtime deps`); any other caller of the building blocks must provide
+them itself.
+
+**Trust model.** The network, the downloaded file and the vendor installer inside it are untrusted. The only trusted
+input is the manifest `crates/deps/packages.toml`, compiled into the binary with `include_str!`: there is no remote
+manifest, no user manifest, and no flag or environment variable that points the runtime at another one (tests inject
+theirs through the library, never through the CLI). Updating a pin is a release task. Parsing is strict (unknown
+fields, duplicate ids, cycles, non-`https` urls, malformed sha256, unknown references, overlapping destinations and a
+url whose path names a sha256 other than the package's are errors), and the same checks run as a test over the real
+bundled manifest, which also refuses placeholder-looking pins.
+
+**What is verified.**
+- **The file itself: sha256 and exact size from the manifest.** The hash is computed while streaming; a mismatch
+  deletes the temp file and fails hard. There is no retry and no fallback. Only then is the file renamed to
+  `<data>/deps-cache/<sha256>` and made read-only (`0400`).
+- **HTTPS only**, checked before any connection; every redirect must stay HTTPS; at most 3 redirects.
+- **Byte cap = the manifest size.** The connection is aborted as soon as more bytes arrive, and a short body fails
+  too. `Content-Length` is never trusted on its own; an unsolicited `Content-Encoding` is hashed as served (and fails).
+- **Deadlines.** Connect timeout 10 s, a per-read stall timeout of 20 s, and an absolute total deadline that every
+  redirect hop, TLS handshake, header and body read shares (a peer dribbling the handshake a byte at a time is cut off
+  too): 300 s plus one second per 32 KiB of the package, at most one hour (1082 s for the 25 MB VC++ redistributable,
+  so a slow but steady link of about 24 KB/s still finishes; a dead one is cut off by the stall timeout). Proxies
+  from the environment are ignored.
+- **Cache hits are re-verified** (size and sha256) before use, never trusted; a corrupt entry is deleted. The cache
+  directory must be a real directory owned by the user and not group- or world-writable; temp files are `0600`,
+  `O_EXCL`, and removed on every error path.
+- **Hostile archives.** Zip goes through the Phase 2 hardened `rt_core::unzip`; `tar.gz` through a small bounded tar
+  reader (caps on entries, names and sizes; no symlinks, hardlinks or devices; no absolute or `..` names). Only the
+  manifest's `extract` pairs are written, each resolved under `drive_c` without following symlinks, and DLL overrides
+  are written only for names the package `provides`. Every file written, replaced (backed up in `<app>/deps-backup`)
+  or created is journalled before it is touched, so what a killed install did to files and directories can be
+  undone (`runtime deps <app> --discard-interrupted <pkg>`). Not exactly everything: DLL overrides are not journalled
+  (an override a killed run already set stays), and a restored original comes back with mode `0644`, not the mode it
+  had (Wine creates its placeholders `0664`); its bytes are restored exactly.
+- **Installer packages run only in the installer sandbox, offline** (`allow_network = false`, always; see "Installer
+  sandbox" above), from a copy staged in `drive_c` and re-hashed there, with a 20-minute deadline, on a one-run
+  null-driver desktop (`explorer.exe /desktop=...,null`). The staged copy is removed afterwards by re-resolving its
+  path, so a symlink the installer planted is never followed. The runtime's own steps right after the installer (its
+  `reg.exe` runs that set, and on failure delete, the package's DLL overrides) run in the same sandbox, offline too
+  (Ruling 17): the Wine session they start also starts whatever the installer registered (auto-start services and
+  the like). Real-Wine test: an "installer" that registers an auto-start service writing to a host directory; the
+  override step leaves the host file unwritten, and a plain Wine session afterwards writes it (the control).
+- Real-Wine end-to-end tests (`e2e_real_wine_*` in `crates/deps`) check these outcomes against the local HTTPS test
+  server: a tampered download installs nothing and leaves no cache file, a denied package is never requested, a
+  second run downloads nothing, and removing the app leaves nothing of it. They have been run locally only (Wine
+  10.0 on Ubuntu 26.04). CI's `wine-e2e` job is written to run them but has NEVER run on a hosted runner and does not
+  gate anything (`continue-on-error`).
+
+**Consent.** Packages whose licence is not permissive (`proprietary-redistributable`) need consent, per package and per
+version. The prompt shows the package id, version, licence LABEL, url, size and sha256; the consent record in
+`metadata.json` stores a hash of exactly that text, so a different version, url or hash means earlier consent does not
+count. A bare `--yes` is rejected; `--yes <pkg>` must name a consent-gated package of the plan, and its text is still
+printed. With no terminal and no `--yes`, the answer is no. A denied package, and everything that needs it, is skipped
+and never downloaded. Permissive packages (DXVK) need no consent but still need an explicit `--install`.
+
+**What is NOT verified, or not prevented** (read this before trusting a package install):
+- **The vendor installer's behaviour.** The sha256 pin proves which file was staged, nothing about what it does. The
+  sandbox bounds what it can touch (its own prefix, read-write); inside the prefix it can do anything, including
+  registering programs that Wine starts on its own later (services, `RunOnce` entries, ...). **Only the runtime's own
+  steps are sandboxed.** Any later Wine session in the prefix outside the sandbox, `runtime run` above all (and the
+  `reg.exe` runs that set an ARCHIVE package's overrides), starts whatever a vendor installer registered, unsandboxed,
+  with the user's network and files, exactly like the app itself. Success is judged
+  by the package's marker (a file or registry value), which is the installer's own claim: a hostile installer can
+  write it and exit. The exit status of an exe installer is not even visible (the desktop wrapper exits 0), so marker
+  presence is the ONLY success signal. `explorer.exe`, `msiexec.exe` and `reg.exe` are whatever the prefix holds, not
+  pinned: a program that earlier planted a native copy there could fake a marker or an override.
+- **EULA acceptance on the user's behalf.** A vendor's silent installer accepts the vendor's own licence terms. The
+  prompt says so, but the terms themselves are not shown (the manifest carries only a licence label); the user reads
+  them at the vendor.
+- **Path-based operations (TOCTOU).** Extraction, backups, removal and staging check and use paths, not held
+  directory descriptors; `O_NOFOLLOW` covers only the last component. A process running inside `drive_c` at the same
+  time could race a check and redirect a write or delete. Today apps are not sandboxed anyway (they can reach the host
+  directly): the prefix hardening removes the `Z:` drive, but NT paths like `\\?\unix\...` still reach any host file
+  of the same user, so `deps-backup` is reachable from inside the prefix too. Before Phase 5 makes the prefix a boundary, these must move to `openat`/`renameat`/`unlinkat` against
+  held parent descriptors.
+- **Busy-prefix and lock limits.** An install refuses while any `wineserver` serves the prefix (checked before the
+  download and again before installing) and holds `<app>/deps.lock` exclusively. `run` holds the lock shared only
+  while it starts the app and releases it once the app has started; after that the running-`wineserver` check is what
+  refuses an install. Detection is a `/proc` scan by `WINEPREFIX` and Wine's server directory: a program started
+  another way can be missed. If `deps.lock` cannot be locked by anyone (a symlink or directory in its place, or a file
+  system without `flock`: `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`), `run`, `remove` and `uninstall` warn and continue, and
+  dependency installs refuse.
+- **Wine builtin versus native DLLs.** A DLL in `system32` is not necessarily loaded: Wine prefers its own builtins for
+  many names. Each package declares its `dll_overrides`, set to `native,builtin` in `HKCU\Software\Wine\DllOverrides`
+  through the prefix's `reg.exe` (for an installer package in the installer sandbox, for an archive package through
+  the backend like any Wine helper). There is no per-DLL policy beyond that list, and overrides are never removed
+  (there is no dependency removal).
+- **Dependencies of a denied package still install** (spec rule: only the denied package and what needs it are
+  skipped).
+- **Upgrades are not supported.** A package recorded at another version or sha256 is refused before any download;
+  the user recreates the environment to get the new version.
+- **Recorded state is the runtime's own record**, never inferred from the prefix. An installer package whose marker is
+  already present (usually from the app's own installer) is skipped and not recorded, and the runtime sets NONE of
+  its DLL overrides (Ruling 18): Wine may keep loading its builtin copies. `deps` and `doctor` say so; recreating the
+  environment is the only way to get the runtime's own install of it today.
+- **x64 only.** Archives install their 64-bit DLLs; a 32-bit app keeps Wine's builtins (the plan warns).
+
+**Residual risks.** A compromised upstream serving the pinned bytes cannot happen without breaking SHA-256; a
+compromised upstream serving other bytes fails the pin (safe, but the package cannot be installed until a release
+refreshes it; the weekly `verify-pins` workflow notices). TLS uses rustls with the bundled Mozilla roots: frozen at
+build time, no revocation checks, system and enterprise CAs ignored (a TLS-intercepting proxy fails closed); TLS is
+defence in depth behind the pin. The trust placed in a pinned vendor installer is trust in the vendor. The download
+cache is shared by all apps of the user and trusted only after re-verification.
+
 ## Roadmap
 
 Phase 5 adds the actual boundary for ordinary app runs, not just installer helpers: run Wine itself inside

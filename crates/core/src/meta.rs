@@ -22,12 +22,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The schema version this crate writes.
-pub const SCHEMA_VERSION: u32 = 2;
-/// The oldest schema version this crate still reads. Schema 1 (Phase 2) had no `installer` field; it deserialises
-/// fine into today's `Metadata` because `installer` is `#[serde(default)]`, so `1..=SCHEMA_VERSION` is accepted
-/// rather than exact equality. There is no other shape difference between 1 and 2 yet, so no field-by-field
-/// migration code exists: `installer: None` for a v1 file already IS its correct v2 reading.
+pub const SCHEMA_VERSION: u32 = 3;
+/// The oldest schema version this crate still reads, so `MIN_SCHEMA_VERSION..=SCHEMA_VERSION` is accepted. Each
+/// version only added a `#[serde(default)]` field: schema 1 (Phase 2) had no `installer` (added in 2), and neither
+/// 1 nor 2 has `dependencies` (added in 3). So no field-by-field migration code exists: `installer: None` and
+/// `dependencies: []` for an older file already ARE its correct v3 reading. Frozen v1/v2 bytes in the tests guard it.
 pub const MIN_SCHEMA_VERSION: u32 = 1;
+/// Most [`DependencyRecord`]s one app may record. The bundled manifest has about a dozen packages; the cap keeps a
+/// hostile file's validation cheap and a full list of realistic records well inside [`MAX_FILE_BYTES`].
+pub const MAX_DEPENDENCIES: usize = 128;
 /// Largest `metadata.json` that is read, in bytes.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// Longest `name`, in bytes.
@@ -60,6 +63,13 @@ pub enum MetaError {
     ExecutableIsRoot,
     #[error("executable must be in canonical form (`C:\\dir\\file.exe`: uppercase drive, backslashes, no `.` parts)")]
     NonCanonicalExecutable,
+    #[error("more than {MAX_DEPENDENCIES} dependency records")]
+    TooManyDependencies,
+    /// The id is not quoted: it is untrusted and could be long.
+    #[error("two dependency records have the same id")]
+    DuplicateDependency,
+    #[error("field `{field}` must be exactly 64 lowercase hex digits")]
+    BadSha256 { field: &'static str },
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }
@@ -90,6 +100,32 @@ pub struct InstallerMeta {
     pub uninstall_command: Option<String>,
 }
 
+/// A package the runtime itself installed into this app's environment (schema version 3). Written only by
+/// `rt_deps::state`; the prefix is never scanned to infer these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyRecord {
+    /// Manifest package id. Unique within [`Metadata::dependencies`].
+    pub id: String,
+    pub version: String,
+    /// Lowercase hex SHA-256 of the package file that was installed.
+    pub sha256: String,
+    /// Unix seconds.
+    pub installed_at: u64,
+    /// `Some` when the package needed consent and it was given.
+    pub consent: Option<ConsentRecord>,
+}
+
+/// Consent given for one package version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsentRecord {
+    /// Unix seconds.
+    pub given_at: u64,
+    /// Lowercase hex SHA-256 of the exact licence text that was shown.
+    pub licence_text_sha256: String,
+}
+
 /// The contents of `metadata.json`. The public fields make it easy to build; `serde` alone does not validate,
 /// so read and write only through [`Metadata::parse`], [`Metadata::read`] and [`Metadata::write_atomic`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,11 +148,22 @@ pub struct Metadata {
     /// so a schema-1 file (no `installer` key) still deserialises, as `None`.
     #[serde(default)]
     pub installer: Option<InstallerMeta>,
+    /// Packages installed for this app, sorted by id (schema version 3). `#[serde(default)]` so v1/v2 files read
+    /// as empty. At most [`MAX_DEPENDENCIES`], ids unique.
+    #[serde(default)]
+    pub dependencies: Vec<DependencyRecord>,
 }
 
 fn cap(field: &'static str, value: &str, max: usize) -> Result<(), MetaError> {
     if value.len() > max {
         return Err(MetaError::TooLong { field, max });
+    }
+    Ok(())
+}
+
+fn sha256_hex(field: &'static str, value: &str) -> Result<(), MetaError> {
+    if value.len() != 64 || !value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(MetaError::BadSha256 { field });
     }
     Ok(())
 }
@@ -205,6 +252,7 @@ impl Metadata {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
             installer: None,
+            dependencies: Vec::new(),
         }
     }
 
@@ -244,6 +292,21 @@ impl Metadata {
             }
             if let Some(u) = &installer.uninstall_command {
                 cap("installer.uninstallCommand", u, MAX_FIELD_LEN)?;
+            }
+        }
+        if self.dependencies.len() > MAX_DEPENDENCIES {
+            return Err(MetaError::TooManyDependencies);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.dependencies.len());
+        for d in &self.dependencies {
+            cap("dependencies.id", &d.id, MAX_FIELD_LEN)?;
+            cap("dependencies.version", &d.version, MAX_FIELD_LEN)?;
+            sha256_hex("dependencies.sha256", &d.sha256)?;
+            if let Some(c) = &d.consent {
+                sha256_hex("dependencies.consent.licenceTextSha256", &c.licence_text_sha256)?;
+            }
+            if !seen.insert(d.id.as_str()) {
+                return Err(MetaError::DuplicateDependency);
             }
         }
         Ok(())
@@ -291,6 +354,10 @@ impl Metadata {
     pub fn write_atomic(&self, path: &Path) -> Result<(), MetaError> {
         self.validate()?;
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        // Never persist what `read` would refuse: many long dependency records can pass `validate` yet exceed it.
+        if json.len() as u64 > MAX_FILE_BYTES {
+            return Err(MetaError::TooLarge);
+        }
         let dir = match path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
@@ -348,6 +415,7 @@ pub(crate) fn sample(id: &str) -> Metadata {
         subsystem: "gui".into(),
         created: 1_700_000_000,
         installer: None,
+        dependencies: Vec::new(),
     }
 }
 
@@ -389,7 +457,8 @@ mod tests {
         m.write_atomic(&path).unwrap();
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
-        for key in ["\"schemaVersion\": 2", "\"created\"", "\"backend\"", "\"executable\""] {
+        // New saves write schema 3 (the literal, not the constant, so a bump has to touch this test).
+        for key in ["\"schemaVersion\": 3", "\"created\"", "\"backend\"", "\"executable\""] {
             assert!(text.contains(key), "{key} missing in {text}");
         }
         let mut none_version = m.clone();
@@ -444,25 +513,29 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_accepts_1_and_2_and_rejects_everything_else() {
-        for v in [0u64, 3, 99, u64::MAX] {
+    fn schema_version_accepts_1_to_3_and_rejects_everything_else() {
+        for v in [0u64, 4, 99, u64::MAX] {
             let err = Metadata::parse(&with("schemaVersion", Some(serde_json::json!(v)))).unwrap_err();
             assert!(matches!(err, MetaError::SchemaVersion(n) if n == v), "{v}: {err:?}");
         }
         // Both ends of the supported range parse (the sample's own shape already carries `installer: None`).
-        for v in [1u64, 2] {
+        for v in [1u64, 2, 3] {
             let bytes = with("schemaVersion", Some(serde_json::json!(v)));
             Metadata::parse(&bytes).unwrap_or_else(|e| panic!("schemaVersion {v} should parse: {e}"));
         }
         // An unknown future version with a shape we do not know is still reported as the version.
-        let err = Metadata::parse(br#"{"schemaVersion":3,"totally":"different"}"#).unwrap_err();
-        assert!(matches!(err, MetaError::SchemaVersion(3)), "{err:?}");
-        let mut m = sample("app");
-        m.schema_version = 3;
-        assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(3))));
-        let mut m = sample("app");
-        m.schema_version = 1;
-        m.validate().unwrap();
+        let err = Metadata::parse(br#"{"schemaVersion":4,"totally":"different"}"#).unwrap_err();
+        assert!(matches!(err, MetaError::SchemaVersion(4)), "{err:?}");
+        for bad in [0u32, 4] {
+            let mut m = sample("app");
+            m.schema_version = bad;
+            assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(n)) if n == u64::from(bad)));
+        }
+        for good in [1, 2, 3] {
+            let mut m = sample("app");
+            m.schema_version = good;
+            m.validate().unwrap();
+        }
     }
 
     /// The migration proper: genuine OLD-shape bytes (schema version 1, no `installer` key at all — not merely a
@@ -928,5 +1001,297 @@ mod tests {
         mkfifo(&fifo);
         let err = within_10s(move || Metadata::read(&fifo)).unwrap_err();
         assert!(matches!(err, MetaError::NotRegular), "{err:?}");
+    }
+
+    // ---------------------------------------------------------------- Phase 4A Task 4: schema v3, dependencies
+
+    /// FROZEN: the exact bytes `Metadata::write_atomic` wrote at commit 06603d5 (branch `phase-2-wine-backend`,
+    /// schema 1) for `sample("my-app")`. Produced by running that revision's code, not today's. Never edit.
+    const FROZEN_V1: &str = r#"{
+  "schemaVersion": 1,
+  "id": "my-app",
+  "name": "Sample App",
+  "version": "1.2.3",
+  "architecture": "x86_64",
+  "executable": "C:\\Program Files\\Sample\\app.exe",
+  "environment": "default",
+  "backend": {
+    "id": "wine",
+    "version": "wine-10.0"
+  },
+  "subsystem": "gui",
+  "created": 1700000000
+}"#;
+
+    /// FROZEN: the exact bytes `Metadata::write_atomic` wrote at commit 0642d2a (`main` before Phase 4, schema 2)
+    /// for `sample("hello-nsis")` with an NSIS `installer` record. Produced by running that revision's code. Never
+    /// edit.
+    const FROZEN_V2: &str = r#"{
+  "schemaVersion": 2,
+  "id": "hello-nsis",
+  "name": "Sample App",
+  "version": "1.2.3",
+  "architecture": "x86_64",
+  "executable": "C:\\Program Files\\Sample\\app.exe",
+  "environment": "default",
+  "backend": {
+    "id": "wine",
+    "version": "wine-10.0"
+  },
+  "subsystem": "gui",
+  "created": 1700000000,
+  "installer": {
+    "family": "nsis",
+    "productName": "Hello NSIS",
+    "uninstallCommand": "\"C:\\Program Files\\hello\\uninstall.exe\" /S"
+  }
+}"#;
+
+    fn frozen_common(id: &str, schema_version: u32, installer: Option<InstallerMeta>) -> Metadata {
+        Metadata {
+            schema_version,
+            id: AppId::parse(id).unwrap(),
+            name: "Sample App".into(),
+            version: Some("1.2.3".into()),
+            architecture: "x86_64".into(),
+            executable: "C:\\Program Files\\Sample\\app.exe".into(),
+            environment: "default".into(),
+            backend: BackendInfo {
+                id: "wine".into(),
+                version: "wine-10.0".into(),
+            },
+            subsystem: "gui".into(),
+            created: 1_700_000_000,
+            installer,
+            dependencies: Vec::new(),
+        }
+    }
+
+    /// Parses `bytes` directly and through a real file with `Metadata::read`; both must agree.
+    fn parse_both_ways(bytes: &str) -> Metadata {
+        let direct = Metadata::parse(bytes.as_bytes()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), direct);
+        direct
+    }
+
+    #[test]
+    fn frozen_v1_bytes_read_with_no_installer_and_no_dependencies() {
+        assert!(!FROZEN_V1.contains("installer") && !FROZEN_V1.contains("dependencies"));
+        let m = parse_both_ways(FROZEN_V1);
+        assert_eq!(m, frozen_common("my-app", 1, None));
+        assert!(m.dependencies.is_empty());
+    }
+
+    #[test]
+    fn frozen_v2_bytes_read_with_their_installer_and_no_dependencies() {
+        assert!(!FROZEN_V2.contains("dependencies"));
+        let m = parse_both_ways(FROZEN_V2);
+        let installer = InstallerMeta {
+            family: "nsis".into(),
+            product_name: Some("Hello NSIS".into()),
+            uninstall_command: Some("\"C:\\Program Files\\hello\\uninstall.exe\" /S".into()),
+        };
+        assert_eq!(m, frozen_common("hello-nsis", 2, Some(installer)));
+        assert!(m.dependencies.is_empty());
+    }
+
+    const HASH_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const HASH_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    fn dep(id: &str) -> DependencyRecord {
+        DependencyRecord {
+            id: id.into(),
+            version: "14.40.33810".into(),
+            sha256: HASH_A.into(),
+            installed_at: 1_800_000_000,
+            consent: Some(ConsentRecord {
+                given_at: 1_799_999_999,
+                licence_text_sha256: HASH_B.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn v3_round_trip_preserves_dependency_records_in_camel_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        let mut m = sample("app");
+        m.installer = Some(InstallerMeta {
+            family: "msi".into(),
+            product_name: None,
+            uninstall_command: None,
+        });
+        let mut no_consent = dep("dxvk");
+        no_consent.consent = None;
+        m.dependencies = vec![no_consent, dep("vcrun2022")];
+        m.write_atomic(&path).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), m);
+        let text = fs::read_to_string(&path).unwrap();
+        for key in [
+            "\"schemaVersion\": 3",
+            "\"dependencies\"",
+            "\"installedAt\"",
+            "\"givenAt\"",
+            "\"licenceTextSha256\"",
+            "\"installer\"",
+        ] {
+            assert!(text.contains(key), "{key} missing in {text}");
+        }
+        // `consent` may be absent altogether, not just null.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            v["dependencies"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("consent")
+                .is_some()
+        );
+        assert_eq!(Metadata::parse(&serde_json::to_vec(&v).unwrap()).unwrap(), m);
+    }
+
+    #[test]
+    fn dependency_count_is_capped_on_write_and_read() {
+        let many = |n: usize| {
+            let mut m = sample("app");
+            m.dependencies = (0..n).map(|i| dep(&format!("p{i:04}"))).collect();
+            m
+        };
+        let full = many(MAX_DEPENDENCIES);
+        full.validate().unwrap();
+        // A full list of realistic records fits the read cap, so it is written and read back.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        full.write_atomic(&path).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), full);
+        let over = many(MAX_DEPENDENCIES + 1);
+        assert!(matches!(over.validate(), Err(MetaError::TooManyDependencies)));
+        let bytes = serde_json::to_vec(&over).unwrap();
+        assert!(matches!(Metadata::parse(&bytes), Err(MetaError::TooManyDependencies)));
+    }
+
+    #[test]
+    fn a_hundred_thousand_records_are_refused_by_the_file_cap_or_the_count_cap() {
+        let rec = serde_json::to_string(&dep("x")).unwrap();
+        let text = json(&sample("app"));
+        let list = format!("[{}]", vec![rec.as_str(); 100_000].join(","));
+        let hostile = text.replace("\"dependencies\":[]", &format!("\"dependencies\":{list}"));
+        assert_ne!(hostile, text, "the empty list must have been replaced");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        fs::write(&path, &hostile).unwrap();
+        assert!(matches!(Metadata::read(&path), Err(MetaError::TooLarge)));
+        // `parse` has no size cap of its own (read applies it); the count cap still refuses it.
+        assert!(matches!(
+            Metadata::parse(hostile.as_bytes()),
+            Err(MetaError::TooManyDependencies)
+        ));
+    }
+
+    #[test]
+    fn duplicate_dependency_ids_are_rejected() {
+        let mut m = sample("app");
+        m.dependencies = vec![dep("a"), dep("b"), dep("a")];
+        assert!(matches!(m.validate(), Err(MetaError::DuplicateDependency)));
+        let bytes = serde_json::to_vec(&m).unwrap();
+        assert!(matches!(Metadata::parse(&bytes), Err(MetaError::DuplicateDependency)));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        assert!(m.write_atomic(&path).is_err());
+        assert!(!path.exists());
+        m.dependencies.pop();
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn dependency_hashes_must_be_64_lowercase_hex() {
+        type Set = fn(&mut DependencyRecord, String);
+        let fields: [(&str, Set); 2] = [
+            ("dependencies.sha256", |d, s| d.sha256 = s),
+            ("dependencies.consent.licenceTextSha256", |d, s| {
+                d.consent.as_mut().unwrap().licence_text_sha256 = s
+            }),
+        ];
+        let bad = [
+            String::new(),
+            HASH_A[..63].to_owned(),
+            format!("{HASH_A}0"),
+            HASH_A.to_uppercase(),
+            format!("g{}", &HASH_A[1..]),
+            format!(" {}", &HASH_A[1..]),
+            "a".repeat(MAX_FIELD_LEN + 1),
+        ];
+        for (name, set) in fields {
+            for b in &bad {
+                let mut m = sample("app");
+                m.dependencies = vec![dep("a")];
+                set(&mut m.dependencies[0], b.clone());
+                let err = m.validate().unwrap_err();
+                assert!(
+                    matches!(err, MetaError::BadSha256 { field } if field == name),
+                    "{name}={b:?}: {err:?}"
+                );
+                let bytes = serde_json::to_vec(&m).unwrap();
+                assert!(
+                    matches!(Metadata::parse(&bytes), Err(MetaError::BadSha256 { .. })),
+                    "{name}={b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_string_fields_are_capped_on_write_and_read() {
+        type Set = fn(&mut DependencyRecord, String);
+        let fields: [(&str, Set); 2] = [
+            ("dependencies.id", |d, s| d.id = s),
+            ("dependencies.version", |d, s| d.version = s),
+        ];
+        for (name, set) in fields {
+            let mut ok = sample("app");
+            ok.dependencies = vec![dep("a")];
+            set(&mut ok.dependencies[0], "a".repeat(MAX_FIELD_LEN));
+            ok.validate().unwrap_or_else(|e| panic!("{name} at cap: {e}"));
+            let mut long = ok.clone();
+            set(&mut long.dependencies[0], "a".repeat(MAX_FIELD_LEN + 1));
+            let err = long.validate().unwrap_err();
+            assert!(
+                matches!(err, MetaError::TooLong { field, .. } if field == name),
+                "{name}: {err:?}"
+            );
+            let bytes = serde_json::to_vec(&long).unwrap();
+            assert!(
+                matches!(Metadata::parse(&bytes), Err(MetaError::TooLong { .. })),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_refuses_a_valid_file_that_read_would_refuse_as_too_large() {
+        let mut m = sample("app");
+        m.dependencies = (0..MAX_DEPENDENCIES)
+            .map(|i| {
+                let mut d = dep(&format!("{i:04}{}", "x".repeat(MAX_FIELD_LEN - 4)));
+                d.version = "v".repeat(MAX_FIELD_LEN);
+                d
+            })
+            .collect();
+        m.validate().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        assert!(matches!(m.write_atomic(&path), Err(MetaError::TooLarge)));
+        assert!(entries(tmp.path()).is_empty(), "nothing may be left behind");
+    }
+
+    #[test]
+    fn dependency_error_messages_are_bounded_and_do_not_quote_ids() {
+        let mut m = sample("app");
+        let long = "\u{1b}".repeat(MAX_FIELD_LEN);
+        m.dependencies = vec![dep(&long), dep(&long)];
+        let msg = m.validate().unwrap_err().to_string();
+        assert!(msg.len() < 128 && !msg.contains('\u{1b}'), "{msg:?}");
     }
 }
