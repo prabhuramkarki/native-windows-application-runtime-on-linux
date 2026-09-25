@@ -130,6 +130,7 @@ struct Sc {
     prefix: PrefixState,
     app_home: Option<Result<(), String>>,
     prefix_root: Option<PathBuf>,
+    vulkan: Option<crate::HostVulkan>,
 }
 
 /// A system report on a good desktop.
@@ -145,6 +146,7 @@ fn sc() -> Sc {
         prefix: PrefixState::NotApplicable,
         app_home: None,
         prefix_root: None,
+        vulkan: None,
     }
 }
 
@@ -202,6 +204,7 @@ impl Sc {
                 .as_ref()
                 .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
             prefix_root: self.prefix_root.as_deref(),
+            vulkan: self.vulkan.as_ref(),
         })
     }
 }
@@ -338,6 +341,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         prefix: PrefixState::NotApplicable,
         app_home: None,
         prefix_root: None,
+        vulkan: None,
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -362,11 +366,54 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         prefix: PrefixState::NotApplicable,
         app_home: None,
         prefix_root: None,
+        vulkan: None,
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
     assert_tame(&c.text);
     assert!(c.text.chars().count() < 100, "{}", c.text.chars().count());
+}
+
+fn dev(api: (u32, u32)) -> crate::VulkanDevice {
+    crate::VulkanDevice {
+        name: "gpu".into(),
+        device_type: "X".into(),
+        api,
+        driver: "d".into(),
+    }
+}
+
+#[test]
+fn vulkan_verdicts_from_the_runner() {
+    let mut s = sc();
+    s.vulkan = Some(crate::HostVulkan {
+        tool_found: true,
+        loader_found: true,
+        devices: vec![dev((1, 3))],
+    });
+    let c = one(&s.run(), Area::Graphics, "Vulkan").clone();
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.text.contains("1 device"), "{}", c.text);
+
+    // Unusable: no loader (the runner's view wins over the file check).
+    s.vulkan = Some(crate::HostVulkan {
+        tool_found: false,
+        loader_found: false,
+        devices: vec![],
+    });
+    let c = one(&s.run(), Area::Graphics, "Vulkan").clone();
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.text.contains("not found"), "{}", c.text);
+
+    // Unknown: the loader line as before.
+    s.vulkan = Some(crate::HostVulkan {
+        tool_found: false,
+        loader_found: true,
+        devices: vec![],
+    });
+    let c = one(&s.run(), Area::Graphics, "Vulkan").clone();
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.text.contains("loader found"), "{}", c.text);
 }
 
 #[test]
@@ -1692,6 +1739,7 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         prefix: PrefixState::NotApplicable,
         app_home: None,
         prefix_root: None,
+        vulkan: None,
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);

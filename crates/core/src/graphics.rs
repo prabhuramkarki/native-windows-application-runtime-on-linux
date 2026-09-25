@@ -112,9 +112,58 @@ pub fn judge(devices: &[VulkanDevice], min: Option<(u32, u32)>) -> VulkanVerdict
     }
 }
 
+/// What the host offers: whether the loader and `vulkaninfo` were found, and the devices it listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostVulkan {
+    pub tool_found: bool,
+    pub loader_found: bool,
+    pub devices: Vec<VulkanDevice>,
+}
+
+/// `run` returns the tool's stdout, or `None` if it is missing, timed out, failed or printed too much.
+pub fn probe_host(run: &dyn Fn() -> Option<String>, loader_found: bool) -> HostVulkan {
+    let out = if loader_found { run() } else { None };
+    HostVulkan {
+        tool_found: out.is_some(),
+        loader_found,
+        devices: out.as_deref().map(parse_vulkaninfo_summary).unwrap_or_default(),
+    }
+}
+
+/// No loader: `Unusable`. A loader whose tool gave nothing: `Unknown` (never blocks). Otherwise [`judge`].
+pub fn host_verdict(h: &HostVulkan, min: Option<(u32, u32)>) -> VulkanVerdict {
+    if !h.loader_found {
+        return VulkanVerdict::Unusable("Vulkan loader (libvulkan.so.1) not found".into());
+    }
+    if !h.tool_found {
+        return VulkanVerdict::Unknown;
+    }
+    judge(&h.devices, min)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_loader_is_unusable() {
+        let h = HostVulkan {
+            tool_found: true,
+            loader_found: false,
+            devices: vec![],
+        };
+        assert!(matches!(host_verdict(&h, Some((1, 3))), VulkanVerdict::Unusable(_)));
+    }
+    #[test]
+    fn loader_but_tool_failed_is_unknown() {
+        let h = probe_host(&|| None, true);
+        assert_eq!(host_verdict(&h, Some((1, 3))), VulkanVerdict::Unknown);
+    }
+    #[test]
+    fn tool_output_is_judged() {
+        let h = probe_host(&|| Some(LLVMPIPE.to_string()), true);
+        assert_eq!(host_verdict(&h, Some((1, 3))), VulkanVerdict::Usable);
+    }
 
     const REAL: &str = r#"Devices:
 ========

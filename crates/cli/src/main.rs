@@ -1,6 +1,7 @@
 mod analyze;
 mod deps;
 mod doctor;
+mod graphics;
 mod install;
 mod list;
 mod logs;
@@ -18,6 +19,12 @@ pub(crate) const SANDBOX_NOTE: &str =
     "note: Windows applications run WITHOUT a sandbox until Phase 5 (see docs/SECURITY.md)";
 
 pub(crate) type CmdError = Box<dyn std::error::Error>;
+
+#[derive(Subcommand)]
+enum GraphicsCmd {
+    /// The Vulkan devices `vulkaninfo` lists and whether they are usable for DXVK/VKD3D (runs `vulkaninfo`, bounded)
+    Info,
+}
 
 #[derive(Parser)]
 #[command(name = "runtime", version, about = "Run Windows applications on Linux")]
@@ -102,6 +109,9 @@ enum Cmd {
     /// that needs it; the packages it needs itself still install. `runtime deps list` shows the manifest,
     /// `runtime deps cache [--clear]` the download cache. Exit code 1 when anything failed or was skipped.
     Deps(deps::DepsArgs),
+    /// Show what the host's graphics stack offers (`runtime graphics info`)
+    #[command(subcommand)]
+    Graphics(GraphicsCmd),
     /// Show the newest log of an app (its last run's stderr)
     Logs {
         app: String,
@@ -171,6 +181,7 @@ fn main() -> ExitCode {
         Cmd::Uninstall { app } => uninstall::run(&app).map(|()| 0),
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
         Cmd::Deps(args) => deps::run(args),
+        Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };
     match result {
         Ok(code) => ExitCode::from(code),
