@@ -250,7 +250,15 @@ fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFami
             };
             let builtin = |reason: String| D3dRoute::Wined3d { reason };
             let entry = plan.plan.entries.iter().find(|e| e.package == pkg);
+            // Installed for 64-bit only: a 32-bit app keeps Wine's built-in DLL, whatever is recorded.
+            let x64_only = info.arch == pe::Arch::X86
+                && rt_deps::Manifest::bundled()
+                    .get(pkg)
+                    .is_some_and(|p| p.provides.iter().any(|c| rt_deps::X64_ONLY_CAPS.contains(&c.as_str())));
             let route = match entry.map(|e| &e.action) {
+                Some(rt_deps::Action::Install | rt_deps::Action::AlreadyInstalled) if x64_only => builtin(format!(
+                    "{label} is installed for 64-bit only; this 32-bit app keeps Wine's built-in Direct3D"
+                )),
                 None => builtin(format!("no package provides {}", family_name(f))),
                 Some(rt_deps::Action::Install) => {
                     builtin(format!("{label} not installed: run `runtime deps {app} --install`"))
@@ -637,5 +645,18 @@ mod tests {
             ],
             ["good", "may_fail", "fail"]
         );
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    /// `doctor` says "Vulkan not verified" from the one minimum it is given (the bundled maximum), while the
+    /// route asks for each provider's own minimum: they agree only while both providers share it.
+    #[test]
+    fn both_direct3d_providers_share_the_bundled_vulkan_minimum() {
+        let m = rt_deps::Manifest::bundled();
+        let min = |id: &str| m.get(id).unwrap().min_vulkan;
+        assert_eq!(min("dxvk"), m.max_min_vulkan());
+        assert_eq!(min("vkd3d-proton"), m.max_min_vulkan());
     }
 }

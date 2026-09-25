@@ -2186,6 +2186,61 @@ fn doctor_d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in() {
 }
 
 #[test]
+fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded() {
+    let r = rig();
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .unwrap();
+    bytes[at..at + 11].copy_from_slice(b"d3d11.dll\0\0");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    bytes[pe + 4..pe + 6].copy_from_slice(&0x014Cu16.to_le_bytes()); // machine: i386
+    let p = r.input("x86.exe", &bytes);
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let id = installed_id(&o);
+    let want = |out: &str, why: &str| {
+        let l = route_lines(out);
+        assert!(
+            l.len() == 1
+                && l[0].contains("[warn]")
+                && l[0].contains("built-in")
+                && l[0].contains(why)
+                && !l[0].contains("DXVK:"),
+            "{out}"
+        );
+    };
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    want(&out, "64-bit only");
+    record_installed(&r, &id, "dxvk");
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    want(&out, "DXVK is installed for 64-bit only");
+}
+
+#[test]
+fn doctor_reports_one_direct3d_10_line_for_all_d3d10_imports() {
+    let r = rig();
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    for (from, to) in [
+        (&b"kernel32.dll"[..], &b"d3d10_1.dll\0"[..]),
+        (b"msvcrt.dll\0", b"D3D10.DLL\0\0"),
+    ] {
+        let at = bytes
+            .windows(from.len())
+            .position(|w| w.eq_ignore_ascii_case(from))
+            .unwrap();
+        bytes[at..at + to.len()].copy_from_slice(to);
+    }
+    let p = r.input("d10.exe", &bytes);
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let out = s(&r.desktop().args(["doctor", &installed_id(&o)]).output().unwrap().stdout);
+    assert_eq!(route_lines(&out).len(), 1, "{out}");
+    assert!(route_lines(&out)[0].contains("Direct3D 10"), "{out}");
+}
+
+#[test]
 fn doctor_of_a_file_or_the_system_predicts_no_direct3d_route() {
     let r = rig();
     let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
