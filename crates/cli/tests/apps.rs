@@ -2260,3 +2260,196 @@ fn deps_discard_of_an_installer_package_does_not_claim_a_clean_prefix() {
         "{out}"
     );
 }
+
+// ================================================================ display
+
+/// The fake `reg.exe` (the fake wine runs it as an app, `$2` is the verb): `add ... /d V` writes a `user.reg`
+/// with `Graphics` = V, `delete` removes it. Returns the app's prefix.
+fn display_app(r: &Rig) -> PathBuf {
+    let dir = r.plant("dapp", "D");
+    let prefix = dir.join("prefix");
+    fs::create_dir_all(prefix.join("drive_c/windows/system32")).unwrap();
+    fs::create_dir_all(dir.join("runtime/home")).unwrap();
+    fs::write(prefix.join("drive_c/windows/system32/reg.exe"), b"MZ").unwrap();
+    r.hook(
+        r#"case "$2" in
+  add) printf 'WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers] 1\n"Graphics"="%s"\n\n' "$7" > "$WINEPREFIX/user.reg" ;;
+  delete) rm -f "$WINEPREFIX/user.reg" ;;
+esac"#,
+    );
+    prefix
+}
+
+fn user_reg(prefix: &Path, body: &str) {
+    fs::write(
+        prefix.join("user.reg"),
+        format!("WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers] 1\n{body}\n\n"),
+    )
+    .unwrap();
+}
+
+/// A Wayland session: a socket `wayland-1` under `run/`.
+fn wayland(r: &Rig) -> Command {
+    let run = r.root.join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("wayland-1"), b"").unwrap();
+    let mut c = r.cmd();
+    c.env("WAYLAND_DISPLAY", "wayland-1").env("XDG_RUNTIME_DIR", &run);
+    c
+}
+
+fn display_lines(o: &Output) -> Vec<String> {
+    assert_ok(o);
+    s(&o.stdout).lines().map(String::from).collect()
+}
+
+fn reg_ran(r: &Rig) -> bool {
+    r.calls().iter().any(|c| c == "wine <app>")
+}
+
+#[test]
+fn display_reads_auto_on_a_fresh_app() {
+    let r = rig();
+    display_app(&r);
+    assert_eq!(
+        display_lines(&r.rt(&["display", "dapp"])),
+        ["graphics driver: auto", "session: none", "winewayland: not verified"]
+    );
+    r.wine_dlls(&["kernel32.dll"]);
+    let o = r.cmd().env("DISPLAY", ":0").args(["display", "dapp"]).output().unwrap();
+    assert_eq!(
+        display_lines(&o),
+        [
+            "graphics driver: auto",
+            "session: x11 DISPLAY :0",
+            "winewayland: not found"
+        ]
+    );
+    let o = wayland(&r).args(["display", "dapp"]).output().unwrap();
+    assert_eq!(display_lines(&o)[1], "session: wayland socket wayland-1");
+    assert!(!reg_ran(&r));
+}
+
+#[test]
+fn display_wayland_is_refused_without_a_session_and_writes_nothing() {
+    let r = rig();
+    let prefix = display_app(&r);
+    r.wine_dlls(&["winewayland.drv"]);
+    let err = assert_fails(&r.rt(&["display", "dapp", "wayland"]));
+    assert!(err.contains("no Wayland session"), "{err}");
+    // WAYLAND_DISPLAY set but no socket: still no session
+    let o = r
+        .cmd()
+        .env("WAYLAND_DISPLAY", "wayland-9")
+        .env("XDG_RUNTIME_DIR", r.root.join("run"))
+        .args(["display", "dapp", "wayland"])
+        .output()
+        .unwrap();
+    assert!(assert_fails(&o).contains("no Wayland session"));
+    assert!(!prefix.join("user.reg").exists() && !reg_ran(&r));
+}
+
+#[test]
+fn display_wayland_is_refused_when_wine_has_no_winewayland() {
+    let r = rig();
+    let prefix = display_app(&r);
+    r.wine_dlls(&["kernel32.dll"]);
+    let o = wayland(&r).args(["display", "dapp", "wayland"]).output().unwrap();
+    assert!(assert_fails(&o).contains("no winewayland"));
+    assert!(!prefix.join("user.reg").exists() && !reg_ran(&r));
+}
+
+#[test]
+fn display_wayland_sets_and_rereads_and_auto_and_x11_follow() {
+    let r = rig();
+    let prefix = display_app(&r);
+    r.wine_dlls(&["winewayland.drv"]);
+    let o = wayland(&r).args(["display", "dapp", "wayland"]).output().unwrap();
+    assert_ok(&o);
+    let o = wayland(&r).args(["display", "dapp"]).output().unwrap();
+    assert_eq!(
+        display_lines(&o),
+        [
+            "graphics driver: wayland",
+            "session: wayland socket wayland-1",
+            "winewayland: present"
+        ]
+    );
+    assert_ok(&r.rt(&["display", "dapp", "auto"]));
+    assert!(!prefix.join("user.reg").exists());
+    // x11 without DISPLAY warns and still sets
+    let o = r.rt(&["display", "dapp", "x11"]);
+    assert_ok(&o);
+    assert!(s(&o.stderr).contains("warning: DISPLAY is not set"), "{}", s(&o.stderr));
+    assert_eq!(display_lines(&r.rt(&["display", "dapp"]))[0], "graphics driver: x11");
+}
+
+#[test]
+fn display_shows_a_custom_value_cleaned_and_setting_overwrites_it() {
+    let r = rig();
+    let prefix = display_app(&r);
+    user_reg(&prefix, "\"Graphics\"=\"x11,wayland\"");
+    assert_eq!(
+        display_lines(&r.rt(&["display", "dapp"]))[0],
+        "graphics driver: custom: x11,wayland"
+    );
+    user_reg(&prefix, "\"Graphics\"=\"a\\x1b[31m\\x202ez\"");
+    let o = r.rt(&["display", "dapp"]);
+    assert_tame(&s(&o.stdout), "display output");
+    assert_ok(&r.rt(&["display", "dapp", "x11"]));
+    assert_eq!(display_lines(&r.rt(&["display", "dapp"]))[0], "graphics driver: x11");
+}
+
+#[test]
+fn display_with_a_symlinked_or_hostile_user_reg_fails_or_says_auto_without_hanging() {
+    let r = rig();
+    let prefix = display_app(&r);
+    fs::write(prefix.join("real.reg"), b"x").unwrap();
+    symlink(prefix.join("real.reg"), prefix.join("user.reg")).unwrap();
+    assert!(assert_fails(&r.rt(&["display", "dapp"])).contains("symlink"));
+    fs::remove_file(prefix.join("user.reg")).unwrap();
+    // a FIFO is not a regular file: Auto, and the open does not block
+    let fifo = std::ffi::CString::new(prefix.join("user.reg").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert_eq!(display_lines(&r.rt(&["display", "dapp"]))[0], "graphics driver: auto");
+    fs::remove_file(prefix.join("user.reg")).unwrap();
+    fs::write(
+        prefix.join("user.reg"),
+        [0xffu8, b'[', b'\\', 0, b'\n', b'"'].repeat(2000),
+    )
+    .unwrap();
+    let o = r.rt(&["display", "dapp"]);
+    assert!(o.status.code().is_some_and(|c| c <= 1), "{}", s(&o.stderr));
+}
+
+#[test]
+fn display_set_is_refused_while_the_app_runs_and_writes_nothing() {
+    let r = rig();
+    let prefix = display_app(&r);
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse("dapp").unwrap()).unwrap();
+    let _running = rt_deps::lock_app_shared(&env).unwrap();
+    let o = r.rt(&["display", "dapp", "x11"]);
+    assert!(assert_fails(&o).contains("dapp"));
+    assert!(!prefix.join("user.reg").exists() && !reg_ran(&r));
+}
+
+#[test]
+fn display_rejects_bad_ids_unknown_apps_and_unknown_choices() {
+    let r = rig();
+    display_app(&r);
+    for bad in ["../x", "/etc", "a/b", ".."] {
+        let err = assert_fails(&r.rt(&["display", bad]));
+        assert!(err.contains("not a valid app id"), "{err}");
+        assert_fails(&r.rt(&["display", bad, "x11"]));
+    }
+    assert!(assert_fails(&r.rt(&["display", "nope"])).contains("no app named"));
+    let o = r.rt(&["display", "dapp", "bogus"]);
+    assert_eq!(o.status.code(), Some(2));
+    let err = s(&o.stderr);
+    assert!(
+        err.contains("auto") && err.contains("x11") && err.contains("wayland"),
+        "{err}"
+    );
+    assert!(!reg_ran(&r));
+}

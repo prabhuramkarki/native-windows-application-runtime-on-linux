@@ -1069,7 +1069,7 @@ fn rollback_error(original: &ArchiveError, failures: &[ArchiveError]) -> Archive
 /// must not get the host's network or files from the runtime's own step. The registry still flushes (the settle
 /// wait runs inside the sandbox); the output is not captured there, only the exit status. `None` (archive packages)
 /// runs it like any other Wine helper of the backend.
-fn reg(
+pub(crate) fn reg(
     args: &[&str],
     env: &AppEnv,
     backend: &dyn CompatBackend,

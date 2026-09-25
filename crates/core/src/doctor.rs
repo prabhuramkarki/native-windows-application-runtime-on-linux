@@ -713,18 +713,27 @@ fn runtime_dir(input: &DoctorInput<'_>) -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+/// The Wayland socket of the session: `$WAYLAND_DISPLAY` (absolute, or under an absolute `$XDG_RUNTIME_DIR`)
+/// when it is set and that socket exists. `runtime display` uses the same test as `doctor`.
+pub fn wayland_socket(env: &dyn Fn(&str) -> Option<OsString>, fs: &dyn FsProbe) -> Option<PathBuf> {
+    let get = |n: &str| env(n).filter(|v| !v.is_empty());
+    let p = PathBuf::from(get("WAYLAND_DISPLAY")?);
+    let socket = if p.is_absolute() {
+        p
+    } else {
+        let dir = PathBuf::from(get("XDG_RUNTIME_DIR")?);
+        if !dir.is_absolute() {
+            return None;
+        }
+        dir.join(p)
+    };
+    fs.exists(&socket).then_some(socket)
+}
+
 fn display(input: &DoctorInput<'_>, out: &mut Out) {
     let wayland = var(input, "WAYLAND_DISPLAY");
-    let socket = wayland.as_ref().and_then(|name| {
-        let p = PathBuf::from(name);
-        if p.is_absolute() {
-            Some(p)
-        } else {
-            runtime_dir(input).map(|d| d.join(p))
-        }
-    });
-    if let (Some(name), Some(socket)) = (&wayland, &socket)
-        && input.fs.exists(socket)
+    if let Some(name) = &wayland
+        && wayland_socket(input.env, input.fs).is_some()
     {
         let name = name.to_string_lossy();
         out.add(
