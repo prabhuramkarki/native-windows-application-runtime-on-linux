@@ -23,7 +23,19 @@
 //!    `user.reg` before the run returns), inside `InstallerSandbox` with `allow_network = false` ALWAYS and
 //!    `extra_ro_binds = backend.dll_dirs()`. Every silent argument is one argv element (never shell text). An MSI
 //!    (OLE2 magic, or a url ending `.msi`) runs as `msiexec.exe /i <staged C:\ path> <silent_args>` from the
-//!    prefix's own `windows/system32` (as Phase 3 does); anything else runs as the staged program itself.
+//!    prefix's own `windows/system32` (as Phase 3 does). Anything else runs on a virtual desktop with Wine's
+//!    `null` graphics driver: `explorer.exe /desktop=`[`NULL_DESKTOP`]` <staged C:\ path> <silent_args>` from the
+//!    prefix's `windows` directory ([`InstallerPkgError::ExplorerMissing`] if it is not there). The sandbox has no
+//!    display, so without a driver any window fails to open, even a hidden one: the real VC++ redistributable
+//!    (a WiX Burn bundle) exits `0x7e` "Failed to create window" in `/quiet` mode. The `null` driver lets windows
+//!    exist without a display, for this run only (nothing is written to the prefix's driver settings). Wine
+//!    rebuilds the program's command line from these argv elements with Windows quoting, so arguments with
+//!    spaces, quotes and backslashes arrive exactly (tested on real Wine).
+//!    **Exit status of a wrapped run:** `explorer.exe` always exits 0 once it has started the program (checked on
+//!    Wine 10.0: a program exiting 3 still gives 0), so for these installers the exit code carries no information
+//!    and success or failure is decided by the marker ALONE; a failed installer shows up as
+//!    [`InstallerPkgError::MarkerMissing`]. `backend.settle` still waits for every process of the prefix, so the
+//!    installer itself has finished (or was killed at the deadline) when the marker is read.
 //! 6. **Deadline.** Phase 3 waits forever (an interactive GUI install); a dependency runs silently, so it gets
 //!    [`INSTALLER_DEADLINE`]. The sandbox has no display (no X11/Wayland socket, `DISPLAY` denied): a vendor
 //!    installer that opens a dialog despite its silent flags would wait forever for a click that cannot come, and
@@ -79,6 +91,10 @@ use std::time::Duration;
 pub const INSTALLER_DEADLINE: Duration = Duration::from_secs(20 * 60);
 /// Where the installer copy is staged, per package id. Lowercase, as Wine itself spells `windows\temp` on disk.
 pub const STAGING_DIR: &str = r"C:\windows\temp\rt-deps";
+/// Wine's `explorer.exe`, relative to `drive_c`: it starts a non-MSI installer on a [`NULL_DESKTOP`].
+pub const EXPLORER_RELATIVE: &str = "windows/explorer.exe";
+/// `explorer.exe /desktop=` argument: a fixed desktop name, a size, and Wine's `null` graphics driver.
+pub const NULL_DESKTOP: &str = "rt-deps,800x600,null";
 /// OLE2 compound-file magic (an `.msi`).
 const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Longest error text built from something outside this crate (a path, an OS error, a registry file's name).
@@ -122,6 +138,8 @@ pub enum InstallerPkgError {
     TimedOut { secs: u64 },
     #[error("msiexec.exe is missing from this prefix's windows/system32")]
     MsiExecMissing,
+    #[error("explorer.exe is missing from this prefix's windows directory")]
+    ExplorerMissing,
     #[error("cannot check the marker file: {0}")]
     Marker(String),
 }
@@ -203,7 +221,16 @@ fn install_with(
         args.extend(silent_args.iter().map(OsString::from));
         (msiexec, args)
     } else {
-        (staged_unix, silent_args.iter().map(OsString::from).collect())
+        let explorer = drive_c.join(EXPLORER_RELATIVE);
+        if !fs::symlink_metadata(&explorer).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(InstallerPkgError::ExplorerMissing);
+        }
+        let mut args = vec![
+            OsString::from(format!("/desktop={NULL_DESKTOP}")),
+            OsString::from(winpath.to_string()),
+        ];
+        args.extend(silent_args.iter().map(OsString::from));
+        (explorer, args)
     };
     let opts = SandboxOpts {
         allow_network: false,

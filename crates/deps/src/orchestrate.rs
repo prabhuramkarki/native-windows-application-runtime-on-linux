@@ -641,7 +641,8 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::Stage(_)
         | E::BwrapNotFound
         | E::BadSilentArg(_)
-        | E::MsiExecMissing => e.to_string(),
+        | E::MsiExecMissing
+        | E::ExplorerMissing => e.to_string(),
         E::Sandbox(_)
         | E::MarkerMissing
         | E::NonZeroAndNoMarker { .. }
