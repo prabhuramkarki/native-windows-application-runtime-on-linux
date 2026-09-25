@@ -18,7 +18,10 @@
 //! passes, e.g. a symlink re-pointed at `$HOME`, is refused at run time): absolute, no `.`/`..`, no control or
 //! invisible characters, the symlink-resolved path re-checked, and never `/`, `$HOME`, the runtime data
 //! directory (equal, above or below), a fixed list of secret directories under `$HOME` (equal, above or below),
-//! or `/proc`, `/sys`, `/dev`, `/run/user` (devices and runtime sockets belong to the gpu/display/audio switches).
+//! or `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp` itself, `/tmp/.X11-unix` and `$XDG_RUNTIME_DIR` (devices and
+//! runtime sockets belong to the gpu/display/audio switches, and a daemon socket such as docker's would be root on
+//! the host). A grant must resolve to a DIRECTORY (never a socket, device node or dotfile), and `rw` is refused on
+//! (and below) the system trees in [`RO_ONLY`], where `ro` stays allowed.
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -45,8 +48,18 @@ const SENSITIVE: [&str; 7] = [
     ".docker",
     ".password-store",
 ];
-/// Host paths governed by the gpu/display/audio switches, never by a grant.
-const SYSTEM: [&str; 4] = ["/proc", "/sys", "/dev", "/run/user"];
+/// Host paths governed by the gpu/display/audio switches, never by a grant (equal, above or below). `/run` holds
+/// every daemon socket (`docker.sock`, `dbus`, ...); `/var/run` is the same tree on hosts where it is no symlink.
+const SYSTEM: [&str; 5] = ["/proc", "/sys", "/dev", "/run", "/var/run"];
+/// Shared spots holding other programs' sockets (ssh-agent, the X11 socket that would bypass `display=off`).
+const RESERVED_TMP: &str = "/tmp";
+const RESERVED_X11: &str = "/tmp/.X11-unix";
+/// System trees that may be granted read-only but never read-write (equal or below), except [`RW_OK`].
+const RO_ONLY: [&str; 12] = [
+    "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot", "/opt", "/var", "/srv", "/root",
+];
+/// A world-writable scratch directory under `/var`, like `/tmp` children.
+const RW_OK: &str = "/var/tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -93,7 +106,35 @@ impl Default for Permissions {
 #[derive(Debug, Clone)]
 pub struct GrantCtx {
     pub home: PathBuf,
+    /// Other spellings of a home directory (the account's, from the password database): everything that holds
+    /// for `home` holds for these too, so a different `$HOME` cannot sidestep the sensitive list.
+    pub extra_homes: Vec<PathBuf>,
     pub data_root: PathBuf,
+    /// `$XDG_RUNTIME_DIR` when set (its own sockets are never granted, wherever it is).
+    pub runtime_dir: Option<PathBuf>,
+}
+
+impl GrantCtx {
+    fn homes(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.home).chain(&self.extra_homes)
+    }
+}
+
+/// The current account's home directory from the password database (`getpwuid_r` of the effective uid), when it
+/// is an absolute path.
+pub fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut res: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call; `pw_dir` points into `buf`, which outlives the copy below.
+    let rc = unsafe { libc::getpwuid_r(libc::geteuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut res) };
+    if rc != 0 || res.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let p = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    p.is_absolute().then_some(p)
 }
 
 /// Why a grant path was refused.
@@ -119,8 +160,16 @@ pub enum Refusal {
     Inside(&'static str),
     #[error("it is, contains or is inside the runtime's data directory")]
     DataRoot,
-    #[error("{0} is governed by the gpu/display/audio switches, not by a grant")]
+    #[error("{0} holds device nodes and runtime sockets (the gpu/display/audio switches govern them, never a grant)")]
     System(&'static str),
+    #[error("{0} holds other programs' sockets and cannot be granted")]
+    Reserved(&'static str),
+    #[error("it is, contains or is inside $XDG_RUNTIME_DIR, which holds the session's sockets")]
+    RuntimeDir,
+    #[error("it is not a directory (only directories can be granted, never a socket, device or plain file)")]
+    NotDirectory,
+    #[error("{0} is never writable: grant it read-only (ro)")]
+    ReadOnlyOnly(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -202,19 +251,21 @@ fn locate(p: &Path, ctx: &GrantCtx) -> Result<(), Refusal> {
     if p == Path::new("/") {
         return Err(Refusal::Root);
     }
-    if variants(&ctx.home).iter().any(|h| p == h) {
+    if ctx.homes().any(|h| variants(h).iter().any(|h| p == h)) {
         return Err(Refusal::Home);
     }
     if variants(&ctx.data_root).iter().any(|d| related(p, d)) {
         return Err(Refusal::DataRoot);
     }
     for name in SENSITIVE {
-        for s in variants(&ctx.home.join(name)) {
-            if p.starts_with(&s) {
-                return Err(Refusal::Inside(name));
-            }
-            if s.starts_with(p) {
-                return Err(Refusal::Ancestor(name));
+        for home in ctx.homes() {
+            for s in variants(&home.join(name)) {
+                if p.starts_with(&s) {
+                    return Err(Refusal::Inside(name));
+                }
+                if s.starts_with(p) {
+                    return Err(Refusal::Ancestor(name));
+                }
             }
         }
     }
@@ -223,20 +274,54 @@ fn locate(p: &Path, ctx: &GrantCtx) -> Result<(), Refusal> {
             return Err(Refusal::System(sys));
         }
     }
+    if p == Path::new(RESERVED_TMP) {
+        return Err(Refusal::Reserved(RESERVED_TMP));
+    }
+    if related(p, Path::new(RESERVED_X11)) {
+        return Err(Refusal::Reserved(RESERVED_X11));
+    }
+    if let Some(rd) = &ctx.runtime_dir
+        && variants(rd).iter().any(|d| related(p, d))
+    {
+        return Err(Refusal::RuntimeDir);
+    }
     Ok(())
 }
 
-/// Checks one host directory grant and returns the path to store and bind: `path` with symlinks resolved. The
-/// rules run on the path as written (so a refusal names the real reason even for a path that does not exist) and
-/// again on the resolved path (a symlink is judged by its target).
-pub fn validate_grant(path: &Path, ctx: &GrantCtx) -> Result<PathBuf, PermError> {
+/// `rw` on a system tree is refused (`ro` is fine: programs may read `/usr/share/...`).
+fn writable(p: &Path, access: Access) -> Result<(), Refusal> {
+    if access == Access::Rw
+        && !p.starts_with(RW_OK)
+        && let Some(t) = RO_ONLY.iter().find(|t| p.starts_with(t))
+    {
+        return Err(Refusal::ReadOnlyOnly(t));
+    }
+    Ok(())
+}
+
+/// [`validate_grant`] for a grant with `access`. The fixed lists are checked on the path as written BEFORE it must
+/// exist (a refusal never depends on what the host has), then again on the resolved path, which must be a
+/// directory.
+pub fn validate_grant_for(path: &Path, access: Access, ctx: &GrantCtx) -> Result<PathBuf, PermError> {
     let bad = |why| PermError::Grant { path: lossy(path), why };
     syntax(path).map_err(bad)?;
     locate(path, ctx).map_err(bad)?;
+    writable(path, access).map_err(bad)?;
     let real = fs::canonicalize(path).map_err(|_| bad(Refusal::Missing))?;
     syntax(&real).map_err(bad)?;
     locate(&real, ctx).map_err(bad)?;
+    writable(&real, access).map_err(bad)?;
+    if !fs::metadata(&real).is_ok_and(|m| m.is_dir()) {
+        return Err(bad(Refusal::NotDirectory));
+    }
     Ok(real)
+}
+
+/// Checks one host directory grant (as read-only: see [`validate_grant_for`]) and returns the path to store and
+/// bind: `path` with symlinks resolved. The rules run on the path as written (so a refusal names the real reason
+/// even for a path that does not exist) and again on the resolved path (a symlink is judged by its target).
+pub fn validate_grant(path: &Path, ctx: &GrantCtx) -> Result<PathBuf, PermError> {
+    validate_grant_for(path, Access::Ro, ctx)
 }
 
 #[derive(Deserialize)]
@@ -271,8 +356,15 @@ fn deny() -> Network {
 }
 
 impl Permissions {
-    /// Strict parse of a whole profile; every grant goes through [`validate_grant`] and is kept resolved.
+    /// Strict parse of a whole profile; every grant goes through [`validate_grant_for`] and is kept resolved.
     pub fn parse(text: &str, ctx: &GrantCtx) -> Result<Permissions, PermError> {
+        Permissions::parse_raw(text)?.validated(ctx)
+    }
+
+    /// The syntax half of [`Permissions::parse`]: strict TOML, version, sizes and counts, but the grants are kept
+    /// as written and NOT checked against the host. Only for editing a profile that may hold a stale grant (see
+    /// [`Permissions::validated`]); never bind what this returns.
+    pub fn parse_raw(text: &str) -> Result<Permissions, PermError> {
         if text.len() as u64 > MAX_BYTES {
             return Err(PermError::TooLarge);
         }
@@ -283,21 +375,33 @@ impl Permissions {
         if raw.filesystem.len() > MAX_GRANTS {
             return Err(PermError::TooManyGrants);
         }
-        let mut filesystem: Vec<FsGrant> = Vec::new();
-        for g in raw.filesystem {
-            let path = validate_grant(Path::new(&g.path), ctx)?;
-            if filesystem.iter().any(|f| f.path == path) {
-                return Err(PermError::DuplicateGrant(lossy(&path)));
-            }
-            filesystem.push(FsGrant { path, access: g.access });
-        }
         Ok(Permissions {
             network: raw.network,
             display: raw.display,
             audio: raw.audio,
             gpu: raw.gpu,
-            filesystem,
+            filesystem: raw
+                .filesystem
+                .into_iter()
+                .map(|g| FsGrant {
+                    path: PathBuf::from(g.path),
+                    access: g.access,
+                })
+                .collect(),
         })
+    }
+
+    /// Every grant checked and resolved ([`validate_grant_for`]); a duplicate after resolution is refused.
+    pub fn validated(self, ctx: &GrantCtx) -> Result<Permissions, PermError> {
+        let mut filesystem: Vec<FsGrant> = Vec::new();
+        for g in self.filesystem {
+            let path = validate_grant_for(&g.path, g.access, ctx)?;
+            if filesystem.iter().any(|f| f.path == path) {
+                return Err(PermError::DuplicateGrant(lossy(&path)));
+            }
+            filesystem.push(FsGrant { path, access: g.access });
+        }
+        Ok(Permissions { filesystem, ..self })
     }
 
     /// The canonical file text: fixed key order, grants in order, strings escaped. `parse(to_toml(p)) == p` for
@@ -348,7 +452,7 @@ impl Permissions {
                 "rw" => Access::Rw,
                 _ => return Err(bad()),
             };
-            let path = validate_grant(Path::new(path), ctx)?;
+            let path = validate_grant_for(Path::new(path), access, ctx)?;
             if let Some(g) = self.filesystem.iter_mut().find(|g| g.path == path) {
                 g.access = access;
             } else if self.filesystem.len() >= MAX_GRANTS {
@@ -359,7 +463,8 @@ impl Permissions {
             return Ok(());
         }
         if let Some(path) = expr.strip_prefix("fs-=") {
-            // Removal must work for a grant whose directory is gone, so no validation and no existence needed.
+            // Removal must work for a grant whose directory is gone: no validation, no existence needed (the CLI edits
+            // a profile read with `load_opt_raw` and validates what remains).
             let p = Path::new(path);
             let real = fs::canonicalize(p).ok();
             let at = self
@@ -388,10 +493,10 @@ impl Permissions {
     }
 }
 
-/// The profile of the app at `app_root`, `None` when there is no file. Opened with `O_NOFOLLOW` (a symlink is
-/// refused, never followed), `O_NONBLOCK` (a FIFO cannot hang the open); it must be a regular file and its size
-/// is checked on the open handle before anything is read.
-pub fn load_opt(app_root: &Path, ctx: &GrantCtx) -> Result<Option<Permissions>, PermError> {
+/// The text of `permissions.toml` in `app_root`, `None` when there is no file. Opened with `O_NOFOLLOW` (a
+/// symlink is refused, never followed), `O_NONBLOCK` (a FIFO cannot hang the open); it must be a regular file and
+/// its size is checked on the open handle before anything is read.
+fn read_file(app_root: &Path) -> Result<Option<String>, PermError> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -414,8 +519,21 @@ pub fn load_opt(app_root: &Path, ctx: &GrantCtx) -> Result<Option<Permissions>, 
     if bytes.len() as u64 > MAX_BYTES {
         return Err(PermError::TooLarge);
     }
-    let text = String::from_utf8(bytes).map_err(|_| PermError::Toml("not UTF-8".into()))?;
-    Permissions::parse(&text, ctx).map(Some)
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| PermError::Toml("not UTF-8".into()))
+}
+
+/// The profile of the app at `app_root` (see [`read_file`]), `None` when there is no file; every grant is
+/// validated.
+pub fn load_opt(app_root: &Path, ctx: &GrantCtx) -> Result<Option<Permissions>, PermError> {
+    read_file(app_root)?.map(|t| Permissions::parse(&t, ctx)).transpose()
+}
+
+/// [`load_opt`] without checking the grants against the host ([`Permissions::parse_raw`]): for `--set fs-=` on a
+/// profile whose directory has vanished. Its result is validated ([`Permissions::validated`]) before it is stored.
+pub fn load_opt_raw(app_root: &Path) -> Result<Option<Permissions>, PermError> {
+    read_file(app_root)?.map(|t| Permissions::parse_raw(&t)).transpose()
 }
 
 /// [`load_opt`], with the default profile when there is no file.
@@ -423,16 +541,46 @@ pub fn load(app_root: &Path, ctx: &GrantCtx) -> Result<Permissions, PermError> {
     Ok(load_opt(app_root, ctx)?.unwrap_or_default())
 }
 
+/// How old a leftover temp file must be before `store` deletes it (the runtime holds the app lock while storing,
+/// so nothing that recent can be another writer's; the margin only protects a store racing outside the CLI).
+const STALE_TEMP: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Best-effort removal of `.permissions.toml.tmp-*` regular files in `app_root` older than [`STALE_TEMP`].
+fn remove_stale_temps(app_root: &Path) {
+    let Ok(rd) = fs::read_dir(app_root) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().starts_with(&format!(".{FILE_NAME}.tmp-")) {
+            continue;
+        }
+        let old = fs::symlink_metadata(e.path())
+            .ok()
+            .filter(|m| m.file_type().is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMP);
+        if old {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Writes the profile atomically: a `0600` temp file next to the target (`O_EXCL`), `sync_all`, rename over
 /// `permissions.toml`. The file is therefore either the old or the new profile, and a symlink or other non-file
-/// at the target is refused. The temp file is removed on every failure.
+/// at the target is refused. The temp file is removed on every failure; one a crash left behind (older than
+/// [`STALE_TEMP`], named like ours) is removed on the next store. Grants are NOT validated here (the caller
+/// validates before, and every load validates again).
 pub fn store(app_root: &Path, p: &Permissions) -> Result<(), PermError> {
+    if p.filesystem.len() > MAX_GRANTS {
+        return Err(PermError::TooManyGrants);
+    }
     let text = p.to_toml();
-    if text.len() as u64 > MAX_BYTES || p.filesystem.len() > MAX_GRANTS {
+    if text.len() as u64 > MAX_BYTES {
         return Err(PermError::TooLarge);
     }
+    remove_stale_temps(app_root);
     let target = app_root.join(FILE_NAME);
     match fs::symlink_metadata(&target) {
         Ok(m) if m.file_type().is_file() => {}
@@ -501,7 +649,12 @@ mod tests {
         T {
             _t: td,
             root,
-            ctx: GrantCtx { home, data_root },
+            ctx: GrantCtx {
+                home,
+                extra_homes: vec![],
+                data_root,
+                runtime_dir: None,
+            },
         }
     }
 
@@ -639,9 +792,152 @@ mod tests {
         );
         symlink(&d, x.root.join("alias")).unwrap();
         assert_eq!(validate_grant(&x.root.join("alias"), &x.ctx).unwrap(), d);
-        // a file is a legal grant target too
+    }
+
+    #[test]
+    fn only_directories_can_be_granted() {
+        use std::os::unix::net::UnixListener;
+        let x = t();
         fs::write(x.root.join("share/f.txt"), b"x").unwrap();
-        assert!(validate_grant(&x.root.join("share/f.txt"), &x.ctx).is_ok());
+        assert_eq!(x.why(&x.root.join("share/f.txt")), Refusal::NotDirectory);
+        fs::write(x.ctx.home.join(".bashrc"), b"x").unwrap();
+        let mut p = Permissions::default();
+        assert!(matches!(
+            p.apply_set(&format!("fs+={}:rw", x.ctx.home.join(".bashrc").display()), &x.ctx),
+            Err(PermError::Grant {
+                why: Refusal::NotDirectory,
+                ..
+            })
+        ));
+        let sock = x.root.join("share/agent.sock");
+        let _l = UnixListener::bind(&sock).unwrap();
+        assert_eq!(x.why(&sock), Refusal::NotDirectory);
+        // a symlink to a socket is judged by its target
+        symlink(&sock, x.root.join("share/alias.sock")).unwrap();
+        assert_eq!(x.why(&x.root.join("share/alias.sock")), Refusal::NotDirectory);
+        assert_eq!(x.why(Path::new("/dev/null")), Refusal::System("/dev"));
+    }
+
+    #[test]
+    fn run_tree_and_var_run_are_refused_by_prefix_without_existing() {
+        let x = t();
+        for p in [
+            "/run",
+            "/run/docker.sock",
+            "/run/dbus",
+            "/run/dbus/system_bus_socket",
+            "/run/user/1000",
+            "/var/run",
+            "/var/run/docker.sock",
+            "/var/run/x/y",
+        ] {
+            let want = if p.starts_with("/var/run") { "/var/run" } else { "/run" };
+            assert_eq!(x.why(Path::new(p)), Refusal::System(want), "{p}");
+        }
+        // a symlink to /run resolves and is refused
+        symlink("/run", x.root.join("share/r")).unwrap();
+        assert_eq!(x.why(&x.root.join("share/r")), Refusal::System("/run"));
+    }
+
+    #[test]
+    fn tmp_and_the_x11_socket_dir_are_refused_by_prefix_but_tmp_children_are_fine() {
+        let x = t();
+        // home and data directory elsewhere: here the temp root is under /tmp, so /tmp is above the data dir
+        let ctx = GrantCtx {
+            home: "/nonexistent-home".into(),
+            extra_homes: vec![],
+            data_root: "/nonexistent-data".into(),
+            runtime_dir: None,
+        };
+        let why = |p: &Path| match validate_grant(p, &ctx) {
+            Err(PermError::Grant { why, .. }) => why,
+            o => panic!("{p:?}: {o:?}"),
+        };
+        assert_eq!(why(Path::new("/tmp")), Refusal::Reserved("/tmp"));
+        assert_eq!(why(Path::new("/tmp/")), Refusal::Reserved("/tmp"));
+        assert_eq!(why(Path::new("/tmp/.X11-unix")), Refusal::Reserved("/tmp/.X11-unix"));
+        assert_eq!(why(Path::new("/tmp/.X11-unix/X0")), Refusal::Reserved("/tmp/.X11-unix"));
+        symlink("/tmp", x.root.join("share/t")).unwrap();
+        assert_eq!(why(&x.root.join("share/t")), Refusal::Reserved("/tmp"));
+        assert!(validate_grant(&x.dir("share/fine"), &ctx).is_ok()); // the temp dir itself is under /tmp
+    }
+
+    #[test]
+    fn the_session_runtime_dir_is_refused_wherever_it_is() {
+        let x = t();
+        let rd = x.dir("xdg-run");
+        let ctx = GrantCtx {
+            runtime_dir: Some(rd.clone()),
+            ..x.ctx.clone()
+        };
+        let why = |p: &Path| match validate_grant(p, &ctx) {
+            Err(PermError::Grant { why, .. }) => why,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(why(&rd), Refusal::RuntimeDir);
+        assert_eq!(why(&rd.join("bus")), Refusal::RuntimeDir);
+        assert!(validate_grant(&x.dir("share/ok"), &ctx).is_ok());
+    }
+
+    #[test]
+    fn rw_is_refused_on_system_trees_and_ro_is_allowed_there() {
+        let x = t();
+        for (p, tree) in [
+            ("/etc", "/etc"),
+            ("/usr/local", "/usr"),
+            ("/usr", "/usr"),
+            ("/var/lib/x", "/var"),
+            ("/opt/app", "/opt"),
+            ("/root", "/root"),
+        ] {
+            let mut perm = Permissions::default();
+            let e = perm.apply_set(&format!("fs+={p}:rw"), &x.ctx);
+            assert!(
+                matches!(&e, Err(PermError::Grant { why: Refusal::ReadOnlyOnly(t), .. }) if *t == tree),
+                "{p}: {e:?}"
+            );
+            assert!(perm.filesystem.is_empty());
+        }
+        assert!(validate_grant(Path::new("/usr"), &x.ctx).is_ok());
+        let mut perm = Permissions::default();
+        perm.apply_set("fs+=/usr:ro", &x.ctx).unwrap();
+        // a file that says rw is refused at parse too
+        let e = Permissions::parse(
+            "version = 1\n[[filesystem]]\npath = \"/etc\"\naccess = \"rw\"\n",
+            &x.ctx,
+        );
+        assert!(
+            matches!(
+                e,
+                Err(PermError::Grant {
+                    why: Refusal::ReadOnlyOnly("/etc"),
+                    ..
+                })
+            ),
+            "{e:?}"
+        );
+        // /var/tmp stays writable, like /tmp children
+        assert_eq!(writable(Path::new("/var/tmp/x"), Access::Rw), Ok(()));
+    }
+
+    #[test]
+    fn the_accounts_own_home_counts_even_when_home_says_otherwise() {
+        let x = t();
+        let real = x.dir("realhome");
+        fs::create_dir_all(real.join(".ssh")).unwrap();
+        let ctx = GrantCtx {
+            home: x.root.join("fakehome"),
+            extra_homes: vec![real.clone()],
+            ..x.ctx.clone()
+        };
+        let why = |p: &Path| match validate_grant(p, &ctx) {
+            Err(PermError::Grant { why, .. }) => why,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(why(&real.join(".ssh")), Refusal::Inside(".ssh"));
+        assert_eq!(why(&real), Refusal::Home);
+        assert_eq!(why(&x.root), Refusal::DataRoot); // above the real home too
+        assert!(account_home().is_none_or(|h| h.is_absolute()));
     }
 
     #[test]
@@ -691,8 +987,8 @@ mod tests {
         assert_eq!(x.why(&x.ctx.home.join(".local")), Refusal::DataRoot);
         // outside $HOME the same holds
         let out = GrantCtx {
-            home: x.ctx.home.clone(),
             data_root: x.dir("elsewhere/rt"),
+            ..x.ctx.clone()
         };
         assert_eq!(
             validate_grant(&x.dir("elsewhere"), &out),
@@ -720,7 +1016,7 @@ mod tests {
         symlink(&x.ctx.home, x.root.join("home-alias")).unwrap();
         let aliased = GrantCtx {
             home: x.root.join("home-alias"),
-            data_root: x.ctx.data_root.clone(),
+            ..x.ctx.clone()
         };
         fs::create_dir_all(x.ctx.home.join(".kube")).unwrap();
         assert_eq!(
@@ -740,9 +1036,9 @@ mod tests {
         assert_eq!(x.why(Path::new("/sys")), Refusal::System("/sys"));
         assert_eq!(x.why(Path::new("/dev")), Refusal::System("/dev"));
         assert_eq!(x.why(Path::new("/dev/shm")), Refusal::System("/dev"));
-        assert_eq!(x.why(Path::new("/run/user")), Refusal::System("/run/user"));
-        assert_eq!(x.why(Path::new("/run/user/1000/bus")), Refusal::System("/run/user"));
-        assert_eq!(x.why(Path::new("/run")), Refusal::System("/run/user"));
+        assert_eq!(x.why(Path::new("/run/user")), Refusal::System("/run"));
+        assert_eq!(x.why(Path::new("/run/user/1000/bus")), Refusal::System("/run"));
+        assert_eq!(x.why(Path::new("/run")), Refusal::System("/run"));
     }
 
     #[test]
@@ -815,18 +1111,27 @@ mod tests {
             "gpu=",
             "gpu = on",
             "Network=allow",
-            "fs+=rel:ro",
-            "fs+=/x:rx",
             "fs+=/x",
             "fs+=",
-            "fs+=:ro",
+            "fs+=/x:rx",
             "fs=/x:ro",
             "fs+ =/x:ro",
             "audio=on;network=allow",
         ] {
+            assert_eq!(
+                p.apply_set(bad, &x.ctx),
+                Err(PermError::Expr(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
+        for (bad, why) in [
+            ("fs+=rel:ro", Refusal::NotAbsolute),
+            ("fs+=:ro", Refusal::NotAbsolute),
+            ("fs+=/x-does-not-exist:ro", Refusal::Missing),
+        ] {
             let e = p.apply_set(bad, &x.ctx);
             assert!(
-                matches!(e, Err(PermError::Expr(_)) | Err(PermError::Grant { .. })),
+                matches!(&e, Err(PermError::Grant { why: w, .. }) if *w == why),
                 "{bad:?}: {e:?}"
             );
         }
@@ -1035,5 +1340,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn store_reports_too_many_grants_as_such() {
+        let x = t();
+        let app = x.dir("app");
+        let p = Permissions {
+            filesystem: (0..=MAX_GRANTS)
+                .map(|i| FsGrant {
+                    path: PathBuf::from(format!("/g{i}")),
+                    access: Access::Ro,
+                })
+                .collect(),
+            ..Permissions::default()
+        };
+        assert_eq!(store(&app, &p), Err(PermError::TooManyGrants));
+        assert!(!app.join(FILE_NAME).exists());
+    }
+
+    #[test]
+    fn store_removes_only_old_temp_files_it_would_have_made() {
+        let x = t();
+        let app = x.dir("app");
+        let old = app.join(format!(".{FILE_NAME}.tmp-1-1"));
+        let fresh = app.join(format!(".{FILE_NAME}.tmp-1-2"));
+        let other = app.join("other.tmp-1-1");
+        for f in [&old, &fresh, &other] {
+            fs::write(f, "x").unwrap();
+        }
+        let ancient = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for f in [&old, &other] {
+            fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(ancient)
+                .unwrap();
+        }
+        store(&app, &Permissions::default()).unwrap();
+        assert!(!old.exists() && fresh.exists() && other.exists());
+    }
+
+    #[test]
+    fn a_grant_whose_directory_vanished_can_be_removed_from_a_raw_profile() {
+        let x = t();
+        let app = x.dir("app");
+        let d = x.dir("share/gone");
+        let mut p = Permissions::default();
+        p.apply_set(&format!("fs+={}:rw", d.display()), &x.ctx).unwrap();
+        store(&app, &p).unwrap();
+        fs::remove_dir(&d).unwrap();
+        // the strict load refuses the stale grant, the raw one still reads it
+        assert!(matches!(
+            load(&app, &x.ctx),
+            Err(PermError::Grant {
+                why: Refusal::Missing,
+                ..
+            })
+        ));
+        let mut raw = load_opt_raw(&app).unwrap().unwrap();
+        raw.apply_set(&format!("fs-={}", d.display()), &x.ctx).unwrap();
+        let fixed = raw.validated(&x.ctx).unwrap();
+        assert!(fixed.filesystem.is_empty());
+        store(&app, &fixed).unwrap();
+        assert_eq!(load(&app, &x.ctx).unwrap(), fixed);
+        // a stale grant that is not removed still blocks the write
+        let e = Permissions {
+            filesystem: vec![FsGrant {
+                path: d,
+                access: Access::Ro,
+            }],
+            ..Permissions::default()
+        };
+        assert!(matches!(
+            e.validated(&x.ctx),
+            Err(PermError::Grant {
+                why: Refusal::Missing,
+                ..
+            })
+        ));
     }
 }

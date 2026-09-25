@@ -3131,3 +3131,62 @@ fn permissions_rejects_bad_ids_and_unknown_apps() {
         .unwrap();
     assert!(assert_fails(&o).contains("HOME"));
 }
+
+#[test]
+fn permissions_refuses_sockets_files_daemon_dirs_and_rw_system_trees() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let sock = home.join("share/agent.sock");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    fs::write(home.join(".bashrc"), "x").unwrap();
+    for (grant, why) in [
+        (format!("{}:rw", sock.display()), "not a directory"),
+        (format!("{}:rw", home.join(".bashrc").display()), "not a directory"),
+        ("/run/docker.sock:rw".into(), "/run"),
+        ("/run/dbus:ro".into(), "/run"),
+        ("/tmp:ro".into(), "/tmp"),
+        ("/tmp/.X11-unix:ro".into(), "/tmp/.X11-unix"),
+        ("/etc:rw".into(), "never writable"),
+        ("/usr/local:rw".into(), "never writable"),
+    ] {
+        let err = assert_fails(&perm(&r, &home, &["papp", "--set", &format!("fs+={grant}")]));
+        assert!(
+            err.contains(why) && err.contains("nothing was changed"),
+            "{grant}: {err}"
+        );
+        assert!(!app.join("permissions.toml").exists(), "{grant}");
+    }
+    // the account's real home counts even if HOME points elsewhere
+    if let Some(real) = rt_sandbox::account_home().filter(|h| h.join(".ssh").is_dir()) {
+        let o = perm(
+            &r,
+            &home,
+            &["papp", "--set", &format!("fs+={}:ro", real.join(".ssh").display())],
+        );
+        assert!(assert_fails(&o).contains("~/.ssh"));
+    }
+}
+
+#[test]
+fn permissions_can_remove_a_grant_whose_directory_is_gone() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let gone = home.join("gone");
+    fs::create_dir(&gone).unwrap();
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", &format!("fs+={}:rw", gone.display())],
+    ));
+    fs::remove_dir(&gone).unwrap();
+    // reading refuses, and says how to get out
+    let err = assert_fails(&perm(&r, &home, &["papp"]));
+    assert!(err.contains("does not exist") && err.contains("--reset"), "{err}");
+    assert_ok(&perm(&r, &home, &["papp", "--set", &format!("fs-={}", gone.display())]));
+    assert!(
+        !fs::read_to_string(app.join("permissions.toml"))
+            .unwrap()
+            .contains("filesystem")
+    );
+    assert_ok(&perm(&r, &home, &["papp"]));
+}
