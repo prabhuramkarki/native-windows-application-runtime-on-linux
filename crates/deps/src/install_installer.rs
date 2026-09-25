@@ -53,7 +53,8 @@
 //!    host directory, and cleanup must never follow that out of the prefix. What cannot be removed safely is left
 //!    in place, with a warning.
 //! 9. Only after the marker is confirmed, the package's `dll_overrides` are set to `native,builtin` with Wine's
-//!    `reg.exe` (the same settled, bounded helper as archive packages, outside the sandbox). Without them Wine keeps
+//!    `reg.exe` (the same settled, bounded helper as archive packages, but run in the installer sandbox, offline:
+//!    Ruling 17; the Wine session it starts also starts what the installer registered, e.g. auto-start services). Without them Wine keeps
 //!    loading its own builtin DLL of the same name even though the installer put the native one in `system32`
 //!    (seen for real with the VC++ redistributable on Wine 10.0). If one cannot be set, the ones already set are
 //!    deleted again, newest first, and the result is [`InstallerPkgError::DllOverride`] (the caller records
@@ -287,7 +288,7 @@ fn install_with(
             if let Err(why) = &removed {
                 warnings.push(format!("the staged installer copy was not removed: {why}"));
             }
-            set_overrides(overrides, env, backend, launcher)?;
+            set_overrides(overrides, env, backend, launcher, &bwrap)?;
             Ok(InstallerPkgInstalled {
                 marker_confirmed: true,
                 warnings,
@@ -358,22 +359,26 @@ fn check_package(pkg: &Package) -> Result<Checked<'_>, InstallerPkgError> {
     Ok((silent_args, marker, dll_overrides))
 }
 
-/// Sets each DLL override (`native,builtin`, through the same settled `reg.exe` as archive packages). If one
-/// fails, the ones already set are deleted again, newest first, and the install fails: the vendor installer's own
-/// changes stay (they cannot be undone), and nothing is recorded by the caller.
+/// Sets each DLL override (`native,builtin`, through the same settled `reg.exe` helper as archive packages). If
+/// one fails, the ones already set are deleted again, newest first, and the install fails: the vendor installer's
+/// own changes stay (they cannot be undone), and nothing is recorded by the caller. Every `reg.exe` run (set,
+/// delete, query) is in the installer sandbox, offline (Ruling 17): the vendor installer has just run, and whatever
+/// it registered to start with the next Wine session (services, ...) starts with these.
 fn set_overrides(
     names: &[String],
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
+    bwrap: &Path,
 ) -> Result<(), InstallerPkgError> {
+    let sandbox = Some(bwrap);
     for (i, name) in names.iter().enumerate() {
-        if let Err(e) = install_archive::set_override(name, env, backend, launcher) {
+        if let Err(e) = install_archive::set_override(name, env, backend, launcher, sandbox) {
             // Delete the failed one too: a `reg add` that fails may still have written it.
             let undo: Vec<String> = names[..=i]
                 .iter()
                 .rev()
-                .filter_map(|n| install_archive::delete_override(n, env, backend, launcher).err())
+                .filter_map(|n| install_archive::delete_override(n, env, backend, launcher, sandbox).err())
                 .map(|e| bounded(&e))
                 .collect();
             let mut why = format!("{name}: {}", bounded(&e));

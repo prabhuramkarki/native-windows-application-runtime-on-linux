@@ -954,6 +954,31 @@ fn dll_overrides_are_set_after_the_marker_is_confirmed() {
     }
 }
 
+/// Ruling 17: the runtime's own `reg.exe` calls after a vendor installer ran (set, and the rollback's delete and
+/// query) run in the installer sandbox too, offline: a service or `RunOnce` entry the installer registered would
+/// otherwise be started by that Wine session with the host's network and files.
+#[test]
+fn dll_override_reg_calls_run_offline_in_the_sandbox() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let record = "readlink /proc/self/ns/net >> reg-netns.txt; [ \"$1\" = add ] && [ \"$4\" = b ] && exit 1; exit 0";
+    let b = reg_backend(&f, record, MAKE_MARKER);
+    let p = pkg_with_overrides(&["/S"], &["a", "b"], &["a", "b"]);
+    let err = run_with(&f, &p, &b, &bwrap).unwrap_err();
+    assert!(matches!(&err, InstallerPkgError::DllOverride(_)), "{err:?}");
+    // add a, add b (fails), delete b, delete a: all four inside a network namespace that is not the host's.
+    assert_eq!(reg_calls(&b), ["add a", "add b", "delete b", "delete a"]);
+    let host = fs::read_link("/proc/self/ns/net").unwrap();
+    let inside = fs::read_to_string(f.c("reg-netns.txt")).unwrap();
+    assert_eq!(inside.lines().count(), 4, "{inside}");
+    for ns in inside.lines() {
+        assert!(
+            ns.starts_with("net:[") && ns != host.to_str().unwrap(),
+            "reg.exe shared the host network: {ns}"
+        );
+    }
+}
+
 #[test]
 fn dll_overrides_are_not_set_when_the_marker_is_missing() {
     let Some(bwrap) = require_real_bwrap() else { return };
@@ -1237,6 +1262,74 @@ fn e2e_real_wine_hanging_installer_on_the_null_desktop_times_out_and_is_cleaned_
     assert!(t.elapsed() < Duration::from_secs(40), "{:?}", t.elapsed());
     assert!(w.staging_empty());
     w.assert_no_wineserver();
+}
+
+/// Ruling 17 on real Wine: the "installer" is Wine's own `sc.exe` (package id `sc`, so the staged placeholder loads
+/// the builtin), registering an auto-start service whose command writes a canary to a HOST directory outside the
+/// prefix. The runtime's override step afterwards starts a Wine session, which starts that service: it must run in
+/// the sandbox (host directory not bound, no canary). A plain unsandboxed Wine session afterwards (what any later
+/// `runtime run` is) does start it and writes the canary: the control that proves the service works.
+#[test]
+#[ignore = "needs Wine and bwrap"]
+fn e2e_real_wine_an_installer_registered_service_never_runs_outside_the_sandbox_during_overrides() {
+    let launcher = Launcher::new();
+    let backend = crate::real_wine_backend(&launcher);
+    let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("svc").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    backend.stop(&env).unwrap();
+    let host = tempfile::tempdir().unwrap(); // outside the prefix: never bound into the sandbox
+    let canary = host.path().join("canary.txt");
+    let body = fs::read(env.drive_c().join("windows/system32/sc.exe")).unwrap();
+    let cache = tmp.path().join(sha(&body));
+    fs::write(&cache, &body).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o400)).unwrap();
+    // `Z:` is removed by the prefix hardening; an NT `\\?\unix\` path still reaches host files.
+    let target = format!(r"\\?\unix{}", canary.display().to_string().replace('/', "\\"));
+    let command = format!(r"C:\windows\system32\cmd.exe /c echo pwned > {target}");
+    let args = ["create", "rtsvc", "binPath=", &command, "start=", "auto"];
+    let mut p = pkg_for(
+        &body,
+        &args,
+        reg_marker(r"HKLM\System\ControlSet001\Services\rtsvc", "Start"),
+    );
+    p.id = "sc".into();
+    p.provides = vec!["rtdepsx".into()];
+    if let Install::Installer { dll_overrides, .. } = &mut p.install {
+        *dll_overrides = vec!["rtdepsx".into()];
+    }
+    let bwrap = rt_installer::find_bwrap_on_path().expect("bwrap must be installed");
+    let got = install_with(&p, &cache, &env, &backend, &launcher, Some(bwrap), INSTALLER_DEADLINE).unwrap();
+    eprintln!("sc as installer: {got:?}");
+    assert!(got.marker_confirmed);
+    let user = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
+    assert!(user.contains("\"rtdepsx\"=\"native,builtin\""), "override not set");
+    assert!(
+        !canary.exists(),
+        "the override step started the installer's service OUTSIDE the sandbox (host file written)"
+    );
+    // Control: an ordinary, unsandboxed Wine session in this prefix starts the service, which writes the canary.
+    let reg = env.drive_c().join("windows/system32/reg.exe");
+    let q = ["query", r"HKCU\Software\Wine\DllOverrides"].map(OsString::from);
+    let cmd = backend
+        .command(&env, &reg, &env.drive_c(), &q, &rt_core::RunOpts::default())
+        .unwrap();
+    let out = launcher
+        .run_helper(backend.settle(cmd), Duration::from_secs(120))
+        .unwrap();
+    eprintln!("unsandboxed reg query: {}", out.status);
+    let t = std::time::Instant::now();
+    while !canary.exists() && t.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        canary.exists(),
+        "control failed: the service never ran, so the test proves nothing"
+    );
+    backend.stop(&env).unwrap();
 }
 
 /// The BUNDLED vcrun2022, downloaded for real and installed by `install_installer_pkg` into a fresh real Wine 10.0
