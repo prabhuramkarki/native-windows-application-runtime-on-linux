@@ -1627,15 +1627,12 @@ fn fuzz_tar_gz() {
 #[test]
 #[ignore = "needs Wine and the mingw fixtures"]
 fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
-    use backend_wine::WineBackend;
     let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/build/exports64.dll");
     let dll = fs::read(&dll).expect("fixture missing: run sh tools/build-fixtures.sh");
     for format in FORMATS {
         let launcher = Launcher::new();
-        let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
-        let scratch = Path::new("/tmp/claude-1000");
-        fs::create_dir_all(scratch).unwrap();
-        let tmp = tempfile::tempdir_in(scratch).unwrap();
+        let backend = crate::real_wine_backend(&launcher);
+        let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
         let env = Store::new(tmp.path().join("apps"))
             .unwrap()
             .create(&AppId::parse("e2e").unwrap())
@@ -1709,7 +1706,6 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
 #[test]
 #[ignore = "needs network and Wine"]
 fn real_net_wine_bundled_dxvk_installs_and_removes() {
-    use backend_wine::WineBackend;
     let p = crate::Manifest::bundled().get("dxvk").expect("bundled dxvk");
     let Install::Archive { extract, .. } = &p.install else {
         panic!("dxvk is not an archive package")
@@ -1717,7 +1713,7 @@ fn real_net_wine_bundled_dxvk_installs_and_removes() {
     let tmp = tempfile::tempdir().unwrap();
     let file = crate::fetch::fetch(p, &tmp.path().join("cache"), &crate::fetch::FetchOpts::default()).unwrap();
     let launcher = Launcher::new();
-    let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let backend = crate::real_wine_backend(&launcher);
     let env = Store::new(tmp.path().join("apps"))
         .unwrap()
         .create(&AppId::parse("dxvk").unwrap())

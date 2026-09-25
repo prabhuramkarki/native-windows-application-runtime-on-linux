@@ -1422,3 +1422,5 @@ fn execute_never_fetches_a_gated_install_without_consent() {
     assert!(reason(&rep.failed, "gated").contains("consent missing"), "{rep:?}");
     assert!(r.recorded().is_empty() && a.asked().is_empty());
 }
+
+mod e2e;

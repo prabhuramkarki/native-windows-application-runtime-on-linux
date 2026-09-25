@@ -460,4 +460,4 @@ impl<T: Transport> Transport for StallTransport<T> {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod testserver;
+pub(crate) mod testserver;

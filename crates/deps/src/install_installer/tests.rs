@@ -1030,7 +1030,6 @@ fn msi_detection_is_by_magic_or_url_extension() {
 #[test]
 #[ignore = "needs Wine, bwrap and the NSIS fixture"]
 fn e2e_real_wine_nsis_installer_both_marker_kinds() {
-    use backend_wine::WineBackend;
     let exe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/build/dep-installer.exe");
     let body = fs::read(&exe).expect("fixture missing: run sh tools/build-fixtures.sh");
     let bwrap = rt_installer::find_bwrap_on_path().expect("bwrap must be installed");
@@ -1039,7 +1038,7 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
         reg_marker("HKLM\\Software\\RuntimeDepFixture", "Installed"),
     ] {
         let launcher = Launcher::new();
-        let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+        let backend = crate::real_wine_backend(&launcher);
         let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
         let env = Store::new(tmp.path().join("apps"))
             .unwrap()
@@ -1116,7 +1115,7 @@ fn real_wine(fixture: &str) -> RealWine {
         .join(fixture);
     let body = fs::read(&path).expect("fixture missing: run sh tools/build-fixtures.sh");
     let launcher = Launcher::new();
-    let backend = backend_wine::WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let backend = crate::real_wine_backend(&launcher);
     let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
     let env = Store::new(tmp.path().join("apps"))
         .unwrap()
@@ -1248,7 +1247,6 @@ fn e2e_real_wine_hanging_installer_on_the_null_desktop_times_out_and_is_cleaned_
 #[test]
 #[ignore = "needs network, Wine and bwrap"]
 fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
-    use backend_wine::WineBackend;
     use rt_core::RunOpts;
     let vc = crate::Manifest::bundled().get("vcrun2022").expect("bundled vcrun2022");
     let Install::Installer { marker, .. } = &vc.install else {
@@ -1261,7 +1259,7 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
     let tmp = tempfile::tempdir().unwrap(); // never ~/.wine: a scratch store
     let file = fetch::fetch(vc, &tmp.path().join("cache"), &fetch::FetchOpts::default()).unwrap();
     let launcher = Launcher::new();
-    let backend = WineBackend::discover_with(launcher.clone()).expect("Wine must be installed");
+    let backend = crate::real_wine_backend(&launcher);
     let env = Store::new(tmp.path().join("apps"))
         .unwrap()
         .create(&AppId::parse("vcrun").unwrap())
