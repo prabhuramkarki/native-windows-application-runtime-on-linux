@@ -3,35 +3,41 @@
 //!
 //! **Which app.** The sandbox is attached to a `Launcher`, whose `Sandbox::wrap` gets only the finalized
 //! [`Command`], so the app is derived from that command's `WINEPREFIX`: it must be an absolute, `.`/`..`-free
-//! path of the exact shape `<data root>/apps/<id>/prefix` whose every component is real (no symlink: the resolved
-//! path must be the path itself), and the command's `HOME` must be `<data root>/apps/<id>/runtime/home`, also
-//! real (the Wine backend's choice). Anything else is refused ([`RenderError`]), never bound "as best we can".
-//! Only the prefix and that home are bound read-write; the app root itself (which holds `permissions.toml`,
-//! the logs and metadata) is NEVER bound, nor is the data root, another app or the real `$HOME`.
+//! path of the exact shape `<apps dir>/<id>/prefix`, with the apps directory named `apps`, and the command's
+//! `HOME` must be `<apps dir>/<id>/runtime/home` (the Wine backend's choice). Symlinks ABOVE the apps directory
+//! are fine (a symlinked `~/.local/share`, `/home` on another disk, a `RUNTIME_DATA_DIR` on a symlinked mount),
+//! but the app root, `prefix`, `runtime` and `runtime/home` must be real directories: each must resolve to the
+//! resolved apps directory joined with its own name. The RESOLVED prefix and home are then bound at the paths
+//! the launcher set (`--bind <resolved> <WINEPREFIX>`), so the program sees what it was told. Anything else is
+//! refused ([`RenderError`]), never bound "as best we can". Only the prefix and that home are bound read-write;
+//! the app root itself (which holds `permissions.toml`, the logs and metadata) is NEVER bound, nor is the data
+//! root, another app or the real `$HOME`.
 //!
 //! **The profile** (everything not listed is invisible), in mount order: `--die-with-parent --new-session`
 //! (detaches the real controlling terminal: no TIOCSTI injection) `--unshare-pid --unshare-uts --unshare-ipc`
 //! and `--unshare-net` unless `network = "allow"`; a fresh `/proc`; a minimal `/dev` (bwrap's own: null, zero,
 //! full, random, urandom, tty, pts, and a writable `/dev/shm` Wine needs); a private `/tmp`; read-only
-//! [`RO_BINDS`], the `/etc` files in [`ETC_RO`], with network also [`NET_RO`] (DNS: `/etc/resolv.conf` is often a
-//! symlink into `/run/systemd/resolve`, so both are bound), and the backend's dll dirs; an EMPTY tmpfs at the
-//! runtime directory (`$XDG_RUNTIME_DIR` when absolute and `.`/`..`-free, else `/run/user/<uid>`); then per switch
-//! and only when the host has it: display = the Wayland socket and `/tmp/.X11-unix` and the `XAUTHORITY` file
-//! (read-only, at their own paths; an `XAUTHORITY` under the real home makes that home appear as an otherwise
-//! empty directory holding only the cookie file); audio = `<runtime dir>/pulse/native`; gpu = `--dev-bind-try` of `/dev/dri` and
-//! the NVIDIA nodes in [`GPU_DEV`] plus `/dev/nvidia<N>`, and read-only [`GPU_RO`] (Mesa and the NVIDIA driver read
-//! `/sys`); each host directory grant (`--ro-bind` or `--bind`); finally the prefix and the app home. A
-//! requested socket or node the host lacks is left out and reported by [`AppSandbox::skipped`]. `--dev-bind` is
-//! never used for anything but those GPU nodes.
+//! [`RO_BINDS`], the `/etc` files in [`ETC_RO`], with network also [`NET_RO`] (`/etc/resolv.conf` is often a
+//! symlink into `/run/systemd/resolve`; bwrap follows it on the host side, so only the file itself is bound), and
+//! the backend's dll dirs; an EMPTY, `0700` tmpfs at the runtime directory (`$XDG_RUNTIME_DIR` when absolute and
+//! `.`/`..`-free, else `/run/user/<uid>`); then per switch and only when the host has it: display = the Wayland
+//! socket (which must BE a socket) and `/tmp/.X11-unix` (both read-only at their own paths) and the `XAUTHORITY`
+//! cookie (which must be a regular file, not a link), bound read-only at `<runtime dir>/Xauthority` with the
+//! variable rewritten to match; audio = `<runtime dir>/pulse/native` (a socket); gpu = `--dev-bind-try` of
+//! `/dev/dri` and the NVIDIA nodes in [`GPU_DEV`] plus `/dev/nvidia<N>`, and read-only [`GPU_RO`] (Mesa and the
+//! NVIDIA driver read `/sys`); each host directory grant (`--ro-bind` or `--bind`); finally the prefix and the app
+//! home. A requested socket, cookie or node the host lacks is left out and reported by [`AppSandbox::skipped`].
+//! `--dev-bind` is never used for anything but those GPU nodes.
 //!
 //! **Mount order** (bwrap applies its arguments in order and a LATER mount wins over an EARLIER one at the same
 //! or a nested path, as `rt_installer::sandbox` found against real bwrap 0.11.1): every tmpfs (`/tmp`, the
 //! runtime dir) comes before anything bound below it, or the tmpfs would swallow it (the X11 directory, the
-//! sockets, a grant under `/tmp`, a prefix under `/tmp` in tests); the grants come after the system binds so a
-//! grant below `/usr` is what shows there; and the app's own prefix and home come LAST, so nothing bound later
-//! can hide or replace them (a grant can never be an ancestor of them anyway: grants at, above or below the data
-//! root are refused, and grants are re-validated at render time — a grant that no longer passes, or whose stored
-//! path now resolves elsewhere, is a render error, not skipped).
+//! sockets, the cookie, a prefix under `/tmp` in tests); the grants come after the system binds so a grant below
+//! `/usr` is what shows there; and the app's own prefix and home come LAST, so nothing bound later can hide or
+//! replace them. A grant can never be an ancestor of them anyway: grants at, above or below the data root are
+//! refused, grants are re-validated at render time (one that no longer passes, or whose stored path now resolves
+//! elsewhere, is a render error, not skipped), two grants may not nest (the later would silently override part
+//! of the earlier, e.g. `rw` inside `ro`), and an `rw` grant may not overlap a Wine dll directory.
 //!
 //! **Environment.** Exactly the finalized command's variables that `rt_core::allowed_env` or the Wine backend
 //! ([`BACKEND_ENV`]) may set (the launcher already filtered; re-applied here as defence in depth), minus those of a
@@ -39,18 +45,26 @@
 //! `DBUS_SESSION_BUS_ADDRESS` (no D-Bus socket is ever bound; with a shared network namespace an abstract bus
 //! would otherwise be named for the app). With audio on and the socket bound, `PULSE_SERVER` is kept when it
 //! names exactly that socket (`unix:<path>` or `<path>`) and is otherwise set to `unix:<runtime dir>/pulse/native`
-//! (the only server reachable); without the socket it is dropped. The network switch never changes the environment. The cwd is copied.
+//! (the only server reachable); without the socket it is dropped. `XAUTHORITY` is the bound copy's path, or
+//! dropped when no cookie is bound. The network switch never changes the environment. The cwd is copied.
 //!
-//! **What `network = "allow"` also opens** ([`AppSandbox::caveats`]). The host network namespace is then shared,
-//! and ABSTRACT unix sockets live in the network namespace, not the filesystem: X11's `@/tmp/.X11-unix/X<n>`, and
-//! any abstract D-Bus or other session socket, are reachable whatever is bound. So `display = off` with network
-//! allowed CANNOT be enforced by bubblewrap (the X server's cookie check is all that is left); the renderer says
-//! so instead of pretending.
+//! **What the profile cannot enforce** ([`AppSandbox::caveats`]). With the X11 socket directory bound (display on
+//! and `DISPLAY` set), the program is an ordinary X11 client of the host's X server: it can read and inject the
+//! keyboard and mouse input of every other X11 window (XTEST, XSendEvent), which reaches host code execution. This
+//! is the same as Flatpak's `--socket=x11`; a Wayland session isolates clients. With `network = "allow"` the host
+//! network namespace is shared: ABSTRACT unix sockets live in the network namespace, not the filesystem, so X11's
+//! `@/tmp/.X11-unix/X<n>` and any abstract D-Bus or other session socket are reachable whatever is bound, as are
+//! the host's loopback TCP services. So `display = off` with network allowed CANNOT be enforced by bubblewrap (the
+//! X server's cookie check is all that is left); the renderer says so instead of pretending.
 //!
-//! The renderer is pure: host facts come through [`Host`] (env and path existence), so every switch is
-//! unit-tested with `Command` introspection (`get_program`, `get_args`, `get_envs`, `get_current_dir`).
+//! The renderer is pure: host facts come through [`Host`] (env, path existence, file types, symlink
+//! resolution), so every switch is unit-tested with `Command` introspection (`get_program`, `get_args`,
+//! `get_envs`, `get_current_dir`). [`AppSandbox::skipped`], [`AppSandbox::caveats`] and
+//! [`AppSandbox::argv_preview`] each re-render; a launch computes the plan two or three times, which is cheap.
 use crate::host::Host;
-use crate::permissions::{Access, GrantCtx, Network, PermError, Permissions, account_home, validate_grant_for};
+use crate::permissions::{
+    Access, GrantCtx, Network, PermError, Permissions, account_home, related, validate_grant_for,
+};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -61,8 +75,9 @@ use std::sync::Arc;
 /// for why `/bin` is there — Debian's `/usr/bin/wine` is a `#!/bin/sh` wrapper). `rt_sandbox` does not depend on
 /// `rt_installer`.
 pub const RO_BINDS: [&str; 5] = ["/usr", "/bin", "/lib", "/lib64", "/etc/alternatives"];
-/// The small `/etc` set Wine, fontconfig, the dynamic loader, TLS and Vulkan/GLVND loaders read.
-pub const ETC_RO: [&str; 10] = [
+/// The small `/etc` set Wine, fontconfig, the dynamic loader, TLS (Debian's `/etc/ssl`, Fedora's `/etc/pki`) and
+/// the Vulkan/GLVND loaders read.
+pub const ETC_RO: [&str; 11] = [
     "/etc/passwd",
     "/etc/group",
     "/etc/nsswitch.conf",
@@ -70,12 +85,13 @@ pub const ETC_RO: [&str; 10] = [
     "/etc/localtime",
     "/etc/fonts",
     "/etc/ssl",
+    "/etc/pki",
     "/etc/ca-certificates",
     "/etc/vulkan",
     "/etc/glvnd",
 ];
 /// Name resolution, only with `network = "allow"`.
-pub const NET_RO: [&str; 3] = ["/etc/hosts", "/etc/resolv.conf", "/run/systemd/resolve"];
+pub const NET_RO: [&str; 2] = ["/etc/hosts", "/etc/resolv.conf"];
 /// GPU device nodes (with `/dev/nvidia<N>`, N < [`MAX_NVIDIA`]), dev-bound only when they exist.
 pub const GPU_DEV: [&str; 5] = [
     "/dev/dri",
@@ -98,6 +114,16 @@ pub const BACKEND_ENV: [&str; 6] = [
 ];
 const DISPLAY_ENV: [&str; 3] = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
 const X11_DIR: &str = "/tmp/.X11-unix";
+/// Where the X11 cookie is bound inside, under the runtime directory.
+const XAUTH_NAME: &str = "Xauthority";
+/// Always given when the X11 socket directory is bound (module docs, "What the profile cannot enforce").
+pub const X11_CAVEAT: &str = "X11 is shared with the host: the program can read and inject keyboard/mouse input of \
+                              other X11 windows (use a Wayland session; Wayland isolates clients)";
+const NET_CAVEAT: &str = "network=allow shares the host network namespace: abstract unix sockets (X11's \
+                          @/tmp/.X11-unix/X<n>, any abstract D-Bus or other session socket) and the host's loopback \
+                          TCP services (CUPS, development servers, a TCP Docker API) are reachable from inside";
+const DISPLAY_OFF_CAVEAT: &str = "display=off cannot be enforced with network=allow: the X server's abstract \
+                                  socket @/tmp/.X11-unix/X<n> stays reachable (only its cookie check remains)";
 
 /// Why a command cannot be sandboxed. [`AppSandbox::wrap`] turns every one into a command that refuses to run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -112,6 +138,10 @@ pub enum RenderError {
     NoRealHome,
     #[error("the profile's host directory grant is no longer valid: {0}")]
     Grant(PermError),
+    #[error(
+        "{0:?} and {1:?} overlap (one is inside the other): a grant may not nest in another, and a writable grant may not cover a Wine directory"
+    )]
+    GrantOverlap(String, String),
     #[error("the host directory grant {0:?} now resolves to another directory; grant it again")]
     GrantMoved(String),
 }
@@ -124,10 +154,21 @@ pub struct AppSandbox {
     host: Arc<dyn Host>,
 }
 
-/// One rendering: the command and what was left out.
+/// One rendering: the command, what was left out and what cannot be enforced.
 struct Rendered {
     cmd: Command,
     skipped: Vec<String>,
+    caveats: Vec<String>,
+}
+
+/// The app's two writable directories: `src` is what is bound (symlinks above the apps dir resolved), `dst`
+/// where (the launcher's spelling); and the data root grants are judged against.
+struct AppDirs {
+    prefix_src: PathBuf,
+    prefix_dst: PathBuf,
+    home_src: PathBuf,
+    home_dst: PathBuf,
+    data_root: PathBuf,
 }
 
 /// Absolute and free of `.`/`..` components, judged on the text (`Path::components` drops an interior `.`).
@@ -150,8 +191,8 @@ fn env_of<'a>(cmd: &'a Command, name: &str) -> Option<&'a OsStr> {
         .and_then(|(_, v)| v)
 }
 
-/// `(prefix, app home, data root)` of the command, checked (module docs).
-fn app_dirs(cmd: &Command, host: &dyn Host) -> Result<(PathBuf, PathBuf, PathBuf), RenderError> {
+/// The command's app directories, checked (module docs, "Which app").
+fn app_dirs(cmd: &Command, host: &dyn Host) -> Result<AppDirs, RenderError> {
     let prefix = PathBuf::from(env_of(cmd, "WINEPREFIX").ok_or(RenderError::NoPrefix)?);
     let bad = |why| RenderError::BadPrefix {
         path: lossy(&prefix),
@@ -168,23 +209,38 @@ fn app_dirs(cmd: &Command, host: &dyn Host) -> Result<(PathBuf, PathBuf, PathBuf
         return Err(bad(shape));
     }
     let root = prefix.parent().ok_or(bad(shape))?;
-    let apps = root.parent().filter(|_| root.file_name().is_some()).ok_or(bad(shape))?;
+    let id = root.file_name().ok_or(bad(shape))?;
+    let apps = root.parent().ok_or(bad(shape))?;
     if apps.file_name() != Some(OsStr::new("apps")) {
         return Err(bad(shape));
     }
     let data_root = apps.parent().ok_or(bad(shape))?.to_path_buf();
-    match host.resolve(&prefix) {
-        None => return Err(bad("does not exist")),
-        Some(r) if r != prefix => return Err(bad("goes through a symlink")),
-        Some(_) => {}
+    // Symlinks above `apps` are resolved; at or below the app root every component must be real.
+    let real_apps = host.resolve(apps).ok_or(bad("does not exist"))?;
+    let real_root = real_apps.join(id);
+    let real_prefix = real_root.join("prefix");
+    for (p, want) in [(root, &real_root), (prefix.as_path(), &real_prefix)] {
+        match host.resolve(p) {
+            None => return Err(bad("does not exist")),
+            Some(r) if r != *want => return Err(bad("goes through a symlink at or below the app directory")),
+            Some(_) => {}
+        }
     }
     let home = root.join("runtime/home");
-    let home_ok =
-        env_of(cmd, "HOME").is_some_and(|h| Path::new(h) == home) && host.resolve(&home).is_some_and(|r| r == home);
+    let real_home = real_root.join("runtime/home");
+    let home_ok = env_of(cmd, "HOME").is_some_and(|h| Path::new(h) == home)
+        && host.resolve(&root.join("runtime")) == Some(real_root.join("runtime"))
+        && host.resolve(&home) == Some(real_home.clone());
     if !home_ok {
         return Err(RenderError::Home(lossy(&home)));
     }
-    Ok((prefix, home, data_root))
+    Ok(AppDirs {
+        prefix_src: real_prefix,
+        prefix_dst: prefix.clone(),
+        home_src: real_home,
+        home_dst: home,
+        data_root,
+    })
 }
 
 impl AppSandbox {
@@ -218,24 +274,13 @@ impl AppSandbox {
         self.plan(cmd).map(|r| r.skipped).unwrap_or_default()
     }
 
-    /// What this profile cannot enforce (module docs: a shared network namespace).
-    pub fn caveats(&self) -> Vec<String> {
-        let mut v = Vec::new();
-        if self.perms.network == Network::Allow {
-            v.push(
-                "network=allow shares the host network namespace: abstract unix sockets (X11's \
-                 @/tmp/.X11-unix/X<n>, any abstract D-Bus or other session socket) are reachable from inside"
-                    .to_owned(),
-            );
-            if !self.perms.display {
-                v.push(
-                    "display=off cannot be enforced with network=allow: the X server's abstract socket \
-                     @/tmp/.X11-unix/X<n> stays reachable (only its cookie check remains)"
-                        .to_owned(),
-                );
-            }
-        }
-        v
+    /// What this profile, as rendered for `cmd`, cannot enforce; empty when the command cannot be rendered. With
+    /// the X11 socket directory bound, always [`X11_CAVEAT`]: X11 is shared with the host, so the program can read
+    /// and inject keyboard/mouse input of other X11 windows (use a Wayland session; Wayland isolates clients).
+    /// With `network = "allow"`: abstract sockets and host loopback services, and that `display = off` cannot be
+    /// enforced then.
+    pub fn caveats(&self, cmd: &Command) -> Vec<String> {
+        self.plan(cmd).map(|r| r.caveats).unwrap_or_default()
     }
 
     fn ctx(&self, data_root: PathBuf) -> Result<GrantCtx, RenderError> {
@@ -257,22 +302,42 @@ impl AppSandbox {
         })
     }
 
+    /// Every grant re-validated (module docs, "Mount order"): valid, unmoved, not nested in another, and not
+    /// writable over a Wine dll directory.
+    fn grants(&self, data_root: PathBuf) -> Result<Vec<(PathBuf, Access)>, RenderError> {
+        let mut grants: Vec<(PathBuf, Access)> = Vec::new();
+        if self.perms.filesystem.is_empty() {
+            return Ok(grants);
+        }
+        let ctx = self.ctx(data_root)?;
+        for g in &self.perms.filesystem {
+            let real = validate_grant_for(&g.path, g.access, &ctx).map_err(RenderError::Grant)?;
+            if real != g.path {
+                return Err(RenderError::GrantMoved(lossy(&g.path)));
+            }
+            if let Some((other, _)) = grants.iter().find(|(o, _)| related(o, &real)) {
+                return Err(RenderError::GrantOverlap(lossy(other), lossy(&real)));
+            }
+            if g.access == Access::Rw
+                && let Some(dll) = self
+                    .ro_binds
+                    .iter()
+                    .find(|d| self.host.resolve(d).iter().chain([*d]).any(|d| related(d, &real)))
+            {
+                return Err(RenderError::GrantOverlap(lossy(&real), lossy(dll)));
+            }
+            grants.push((real, g.access));
+        }
+        Ok(grants)
+    }
+
     fn plan(&self, cmd: &Command) -> Result<Rendered, RenderError> {
-        let (prefix, home, data_root) = app_dirs(cmd, &*self.host)?;
+        let dirs = app_dirs(cmd, &*self.host)?;
         let p = &self.perms;
         // Grants first: a stale one refuses the whole run before anything else is looked at.
-        let mut grants = Vec::new();
-        if !p.filesystem.is_empty() {
-            let ctx = self.ctx(data_root)?;
-            for g in &p.filesystem {
-                let real = validate_grant_for(&g.path, g.access, &ctx).map_err(RenderError::Grant)?;
-                if real != g.path {
-                    return Err(RenderError::GrantMoved(lossy(&g.path)));
-                }
-                grants.push((real, g.access));
-            }
-        }
+        let grants = self.grants(dirs.data_root.clone())?;
         let mut skipped = Vec::new();
+        let mut caveats = Vec::new();
         let rt_env = env_of(cmd, "XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|d| plain_abs(d));
@@ -306,10 +371,23 @@ impl AppSandbox {
         for d in &self.ro_binds {
             ro_try(&mut out, d);
         }
-        // Empty: only the sockets bound below appear in it (bwrap creates their parent directories).
-        out.arg("--tmpfs").arg(&rt);
+        // Empty and private: only what is bound below appears in it (bwrap creates the parent directories).
+        out.args(["--perms", "0700", "--tmpfs"]).arg(&rt);
 
-        let mut pulse = None;
+        // `<what> path <p> is not a socket`, or bound.
+        let socket = |out: &mut Command, skipped: &mut Vec<String>, what: &str, s: &Path| {
+            if self.host.is_socket(s) {
+                ro_try(out, s);
+                true
+            } else {
+                skipped.push(format!(
+                    "{what} path {} is not a socket (missing or another file type)",
+                    s.display()
+                ));
+                false
+            }
+        };
+        let mut xauth = None;
         if p.display {
             let wayland = env_of(cmd, "WAYLAND_DISPLAY");
             let display = env_of(cmd, "DISPLAY");
@@ -327,44 +405,42 @@ impl AppSandbox {
                     None => skipped
                         .push("display: Wayland socket (XDG_RUNTIME_DIR is unset or not an absolute path)".to_owned()),
                     Some(rt) => {
-                        let s = rt.join(w);
-                        if self.host.exists(&s) {
-                            ro_try(&mut out, &s);
-                        } else {
-                            skipped.push(format!("display: Wayland socket {} does not exist", s.display()));
-                        }
+                        socket(&mut out, &mut skipped, "display: Wayland socket", &rt.join(w));
                     }
                 }
             }
             if display.is_some() {
                 if self.host.exists(Path::new(X11_DIR)) {
                     ro_try(&mut out, Path::new(X11_DIR));
+                    caveats.push(X11_CAVEAT.to_owned());
                 } else {
                     skipped.push(format!("display: X11 socket directory {X11_DIR} does not exist"));
                 }
             }
             if let Some(x) = env_of(cmd, "XAUTHORITY").map(Path::new) {
-                if plain_abs(x) && self.host.exists(x) {
-                    ro_try(&mut out, x);
+                // A copy at a fixed path in the private runtime dir: the host path (often under the real home)
+                // never appears inside.
+                if plain_abs(x) && self.host.is_file(x) {
+                    let dst = rt.join(XAUTH_NAME);
+                    out.arg("--ro-bind").arg(x).arg(&dst);
+                    xauth = Some(dst);
                 } else {
                     skipped.push(format!(
-                        "display: XAUTHORITY file {} does not exist or is not an absolute path",
+                        "display: XAUTHORITY {} is not a regular file (missing, a link or another file type)",
                         x.display()
                     ));
                 }
             }
         }
+        let mut pulse = None;
         if p.audio {
             match &rt_env {
                 None => skipped
                     .push("audio: PulseAudio socket (XDG_RUNTIME_DIR is unset or not an absolute path)".to_owned()),
                 Some(rt) => {
                     let s = rt.join("pulse/native");
-                    if self.host.exists(&s) {
-                        ro_try(&mut out, &s);
+                    if socket(&mut out, &mut skipped, "audio: PulseAudio socket", &s) {
                         pulse = Some(s);
-                    } else {
-                        skipped.push(format!("audio: PulseAudio socket {} does not exist", s.display()));
                     }
                 }
             }
@@ -391,9 +467,10 @@ impl AppSandbox {
                 .arg(g)
                 .arg(g);
         }
-        // Last, so no other mount can hide or replace them (module docs, "Mount order").
-        out.arg("--bind").arg(&prefix).arg(&prefix);
-        out.arg("--bind").arg(&home).arg(&home);
+        // Last, so no other mount can hide or replace them (module docs, "Mount order"); the resolved directory at
+        // the launcher's path.
+        out.arg("--bind").arg(&dirs.prefix_src).arg(&dirs.prefix_dst);
+        out.arg("--bind").arg(&dirs.home_src).arg(&dirs.home_dst);
         out.arg("--");
         out.arg(cmd.get_program());
         out.args(cmd.get_args());
@@ -403,13 +480,17 @@ impl AppSandbox {
         for (k, v) in cmd.get_envs() {
             let Some(v) = v else { continue };
             let allowed = BACKEND_ENV.iter().any(|b| k == OsStr::new(b)) || !rt_core::allowed_env([(k, v)]).is_empty();
-            // A switch that is off, D-Bus (never bound), and PULSE_SERVER (re-decided below).
+            // A switch that is off, D-Bus (never bound), and PULSE_SERVER/XAUTHORITY (re-decided below).
             let withheld = (!p.display && DISPLAY_ENV.iter().any(|d| k == OsStr::new(d)))
-                || k == OsStr::new("PULSE_SERVER")
-                || k == OsStr::new("DBUS_SESSION_BUS_ADDRESS");
+                || ["PULSE_SERVER", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"]
+                    .iter()
+                    .any(|d| k == OsStr::new(d));
             if allowed && !withheld {
                 out.env(k, v);
             }
+        }
+        if let Some(x) = xauth {
+            out.env("XAUTHORITY", x);
         }
         if let Some(sock) = pulse {
             // Only the one bound socket is reachable, so only a value naming exactly it is kept: a list such as
@@ -428,7 +509,17 @@ impl AppSandbox {
         if let Some(dir) = cmd.get_current_dir() {
             out.current_dir(dir);
         }
-        Ok(Rendered { cmd: out, skipped })
+        if p.network == Network::Allow {
+            caveats.push(NET_CAVEAT.to_owned());
+            if !p.display {
+                caveats.push(DISPLAY_OFF_CAVEAT.to_owned());
+            }
+        }
+        Ok(Rendered {
+            cmd: out,
+            skipped,
+            caveats,
+        })
     }
 }
 

@@ -59,14 +59,39 @@ pub fn probe(bwrap: &Path) -> Result<(), String> {
         .filter(|c| !c.is_control())
         .take(200)
         .collect();
-    let userns = ["namespace", "Operation not permitted", "uid map", "Permission denied"];
-    if userns.iter().any(|m| text.contains(m)) {
-        Err(format!(
-            "user namespaces are disabled or restricted on this host: {first}"
-        ))
+    Err(probe_reason(&text, &first))
+}
+
+/// bwrap's own messages when the kernel refuses an unprivileged user namespace (`kernel.unprivileged_userns_clone`,
+/// `user.max_user_namespaces = 0`, AppArmor's `restrict_unprivileged_userns`).
+const USERNS_MESSAGES: [&str; 4] = [
+    "No permissions to create new namespace",
+    "setting up uid map",
+    "Creating new namespace failed",
+    "unprivileged user namespaces",
+];
+
+/// The one-line reason for a failed probe: user namespaces only when bwrap says so, else the excerpt.
+fn probe_reason(text: &str, first: &str) -> String {
+    if USERNS_MESSAGES.iter().any(|m| text.contains(m)) {
+        format!("user namespaces are disabled or restricted on this host ({first})")
     } else {
-        Err(format!("bwrap cannot create a sandbox ({}): {first}", out.status))
+        format!("the sandbox could not be created ({first})")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn grant_tempdir() -> tempfile::TempDir {
+    let exe = std::env::current_exe().unwrap();
+    let base = exe.ancestors().nth(3).unwrap().join("tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    let td = tempfile::tempdir_in(&base).unwrap();
+    assert!(
+        !td.path().canonicalize().unwrap().starts_with("/tmp"),
+        "{:?}",
+        td.path()
+    );
+    td
 }
 
 #[cfg(test)]
@@ -89,6 +114,13 @@ mod tests {
         assert!(e.contains("could not be run"), "{e}");
         // `false` ignores its arguments and fails: a reason, not a panic
         let e = probe(Path::new("/bin/false")).unwrap_err();
-        assert!(e.contains("cannot create a sandbox"), "{e}");
+        assert_eq!(e, "the sandbox could not be created (no output)");
+        let userns = "bwrap: No permissions to create new namespace, likely because the kernel does not allow";
+        assert!(probe_reason(userns, "x").starts_with("user namespaces are disabled"));
+        // an unrelated EPERM is not blamed on user namespaces
+        assert_eq!(
+            probe_reason("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "y"),
+            "the sandbox could not be created (y)"
+        );
     }
 }

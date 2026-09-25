@@ -46,6 +46,9 @@ struct Rig {
     inputs: PathBuf,
     /// `false`: `RUNTIME_WINE` points at a file that does not exist.
     wine_present: bool,
+    /// A second temp directory OUTSIDE `/tmp` (under `CARGO_TARGET_TMPDIR`), for host directories a permission
+    /// grant may name: every grant at or below `/tmp` is refused.
+    grants: tempfile::TempDir,
 }
 
 fn script(path: &Path, body: &str) {
@@ -111,6 +114,7 @@ fn rig_with(wineserver_body: &str) -> Rig {
         log,
         inputs,
         wine_present: true,
+        grants: tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
     }
 }
 
@@ -2886,7 +2890,7 @@ fn doctor_of_an_app_checks_its_graphics_driver_setting_and_keeps_the_areas() {
 /// An app `papp` and a `$HOME` (`home/`, with a `.ssh` and an ordinary `share/` directory) for `HOME`.
 fn perm_app(r: &Rig) -> (PathBuf, PathBuf) {
     let app = r.plant("papp", "P");
-    let home = r.root.join("home");
+    let home = r.grants.path().canonicalize().unwrap().join("home");
     fs::create_dir_all(home.join(".ssh")).unwrap();
     fs::create_dir_all(home.join("share")).unwrap();
     (app, home)
@@ -3136,11 +3140,14 @@ fn permissions_rejects_bad_ids_and_unknown_apps() {
 fn permissions_refuses_sockets_files_daemon_dirs_and_rw_system_trees() {
     let r = rig();
     let (app, home) = perm_app(&r);
-    let sock = home.join("share/agent.sock");
+    // (a socket path must fit `sun_path`; under /tmp it is refused for where it is)
+    let short = tempfile::tempdir_in("/tmp").unwrap();
+    let sock = short.path().join("agent.sock");
     let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     fs::write(home.join(".bashrc"), "x").unwrap();
     for (grant, why) in [
-        (format!("{}:rw", sock.display()), "not a directory"),
+        (format!("{}:rw", sock.display()), "/tmp"),
+        (format!("{}:ro", short.path().display()), "/tmp"),
         (format!("{}:rw", home.join(".bashrc").display()), "not a directory"),
         ("/run/docker.sock:rw".into(), "/run"),
         ("/run/dbus:ro".into(), "/run"),
