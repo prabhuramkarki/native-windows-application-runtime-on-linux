@@ -18,7 +18,10 @@ runtime-backend-wine = { path = "../backend-wine" }
 runtime-deps = { path = "../deps" }
 clap = { version = "4", features = ["derive"] }
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

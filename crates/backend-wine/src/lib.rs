@@ -37,7 +37,7 @@ pub mod harden;
 pub const BACKEND_ID: &str = "wine";
 
 /// Wine's own `WINEDLLOVERRIDES` for every process: no menu spam, no Mono/Gecko download dialogs (.NET apps
-/// fail until Phase 4; `doctor` says so).
+/// fail until a .NET package exists (not planned in Phase 4); `doctor` says so).
 pub const WINEDLLOVERRIDES: &str = "winemenubuilder.exe=d;mscoree=d;mshtml=d";
 
 /// [`CompatBackend::settle`]'s shell wrapper: a FIXED script text, never built with `format!` or any other

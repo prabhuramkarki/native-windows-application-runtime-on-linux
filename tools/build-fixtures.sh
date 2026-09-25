@@ -14,6 +14,10 @@ for arch in x86_64 i686; do
   "$cc" $flags -o "$out/fs$tag.exe" tools/fixtures/fs.c
   "$cc" $flags -mwindows -o "$out/gui$tag.exe" tools/fixtures/gui.c
   "$cc" $flags -shared -o "$out/exports$tag.dll" tools/fixtures/exports.c
+  # x86_64 only: the bundled DXVK ships x64 DLLs only.
+  if [ "$arch" = x86_64 ]; then
+    "$cc" $flags -o "$out/d3d11_64.exe" tools/fixtures/d3d11.c -ld3d11 -ldxgi -ldxguid
+  fi
   rm -f "$out/hello$tag.res.o"
 done
 
