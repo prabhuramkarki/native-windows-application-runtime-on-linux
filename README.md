@@ -62,10 +62,18 @@ skipped. How downloads are verified and what is not: `docs/SECURITY.md`, "Depend
 
 Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
 - **DXVK 3.1.1** (Zlib, no consent): d3d8, d3d9, d3d10core, d3d11 and dxgi, x64 DLLs with `native,builtin` overrides.
+- **VKD3D-Proton 3.0.1** (LGPL-2.1-or-later, no consent, needs DXVK): d3d12 and d3d12core, x64 DLLs with
+  `native,builtin` overrides, read from upstream's `.tar.zst` by the bounded zstd reader. Installing works on any host;
+  actually rendering Direct3D 12 needs a GPU and driver with Vulkan 1.3 and is not verified anywhere. CI verifies
+  the `.tar.zst` install path and the manifest entry's paths and overrides on real Wine with a fixture archive;
+  the pin's download is re-verified weekly by `verify-pins`; installing the real downloaded package on Wine is a
+  manual `--ignored real_net_*` run. `runtime graphics info` shows what
+  the host offers (Vulkan loader, devices and API versions, from a bounded `vulkaninfo` run), and `deps` marks
+  `dxvk` and `vkd3d-proton` as blocked, with the reason, when Vulkan is unusable (and `deps --install` skips them).
 - **VC++ 2015-2022 redistributable x64 14.44.35211** (Microsoft, consent): Microsoft's installer, run offline in the
   installer sandbox on a one-run null-driver desktop; success is its registry marker; 16 DLL overrides set after.
 
-Known gaps: VKD3D-Proton (upstream ships only `.tar.zst`, not read), `d3dcompiler_47` (no verifiable redistributable
+Known gaps: `d3dcompiler_47` (no verifiable redistributable
 source), .NET, Mono and Gecko (no packages; they stay disabled), 32-bit apps (x64 DLLs only; the plan warns), no
 package upgrades (a newer pinned version is refused: recreate the app) and no removal of a single package (removing
 the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
@@ -80,6 +88,8 @@ left alone: the runtime neither installs it nor sets its DLL overrides (`deps` a
   Ubuntu 24.04's Wine 9 is reported to use `/usr/lib/wine/wineserver64`, which is searched too but was not
   verified here). Override both with `RUNTIME_WINE=/abs/path/to/wine` and
   `RUNTIME_WINESERVER=/abs/path/to/wineserver` (a wrong value is an error, not a fallback).
+  `RUNTIME_VULKAN_LOADER=present|absent` overrides the Vulkan loader lookup (used by the tests; any other
+  value, or unset, means the real lookup).
 - Stable Rust 1.88 or newer to build (`cargo build`).
 - mingw-w64 (`apt install mingw-w64`) only to build the test fixtures, never to use the program.
 

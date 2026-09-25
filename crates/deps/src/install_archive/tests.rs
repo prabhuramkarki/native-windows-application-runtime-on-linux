@@ -13,7 +13,7 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFCHR: u32 = 0o020_000;
 const S_IFIFO: u32 = 0o010_000;
-const FORMATS: [ArchiveFormat; 2] = [ArchiveFormat::Zip, ArchiveFormat::TarGz];
+const FORMATS: [ArchiveFormat; 3] = [ArchiveFormat::Zip, ArchiveFormat::TarGz, ArchiveFormat::TarZst];
 
 // ------------------------------------------------------------------------------------------------ archive builders
 
@@ -199,11 +199,25 @@ fn targz_of(entries: &[T]) -> Vec<u8> {
     gzip(&tar_of(entries))
 }
 
+fn zstd(data: &[u8]) -> Vec<u8> {
+    ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
+}
+
+/// A tarball in `format` (tar.gz or tar.zst).
+fn tarball_of(format: ArchiveFormat, entries: &[T]) -> Vec<u8> {
+    match format {
+        ArchiveFormat::TarZst => zstd(&tar_of(entries)),
+        _ => targz_of(entries),
+    }
+}
+
 /// Regular files `(name, data)` in the given format.
 fn files_in(format: ArchiveFormat, files: &[(&str, &[u8])]) -> Vec<u8> {
     match format {
         ArchiveFormat::Zip => zip_of(&files.iter().map(|(n, d)| Z::file(n, d)).collect::<Vec<_>>()),
-        ArchiveFormat::TarGz => targz_of(&files.iter().map(|(n, d)| T::file(n, d)).collect::<Vec<_>>()),
+        ArchiveFormat::TarGz | ArchiveFormat::TarZst => {
+            tarball_of(format, &files.iter().map(|(n, d)| T::file(n, d)).collect::<Vec<_>>())
+        }
     }
 }
 
@@ -292,6 +306,7 @@ fn pkg_with(format: ArchiveFormat, extract: &[(&str, &str)], overrides: &[&str],
         requires_consent: false,
         requires: vec![],
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format,
             extract: extract
@@ -438,15 +453,18 @@ fn a_trailing_slash_selects_every_file_below_a_directory() {
                 Z::file("dxvk/x32/d3d11.dll", b"32"),
                 Z::file("dxvk/x64.txt", b"not below x64/"),
             ]),
-            ArchiveFormat::TarGz => targz_of(&[
-                T::dir("dxvk"),
-                T::dir("dxvk/x64"),
-                T::file("dxvk/x64/d3d11.dll", b"64"),
-                T::dir("dxvk/x64/sub"),
-                T::file("dxvk/x64/sub/deep.dll", b"deep"),
-                T::file("dxvk/x32/d3d11.dll", b"32"),
-                T::file("dxvk/x64.txt", b"not below x64/"),
-            ]),
+            ArchiveFormat::TarGz | ArchiveFormat::TarZst => tarball_of(
+                format,
+                &[
+                    T::dir("dxvk"),
+                    T::dir("dxvk/x64"),
+                    T::file("dxvk/x64/d3d11.dll", b"64"),
+                    T::dir("dxvk/x64/sub"),
+                    T::file("dxvk/x64/sub/deep.dll", b"deep"),
+                    T::file("dxvk/x32/d3d11.dll", b"32"),
+                    T::file("dxvk/x64.txt", b"not below x64/"),
+                ],
+            ),
         };
         let file = e.archive("a", &bytes);
         let done = install(&e, pkg(format, &[("dxvk/x64/", "windows/system32")]), &file).unwrap();
@@ -1006,12 +1024,15 @@ fn file_and_directory_modes_are_fixed_whatever_the_archive_says() {
                 Z::file("d/all.dll", b"A").mode(S_IFREG | 0o7777),
                 Z::file("d/none.dll", b"N").mode(S_IFREG),
             ]),
-            ArchiveFormat::TarGz => targz_of(&[
-                T::dir("d").mode(0o7777),
-                T::file("d/suid.dll", b"S").mode(0o4755),
-                T::file("d/all.dll", b"A").mode(0o7777),
-                T::file("d/none.dll", b"N").mode(0),
-            ]),
+            ArchiveFormat::TarGz | ArchiveFormat::TarZst => tarball_of(
+                format,
+                &[
+                    T::dir("d").mode(0o7777),
+                    T::file("d/suid.dll", b"S").mode(0o4755),
+                    T::file("d/all.dll", b"A").mode(0o7777),
+                    T::file("d/none.dll", b"N").mode(0),
+                ],
+            ),
         };
         let file = e.archive("a", &bytes);
         let done = install(&e, pkg(format, &[("d/", "new/sub")]), &file).unwrap();
@@ -1588,6 +1609,8 @@ fn fuzz(format: ArchiveFormat, seed: u64) {
             (ArchiveFormat::Zip, _) => mutate(&mut rng, zip_of(&zips)),
             (ArchiveFormat::TarGz, 0) => mutate(&mut rng, targz_of(&tars)),
             (ArchiveFormat::TarGz, _) => gzip(&mutate(&mut rng, tar_of(&tars))),
+            (ArchiveFormat::TarZst, 0) => mutate(&mut rng, zstd(&tar_of(&tars))),
+            (ArchiveFormat::TarZst, _) => zstd(&mutate(&mut rng, tar_of(&tars))),
         };
         if bytes.is_empty() {
             continue;
@@ -1618,6 +1641,11 @@ fn fuzz_zip() {
 #[test]
 fn fuzz_tar_gz() {
     fuzz(ArchiveFormat::TarGz, 0x5eed_0002);
+}
+
+#[test]
+fn fuzz_tar_zst() {
+    fuzz(ArchiveFormat::TarZst, 0x5eed_0003);
 }
 
 // ------------------------------------------------------------------------------------------------ real Wine
@@ -1699,16 +1727,14 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
     }
 }
 
-/// The BUNDLED dxvk, downloaded for real and installed into a fresh real Wine 10.0 prefix: the real upstream
-/// tarball passes the bounded tar reader, every declared DLL lands (replacing Wine's builtin placeholder) with its
-/// override set, and removal restores the placeholders. Needs network, so CI's `e2e_real_wine` filter skips it:
-/// `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
-#[test]
-#[ignore = "needs network and Wine"]
-fn real_net_wine_bundled_dxvk_installs_and_removes() {
-    let p = crate::Manifest::bundled().get("dxvk").expect("bundled dxvk");
+/// The BUNDLED archive package `id`, downloaded for real and installed into a fresh real Wine 10.0 prefix: the real upstream
+/// tarball passes the bounded tar reader, every declared DLL lands (replacing Wine's builtin placeholder, where
+/// Wine ships one) with its override set, and removal restores the previous state. Needs network, so CI's
+/// `e2e_real_wine` filter skips it: `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
+fn real_net_wine_bundled_installs_and_removes(id: &str) {
+    let p = crate::Manifest::bundled().get(id).expect("bundled package");
     let Install::Archive { extract, .. } = &p.install else {
-        panic!("dxvk is not an archive package")
+        panic!("{id} is not an archive package")
     };
     let tmp = tempfile::tempdir().unwrap();
     let file = crate::fetch::fetch(p, &tmp.path().join("cache"), &crate::fetch::FetchOpts::default()).unwrap();
@@ -1716,21 +1742,26 @@ fn real_net_wine_bundled_dxvk_installs_and_removes() {
     let backend = crate::real_wine_backend(&launcher);
     let env = Store::new(tmp.path().join("apps"))
         .unwrap()
-        .create(&AppId::parse("dxvk").unwrap())
+        .create(&AppId::parse(id).unwrap())
         .unwrap();
     backend.prepare(&env).unwrap();
     backend.stop(&env).unwrap();
-    let before: Vec<Vec<u8>> = extract
+    // Wine's builtin placeholder, if it ships one for this DLL.
+    let before: Vec<Option<Vec<u8>>> = extract
         .iter()
-        .map(|e| fs::read(env.drive_c().join(&e.to)).unwrap())
+        .map(|e| fs::read(env.drive_c().join(&e.to)).ok())
         .collect();
     let done = install_archive(p, &file, &env, &backend, &launcher).unwrap();
-    eprintln!("dxvk: {done:?}");
+    eprintln!("{id}: {done:?}");
     assert_eq!(done.overrides, p.provides);
     assert_eq!(done.files.len(), extract.len());
     for (e, old) in extract.iter().zip(&before) {
         let now = fs::read(env.drive_c().join(&e.to)).unwrap();
-        assert!(now != *old && now.starts_with(b"MZ"), "{} not replaced", e.to);
+        assert!(
+            now.starts_with(b"MZ") && old.as_ref() != Some(&now),
+            "{} not replaced",
+            e.to
+        );
     }
     backend.stop(&env).unwrap();
     let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
@@ -1739,13 +1770,65 @@ fn real_net_wine_bundled_dxvk_installs_and_removes() {
     }
     remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
     for (e, old) in extract.iter().zip(&before) {
-        assert_eq!(
-            fs::read(env.drive_c().join(&e.to)).unwrap(),
-            *old,
-            "{} not restored",
-            e.to
-        );
+        assert_eq!(fs::read(env.drive_c().join(&e.to)).ok(), *old, "{} not restored", e.to);
     }
+    backend.stop(&env).unwrap();
+}
+
+#[test]
+#[ignore = "needs network and Wine"]
+fn real_net_wine_bundled_dxvk_installs_and_removes() {
+    real_net_wine_bundled_installs_and_removes("dxvk");
+}
+
+/// Same for VKD3D-Proton: the real `.tar.zst` goes through the zstd reader, and `d3d12` gets `native,builtin`.
+#[test]
+#[ignore = "needs network and Wine"]
+fn real_net_wine_bundled_vkd3d_proton_installs_and_removes() {
+    real_net_wine_bundled_installs_and_removes("vkd3d-proton");
+}
+
+/// Offline (so CI's `e2e_real_wine` filter runs it): the REAL bundled vkd3d-proton entry (paths, overrides, format)
+/// applied to a fixture `.tar.zst` of the same layout, installed into a real Wine 10.0 prefix.
+#[test]
+#[ignore = "needs Wine and the mingw fixtures"]
+fn e2e_real_wine_vkd3d_manifest_shape() {
+    let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/build/exports64.dll");
+    let dll = fs::read(&dll).expect("fixture missing: run sh tools/build-fixtures.sh");
+    let mut p = crate::Manifest::bundled()
+        .get("vkd3d-proton")
+        .expect("bundled vkd3d-proton")
+        .clone();
+    let Install::Archive { format, extract, .. } = &p.install else {
+        panic!("vkd3d-proton is not an archive package")
+    };
+    assert_eq!(*format, ArchiveFormat::TarZst);
+    let names: Vec<(String, Vec<u8>)> = extract.iter().map(|e| (e.from.clone(), dll.clone())).collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let bytes = files_in(ArchiveFormat::TarZst, &files);
+    let launcher = Launcher::new();
+    let backend = crate::real_wine_backend(&launcher);
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("vkd3d").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    let file = tmp.path().join("pkg");
+    fs::write(&file, &bytes).unwrap();
+    p.size = bytes.len() as u64;
+    let done = install_archive(&p, &file, &env, &backend, &launcher).unwrap();
+    eprintln!("vkd3d-proton fixture: {done:?}");
+    for name in ["d3d12", "d3d12core"] {
+        let f = env.drive_c().join(format!("windows/system32/{name}.dll"));
+        assert_eq!(fs::read(&f).unwrap(), dll, "{name}");
+    }
+    backend.stop(&env).unwrap();
+    let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
+    for name in ["d3d12", "d3d12core"] {
+        assert!(user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")), "{name}");
+    }
+    remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
     backend.stop(&env).unwrap();
 }
 

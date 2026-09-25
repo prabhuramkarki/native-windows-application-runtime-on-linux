@@ -38,11 +38,11 @@ use crate::fetch::{self, FetchError, FetchOpts};
 use crate::install_archive::{self, ArchiveError, DiscardReport};
 use crate::install_installer::{self, InstallerPkgError};
 use crate::manifest::{self, Kind, Manifest, Package};
-use crate::resolve::{Action, Facts, Plan, resolve};
+use crate::resolve::{Action, Facts, Plan, block_for_vulkan, resolve};
 use crate::state;
 use rt_core::{
-    AppEnv, CompatBackend, ConsentRecord, DependencyRecord, Input, Launcher, Metadata, Store, StoreError, WinPath,
-    read_input, resolve_under,
+    AppEnv, CompatBackend, ConsentRecord, DependencyRecord, Input, Launcher, Metadata, Store, StoreError,
+    VulkanVerdict, WinPath, read_input, resolve_under,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -114,6 +114,9 @@ pub struct Orchestrator<'a> {
     pub consent: &'a dyn ConsentProvider,
     /// Unix seconds for `installed_at` / `given_at` ([`unix_now`] in real use).
     pub now: fn() -> u64,
+    /// The host's Vulkan verdict; the install re-resolves the plan, so it applies [`block_for_vulkan`] again and
+    /// installs exactly what `plan_for_app` showed as installable.
+    pub vulkan: VulkanFor<'a>,
 }
 
 /// Unix seconds (0 if the clock is before 1970).
@@ -249,8 +252,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Plans `md`'s app against `manifest`. Never fails: an executable that cannot be read safely (missing, not a
 /// regular file, a FIFO, a symlink, not a PE, over the size cap) gives a warning and a plan without imports.
 /// Delay-load imports are included (a missed need is worse than an unused package).
-pub fn plan_for_app(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> AppPlan {
-    let mut plan = plan_for_pe(md, read_exe(env, md).as_ref().map_err(String::as_str), manifest);
+pub fn plan_for_app(env: &AppEnv, md: &Metadata, manifest: &Manifest, vulkan: VulkanFor<'_>) -> AppPlan {
+    let mut plan = plan_for_pe(md, read_exe(env, md).as_ref().map_err(String::as_str), manifest, vulkan);
     drop_present_installers(env, manifest, &mut plan);
     plan
 }
@@ -273,9 +276,19 @@ pub fn drop_present_installers(env: &AppEnv, manifest: &Manifest, app: &mut AppP
     }
 }
 
+/// The host's Vulkan verdict for a minimum API version; asked lazily, once per distinct minimum (see
+/// [`block_for_vulkan`]), so a caller can probe the host only when a package actually needs Vulkan.
+pub type VulkanFor<'a> = &'a dyn Fn(Option<(u32, u32)>) -> VulkanVerdict;
+
 /// [`plan_for_app`] for a caller that already analysed the app's executable (`doctor`), so it is not read twice.
-/// `Err` is why it could not be read, shown in the warning.
-pub fn plan_for_pe(md: &Metadata, exe: Result<&pe::PeInfo, &str>, manifest: &Manifest) -> AppPlan {
+/// `Err` is why it could not be read, shown in the warning. Packages that need a Vulkan the host lacks are
+/// `Blocked` (see [`block_for_vulkan`]).
+pub fn plan_for_pe(
+    md: &Metadata,
+    exe: Result<&pe::PeInfo, &str>,
+    manifest: &Manifest,
+    vulkan: VulkanFor<'_>,
+) -> AppPlan {
     let mut warnings = Vec::new();
     let mut facts = Facts::default();
     let mut arch = md.architecture.clone();
@@ -291,7 +304,8 @@ pub fn plan_for_pe(md: &Metadata, exe: Result<&pe::PeInfo, &str>, manifest: &Man
             "cannot read the app's executable ({why}); the plan does not include what it imports"
         ))),
     }
-    let plan = resolve(&facts, &state::installed_set(md), &[], manifest);
+    let mut plan = resolve(&facts, &state::installed_set(md), &[], manifest);
+    block_for_vulkan(&mut plan, manifest, vulkan);
     if arch == "x86" {
         for e in &plan.entries {
             if let Some(p) = manifest.get(&e.package)
@@ -485,9 +499,11 @@ pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsEr
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;
     let installed = state::installed_set(&md);
-    let first = resolve(&app.facts, &installed, &[], o.manifest);
+    let mut first = resolve(&app.facts, &installed, &[], o.manifest);
+    block_for_vulkan(&mut first, o.manifest, o.vulkan);
     let d = decide(o, &md, &first);
-    let plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    let mut plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    block_for_vulkan(&mut plan, o.manifest, o.vulkan);
     Ok(execute(o, &plan, &d, &md.dependencies))
 }
 

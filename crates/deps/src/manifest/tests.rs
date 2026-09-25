@@ -630,6 +630,7 @@ fn bundled_manifest_invariants() {
             let ext = match format {
                 ArchiveFormat::Zip => ".zip",
                 ArchiveFormat::TarGz => ".tar.gz",
+                ArchiveFormat::TarZst => ".tar.zst",
             };
             assert!(p.url.ends_with(ext), "{}", p.id);
         }
@@ -791,8 +792,20 @@ fn archive_format_parsed_and_checked() {
     let tgz = text.replacen("base.tar.gz", "base.TGZ?x=1#y", 1);
     Manifest::parse(&tgz).unwrap();
     Manifest::parse(&valid_with("base.zip", "base.zip?v=1")).unwrap();
+    let zst = valid_with("format = \"zip\"", "format = \"tar.zst\"").replacen(
+        "example.org/base.zip",
+        "example.org/base.tar.zst",
+        1,
+    );
+    assert!(matches!(
+        Manifest::parse(&zst).unwrap().get("base").unwrap().install,
+        Install::Archive {
+            format: ArchiveFormat::TarZst,
+            ..
+        }
+    ));
 
-    for f in ["tar.zst", "ZIP", "tar", "", "7z"] {
+    for f in ["tar.zstd", "tzst", "TAR.ZST", "ZIP", "tar", "", "7z"] {
         let e = err(&valid_with("format = \"zip\"", &format!("format = \"{f}\"")));
         assert!(matches!(e, ManifestError::UnsupportedFormat { .. }), "{f:?}: {e:?}");
     }
@@ -805,6 +818,9 @@ fn archive_format_parsed_and_checked() {
         ("tar.gz", "https://example.org/base.zip"),
         ("tar.gz", "https://example.org/base.tar.zst"),
         ("tar.gz", "https://example.org/base.gz"),
+        ("tar.zst", "https://example.org/base.tar.gz"),
+        ("tar.zst", "https://example.org/base.zst"),
+        ("zip", "https://example.org/base.tar.zst"),
     ] {
         let text = valid_with("format = \"zip\"", &format!("format = \"{fmt}\"")).replacen(
             "https://example.org/base.zip",
@@ -866,4 +882,49 @@ fn distinct_destinations_accepted() {
     let text = archive_to("a", &["w/s/x.dll", "w/s/y.dll", "w/sx", "w/s.dll"])
         + &archive_to("b", &["w/s/xy.dll", "w/x.dll", "ws/x.dll"]);
     assert_eq!(Manifest::parse(&text).unwrap().packages.len(), 2);
+}
+
+/// One archive package `p` whose `min_vulkan` line is `line` (none if empty).
+fn with_min_vulkan(line: &str) -> String {
+    archive("p", &[], &["p"]).replacen(
+        "requires_consent = false",
+        &format!("requires_consent = false\n{line}"),
+        1,
+    )
+}
+
+#[test]
+fn min_vulkan_parses_major_dot_minor() {
+    let m = Manifest::parse(&with_min_vulkan("min_vulkan = \"1.3\"")).unwrap();
+    assert_eq!(m.get("p").unwrap().min_vulkan, Some((1, 3)));
+    assert_eq!(m.max_min_vulkan(), Some((1, 3)));
+}
+
+#[test]
+fn min_vulkan_rejects_junk() {
+    for v in [
+        "1",
+        "1.3.0",
+        "a.b",
+        "",
+        "1.99999999999",
+        "-1.3",
+        "1. 3",
+        "+1.3",
+        "1.",
+        ".3",
+        "12345.1",
+        "1.3\n",
+        "1.3\t",
+    ] {
+        let e = err(&with_min_vulkan(&format!("min_vulkan = {v:?}")));
+        assert!(matches!(e, ManifestError::BadMinVulkan { .. }), "{v}: {e:?}");
+    }
+}
+
+#[test]
+fn min_vulkan_is_optional() {
+    let m = Manifest::parse(&with_min_vulkan("")).unwrap();
+    assert_eq!(m.get("p").unwrap().min_vulkan, None);
+    assert_eq!(m.max_min_vulkan(), None);
 }

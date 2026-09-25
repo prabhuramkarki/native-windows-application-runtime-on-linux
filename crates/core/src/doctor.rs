@@ -23,6 +23,7 @@
 //! itself (a directory that does not exist is fine and silent) is REPORTED: the imports get one extra Warn
 //! "DLL listing incomplete", and the missing-DLL lines then say "not found in the listed files", not "not found".
 use crate::CompatBackend;
+use crate::graphics::{HostVulkan, VulkanVerdict, host_verdict};
 use crate::text::{clean, quote_max};
 use pe::{Arch, InstallerKind, Kind, PeInfo, Subsystem};
 use std::collections::HashSet;
@@ -186,6 +187,10 @@ pub struct DoctorInput<'a> {
     pub app_home: Option<Result<(), &'a str>>,
     /// The prefix directory (its `system32`/`syswow64` count as DLL sources), if there is one.
     pub prefix_root: Option<&'a Path>,
+    /// The host's Vulkan probe (`runtime graphics info`'s runner); `None` keeps the loader-file check alone.
+    pub vulkan: Option<&'a HostVulkan>,
+    /// The highest Vulkan API version a bundled package needs (DXVK), if any: a device below it is not usable.
+    pub vulkan_min: Option<(u32, u32)>,
 }
 
 /// Names read from one directory listing at most.
@@ -203,7 +208,7 @@ const NAME_WIDTH: usize = 40;
 /// Import entries looked at (the PE parser already caps its tables lower).
 const MAX_IMPORTS: usize = 20_000;
 /// Standard library directories searched for the Vulkan loader.
-const VULKAN_DIRS: &[&str] = &[
+pub const VULKAN_DIRS: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu",
     "/usr/lib64",
     "/usr/lib",
@@ -668,6 +673,24 @@ fn wine(input: &DoctorInput<'_>, out: &mut Out) {
 }
 
 fn vulkan(input: &DoctorInput<'_>, out: &mut Out) {
+    if let Some(h) = input.vulkan {
+        match host_verdict(h, input.vulkan_min) {
+            VulkanVerdict::Usable => {
+                // Only the devices that meet the bundled minimum count as usable.
+                let n = h
+                    .devices
+                    .iter()
+                    .filter(|d| input.vulkan_min.is_none_or(|m| d.api >= m))
+                    .count();
+                let s = if n == 1 { "" } else { "s" };
+                return out.add(Area::Graphics, Status::Ok, format!("Vulkan: {n} device{s} usable"));
+            }
+            VulkanVerdict::Unusable(why) => {
+                return out.add(Area::Graphics, Status::Warn, format!("Vulkan unusable: {why}"));
+            }
+            VulkanVerdict::Unknown => {} // the loader line below
+        }
+    }
     match VULKAN_DIRS.iter().find(|d| input.fs.exists(&Path::new(d).join("libvulkan.so.1"))) {
         Some(dir) => out.add(Area::Graphics, Status::Ok, format!("Vulkan loader found in {dir}")),
         None => out.add(
