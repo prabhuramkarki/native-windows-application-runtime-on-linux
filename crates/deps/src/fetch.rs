@@ -24,6 +24,11 @@ use ureq::unversioned::transport::{
 
 /// Most redirects ever followed, whatever `FetchOpts::max_redirects` says.
 pub const MAX_REDIRECTS: u8 = 3;
+/// The download rate the total deadline allows for: each [`MIN_RATE`] bytes of a package add one second to
+/// [`FetchOpts::total_deadline`] (see [`total_deadline_for`]).
+pub const MIN_RATE: u64 = 32 * 1024;
+/// The most a package's size can stretch the total deadline to.
+pub const MAX_TOTAL_DEADLINE: Duration = Duration::from_secs(3600);
 /// Response header block cap (ureq's default is 64 KiB).
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const CHUNK: usize = 64 * 1024;
@@ -38,7 +43,7 @@ pub struct FetchOpts {
     /// connection (an absolute deadline, so a handshake dribbled a byte at a time cannot extend it).
     pub connect_timeout: Duration,
     /// Absolute deadline for the whole fetch from the moment the request starts: every redirect hop, connect, TLS
-    /// handshake, headers and body.
+    /// handshake, headers and body. Stretched by the package's size, see [`total_deadline_for`].
     pub total_deadline: Duration,
     /// Longest a single socket read or write may block (reported as `Stalled`).
     pub stall_timeout: Duration,
@@ -174,7 +179,8 @@ fn fetch_inner(pkg: &Package, cache_dir: &Path, opts: &FetchOpts, roots: RootCer
 
 /// Streams the response body into `out`, counting against `pkg.size` and hashing as it goes.
 fn download(pkg: &Package, opts: &FetchOpts, roots: RootCerts, out: &mut File) -> Result<(), FetchError> {
-    let agent = agent(opts, roots, Instant::now() + opts.total_deadline);
+    let total = total_deadline_for(opts, pkg.size);
+    let agent = agent(opts, roots, total, Instant::now() + total);
     let resp = agent.get(&pkg.url).call().map_err(map_err)?;
     let status = resp.status().as_u16();
     if status != 200 {
@@ -211,7 +217,16 @@ fn download(pkg: &Package, opts: &FetchOpts, roots: RootCerts, out: &mut File) -
 }
 
 /// ureq's defaults are unsafe (no https-only, no timeouts, env proxies): every relevant setting is explicit here.
-fn agent(opts: &FetchOpts, roots: RootCerts, deadline: Instant) -> ureq::Agent {
+/// The whole-fetch deadline for a package of `size` bytes: `opts.total_deadline` plus one second per [`MIN_RATE`]
+/// bytes, at most [`MAX_TOTAL_DEADLINE`] (or `opts.total_deadline` if that is longer). A fixed 300 s would fail the
+/// 25 MB VC++ redistributable on any link slower than about 85 KB/s; the stall timeout still ends a dead one.
+pub fn total_deadline_for(opts: &FetchOpts, size: u64) -> Duration {
+    opts.total_deadline
+        .saturating_add(Duration::from_secs(size / MIN_RATE))
+        .min(MAX_TOTAL_DEADLINE.max(opts.total_deadline))
+}
+
+fn agent(opts: &FetchOpts, roots: RootCerts, total: Duration, deadline: Instant) -> ureq::Agent {
     let tls = TlsConfig::builder().root_certs(roots).build();
     let config = ureq::Agent::config_builder()
         .https_only(true)
@@ -226,7 +241,7 @@ fn agent(opts: &FetchOpts, roots: RootCerts, deadline: Instant) -> ureq::Agent {
         .accept_encoding("")
         .timeout_resolve(Some(opts.connect_timeout))
         .timeout_connect(Some(opts.connect_timeout))
-        .timeout_global(Some(opts.total_deadline))
+        .timeout_global(Some(total))
         .tls_config(tls)
         .build();
     // Our own chain: TCP, stall cap, TLS. No SOCKS or CONNECT-proxy connector exists in it at all.
