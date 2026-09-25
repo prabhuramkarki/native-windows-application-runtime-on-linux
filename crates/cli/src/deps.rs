@@ -132,6 +132,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
         fetcher: &NetFetcher,
         consent: &consent,
         now: rt_deps::unix_now,
+        vulkan: &crate::graphics::verdict_for,
     };
     let (text, code) = install_report(&o, &plan)?;
     crate::emit(&text)?;

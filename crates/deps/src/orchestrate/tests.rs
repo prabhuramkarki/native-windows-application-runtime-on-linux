@@ -257,6 +257,7 @@ fn run_with(r: &Rig, app: &AppPlan, f: &FakeFetcher, a: &Answers, b: &FakeBacken
         fetcher: f,
         consent: a,
         now,
+        vulkan: &|_| VulkanVerdict::Unknown,
     };
     install_plan(&o, app)
 }
@@ -291,6 +292,49 @@ fn text_hash(p: &Package) -> String {
 }
 
 // ------------------------------------------------------------------------------------------------ consent
+
+#[test]
+fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable_one() {
+    let (mut vk, vk_body) = archive("vk", false, &[], &["d3d11"]);
+    vk.min_vulkan = Some((1, 3));
+    let (other, other_body) = archive("other", false, &[], &["x"]);
+    let r = Rig::new(vec![(vk, vk_body), (other, other_body)]);
+    let facts = Facts {
+        imports: vec![],
+        extra_capabilities: vec!["d3d11".into(), "x".into()],
+    };
+    let unusable = |_: Option<(u32, u32)>| VulkanVerdict::Unusable("no device".into());
+    let mut plan = resolve(&facts, &state::installed_set(&r.md()), &[], &r.manifest);
+    block_for_vulkan(&mut plan, &r.manifest, &unusable);
+    let app = AppPlan {
+        facts,
+        plan,
+        warnings: vec![],
+    };
+    let (f, a, l, b) = (
+        FakeFetcher::default(),
+        Answers::default(),
+        launcher(),
+        FakeBackend::new(),
+    );
+    let o = Orchestrator {
+        manifest: &r.manifest,
+        cache_dir: &r.tmp.path().join("files"),
+        env: &r.env,
+        store: &r.store,
+        backend: &b,
+        launcher: &l,
+        fetcher: &f,
+        consent: &a,
+        now,
+        vulkan: &unusable,
+    };
+    let rep = install_plan(&o, &app).unwrap();
+    assert_eq!(f.calls(), ["other"], "something Vulkan-blocked was downloaded");
+    assert_eq!(rep.completed, ["other"], "{rep:?}");
+    assert_eq!(r.recorded(), ["other"]);
+    assert!(!r.c("windows/system32/vk.dll").exists());
+}
 
 #[test]
 fn without_consent_a_gated_package_is_never_fetched_and_the_rest_still_installs() {
@@ -1461,6 +1505,7 @@ fn execute_never_fetches_a_gated_install_without_consent() {
         fetcher: &f,
         consent: &a,
         now,
+        vulkan: &|_| VulkanVerdict::Unknown,
     };
     let plan = Plan {
         entries: vec![PlanEntry {
