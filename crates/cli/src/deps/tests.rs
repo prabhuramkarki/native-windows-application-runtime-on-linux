@@ -694,6 +694,13 @@ fn lock_or_refuse_refuses_while_held_and_names_the_command() {
     let r = three();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = r.env.root().join(".rt-root-probe");
+    if fs::File::create(&probe).is_ok() {
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("SKIPPED the read-only-directory check: running as root, which writes there anyway");
+        return;
+    }
     let got: Vec<_> = [true, false]
         .map(|shared| lock_or_refuse(&r.env, shared, "remove").map(|l| l.is_some()))
         .into_iter()

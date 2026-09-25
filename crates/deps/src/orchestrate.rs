@@ -148,6 +148,13 @@ pub enum DepsError {
     /// `deps.lock` is a symlink, a directory or another non-regular file: no lock can be taken on it by anyone.
     #[error("{LOCK_FILE} in the app's directory is unusable ({0}); delete it to install dependencies again")]
     LockFileUnusable(String),
+    /// The file system refuses `flock` itself (`ENOLCK`, `EOPNOTSUPP`, `ENOSYS`: e.g. some network mounts): no
+    /// lock can be taken there by anyone.
+    #[error(
+        "the file system holding this app does not support locking ({0}); dependencies cannot be installed \
+         safely there"
+    )]
+    LockUnsupported(String),
     #[error("cannot read the app's metadata: {0}")]
     Metadata(#[source] StoreError),
     #[error("i/o error: {0}")]
@@ -156,6 +163,15 @@ pub enum DepsError {
     Recorded(String),
     #[error("cannot discard what the interrupted install left: {0}")]
     Discard(#[source] ArchiveError),
+}
+
+impl DepsError {
+    /// No lock on `deps.lock` can be taken by anyone ([`DepsError::LockFileUnusable`], [`DepsError::LockUnsupported`]),
+    /// so no dependency install can be running either (an install refuses without the lock): `run`, `remove` and
+    /// `uninstall` may warn and go on. Every other lock error, [`DepsError::LockHeld`] above all, refuses.
+    pub fn nobody_can_lock(&self) -> bool {
+        matches!(self, DepsError::LockFileUnusable(_) | DepsError::LockUnsupported(_))
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ text
@@ -349,14 +365,18 @@ fn lock_app_as(env: &AppEnv, mode: libc::c_int) -> Result<AppLock, DepsError> {
     }
     // SAFETY: flock on a file descriptor we own; no memory is passed.
     if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
-        let e = io::Error::last_os_error();
-        return Err(if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            DepsError::LockHeld
-        } else {
-            e.into()
-        });
+        return Err(flock_error(io::Error::last_os_error()));
     }
     Ok(AppLock(file))
+}
+
+/// A failed non-blocking `flock`: held by someone else, unsupported by the file system, or another I/O error.
+fn flock_error(e: io::Error) -> DepsError {
+    match e.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => DepsError::LockHeld,
+        Some(libc::ENOLCK | libc::EOPNOTSUPP | libc::ENOSYS) => DepsError::LockUnsupported(e.to_string()),
+        _ => e.into(),
+    }
 }
 
 /// How a `wineserver` for one prefix is recognised: by `WINEPREFIX` spelled as the runtime spells it (the backend

@@ -992,9 +992,41 @@ fn a_symlinked_lock_file_is_refused() {
     let r = abc();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    if writable_anyway(r.env.root()) {
+        fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
     let got = lock_app(&r.env);
     fs::set_permissions(r.env.root(), fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(got, Err(DepsError::Io(_))), "{got:?}");
+}
+
+/// Whether `dir` (just made read-only) is writable anyway, i.e. the tests run as root: then a read-only directory
+/// proves nothing, and the caller skips that part (saying so).
+fn writable_anyway(dir: &Path) -> bool {
+    let probe = dir.join(".rt-root-probe");
+    let root = fs::File::create(&probe).is_ok();
+    if root {
+        let _ = fs::remove_file(&probe);
+        eprintln!("SKIPPED the read-only-directory check: running as root, which writes there anyway");
+    }
+    root
+}
+
+#[test]
+fn flock_errors_are_classified_and_only_unlockable_ones_may_be_bypassed() {
+    let e = |n| flock_error(io::Error::from_raw_os_error(n));
+    assert!(matches!(e(libc::EWOULDBLOCK), DepsError::LockHeld));
+    for n in [libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOSYS] {
+        let got = e(n);
+        assert!(matches!(got, DepsError::LockUnsupported(_)), "{n}: {got:?}");
+        assert!(got.nobody_can_lock(), "{n}");
+        assert!(got.to_string().contains("does not support locking"), "{got}");
+    }
+    assert!(matches!(e(libc::EACCES), DepsError::Io(_)));
+    assert!(!e(libc::EACCES).nobody_can_lock());
+    assert!(!DepsError::LockHeld.nobody_can_lock(), "a held lock must refuse");
+    assert!(DepsError::LockFileUnusable("x".into()).nobody_can_lock());
 }
 
 /// A shell script named `wineserver` that blocks reading its (never written) stdin; killed on drop. `comm` is the
