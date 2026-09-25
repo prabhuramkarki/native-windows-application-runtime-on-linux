@@ -7,7 +7,7 @@
 //! `DISPLAY` only warns. The lock is exclusive, so a running app refuses it.
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
-use rt_core::doctor::{HostFs, wayland_socket};
+use rt_core::doctor::{HostFs, MAX_DLL_DIRS, MAX_LISTING, wayland_socket};
 use rt_core::{CompatBackend, GraphicsDriver, Launcher};
 use rt_deps::wine_config::{read_graphics_driver_from_prefix, set_graphics_driver};
 use std::ffi::OsString;
@@ -17,24 +17,28 @@ fn env_var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
-/// `Some(found)` when the backend's DLL directories could be listed (or `winewayland` was found anyway),
-/// `None` when nothing could be checked.
-fn has_winewayland(backend: &dyn CompatBackend) -> Option<bool> {
+/// File names (lowercase) of the Wine driver modules (`wine*.drv`) in the backend's DLL directories: at most 200,
+/// from at most 16 directories and 50 000 entries each. `None` when none of the directories could be listed.
+/// `doctor` and `display` both use it.
+pub fn wine_drivers(backend: &dyn CompatBackend) -> Option<Vec<String>> {
+    let mut found = Vec::new();
     let mut verified = false;
-    for dir in backend.dll_dirs() {
-        let Ok(rd) = fs::read_dir(&dir) else { continue };
+    for dir in backend.dll_dirs().iter().take(MAX_DLL_DIRS) {
+        let Ok(rd) = fs::read_dir(dir) else { continue };
         verified = true;
-        for e in rd.flatten() {
-            if e.file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("winewayland")
-            {
-                return Some(true);
+        for e in rd.take(MAX_LISTING).flatten() {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            if n.starts_with("wine") && n.ends_with(".drv") && found.len() < 200 && !found.contains(&n) {
+                found.push(n);
             }
         }
     }
-    verified.then_some(false)
+    verified.then_some(found)
+}
+
+/// `Some(found)` when the backend's DLL directories could be listed, `None` when nothing could be checked.
+fn has_winewayland(backend: &dyn CompatBackend) -> Option<bool> {
+    wine_drivers(backend).map(|l| l.iter().any(|n| n == "winewayland.drv"))
 }
 
 fn session() -> String {
