@@ -4,11 +4,14 @@ use rt_core::Sandbox;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-/// A host made of an env map and a set of existing paths; `links` maps a path to its resolved form.
+/// A host made of an env map and a set of existing paths (`sockets` and `files` say which of them are sockets
+/// or regular files); `links` maps a path to its resolved form.
 #[derive(Clone, Default)]
 struct FakeHost {
     env: HashMap<String, OsString>,
     exists: BTreeSet<PathBuf>,
+    sockets: BTreeSet<PathBuf>,
+    files: BTreeSet<PathBuf>,
     links: HashMap<PathBuf, PathBuf>,
     uid: u32,
 }
@@ -19,6 +22,12 @@ impl Host for FakeHost {
     }
     fn exists(&self, p: &Path) -> bool {
         self.exists.contains(p)
+    }
+    fn is_socket(&self, p: &Path) -> bool {
+        self.sockets.contains(p)
+    }
+    fn is_file(&self, p: &Path) -> bool {
+        self.files.contains(p)
     }
     fn resolve(&self, p: &Path) -> Option<PathBuf> {
         self.links
@@ -37,8 +46,27 @@ impl FakeHost {
         self
     }
     fn without(mut self, p: &str) -> Self {
-        self.exists.remove(Path::new(p));
+        for set in [&mut self.exists, &mut self.sockets, &mut self.files] {
+            set.remove(Path::new(p));
+        }
         self
+    }
+    fn socket(mut self, p: &str) -> Self {
+        self.sockets.insert(p.into());
+        self.with(p)
+    }
+    fn file(mut self, p: &str) -> Self {
+        self.files.insert(p.into());
+        self.with(p)
+    }
+    /// An app's real directories: `<apps>`, `<apps>/<id>`, its prefix, `runtime` and `runtime/home`.
+    fn app(self, prefix: &str) -> Self {
+        let root = Path::new(prefix).parent().unwrap().to_path_buf();
+        self.with(root.parent().unwrap())
+            .with(root.join("runtime"))
+            .with(root.join("runtime/home"))
+            .with(root)
+            .with(prefix)
     }
     fn set(mut self, k: &str, v: impl Into<OsString>) -> Self {
         self.env.insert(k.into(), v.into());
@@ -58,18 +86,12 @@ fn host() -> FakeHost {
         ..FakeHost::default()
     }
     .set("HOME", "/home/me")
-    .set("XDG_RUNTIME_DIR", RT);
-    for p in [
-        PREFIX,
-        APP_HOME,
-        "/run/user/1000/wayland-1",
-        "/run/user/1000/pulse/native",
-        "/tmp/.X11-unix",
-        "/home/me/.Xauthority",
-        "/dev/dri",
-        "/dev/nvidiactl",
-        "/dev/nvidia0",
-    ] {
+    .set("XDG_RUNTIME_DIR", RT)
+    .app(PREFIX)
+    .socket("/run/user/1000/wayland-1")
+    .socket("/run/user/1000/pulse/native")
+    .file("/home/me/.Xauthority");
+    for p in ["/tmp/.X11-unix", "/dev/dri", "/dev/nvidiactl", "/dev/nvidia0"] {
         h = h.with(p);
     }
     h
@@ -164,6 +186,7 @@ fn the_default_profile_is_exactly_this() {
         "/etc/localtime",
         "/etc/fonts",
         "/etc/ssl",
+        "/etc/pki",
         "/etc/ca-certificates",
         "/etc/vulkan",
         "/etc/glvnd",
@@ -171,15 +194,16 @@ fn the_default_profile_is_exactly_this() {
     ] {
         want.extend(["--ro-bind-try", d, d]);
     }
-    want.extend(["--tmpfs", RT]);
-    for s in [
-        "/run/user/1000/wayland-1",
-        "/tmp/.X11-unix",
-        "/home/me/.Xauthority",
-        "/run/user/1000/pulse/native",
-    ] {
+    want.extend(["--perms", "0700", "--tmpfs", RT]);
+    for s in ["/run/user/1000/wayland-1", "/tmp/.X11-unix"] {
         want.extend(["--ro-bind-try", s, s]);
     }
+    want.extend(["--ro-bind", "/home/me/.Xauthority", "/run/user/1000/Xauthority"]);
+    want.extend([
+        "--ro-bind-try",
+        "/run/user/1000/pulse/native",
+        "/run/user/1000/pulse/native",
+    ]);
     for d in ["/dev/dri", "/dev/nvidiactl", "/dev/nvidia0"] {
         want.extend(["--dev-bind-try", d, d]);
     }
@@ -195,7 +219,7 @@ fn the_default_profile_is_exactly_this() {
         ("LANG", "C.UTF-8"),
         ("DISPLAY", ":0"),
         ("WAYLAND_DISPLAY", "wayland-1"),
-        ("XAUTHORITY", "/home/me/.Xauthority"),
+        ("XAUTHORITY", "/run/user/1000/Xauthority"),
         ("XDG_RUNTIME_DIR", RT),
         ("XDG_SESSION_TYPE", "wayland"),
         ("PULSE_SERVER", "unix:/run/user/1000/pulse/native"),
@@ -213,7 +237,8 @@ fn the_default_profile_is_exactly_this() {
     assert_eq!(c.get_current_dir(), Some(Path::new("/data/apps/a/prefix/drive_c")));
     let s = sb(Permissions::default(), host());
     assert!(s.skipped(&app_cmd()).is_empty(), "{:?}", s.skipped(&app_cmd()));
-    assert!(s.caveats().is_empty());
+    // the only caveat of the default profile on an X11-capable host: X11 itself
+    assert_eq!(s.caveats(&app_cmd()), [X11_CAVEAT]);
     // the preview is the wrapped command line, program first
     let preview = s.argv_preview(&app_cmd());
     assert_eq!(preview[0], "/usr/bin/bwrap");
@@ -227,16 +252,22 @@ fn network_allow_shares_the_net_namespace_binds_dns_and_says_what_that_exposes()
     let p = perms(|p| p.network = Network::Allow);
     let a = argv(&rendered(p.clone(), host()));
     assert!(!a.contains(&"--unshare-net".to_owned()));
-    for f in ["/etc/hosts", "/etc/resolv.conf", "/run/systemd/resolve"] {
+    for f in ["/etc/hosts", "/etc/resolv.conf"] {
         assert!(pos(&a, &["--ro-bind-try", f, f]).is_some(), "{f}: {a:?}");
     }
+    // bwrap follows the resolv.conf symlink on the source side: the resolver's whole directory is not bound
+    assert!(!a.iter().any(|x| x.starts_with("/run/systemd")), "{a:?}");
     // the network namespace never changes the environment
     assert_eq!(
         envs(&rendered(p.clone(), host())),
         envs(&rendered(Permissions::default(), host()))
     );
-    let cav = sb(p, host()).caveats();
+    let cav = sb(p, host()).caveats(&app_cmd());
     assert!(cav.iter().any(|c| c.contains("abstract")), "{cav:?}");
+    assert!(
+        cav.iter().any(|c| c.contains("loopback") && c.contains("CUPS")),
+        "{cav:?}"
+    );
     // DNS files are not there without network
     let d = argv(&rendered(Permissions::default(), host()));
     assert!(
@@ -252,13 +283,14 @@ fn display_off_binds_no_display_socket_and_drops_its_variables() {
     for s in ["/run/user/1000/wayland-1", "/tmp/.X11-unix", "/home/me/.Xauthority"] {
         assert!(!a.iter().any(|x| x == s), "{s}: {a:?}");
     }
+    assert!(!a.iter().any(|x| x.contains("Xauthority")), "{a:?}");
     let e = envs(&c);
     for k in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"] {
         assert!(!e.contains_key(k), "{k}");
     }
     assert!(e.contains_key("PULSE_SERVER") && e.contains_key("XDG_RUNTIME_DIR"));
     // no caveat without network; with network the X11 abstract socket stays reachable and says so
-    assert!(sb(perms(|p| p.display = false), host()).caveats().is_empty());
+    assert!(sb(perms(|p| p.display = false), host()).caveats(&app_cmd()).is_empty());
     let cav = sb(
         perms(|p| {
             p.display = false;
@@ -266,7 +298,7 @@ fn display_off_binds_no_display_socket_and_drops_its_variables() {
         }),
         host(),
     )
-    .caveats();
+    .caveats(&app_cmd());
     assert!(
         cav.iter()
             .any(|c| c.contains("display=off") && c.contains("@/tmp/.X11-unix/X")),
@@ -366,8 +398,7 @@ fn missing_sockets_and_nodes_are_skipped_and_reported() {
         ..FakeHost::default()
     }
     .set("HOME", "/home/me")
-    .with(PREFIX)
-    .with(APP_HOME);
+    .app(PREFIX);
     let s = sb(Permissions::default(), h);
     let c = s.render(&app_cmd()).unwrap();
     let a = argv(&c);
@@ -383,10 +414,10 @@ fn missing_sockets_and_nodes_are_skipped_and_reported() {
     assert!(!envs(&c).contains_key("PULSE_SERVER"));
     let sk = s.skipped(&app_cmd()).join("\n");
     for want in [
-        "display: Wayland socket /run/user/1000/wayland-1",
+        "display: Wayland socket path /run/user/1000/wayland-1 is not a socket",
         "display: X11 socket directory /tmp/.X11-unix",
-        "display: XAUTHORITY file /home/me/.Xauthority",
-        "audio: PulseAudio socket /run/user/1000/pulse/native",
+        "display: XAUTHORITY /home/me/.Xauthority is not a regular file",
+        "audio: PulseAudio socket path /run/user/1000/pulse/native is not a socket",
         "gpu: no GPU device nodes",
     ] {
         assert!(sk.contains(want), "{want}: {sk}");
@@ -452,7 +483,7 @@ fn an_unset_or_relative_runtime_dir_gets_the_uid_fallback_tmpfs_and_no_sockets()
 
 #[test]
 fn host_directory_grants_are_bound_ro_or_rw_before_the_apps_own_dirs() {
-    let td = tempfile::tempdir().unwrap();
+    let td = crate::grant_tempdir();
     let root = td.path().canonicalize().unwrap();
     let (ro, rw) = (root.join("ro"), root.join("rw"));
     std::fs::create_dir_all(&ro).unwrap();
@@ -483,7 +514,7 @@ fn host_directory_grants_are_bound_ro_or_rw_before_the_apps_own_dirs() {
 
 #[test]
 fn a_stored_grant_that_no_longer_validates_is_a_render_error() {
-    let td = tempfile::tempdir().unwrap();
+    let td = crate::grant_tempdir();
     let root = td.path().canonicalize().unwrap();
     let gone = root.join("gone");
     let grant = |path: PathBuf| {
@@ -537,13 +568,13 @@ fn a_stored_grant_that_no_longer_validates_is_a_render_error() {
 
 #[test]
 fn a_grant_equal_to_the_prefix_or_the_app_home_is_refused() {
-    let td = tempfile::tempdir().unwrap();
+    let td = crate::grant_tempdir();
     let root = td.path().canonicalize().unwrap();
     let prefix = root.join("apps/a/prefix");
     let home = root.join("apps/a/runtime/home");
     std::fs::create_dir_all(&prefix).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    let h = host().with(&prefix).with(&home);
+    let h = host().app(prefix.to_str().unwrap());
     let cmd = app_cmd_at(prefix.to_str().unwrap(), home.to_str().unwrap());
     for g in [&prefix, &home, &root.join("apps/a"), &root.join("apps")] {
         let p = perms(|p| {
@@ -628,7 +659,10 @@ fn a_command_without_a_usable_prefix_is_refused() {
     linked
         .links
         .insert("/data/apps/b/prefix".into(), "/home/me/prefix".into());
-    linked = linked.with("/data/apps/b/runtime/home");
+    linked = linked
+        .with("/data/apps/b")
+        .with("/data/apps/b/runtime")
+        .with("/data/apps/b/runtime/home");
     for (prefix, why) in [
         ("data/apps/a/prefix", "is not absolute"),
         ("/data/apps/a/../a/prefix", "contains"),
@@ -676,7 +710,7 @@ fn the_prefix_is_bound_after_every_tmpfs_that_contains_it() {
             "/run/user/1000/rt/apps/a/runtime/home",
         ),
     ] {
-        let h = host().with(prefix).with(home);
+        let h = host().app(prefix);
         let a = argv(&sb(Permissions::default(), h).render(&app_cmd_at(prefix, home)).unwrap());
         let p = pos(&a, &["--bind", prefix, prefix]).unwrap();
         let hm = pos(&a, &["--bind", home, home]).unwrap();
@@ -691,21 +725,213 @@ fn the_prefix_is_bound_after_every_tmpfs_that_contains_it() {
     }
 }
 
-/// The real thing: `bwrap` runs a shell inside the default profile. Skips (loudly) without bwrap or user
-/// namespaces, unless `RUNTIME_REQUIRE_BWRAP=1`.
 #[test]
-fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
-    let required = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
-    let skip = |why: String| {
-        assert!(!required, "RUNTIME_REQUIRE_BWRAP=1 but {why}");
-        eprintln!("SKIPPED real_bwrap_runs_the_default_profile_and_hides_the_host: {why}");
-    };
-    let Some(bwrap) = crate::find_bwrap_on_path() else {
-        return skip("bwrap is not on PATH".into());
-    };
-    if let Err(e) = crate::probe(&bwrap) {
-        return skip(e);
+fn non_socket_display_and_audio_paths_and_a_non_file_xauthority_are_skipped() {
+    // `WAYLAND_DISPLAY=bus`-style names pointing at something that is not a socket; the Pulse path a regular file
+    let h = host()
+        .without("/run/user/1000/wayland-1")
+        .with("/run/user/1000/wayland-1")
+        .with("/run/user/1000/bus")
+        .without("/run/user/1000/pulse/native")
+        .file("/run/user/1000/pulse/native");
+    for w in ["wayland-1", "bus"] {
+        let mut cmd = app_cmd();
+        cmd.env("WAYLAND_DISPLAY", w);
+        let s = sb(Permissions::default(), h.clone());
+        let c = s.render(&cmd).unwrap();
+        let a = argv(&c);
+        assert!(!a.iter().any(|x| x.ends_with(w) || x.contains("pulse")), "{w}: {a:?}");
+        assert!(!envs(&c).contains_key("PULSE_SERVER"));
+        let sk = s.skipped(&cmd).join("\n");
+        assert!(sk.contains(&format!("/run/user/1000/{w} is not a socket")), "{sk}");
+        assert!(sk.contains("/run/user/1000/pulse/native is not a socket"), "{sk}");
     }
+    // XAUTHORITY that is a directory, a symlink to the cookie, or relative: not bound, the variable dropped
+    for (x, h) in [
+        ("/home/me", host().with("/home/me")),
+        ("/home/me/link", host().with("/home/me/link")),
+        ("rel/.Xauthority", host()),
+    ] {
+        let mut cmd = app_cmd();
+        cmd.env("XAUTHORITY", x);
+        let s = sb(Permissions::default(), h);
+        let c = s.render(&cmd).unwrap();
+        assert!(!argv(&c).iter().any(|a| a.contains("Xauthority") || a == x), "{x}");
+        assert!(!envs(&c).contains_key("XAUTHORITY"), "{x}");
+        assert!(
+            s.skipped(&cmd)
+                .join("\n")
+                .contains(&format!("XAUTHORITY {x} is not a regular file"))
+        );
+    }
+}
+
+#[test]
+fn the_x11_caveat_is_given_exactly_when_the_x11_socket_dir_is_bound() {
+    let has = |p: Permissions, cmd: &Command, h: FakeHost| sb(p, h).caveats(cmd).iter().any(|c| c == X11_CAVEAT);
+    assert!(has(Permissions::default(), &app_cmd(), host()));
+    assert!(!has(perms(|p| p.display = false), &app_cmd(), host()));
+    let mut wayland_only = app_cmd();
+    wayland_only.env_remove("DISPLAY");
+    assert!(!has(Permissions::default(), &wayland_only, host()));
+    // no X11 socket directory on the host: nothing bound, no caveat
+    assert!(!has(
+        Permissions::default(),
+        &app_cmd(),
+        host().without("/tmp/.X11-unix")
+    ));
+    assert!(X11_CAVEAT.contains("inject keyboard/mouse input") && X11_CAVEAT.contains("Wayland"));
+}
+
+#[test]
+fn nested_grants_and_rw_grants_over_the_dll_dirs_are_refused_at_render() {
+    let td = crate::grant_tempdir();
+    let root = td.path().canonicalize().unwrap();
+    let (outer, inner) = (root.join("g"), root.join("g/in"));
+    std::fs::create_dir_all(&inner).unwrap();
+    let two = |a: &PathBuf, b: &PathBuf| {
+        perms(|p| {
+            p.filesystem = vec![
+                FsGrant {
+                    path: a.clone(),
+                    access: Access::Ro,
+                },
+                FsGrant {
+                    path: b.clone(),
+                    access: Access::Rw,
+                },
+            ]
+        })
+    };
+    for (a, b) in [(&outer, &inner), (&inner, &outer)] {
+        let e = sb(two(a, b), host()).render(&app_cmd()).unwrap_err();
+        assert!(matches!(&e, RenderError::GrantOverlap(..)), "{e:?}");
+    }
+    // a Wine dll dir inside (or equal to, or above) a rw grant: refused; the same grant read-only is fine
+    let dll = root.join("wine/lib");
+    std::fs::create_dir_all(&dll).unwrap();
+    for g in [root.join("wine"), dll.clone()] {
+        let grant = |access| {
+            perms(|p| {
+                p.filesystem = vec![FsGrant {
+                    path: g.clone(),
+                    access,
+                }]
+            })
+        };
+        let s = |p| AppSandbox::new("/usr/bin/bwrap".into(), p, vec![dll.clone()], Arc::new(host()));
+        let e = s(grant(Access::Rw)).render(&app_cmd()).unwrap_err();
+        assert!(matches!(&e, RenderError::GrantOverlap(..)), "{g:?}: {e:?}");
+        assert!(s(grant(Access::Ro)).render(&app_cmd()).is_ok());
+    }
+}
+
+/// `<base>/real/data/apps/a/{prefix,runtime/home}` and `<base>/data -> real/data`.
+fn symlinked_data_root() -> (tempfile::TempDir, PathBuf) {
+    let td = crate::grant_tempdir();
+    let base = td.path().canonicalize().unwrap();
+    std::fs::create_dir_all(base.join("real/data/apps/a/prefix")).unwrap();
+    std::fs::create_dir_all(base.join("real/data/apps/a/runtime/home")).unwrap();
+    std::os::unix::fs::symlink(base.join("real/data"), base.join("data")).unwrap();
+    (td, base)
+}
+
+#[test]
+fn a_symlink_above_the_apps_dir_is_followed_and_the_resolved_dirs_are_bound_at_the_launchers_paths() {
+    let (_td, base) = symlinked_data_root();
+    let prefix = base.join("data/apps/a/prefix");
+    let home = base.join("data/apps/a/runtime/home");
+    let cmd = app_cmd_at(prefix.to_str().unwrap(), home.to_str().unwrap());
+    let s = AppSandbox::new(
+        "/usr/bin/bwrap".into(),
+        Permissions::default(),
+        vec![],
+        Arc::new(crate::RealHost),
+    );
+    let c = s.render(&cmd).unwrap();
+    let a = argv(&c);
+    let real = |p: &str| base.join("real/data/apps/a").join(p).to_str().unwrap().to_owned();
+    assert!(
+        pos(&a, &["--bind", &real("prefix"), prefix.to_str().unwrap()]).is_some(),
+        "{a:?}"
+    );
+    assert!(
+        pos(&a, &["--bind", &real("runtime/home"), home.to_str().unwrap()]).is_some(),
+        "{a:?}"
+    );
+    // inside, the paths stay what the launcher set
+    let e = envs(&c);
+    assert_eq!(e["WINEPREFIX"], prefix.to_str().unwrap());
+    assert_eq!(e["HOME"], home.to_str().unwrap());
+}
+
+#[test]
+fn a_symlink_at_or_below_the_app_root_is_refused() {
+    type Mutate = fn(&Path);
+    let cases: [(&str, Mutate); 5] = [
+        ("app root", |app| {
+            std::fs::rename(app, app.with_file_name("a-real")).unwrap();
+            std::os::unix::fs::symlink(app.with_file_name("a-real"), app).unwrap();
+        }),
+        ("prefix", |app| {
+            std::fs::rename(app.join("prefix"), app.join("p2")).unwrap();
+            std::os::unix::fs::symlink(app.join("p2"), app.join("prefix")).unwrap();
+        }),
+        ("prefix elsewhere", |app| {
+            std::fs::remove_dir(app.join("prefix")).unwrap();
+            let elsewhere = app.parent().unwrap().parent().unwrap().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, app.join("prefix")).unwrap();
+        }),
+        ("runtime", |app| {
+            std::fs::rename(app.join("runtime"), app.join("rt2")).unwrap();
+            std::os::unix::fs::symlink(app.join("rt2"), app.join("runtime")).unwrap();
+        }),
+        ("runtime/home", |app| {
+            std::fs::rename(app.join("runtime/home"), app.join("h2")).unwrap();
+            std::os::unix::fs::symlink(app.join("h2"), app.join("runtime/home")).unwrap();
+        }),
+    ];
+    for (what, mutate) in cases {
+        let (_td, base) = symlinked_data_root();
+        mutate(&base.join("real/data/apps/a"));
+        let prefix = base.join("data/apps/a/prefix");
+        let home = base.join("data/apps/a/runtime/home");
+        let cmd = app_cmd_at(prefix.to_str().unwrap(), home.to_str().unwrap());
+        let s = AppSandbox::new(
+            "/usr/bin/bwrap".into(),
+            Permissions::default(),
+            vec![],
+            Arc::new(crate::RealHost),
+        );
+        let e = s.render(&cmd).unwrap_err();
+        let ok = match what {
+            "runtime" | "runtime/home" => matches!(e, RenderError::Home(_)),
+            _ => matches!(&e, RenderError::BadPrefix { why, .. } if why.contains("symlink")),
+        };
+        assert!(ok, "{what}: {e:?}");
+    }
+}
+
+/// `bwrap`, or `None` after saying why the real-bwrap tests are skipped (a failure under `RUNTIME_REQUIRE_BWRAP`).
+fn real_bwrap(test: &str) -> Option<PathBuf> {
+    let required = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
+    let why = match crate::find_bwrap_on_path() {
+        None => "bwrap is not on PATH".to_owned(),
+        Some(b) => match crate::probe(&b) {
+            Ok(()) => return Some(b),
+            Err(e) => e,
+        },
+    };
+    assert!(!required, "RUNTIME_REQUIRE_BWRAP=1 but {why}");
+    eprintln!("SKIPPED {test}: {why}");
+    None
+}
+
+/// A temp data root with app `a` (and a `permissions.toml`, an app-root secret and a data-root secret), `script`
+/// run by `/bin/sh -c` inside the sandbox with `$1` = the real `$HOME`, `$2` = the app root, `$3` = the temp root.
+/// Returns (stdout, stderr, temp root).
+fn run_real(bwrap: PathBuf, p: Permissions, script: &str) -> (String, String, tempfile::TempDir) {
     let td = tempfile::tempdir().unwrap();
     let root = td.path().canonicalize().unwrap();
     let app = root.join("apps/a");
@@ -713,49 +939,87 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
     std::fs::create_dir_all(prefix.join("drive_c")).unwrap();
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(app.join("permissions.toml"), "version = 1\n").unwrap();
+    std::fs::write(app.join("secret"), "s").unwrap();
+    std::fs::write(root.join("secret"), "s").unwrap();
+    std::fs::write(root.join("cookie"), "cookie").unwrap();
     let real_home = std::env::var_os("HOME").unwrap_or_else(|| "/nonexistent".into());
-    let script = r#"
-        echo ok
-        ls -A "$1" 2>/dev/null | head -3
-        echo "--home-end"
-        [ -e "$2" ] && echo "APP-ROOT-VISIBLE"
-        touch "$WINEPREFIX/w" && echo prefix-rw
-        touch "$HOME/w" && echo home-rw
-        touch /dev/shm/w && echo shm-rw
-        [ -z "$(ls -A /tmp | grep -v -e "^$(basename "$3")$" -e '^.X11-unix$')" ] && echo tmp-private
-        if [ -n "$WAYLAND_DISPLAY" ]; then [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && echo wayland-ok; fi
-        if [ -n "$PULSE_SERVER" ]; then [ -S "${PULSE_SERVER#unix:}" ] && echo pulse-ok; fi
-        [ -e "$XDG_RUNTIME_DIR/bus" ] && echo "BUS-VISIBLE"
-        true
-    "#;
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", script, "sh"])
         .arg(&real_home)
-        .arg(app.join("permissions.toml"))
+        .arg(&app)
         .arg(&root)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("WINEPREFIX", &prefix)
         .env("HOME", &home)
+        .env("XAUTHORITY", root.join("cookie"))
         .current_dir(prefix.join("drive_c"));
     for k in ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY"] {
         if let Some(v) = std::env::var_os(k) {
             cmd.env(k, v);
         }
     }
-    let s = AppSandbox::new(bwrap, Permissions::default(), vec![], Arc::new(crate::RealHost));
+    let s = AppSandbox::new(bwrap, p, vec![], Arc::new(crate::RealHost));
     let out = s.wrap(cmd).output().unwrap();
-    let so = String::from_utf8_lossy(&out.stdout);
-    let se = String::from_utf8_lossy(&out.stderr);
+    let (so, se) = (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
     assert!(out.status.success(), "{so}\n{se}");
+    (so, se, td)
+}
+
+/// The real thing: `bwrap` runs a shell inside the default profile. Skips (loudly) without bwrap or user
+/// namespaces, unless `RUNTIME_REQUIRE_BWRAP=1`.
+#[test]
+fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
+    let Some(bwrap) = real_bwrap("real_bwrap_runs_the_default_profile_and_hides_the_host") else {
+        return;
+    };
+    let script = r#"
+        echo ok
+        ls -A "$1" 2>/dev/null | head -3
+        echo "--home-end"
+        [ -e "$2/permissions.toml" ] && echo "APP-ROOT-VISIBLE"
+        echo pwned 2>/dev/null > "$2/permissions.toml"
+        for f in "$2/secret" "$3/secret"; do [ -r "$f" ] && echo "SECRET-READ $f"; done
+        touch /usr/rt-sandbox-probe 2>/dev/null && echo "USR-WRITABLE"
+        touch "$WINEPREFIX/w" && echo prefix-rw
+        touch "$HOME/w" && echo home-rw
+        touch /dev/shm/w && echo shm-rw
+        [ -z "$(ls -A /tmp | grep -v -e "^$(basename "$3")$" -e '^.X11-unix$')" ] && echo tmp-private
+        echo "net:$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | tr '\n' ,)"
+        if [ -n "$WAYLAND_DISPLAY" ]; then [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && echo wayland-ok; fi
+        if [ -n "$PULSE_SERVER" ]; then [ -S "${PULSE_SERVER#unix:}" ] && echo pulse-ok; fi
+        case "$XAUTHORITY" in */Xauthority) [ "$(cat "$XAUTHORITY")" = cookie ] && echo xauth-ok;; esac
+        [ -e "$XDG_RUNTIME_DIR/bus" ] && echo "BUS-VISIBLE"
+        [ -e /etc/resolv.conf ] && echo "RESOLV-VISIBLE"
+        true
+    "#;
+    let (so, se, td) = run_real(bwrap, Permissions::default(), script);
+    let root = td.path().canonicalize().unwrap();
+    let app = root.join("apps/a");
     let lines: Vec<&str> = so.lines().collect();
     assert_eq!(lines[0], "ok", "{so}\n{se}");
     assert_eq!(lines[1], "--home-end", "the real home is listed inside: {so}");
-    for want in ["prefix-rw", "home-rw", "shm-rw", "tmp-private"] {
+    for want in ["prefix-rw", "home-rw", "shm-rw", "tmp-private", "net:lo,", "xauth-ok"] {
         assert!(lines.contains(&want), "{want}: {so}\n{se}");
     }
-    assert!(!so.contains("APP-ROOT-VISIBLE") && !so.contains("BUS-VISIBLE"), "{so}");
-    assert!(prefix.join("w").exists() && home.join("w").exists());
+    for bad in [
+        "APP-ROOT-VISIBLE",
+        "SECRET-READ",
+        "USR-WRITABLE",
+        "BUS-VISIBLE",
+        "RESOLV-VISIBLE",
+    ] {
+        assert!(!so.contains(bad), "{bad}: {so}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(app.join("permissions.toml")).unwrap(),
+        "version = 1\n"
+    );
+    assert!(!Path::new("/usr/rt-sandbox-probe").exists());
+    assert!(app.join("prefix/w").exists() && app.join("runtime/home/w").exists());
     // sockets bound at their own path inside the tmpfs runtime dir are really there (when the host has them)
     let rt = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     match (&rt, std::env::var_os("WAYLAND_DISPLAY")) {
@@ -766,4 +1030,28 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
         Some(rt) if rt.join("pulse/native").exists() => assert!(lines.contains(&"pulse-ok"), "{so}"),
         _ => eprintln!("SKIPPED pulse socket check: no PulseAudio socket on this host"),
     }
+}
+
+/// With `network = "allow"` the resolver configuration is readable inside (bwrap follows the `resolv.conf`
+/// symlink on the host side) and more than loopback is visible.
+#[test]
+fn real_bwrap_with_network_allow_reads_the_resolver_config() {
+    let Some(bwrap) = real_bwrap("real_bwrap_with_network_allow_reads_the_resolver_config") else {
+        return;
+    };
+    let script = r#"
+        grep -q '^nameserver' /etc/resolv.conf && echo dns-ok
+        [ -r /etc/hosts ] && echo hosts-ok
+        [ -e /run/systemd/resolve ] && echo "RESOLVE-DIR-VISIBLE"
+        true
+    "#;
+    if !std::fs::read_to_string("/etc/resolv.conf").is_ok_and(|t| t.lines().any(|l| l.starts_with("nameserver"))) {
+        eprintln!(
+            "SKIPPED real_bwrap_with_network_allow_reads_the_resolver_config: no nameserver in the host's resolv.conf"
+        );
+        return;
+    }
+    let (so, se, _td) = run_real(bwrap, perms(|p| p.network = Network::Allow), script);
+    assert!(so.contains("dns-ok") && so.contains("hosts-ok"), "{so}\n{se}");
+    assert!(!so.contains("RESOLVE-DIR-VISIBLE"), "{so}");
 }

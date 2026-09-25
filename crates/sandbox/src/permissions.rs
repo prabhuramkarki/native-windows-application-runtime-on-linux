@@ -18,9 +18,8 @@
 //! passes, e.g. a symlink re-pointed at `$HOME`, is refused at run time): absolute, no `.`/`..`, no control or
 //! invisible characters, the symlink-resolved path re-checked, and never `/`, `$HOME`, the runtime data
 //! directory (equal, above or below), a fixed list of secret directories under `$HOME` (equal, above or below),
-//! or `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp` itself, the socket-bearing `/tmp` children in
-//! [`RESERVED_TMP_CHILDREN`] (`.X11-unix`, `tmux-*`, `ssh-*`, ...; equal or below), any other `/tmp` directory
-//! holding a socket near its top ([`socket_within`]), and `$XDG_RUNTIME_DIR` (devices and runtime sockets belong to
+//! or `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, anything at or below `/tmp` (the shared directory where
+//! ssh-agent, tmux, X11, nvim, Chromium and others keep their sockets, under any name), and `$XDG_RUNTIME_DIR` (devices and runtime sockets belong to
 //! the gpu/display/audio switches, and a daemon socket such as docker's would be root on the host). A grant must
 //! resolve to a DIRECTORY (never a socket, device node or dotfile), and `rw` is refused on
 //! (and below) the system trees in [`RO_ONLY`], where `ro` stays allowed.
@@ -43,8 +42,9 @@ const MAX_PATH_BYTES: usize = 4096;
 /// Directories under `$HOME` no grant may equal, contain or sit inside: credentials and keyrings, browser and
 /// mail profiles, CLI tokens (`gh`, `rclone`, cloud SDKs, `cargo`'s registry token), and places whose contents
 /// the host later EXECUTES (`~/.local/bin` on `$PATH`, systemd user units, autostart entries, git hooks and
-/// config, Flatpak app data). An ancestor such as `~/.config` is refused too, naming the child it would expose.
-const SENSITIVE: [&str; 24] = [
+/// config, Flatpak app data, `~/bin`, shell and session environment config, desktop entries), and the VM-backed
+/// container runtimes whose directories hold a Docker API socket (Colima, Lima, Rancher Desktop, OrbStack). An ancestor such as `~/.config` is refused too, naming the child it would expose.
+const SENSITIVE: [&str; 33] = [
     ".ssh",
     ".gnupg",
     ".aws",
@@ -69,34 +69,28 @@ const SENSITIVE: [&str; 24] = [
     ".config/autostart",
     ".local/bin",
     ".config/git",
+    "bin",
+    ".config/fish",
+    ".config/environment.d",
+    ".local/share/applications",
+    ".local/share/systemd",
+    ".colima",
+    ".lima",
+    ".rd",
+    ".orbstack",
 ];
 /// Host paths governed by the gpu/display/audio switches, never by a grant (equal, above or below). `/run` holds
 /// every daemon socket (`docker.sock`, `dbus`, ...); `/var/run` is the same tree on hosts where it is no symlink.
 const SYSTEM: [&str; 5] = ["/proc", "/sys", "/dev", "/run", "/var/run"];
-/// Shared spots holding other programs' sockets (ssh-agent, the X11 socket that would bypass `display=off`).
+/// The shared temporary directory: every grant at or below it is refused. Programs keep sockets there under
+/// names nobody can list in advance (`tmux-*`, `ssh-*`, `.X11-unix`, `nvim.*`, `org.chromium.*`, ...), and a
+/// socket created after the grant was checked would still be reachable. (`/var/tmp` stays grantable.)
 const RESERVED_TMP: &str = "/tmp";
-/// `/tmp` children that hold (or will hold) other programs' sockets, by name: a grant equal to or below one is
-/// refused ([`RESERVED_TMP`] itself, the only thing above them, already is). A trailing `*` matches any rest of
-/// the name. Other `/tmp` children are judged by what they hold: see [`socket_within`].
-const RESERVED_TMP_CHILDREN: [&str; 12] = [
-    "/tmp/.X11-unix",
-    "/tmp/.ICE-unix",
-    "/tmp/.XIM-unix",
-    "/tmp/.font-unix",
-    "/tmp/.Test-unix",
-    "/tmp/snap-private-tmp",
-    "/tmp/tmux-*",
-    "/tmp/ssh-*",
-    "/tmp/dbus-*",
-    "/tmp/pulse-*",
-    "/tmp/runtime-*",
-    "/tmp/systemd-private-*",
-];
 /// System trees that may be granted read-only but never read-write (equal or below), except [`RW_OK`].
 const RO_ONLY: [&str; 12] = [
     "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot", "/opt", "/var", "/srv", "/root",
 ];
-/// A world-writable scratch directory under `/var`, like `/tmp` children.
+/// A world-writable scratch directory under `/var`: the one `/var` tree a grant may make writable.
 const RW_OK: &str = "/var/tmp";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -197,33 +191,6 @@ fn grow_buf<T>(mut call: impl FnMut(&mut [libc::c_char]) -> Result<T, i32>) -> O
     }
 }
 
-/// The first socket at depth 1 or 2 below `dir` (entries are not followed: a symlink to a socket is not one, and a
-/// bind never follows it on the host side). A `/tmp` grant holding one is refused: ssh-agent, nvim, Chromium's
-/// singleton and many others put their sockets in arbitrarily named `/tmp` directories.
-///
-/// ponytail: depth 2 and only at validation time (every load and render re-checks); a socket created deeper, or
-/// after the check while the app runs, is not caught. Refusing all of `/tmp/**` would close that, but the test
-/// suites' temp directories live under `/tmp` and a deeper test root would overflow `sun_path` for the socket tests.
-fn socket_within(dir: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::FileTypeExt;
-    for e in fs::read_dir(dir).ok()?.flatten() {
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_socket() {
-            return Some(e.path());
-        }
-        if ft.is_dir()
-            && let Ok(rd) = fs::read_dir(e.path())
-        {
-            for e2 in rd.flatten() {
-                if e2.file_type().is_ok_and(|t| t.is_socket()) {
-                    return Some(e2.path());
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Why a grant path was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
@@ -257,8 +224,6 @@ pub enum Refusal {
     NotDirectory,
     #[error("{0} is never writable: grant it read-only (ro)")]
     ReadOnlyOnly(&'static str),
-    #[error("it is under /tmp and holds a socket ({0}) that would reach another program")]
-    TmpSocket(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -277,6 +242,8 @@ pub enum PermError {
     TooManyGrants,
     #[error("filesystem grant {0:?} appears twice")]
     DuplicateGrant(String),
+    #[error("filesystem grants {0:?} and {1:?} overlap (one is inside the other); keep only one")]
+    NestedGrant(String, String),
     #[error("cannot grant {path:?}: {why}")]
     Grant { path: String, why: Refusal },
     #[error(
@@ -311,7 +278,8 @@ fn variants(p: &Path) -> Vec<PathBuf> {
     v
 }
 
-fn related(a: &Path, b: &Path) -> bool {
+/// One path is equal to, above or below the other.
+pub(crate) fn related(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
@@ -363,23 +331,8 @@ fn locate(p: &Path, ctx: &GrantCtx) -> Result<(), Refusal> {
             return Err(Refusal::System(sys));
         }
     }
-    if p == Path::new(RESERVED_TMP) {
+    if p.starts_with(RESERVED_TMP) {
         return Err(Refusal::Reserved(RESERVED_TMP));
-    }
-    if let Ok(rest) = p.strip_prefix(RESERVED_TMP)
-        && let Some(first) = rest.components().next()
-    {
-        let name = first.as_os_str().to_string_lossy();
-        let hit = RESERVED_TMP_CHILDREN.iter().find(|r| {
-            let r = &r[RESERVED_TMP.len() + 1..];
-            match r.strip_suffix('*') {
-                Some(stem) => name.starts_with(stem),
-                None => name == r,
-            }
-        });
-        if let Some(r) = hit {
-            return Err(Refusal::Reserved(r));
-        }
     }
     if let Some(rd) = &ctx.runtime_dir
         && variants(rd).iter().any(|d| related(p, d))
@@ -414,11 +367,6 @@ pub fn validate_grant_for(path: &Path, access: Access, ctx: &GrantCtx) -> Result
     writable(&real, access).map_err(bad)?;
     if !fs::metadata(&real).is_ok_and(|m| m.is_dir()) {
         return Err(bad(Refusal::NotDirectory));
-    }
-    if real.starts_with(RESERVED_TMP)
-        && let Some(sock) = socket_within(&real)
-    {
-        return Err(bad(Refusal::TmpSocket(lossy(&sock))));
     }
     Ok(real)
 }
@@ -505,6 +453,9 @@ impl Permissions {
             if filesystem.iter().any(|f| f.path == path) {
                 return Err(PermError::DuplicateGrant(lossy(&path)));
             }
+            if let Some(f) = filesystem.iter().find(|f| related(&f.path, &path)) {
+                return Err(PermError::NestedGrant(lossy(&f.path), lossy(&path)));
+            }
             filesystem.push(FsGrant { path, access: g.access });
         }
         Ok(Permissions { filesystem, ..self })
@@ -561,6 +512,8 @@ impl Permissions {
             let path = validate_grant_for(Path::new(path), access, ctx)?;
             if let Some(g) = self.filesystem.iter_mut().find(|g| g.path == path) {
                 g.access = access;
+            } else if let Some(g) = self.filesystem.iter().find(|g| related(&g.path, &path)) {
+                return Err(PermError::NestedGrant(lossy(&g.path), lossy(&path)));
             } else if self.filesystem.len() >= MAX_GRANTS {
                 return Err(PermError::TooManyGrants);
             } else {
@@ -745,7 +698,7 @@ mod tests {
 
     /// `root/home` (with the runtime's data directory under it, as on a real host) and `root/share`.
     fn t() -> T {
-        let td = tempfile::tempdir().unwrap();
+        let td = crate::grant_tempdir();
         let root = td.path().canonicalize().unwrap();
         let home = root.join("home");
         let data_root = home.join(".local/share/runtime");
@@ -915,12 +868,18 @@ mod tests {
                 ..
             })
         ));
-        let sock = x.root.join("share/agent.sock");
-        let _l = UnixListener::bind(&sock).unwrap();
-        assert_eq!(x.why(&sock), Refusal::NotDirectory);
-        // a symlink to a socket is judged by its target
-        symlink(&sock, x.root.join("share/alias.sock")).unwrap();
-        assert_eq!(x.why(&x.root.join("share/alias.sock")), Refusal::NotDirectory);
+        // a socket in a grantable place (short: `sun_path` holds 108 bytes, too few for the target-dir root)
+        match tempfile::tempdir_in("/var/tmp") {
+            Ok(short) => {
+                let sock = short.path().canonicalize().unwrap().join("s");
+                let _l = UnixListener::bind(&sock).unwrap();
+                assert_eq!(x.why(&sock), Refusal::NotDirectory);
+                // a symlink to a socket is judged by its target
+                symlink(&sock, x.root.join("share/alias.sock")).unwrap();
+                assert_eq!(x.why(&x.root.join("share/alias.sock")), Refusal::NotDirectory);
+            }
+            Err(e) => eprintln!("SKIPPED the socket-is-not-a-directory check: /var/tmp: {e}"),
+        }
         assert_eq!(x.why(Path::new("/dev/null")), Refusal::System("/dev"));
     }
 
@@ -946,66 +905,68 @@ mod tests {
     }
 
     #[test]
-    fn tmp_and_the_x11_socket_dir_are_refused_by_prefix_but_tmp_children_are_fine() {
+    fn everything_at_or_below_tmp_is_refused_whatever_its_name_and_content() {
+        use std::os::unix::net::UnixListener;
         let x = t();
-        // home and data directory elsewhere: here the temp root is under /tmp, so /tmp is above the data dir
-        let ctx = GrantCtx {
-            home: "/nonexistent-home".into(),
-            extra_homes: vec![],
-            data_root: "/nonexistent-data".into(),
-            runtime_dir: None,
-        };
-        let why = |p: &Path| match validate_grant(p, &ctx) {
-            Err(PermError::Grant { why, .. }) => why,
-            o => panic!("{p:?}: {o:?}"),
-        };
-        assert_eq!(why(Path::new("/tmp")), Refusal::Reserved("/tmp"));
-        assert_eq!(why(Path::new("/tmp/")), Refusal::Reserved("/tmp"));
-        assert_eq!(why(Path::new("/tmp/.X11-unix")), Refusal::Reserved("/tmp/.X11-unix"));
-        assert_eq!(why(Path::new("/tmp/.X11-unix/X0")), Refusal::Reserved("/tmp/.X11-unix"));
-        symlink("/tmp", x.root.join("share/t")).unwrap();
-        assert_eq!(why(&x.root.join("share/t")), Refusal::Reserved("/tmp"));
-        assert!(validate_grant(&x.dir("share/fine"), &ctx).is_ok()); // the temp dir itself is under /tmp
+        // judged on the path as written, before existence: none of these needs to exist on this host
+        for p in [
+            "/tmp",
+            "/tmp/",
+            "/tmp/.X11-unix",
+            "/tmp/.X11-unix/X0",
+            "/tmp/tmux-1000",
+            "/tmp/tmux-1000/default",
+            "/tmp/ssh-XXXXabcd/agent.1",
+            "/tmp/.ICE-unix",
+            "/tmp/nvim.me/0",
+            "/tmp/an-innocent-name",
+            "/tmp/a/b/c/d",
+        ] {
+            assert_eq!(x.why(Path::new(p)), Refusal::Reserved("/tmp"), "{p}");
+        }
+        // a real /tmp directory, with or without a socket in it, and a symlink to one from a grantable place
+        let td = tempfile::tempdir_in("/tmp").unwrap();
+        let d = td.path().canonicalize().unwrap();
+        assert_eq!(x.why(&d), Refusal::Reserved("/tmp"));
+        let _l = UnixListener::bind(d.join("s")).unwrap();
+        assert_eq!(x.why(&d), Refusal::Reserved("/tmp"));
+        assert_eq!(x.why(&d.join("s")), Refusal::Reserved("/tmp"));
+        symlink(&d, x.root.join("share/t")).unwrap();
+        assert_eq!(x.why(&x.root.join("share/t")), Refusal::Reserved("/tmp"));
+        symlink("/tmp", x.root.join("share/t2")).unwrap();
+        assert_eq!(x.why(&x.root.join("share/t2")), Refusal::Reserved("/tmp"));
+        // /var/tmp is another tree and stays grantable, rw too
+        assert_eq!(writable(Path::new("/var/tmp/x"), Access::Rw), Ok(()));
+        assert!(!Path::new("/var/tmp").starts_with(RESERVED_TMP));
+        // and an ordinary directory outside /tmp is fine
+        assert!(validate_grant(&x.dir("share/fine"), &x.ctx).is_ok());
     }
 
     #[test]
-    fn socket_bearing_tmp_children_are_refused_by_name_equal_or_below() {
+    fn nested_grants_in_one_profile_are_refused() {
         let x = t();
-        let ctx = GrantCtx {
-            home: "/nonexistent-home".into(),
-            extra_homes: vec![],
-            data_root: "/nonexistent-data".into(),
-            runtime_dir: None,
+        let outer = x.dir("share/games");
+        let inner = x.dir("share/games/saves");
+        let text = |a: &Path, b: &Path| {
+            format!(
+                "version = 1\n[[filesystem]]\npath = {:?}\naccess = \"ro\"\n[[filesystem]]\npath = {:?}\naccess = \"rw\"\n",
+                a.to_str().unwrap(),
+                b.to_str().unwrap()
+            )
         };
-        let why = |p: &str| match validate_grant(Path::new(p), &ctx) {
-            Err(PermError::Grant { why, .. }) => why,
-            o => panic!("{p}: {o:?}"),
-        };
-        // judged by name before existence, so none of these needs to exist on this host
-        for (p, rule) in [
-            ("/tmp/tmux-1000", "/tmp/tmux-*"),
-            ("/tmp/tmux-1000/default", "/tmp/tmux-*"),
-            ("/tmp/ssh-XXXXabcd", "/tmp/ssh-*"),
-            ("/tmp/ssh-XXXXabcd/agent.1", "/tmp/ssh-*"),
-            ("/tmp/.ICE-unix", "/tmp/.ICE-unix"),
-            ("/tmp/.ICE-unix/1234", "/tmp/.ICE-unix"),
-            ("/tmp/dbus-abc", "/tmp/dbus-*"),
-            ("/tmp/.X11-unix", "/tmp/.X11-unix"),
-            ("/tmp/.XIM-unix", "/tmp/.XIM-unix"),
-            ("/tmp/.font-unix", "/tmp/.font-unix"),
-            ("/tmp/.Test-unix", "/tmp/.Test-unix"),
-            ("/tmp/pulse-abc", "/tmp/pulse-*"),
-            ("/tmp/runtime-me", "/tmp/runtime-*"),
-            ("/tmp/snap-private-tmp", "/tmp/snap-private-tmp"),
-            ("/tmp/snap-private-tmp/x", "/tmp/snap-private-tmp"),
-            ("/tmp/systemd-private-abc-x", "/tmp/systemd-private-*"),
-        ] {
-            assert_eq!(why(p), Refusal::Reserved(rule), "{p}");
+        for (a, b) in [(&outer, &inner), (&inner, &outer)] {
+            let e = Permissions::parse(&text(a, b), &x.ctx);
+            assert_eq!(e, Err(PermError::NestedGrant(lossy(a), lossy(b))));
         }
-        // a name that merely resembles one is judged normally (here: missing)
-        assert_eq!(why("/tmp/tmux"), Refusal::Missing);
-        assert_eq!(why("/tmp/my-ssh-notes"), Refusal::Missing);
-        drop(x);
+        let mut p = Permissions::default();
+        p.apply_set(&format!("fs+={}:ro", outer.display()), &x.ctx).unwrap();
+        let e = p.apply_set(&format!("fs+={}:rw", inner.display()), &x.ctx);
+        assert_eq!(e, Err(PermError::NestedGrant(lossy(&outer), lossy(&inner))));
+        assert_eq!(p.filesystem.len(), 1);
+        // siblings are fine
+        p.apply_set(&format!("fs+={}:rw", x.dir("share/other").display()), &x.ctx)
+            .unwrap();
+        assert_eq!(p.filesystem.len(), 2);
     }
 
     #[test]
@@ -1030,37 +991,19 @@ mod tests {
             ".config/autostart",
             ".local/bin",
             ".config/git",
+            "bin",
+            ".config/fish",
+            ".config/environment.d",
+            ".local/share/applications",
+            ".local/share/systemd",
+            ".colima",
+            ".lima",
+            ".rd",
+            ".orbstack",
         ] {
             // judged before existence: nothing is created
             assert_eq!(x.why(&h.join(name)), Refusal::Inside(name), "{name}");
             assert_eq!(x.why(&h.join(name).join("x/y")), Refusal::Inside(name), "{name}/x/y");
-        }
-    }
-
-    #[test]
-    fn a_tmp_directory_holding_a_socket_is_refused() {
-        use std::os::unix::net::UnixListener;
-        let x = t();
-        let d1 = x.dir("share/one");
-        let d2 = x.dir("share/two/sub");
-        let clean = x.dir("share/clean/sub");
-        let _a = UnixListener::bind(d1.join("s")).unwrap();
-        let _b = UnixListener::bind(d2.join("s")).unwrap();
-        let deep = x.dir("share/three/a/b");
-        let _c = UnixListener::bind(deep.join("s")).unwrap();
-        assert_eq!(socket_within(&d1), Some(d1.join("s")));
-        assert_eq!(socket_within(&x.root.join("share/two")), Some(d2.join("s")));
-        assert_eq!(socket_within(&clean), None);
-        assert_eq!(socket_within(&x.root.join("share/clean")), None);
-        // ponytail ceiling: depth 3 and deeper is not scanned
-        assert_eq!(socket_within(&x.root.join("share/three")), None);
-        // a symlink to a socket is not a socket (a bind never follows it on the host side)
-        symlink(d1.join("s"), clean.join("link")).unwrap();
-        assert_eq!(socket_within(&clean), None);
-        // end to end, only under /tmp (where the rule applies)
-        if x.root.starts_with("/tmp") {
-            assert_eq!(x.why(&d1), Refusal::TmpSocket(lossy(&d1.join("s"))));
-            assert!(validate_grant(&clean, &x.ctx).is_ok());
         }
     }
 
