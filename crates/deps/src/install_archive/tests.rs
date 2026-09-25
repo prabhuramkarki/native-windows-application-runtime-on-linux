@@ -1727,16 +1727,14 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
     }
 }
 
-/// The BUNDLED dxvk, downloaded for real and installed into a fresh real Wine 10.0 prefix: the real upstream
-/// tarball passes the bounded tar reader, every declared DLL lands (replacing Wine's builtin placeholder) with its
-/// override set, and removal restores the placeholders. Needs network, so CI's `e2e_real_wine` filter skips it:
-/// `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
-#[test]
-#[ignore = "needs network and Wine"]
-fn real_net_wine_bundled_dxvk_installs_and_removes() {
-    let p = crate::Manifest::bundled().get("dxvk").expect("bundled dxvk");
+/// The BUNDLED archive package `id`, downloaded for real and installed into a fresh real Wine 10.0 prefix: the real upstream
+/// tarball passes the bounded tar reader, every declared DLL lands (replacing Wine's builtin placeholder, where
+/// Wine ships one) with its override set, and removal restores the previous state. Needs network, so CI's
+/// `e2e_real_wine` filter skips it: `cargo test -p runtime-deps --lib real_net_wine -- --ignored --nocapture`.
+fn real_net_wine_bundled_installs_and_removes(id: &str) {
+    let p = crate::Manifest::bundled().get(id).expect("bundled package");
     let Install::Archive { extract, .. } = &p.install else {
-        panic!("dxvk is not an archive package")
+        panic!("{id} is not an archive package")
     };
     let tmp = tempfile::tempdir().unwrap();
     let file = crate::fetch::fetch(p, &tmp.path().join("cache"), &crate::fetch::FetchOpts::default()).unwrap();
@@ -1744,21 +1742,26 @@ fn real_net_wine_bundled_dxvk_installs_and_removes() {
     let backend = crate::real_wine_backend(&launcher);
     let env = Store::new(tmp.path().join("apps"))
         .unwrap()
-        .create(&AppId::parse("dxvk").unwrap())
+        .create(&AppId::parse(id).unwrap())
         .unwrap();
     backend.prepare(&env).unwrap();
     backend.stop(&env).unwrap();
-    let before: Vec<Vec<u8>> = extract
+    // Wine's builtin placeholder, if it ships one for this DLL.
+    let before: Vec<Option<Vec<u8>>> = extract
         .iter()
-        .map(|e| fs::read(env.drive_c().join(&e.to)).unwrap())
+        .map(|e| fs::read(env.drive_c().join(&e.to)).ok())
         .collect();
     let done = install_archive(p, &file, &env, &backend, &launcher).unwrap();
-    eprintln!("dxvk: {done:?}");
+    eprintln!("{id}: {done:?}");
     assert_eq!(done.overrides, p.provides);
     assert_eq!(done.files.len(), extract.len());
     for (e, old) in extract.iter().zip(&before) {
         let now = fs::read(env.drive_c().join(&e.to)).unwrap();
-        assert!(now != *old && now.starts_with(b"MZ"), "{} not replaced", e.to);
+        assert!(
+            now.starts_with(b"MZ") && old.as_ref() != Some(&now),
+            "{} not replaced",
+            e.to
+        );
     }
     backend.stop(&env).unwrap();
     let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
@@ -1767,14 +1770,22 @@ fn real_net_wine_bundled_dxvk_installs_and_removes() {
     }
     remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
     for (e, old) in extract.iter().zip(&before) {
-        assert_eq!(
-            fs::read(env.drive_c().join(&e.to)).unwrap(),
-            *old,
-            "{} not restored",
-            e.to
-        );
+        assert_eq!(fs::read(env.drive_c().join(&e.to)).ok(), *old, "{} not restored", e.to);
     }
     backend.stop(&env).unwrap();
+}
+
+#[test]
+#[ignore = "needs network and Wine"]
+fn real_net_wine_bundled_dxvk_installs_and_removes() {
+    real_net_wine_bundled_installs_and_removes("dxvk");
+}
+
+/// Same for VKD3D-Proton: the real `.tar.zst` goes through the zstd reader, and `d3d12` gets `native,builtin`.
+#[test]
+#[ignore = "needs network and Wine"]
+fn real_net_wine_bundled_vkd3d_proton_installs_and_removes() {
+    real_net_wine_bundled_installs_and_removes("vkd3d-proton");
 }
 
 // ------------------------------------------------------------------------------------------------ interrupted installs

@@ -423,6 +423,21 @@ build time, no revocation checks, system and enterprise CAs ignored (a TLS-inter
 defence in depth behind the pin. The trust placed in a pinned vendor installer is trust in the vendor. The download
 cache is shared by all apps of the user and trusted only after re-verification.
 
+**Zstd archives (Phase 4B).** VKD3D-Proton ships only `.tar.zst`. It goes through the same bounded tar walker as gzip,
+with a pure-Rust decoder (`ruzstd`, no C code). Caps: the frame's window (64 MiB, `max_zstd_window`; refused before
+decoding), decompressed bytes (total, per entry, and the decompressed/compressed ratio after a floor, all as for
+gzip), compressed input, exactly one frame (a second is `TooManyFrames`, other trailing bytes `TrailingGarbage`),
+skippable and dictionary frames refused, a truncated frame is an error. The content checksum is not verified by the
+decoder; the package's sha256 already covers the bytes.
+
+**Host graphics probe (Phase 4B).** `runtime graphics info` and `doctor` run `vulkaninfo --summary` on the host,
+outside the sandbox (a read-only query). The runner scrubs the environment (only PATH, HOME, XDG_RUNTIME_DIR,
+DISPLAY, WAYLAND_DISPLAY, VK_ICD_FILENAMES and VK_DRIVER_FILES pass), closes stdin, discards stderr, gives the tool
+its own process group, and bounds the run: 10 s, 64 KiB of output; the reader is never joined (a descendant in its
+own session can hold the pipe), so every wait is bounded. The output is untrusted and is used for nothing but a
+yes/no/unknown verdict on Vulkan (and the device lines shown to the user); it never blocks anything when unknown, and
+the verdict only gates the plan's `blocked` state for packages with `min_vulkan`.
+
 ## Roadmap
 
 Phase 5 adds the actual boundary for ordinary app runs, not just installer helpers: run Wine itself inside
