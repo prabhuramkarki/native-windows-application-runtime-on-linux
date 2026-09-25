@@ -1788,6 +1788,92 @@ fn real_net_wine_bundled_vkd3d_proton_installs_and_removes() {
     real_net_wine_bundled_installs_and_removes("vkd3d-proton");
 }
 
+/// Renders for real: the bundled DXVK, downloaded and installed into a fresh real Wine prefix, then the offscreen
+/// D3D11 fixture (`tools/fixtures/d3d11.c`, no window) run through `backend.command()` + the Launcher (host
+/// `DISPLAY`/`WAYLAND_DISPLAY` pass through the allowlist as for `runtime run`). Needs network and a Vulkan device,
+/// so no CI job runs it: `sh tools/build-fixtures.sh`, then
+/// `cargo test -p runtime-deps --lib -- --ignored real_net_wine_d3d11 --test-threads=1 --nocapture`.
+/// `DXVK_FILTER_DEVICE_NAME` and `WINEDEBUG` are passed through from the test's environment to pick a GPU / debug.
+#[test]
+#[ignore = "needs network, Wine, a Vulkan device and the mingw fixtures"]
+fn real_net_wine_d3d11_renders_via_dxvk() {
+    let exe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/build/d3d11_64.exe");
+    let exe = fs::read(&exe).expect("fixture missing: run sh tools/build-fixtures.sh");
+    let p = crate::Manifest::bundled().get("dxvk").expect("bundled dxvk");
+    let tmp = tempfile::tempdir().unwrap(); // the whole app env lives here and goes with it
+    let file = crate::fetch::fetch(p, &tmp.path().join("cache"), &crate::fetch::FetchOpts::default()).unwrap();
+    // DXVK's own d3d11.dll, read from the verified archive with the same bounded tar reader the install uses.
+    let mut want = Vec::new();
+    crate::tarball::walk(
+        fs::File::open(&file).unwrap(),
+        &crate::tarball::TarLimits::for_package(p.size),
+        |e| match e.path == "dxvk-3.1.1/x64/d3d11.dll" {
+            true => crate::tarball::Selection::Take,
+            false => crate::tarball::Selection::Skip,
+        },
+        |_, r| r.read_to_end(&mut want).map(drop).map_err(Into::into),
+    )
+    .unwrap();
+    assert!(want.starts_with(b"MZ"), "d3d11.dll not found in the DXVK archive");
+    let launcher = Launcher::new();
+    let backend = crate::real_wine_backend(&launcher);
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("d3d11").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    backend.stop(&env).unwrap();
+    install_archive(p, &file, &env, &backend, &launcher).unwrap();
+    backend.stop(&env).unwrap();
+    let dll = fs::read(env.drive_c().join("windows/system32/d3d11.dll")).unwrap();
+    assert!(dll == want, "system32/d3d11.dll is not DXVK's");
+    let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
+    assert!(
+        user_reg.contains("\"d3d11\"=\"native,builtin\""),
+        "d3d11 override missing"
+    );
+
+    let exe_path = env.drive_c().join("d3d11_64.exe");
+    fs::write(&exe_path, &exe).unwrap();
+    let mut cmd = backend
+        .command(&env, &exe_path, &env.drive_c(), &[], &RunOpts::default())
+        .unwrap();
+    // DXVK logs to stderr, which `run_helper` captures together with stdout.
+    cmd.env("DXVK_LOG_LEVEL", "info");
+    let filter = std::env::var("DXVK_FILTER_DEVICE_NAME").unwrap_or_default();
+    for name in ["DXVK_FILTER_DEVICE_NAME", "WINEDEBUG"] {
+        if let Some(v) = std::env::var_os(name) {
+            cmd.env(name, v);
+        }
+    }
+    let out = launcher.run_helper(cmd, Duration::from_secs(60));
+    backend.stop(&env).unwrap();
+    let out = out.unwrap();
+    let text = String::from_utf8_lossy(&out.output);
+    // Without the per-feature dump (hundreds of indented `info:` lines).
+    let short: Vec<&str> = text.lines().filter(|l| !l.starts_with("info:    ")).collect();
+    eprintln!("d3d11_64.exe: {}\n{}", out.status, short.join("\n"));
+    assert!(
+        out.status.success() && text.contains("pixel ok"),
+        "the fixture did not render"
+    );
+    assert!(text.contains("DXVK: v3.1.1"), "no DXVK log line: DXVK did not load");
+    let adapter = text
+        .lines()
+        .find_map(|l| l.strip_prefix("adapter: "))
+        .unwrap_or_default();
+    assert!(!adapter.is_empty(), "no adapter line");
+    // DXVK logs `<device name>:` right after `Creating device:`: the Vulkan device it rendered on.
+    assert!(
+        text.contains(&format!("info:  {adapter}:")),
+        "DXVK did not create a device on {adapter:?}"
+    );
+    assert!(
+        !adapter.contains("llvmpipe") || filter.contains("llvmpipe"),
+        "rendered on llvmpipe although a GPU was expected"
+    );
+}
+
 /// Offline (so CI's `e2e_real_wine` filter runs it): the REAL bundled vkd3d-proton entry (paths, overrides, format)
 /// applied to a fixture `.tar.zst` of the same layout, installed into a real Wine 10.0 prefix.
 #[test]
