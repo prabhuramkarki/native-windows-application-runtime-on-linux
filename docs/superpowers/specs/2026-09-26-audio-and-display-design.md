@@ -17,7 +17,7 @@ Success criteria:
 
 1. `doctor` audio reports the path Wine will really use: PulseAudio-compatible socket present (Ok, and whether it
    is served by PipeWire is not asserted), else ALSA only (Warn), else nothing (Warn); and whether the Wine build
-   has `winepulse` / `winealsa` drivers (from the backend's unix-side directory), never guessing.
+   has `winepulse` / `winealsa` drivers (from the backend's PE `*-windows` DLL directories), never guessing.
 2. `runtime display <app>` prints the app's graphics driver setting (`auto`, `x11` or `wayland`) read from the
    prefix's `user.reg`; `runtime display <app> <auto|x11|wayland>` sets it. No network, no download.
 3. Setting `wayland` on a host without a Wayland session, or without `winewayland`, is refused with a reason;
@@ -39,13 +39,13 @@ Non-goals: per-app audio device choice, latency tuning, PipeWire-native audio, X
 ## 3. Components
 
 - `crates/core/src/doctor.rs`: `audio()` rewritten; `DoctorInput` gains `wine_drivers: Option<&'a [String]>` (names of
-  `*.drv`-style driver modules found in the backend's unix DLL dir, gathered by the CLI) and
+  `*.drv`-style driver modules found in the backend's PE `*-windows` DLL dirs, gathered by the CLI) and
   `graphics_driver: Option<GraphicsDriver>` (the app's setting). New pure `enum GraphicsDriver { Auto, X11, Wayland }`
-  with `parse`/`as_str` in `rt_core` (new small module `display.rs`, also holding `read_graphics_driver(&WineReg)`).
+  with `parse`/`as_str` in `rt_core` (new small module `display.rs`, the reader `read_graphics_driver_from_prefix`, built on `WineReg`, lives in `rt_deps::wine_config`).
 - `crates/deps/src/wine_config.rs` (new, small): `set_graphics_driver(env, backend, launcher, GraphicsDriver)` using
   `install_archive::reg` (made `pub(crate)`); rejects nothing itself (policy lives in the CLI).
 - `crates/cli/src/display.rs` (new) and `main.rs`: `runtime display <app> [auto|x11|wayland]`, taking the app lock
-  exclusively for a set (as `deps --install` does) and refusing while the app runs.
+  exclusively for a set (as `deps --install` does) and refusing while a wineserver runs for the prefix (`rt_deps::wineservers_for`; the lock only excludes other runtime commands).
 
 ## 4. Testing
 

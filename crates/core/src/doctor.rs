@@ -10,8 +10,8 @@
 //! **Bounds.** Directory listings are read through [`FsProbe::list`] with a cap of [`MAX_LISTING`] names (at most
 //! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (the import and the
 //! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
-//! code, not by the input: one Graphics session check, at most one more for the app's graphics driver setting,
-//! and one Audio check.
+//! code, not by the input: one Graphics session check, one Vulkan check, one more for the app's graphics driver setting (an
+//! app report only: its setting, or why it could not be read), and one Audio check.
 //!
 //! **Audio.** Wine 10 has `winepulse` and `winealsa` and no native PipeWire driver, so the socket that counts is the
 //! PulseAudio-compatible `$XDG_RUNTIME_DIR/pulse/native` (`pipewire-pulse` provides it); `pipewire-0` alone is a
@@ -202,8 +202,9 @@ pub struct DoctorInput<'a> {
     /// found in the backend's DLL directories, at most 200; `None` when those directories could not be listed at
     /// all (the driver checks then say "not verified", never "missing").
     pub wine_drivers: Option<&'a [String]>,
-    /// The app's Wine graphics driver setting; `None` for a system report or a prefix that could not be read.
-    pub graphics_driver: Option<GraphicsDriver>,
+    /// The app's Wine graphics driver setting, or why it could not be read (a symlinked, oversized or unparsable
+    /// `user.reg`); `None` for a system report.
+    pub graphics_driver: Option<Result<GraphicsDriver, &'a str>>,
 }
 
 /// Names read from one directory listing at most.
@@ -826,41 +827,53 @@ fn audio(input: &DoctorInput<'_>, out: &mut Out) {
     out.add(Area::Audio, status, text);
 }
 
-/// The app's graphics driver setting against the session and Wine's driver modules (at most one check).
+/// The app's graphics driver setting against the session and Wine's driver modules: exactly one check for an app.
 fn graphics_setting(input: &DoctorInput<'_>, out: &mut Out) {
-    let Some(driver) = &input.graphics_driver else { return };
-    let warn = |out: &mut Out, text: String| out.add(Area::Graphics, Status::Warn, text);
-    match driver {
-        GraphicsDriver::Auto => {}
-        GraphicsDriver::Wayland if wayland_socket(input.env, input.fs).is_none() => warn(
-            out,
+    let driver = match &input.graphics_driver {
+        None => return,
+        Some(Ok(d)) => d,
+        Some(Err(why)) => {
+            return out.add(
+                Area::Graphics,
+                Status::Warn,
+                format!("graphics driver setting not verified: {}", clean(why, 200)),
+            );
+        }
+    };
+    let socket = wayland_socket(input.env, input.fs).is_some();
+    let display = var(input, "DISPLAY").is_some();
+    let session = match (socket, display) {
+        (true, _) => "wayland socket",
+        (false, true) => "DISPLAY",
+        (false, false) => "none",
+    };
+    let no_wl_driver = input
+        .wine_drivers
+        .is_some_and(|l| !l.iter().any(|n| n.eq_ignore_ascii_case("winewayland.drv")));
+    let (status, text) = match driver {
+        GraphicsDriver::Wayland if !socket => (
+            Status::Warn,
             "the app's graphics driver is set to wayland, but no Wayland socket was found: it cannot open windows"
-                .into(),
+                .to_owned(),
         ),
-        GraphicsDriver::Wayland => {
-            if input
-                .wine_drivers
-                .is_some_and(|l| !l.iter().any(|n| n.eq_ignore_ascii_case("winewayland.drv")))
-            {
-                warn(
-                    out,
-                    "the app's graphics driver is set to wayland, but this Wine build has no winewayland driver".into(),
-                );
-            }
-        }
-        GraphicsDriver::X11 => {
-            if var(input, "DISPLAY").is_none() {
-                warn(
-                    out,
-                    "the app's graphics driver is set to x11, but DISPLAY is not set: it cannot open windows".into(),
-                );
-            }
-        }
-        GraphicsDriver::Custom(s) => warn(
-            out,
+        GraphicsDriver::Wayland if no_wl_driver => (
+            Status::Warn,
+            "the app's graphics driver is set to wayland, but this Wine build has no winewayland driver".to_owned(),
+        ),
+        GraphicsDriver::X11 if !display => (
+            Status::Warn,
+            "the app's graphics driver is set to x11, but DISPLAY is not set: it cannot open windows".to_owned(),
+        ),
+        GraphicsDriver::Custom(s) => (
+            Status::Warn,
             format!("custom graphics driver setting {}: not checked", quote_max(s, 60)),
         ),
-    }
+        other => (
+            Status::Ok,
+            format!("Wine graphics driver: {} (session: {session})", other.as_str()),
+        ),
+    };
+    out.add(Area::Graphics, status, text);
 }
 
 // ---------------------------------------------------------------- the prefix and the program

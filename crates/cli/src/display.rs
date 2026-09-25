@@ -3,8 +3,10 @@
 //!
 //! Reading takes no lock and writes nothing. Setting is validated BEFORE the app lock is taken and before
 //! anything is written: `wayland` needs a Wayland session (the socket doctor looks for) and a Wine that has
-//! `winewayland` (a Wine whose files cannot be listed is "not verified", which never refuses). `x11` without a
-//! `DISPLAY` only warns. The lock is exclusive, so a running app refuses it.
+//! `winewayland` (a Wine whose files cannot be listed, or only partly, is "not verified", which never refuses).
+//! `x11` without a `DISPLAY` only warns. The exclusive lock only keeps other runtime commands out (`runtime run`
+//! holds the shared lock just while it starts the app); a running app is refused by the wineserver check
+//! (`rt_deps::wineservers_for`, the guard `deps` uses), which fails closed when `/proc` cannot be read.
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
 use rt_core::doctor::{HostFs, MAX_DLL_DIRS, MAX_LISTING, wayland_socket};
@@ -17,21 +19,40 @@ fn env_var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
-/// File names (lowercase) of the Wine driver modules (`wine*.drv`) in the backend's DLL directories: at most 200,
-/// from at most 16 directories and 50 000 entries each. `None` when none of the directories could be listed.
-/// `doctor` and `display` both use it.
-pub fn wine_drivers(backend: &dyn CompatBackend) -> Option<Vec<String>> {
+/// Driver names kept at most.
+const MAX_DRIVERS: usize = 200;
+
+/// The `wine*.drv` names (lowercase) among `entries`; `None` when an entry could not be read or there are more
+/// than [`MAX_LISTING`] of them (a refusal must never rest on a partly read directory).
+fn drivers_in(entries: impl Iterator<Item = std::io::Result<String>>) -> Option<Vec<String>> {
     let mut found = Vec::new();
+    for (i, e) in entries.enumerate() {
+        let n = e.ok()?.to_ascii_lowercase();
+        if i >= MAX_LISTING {
+            return None;
+        }
+        if n.starts_with("wine") && n.ends_with(".drv") && found.len() < MAX_DRIVERS && !found.contains(&n) {
+            found.push(n);
+        }
+    }
+    Some(found)
+}
+
+/// File names (lowercase) of the Wine driver modules (`wine*.drv`) in the backend's DLL directories: at most
+/// [`MAX_DRIVERS`], from at most [`MAX_DLL_DIRS`] directories. `None` when none of the directories could be listed
+/// or one was read only in part. `doctor` and `display` both use it.
+pub fn wine_drivers(backend: &dyn CompatBackend) -> Option<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
     let mut verified = false;
     for dir in backend.dll_dirs().iter().take(MAX_DLL_DIRS) {
         let Ok(rd) = fs::read_dir(dir) else { continue };
-        verified = true;
-        for e in rd.take(MAX_LISTING).flatten() {
-            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
-            if n.starts_with("wine") && n.ends_with(".drv") && found.len() < 200 && !found.contains(&n) {
+        let names = rd.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
+        for n in drivers_in(names)? {
+            if found.len() < MAX_DRIVERS && !found.contains(&n) {
                 found.push(n);
             }
         }
+        verified = true;
     }
     verified.then_some(found)
 }
@@ -107,10 +128,52 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
         _ => {}
     }
     let _lock = crate::deps::lock_or_refuse(&env, false, "change the graphics driver of")?;
+    // The lock only excludes other runtime commands: a running app is a wineserver for this prefix. Fail closed.
+    match rt_deps::wineservers_for(&env.prefix()) {
+        Ok(pids) if pids.is_empty() => {}
+        Ok(pids) => {
+            return Err(format!(
+                "not set: {} appears to be running (wineserver pid {}): stop it first; nothing was changed",
+                env.id(),
+                pids[0]
+            )
+            .into());
+        }
+        Err(e) => {
+            return Err(format!(
+                "not set: cannot check whether {} is running: {e}; nothing was changed",
+                env.id()
+            )
+            .into());
+        }
+    }
     // Under the lock: the same no-follow, regular-file, size-capped check the read path makes, so Wine's writer
     // never meets a symlinked prefix or `user.reg`. A missing user.reg is fine.
     read_graphics_driver_from_prefix(&env)
         .map_err(|e| format!("not set: cannot use {}'s registry: {e}; nothing was changed", env.id()))?;
     set_graphics_driver(&env, &backend, &launcher, &want).map_err(|e| e.to_string())?;
     crate::emit(&format!("graphics driver of {} set to {}\n", env.id(), want.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drivers_in;
+    use std::io;
+
+    fn ok(n: &str) -> io::Result<String> {
+        Ok(n.to_owned())
+    }
+
+    #[test]
+    fn keeps_wine_drivers_only() {
+        let l = drivers_in([ok("WinePulse.drv"), ok("kernel32.dll"), ok("winealsa.drv")].into_iter());
+        assert_eq!(l.unwrap(), ["winepulse.drv", "winealsa.drv"]);
+        assert_eq!(drivers_in(std::iter::empty()), Some(vec![]));
+    }
+
+    #[test]
+    fn an_unreadable_entry_means_not_verified() {
+        let bad = Err(io::Error::other("boom"));
+        assert_eq!(drivers_in([ok("winepulse.drv"), bad].into_iter()), None);
+    }
 }

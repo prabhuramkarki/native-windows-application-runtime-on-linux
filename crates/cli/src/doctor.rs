@@ -81,7 +81,10 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         vulkan: Some(crate::graphics::host()),
         vulkan_min: rt_deps::Manifest::bundled().max_min_vulkan(),
         wine_drivers: wine_drivers.as_deref(),
-        graphics_driver: facts.graphics_driver,
+        graphics_driver: facts.graphics_driver.as_ref().map(|r| match r {
+            Ok(d) => Ok(d.clone()),
+            Err(e) => Err(e.as_str()),
+        }),
     });
     crate::emit(&if as_json {
         render_json(&report)?
@@ -120,8 +123,8 @@ struct Facts {
     hint: Option<String>,
     /// Installed apps only: installer packages already in the prefix, which the runtime did not install.
     notes: Vec<String>,
-    /// Installed apps only: the Wine graphics driver setting (`None` when the prefix's `user.reg` cannot be read).
-    graphics_driver: Option<GraphicsDriver>,
+    /// Installed apps only: the Wine graphics driver setting, or why `user.reg` could not be read.
+    graphics_driver: Option<Result<GraphicsDriver, String>>,
 }
 
 impl Facts {
@@ -152,7 +155,7 @@ impl Facts {
 
     fn app(store: &Store, id: &AppId) -> Facts {
         let env = store.get(id).ok();
-        let graphics_driver = env.as_ref().and_then(|e| read_graphics_driver_from_prefix(e).ok());
+        let graphics_driver = env.as_ref().map(read_graphics_driver_from_prefix);
         match rt_core::resolve_program(store, id, backend_wine::BACKEND_ID) {
             Ok(p) => {
                 let pe = read_pe(&p.exe);

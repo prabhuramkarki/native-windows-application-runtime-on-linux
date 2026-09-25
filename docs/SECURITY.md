@@ -379,7 +379,7 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
   sandbox bounds what it can touch (its own prefix, read-write); inside the prefix it can do anything, including
   registering programs that Wine starts on its own later (services, `RunOnce` entries, ...). **Only the runtime's own
   steps are sandboxed.** Any later Wine session in the prefix outside the sandbox, `runtime run` above all (and the
-  `reg.exe` runs that set an ARCHIVE package's overrides), starts whatever a vendor installer registered, unsandboxed,
+  `reg.exe` runs that set an ARCHIVE package's overrides, and `runtime display <app> <choice>`), starts whatever a vendor installer registered, unsandboxed,
   with the user's network and files, exactly like the app itself. Success is judged
   by the package's marker (a file or registry value), which is the installer's own claim: a hostile installer can
   write it and exit. The exit status of an exe installer is not even visible (the desktop wrapper exits 0), so marker
@@ -437,6 +437,13 @@ its own process group, and bounds the run: 10 s, 64 KiB of output; the reader is
 own session can hold the pipe), so every wait is bounded. The output is untrusted and is used for nothing but a
 yes/no/unknown verdict on Vulkan (and the device lines shown to the user); it never blocks anything when unknown, and
 the verdict only gates the plan's `blocked` state for packages with `min_vulkan`.
+
+**Graphics driver setting (Phase 4C).** `runtime display <app> <auto|x11|wayland>` runs the prefix's own `reg.exe`
+through Wine, unsandboxed and unpinned (a program can plant a native one), like `runtime run`, so it is not a
+privilege escalation in this phase. Reads (`display`, `doctor`) go through `WineReg`: no-follow, regular file,
+size-capped. The write is re-validated under the exclusive app lock and refused while a `wineserver` runs for the
+prefix (a fail-closed `/proc` scan; the lock alone only excludes other runtime commands). The `reg.exe` arguments
+are fixed (`x11`, `wayland` or a delete), never taken from the prefix or the user's free text.
 
 ## Roadmap
 
