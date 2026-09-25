@@ -11,7 +11,14 @@
 //! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (the import and the
 //! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
 //! code, not by the input: one Graphics session check, one Vulkan check, one more for the app's graphics driver setting (an
-//! app report only: its setting, or why it could not be read), and one Audio check.
+//! app report only: its setting, or why it could not be read), one Audio check, at most one Runtime check for a
+//! managed (.NET) program and at most [`MAX_D3D_ROUTES`] (5) Graphics checks that predict the Direct3D route per
+//! family (an installed app report only: `d3d_routes`).
+//!
+//! **Direct3D route.** `d3d_routes` is the CLI's prediction of what each imported Direct3D family will run on
+//! (DXVK, vkd3d-proton, or Wine's built-in): computed from the recorded packages and the host's Vulkan verdict,
+//! never from prefix files. `doctor` only prints it; a DXVK/vkd3d-proton route is followed by "Vulkan not
+//! verified" when the injected probe's verdict is unknown.
 //!
 //! **Audio.** Wine 10 has `winepulse` and `winealsa` and no native PipeWire driver, so the socket that counts is the
 //! PulseAudio-compatible `$XDG_RUNTIME_DIR/pulse/native` (`pipewire-pulse` provides it); `pipewire-0` alone is a
@@ -205,7 +212,34 @@ pub struct DoctorInput<'a> {
     /// The app's Wine graphics driver setting, or why it could not be read (a symlinked, oversized or unparsable
     /// `user.reg`); `None` for a system report.
     pub graphics_driver: Option<Result<GraphicsDriver, &'a str>>,
+    /// The predicted Direct3D route per imported family; `None` for a system report or a file target (nothing is
+    /// recorded as installed for a file, so no route is predicted).
+    pub d3d_routes: Option<&'a [(D3dFamily, D3dRoute)]>,
 }
+
+/// A Direct3D family an app imports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum D3dFamily {
+    D3d8,
+    D3d9,
+    D3d10,
+    D3d11,
+    D3d12,
+}
+
+/// What a Direct3D family is predicted to run on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum D3dRoute {
+    Dxvk,
+    Vkd3dProton,
+    /// Wine's built-in implementation, and why (untrusted text: cleaned when printed).
+    Wined3d {
+        reason: String,
+    },
+}
+
+/// Route checks printed at most (one per family).
+pub const MAX_D3D_ROUTES: usize = 5;
 
 /// Names read from one directory listing at most.
 pub const MAX_LISTING: usize = 50_000;
@@ -350,6 +384,7 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     vulkan(&input, &mut out);
     display(&input, &mut out);
     graphics_setting(&input, &mut out);
+    d3d_routes(&input, &mut out);
     audio(&input, &mut out);
     prefix(&input.prefix, &mut out);
     program(input.program, &mut out);
@@ -459,7 +494,7 @@ fn runtime_needs(info: &PeInfo, out: &mut Out) {
         out.add(
             Area::Runtime,
             Status::Warn,
-            ".NET program: needs Mono/.NET (Phase 4); it fails until then".into(),
+            ".NET program: no .NET runtime is bundled, so it fails unless Wine provides Mono".into(),
         );
     }
     if let Some(installer) = &info.installer {
@@ -874,6 +909,32 @@ fn graphics_setting(input: &DoctorInput<'_>, out: &mut Out) {
         ),
     };
     out.add(Area::Graphics, status, text);
+}
+
+/// One check per predicted Direct3D family (at most [`MAX_D3D_ROUTES`]).
+fn d3d_routes(input: &DoctorInput<'_>, out: &mut Out) {
+    let unverified = input
+        .vulkan
+        .is_some_and(|h| host_verdict(h, input.vulkan_min) == VulkanVerdict::Unknown);
+    let note = if unverified { " (Vulkan not verified)" } else { "" };
+    for (family, route) in input.d3d_routes.unwrap_or_default().iter().take(MAX_D3D_ROUTES) {
+        let (n, builtin) = match family {
+            D3dFamily::D3d8 => (8, "wined3d"),
+            D3dFamily::D3d9 => (9, "wined3d"),
+            D3dFamily::D3d10 => (10, "wined3d"),
+            D3dFamily::D3d11 => (11, "wined3d"),
+            D3dFamily::D3d12 => (12, "vkd3d"),
+        };
+        let (status, text) = match route {
+            D3dRoute::Dxvk => (Status::Ok, format!("Direct3D {n}: DXVK{note}")),
+            D3dRoute::Vkd3dProton => (Status::Ok, format!("Direct3D {n}: vkd3d-proton{note}")),
+            D3dRoute::Wined3d { reason } => (
+                Status::Warn,
+                format!("Direct3D {n}: Wine's built-in {builtin} ({})", clean(reason, 200)),
+            ),
+        };
+        out.add(Area::Graphics, status, text);
+    }
 }
 
 // ---------------------------------------------------------------- the prefix and the program
