@@ -68,7 +68,8 @@ Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
 Known gaps: VKD3D-Proton (upstream ships only `.tar.zst`, not read), `d3dcompiler_47` (no verifiable redistributable
 source), .NET, Mono and Gecko (no packages; they stay disabled), 32-bit apps (x64 DLLs only; the plan warns), no
 package upgrades (a newer pinned version is refused: recreate the app) and no removal of a single package (removing
-the app removes everything).
+the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
+left alone: the runtime neither installs it nor sets its DLL overrides (`deps` and `doctor` say so).
 
 ## Requirements
 
