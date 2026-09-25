@@ -114,6 +114,9 @@ pub struct Orchestrator<'a> {
     pub consent: &'a dyn ConsentProvider,
     /// Unix seconds for `installed_at` / `given_at` ([`unix_now`] in real use).
     pub now: fn() -> u64,
+    /// The host's Vulkan verdict; the install re-resolves the plan, so it applies [`block_for_vulkan`] again and
+    /// installs exactly what `plan_for_app` showed as installable.
+    pub vulkan: VulkanFor<'a>,
 }
 
 /// Unix seconds (0 if the clock is before 1970).
@@ -496,9 +499,11 @@ pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsEr
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;
     let installed = state::installed_set(&md);
-    let first = resolve(&app.facts, &installed, &[], o.manifest);
+    let mut first = resolve(&app.facts, &installed, &[], o.manifest);
+    block_for_vulkan(&mut first, o.manifest, o.vulkan);
     let d = decide(o, &md, &first);
-    let plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    let mut plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    block_for_vulkan(&mut plan, o.manifest, o.vulkan);
     Ok(execute(o, &plan, &d, &md.dependencies))
 }
 

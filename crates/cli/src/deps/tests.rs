@@ -124,6 +124,7 @@ impl Rig {
             fetcher: f,
             consent,
             now: || 1_900_000_000,
+            vulkan: &|_| rt_core::VulkanVerdict::Unknown,
         };
         install_report(&o, app).unwrap()
     }

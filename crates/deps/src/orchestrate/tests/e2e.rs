@@ -150,6 +150,7 @@ impl WineRig {
             fetcher: &fetcher,
             consent: answers,
             now,
+            vulkan: &|_| VulkanVerdict::Unknown,
         };
         let t = Instant::now();
         let rep = install_plan(&o, &self.plan(imports)).unwrap();

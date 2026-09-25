@@ -2083,6 +2083,38 @@ fn deps_shows_dxvk_blocked_when_the_vulkan_loader_is_absent() {
 }
 
 #[test]
+fn deps_install_does_not_install_a_package_blocked_for_vulkan() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let o = r
+        .cmd()
+        .env("RUNTIME_VULKAN_LOADER", "absent")
+        .args(["deps", &id, "--install"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "a skipped package is exit 1: {}",
+        s(&o.stdout)
+    );
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("skipped:   dxvk: Vulkan is unusable") && out.contains("0 installed"),
+        "{out}"
+    );
+    assert!(
+        !r.data
+            .join("apps")
+            .join(&id)
+            .join("prefix/drive_c/windows/system32/d3d11.dll")
+            .exists(),
+        "dxvk was installed on a host without Vulkan"
+    );
+    assert!(!r.data.join("deps-cache").exists(), "something was downloaded");
+}
+
+#[test]
 fn deps_shows_dxvk_blocked_when_the_only_gpu_is_vulkan_1_1() {
     let r = rig();
     script(&r.bin.join("vulkaninfo"), &vulkaninfo_body(1, 1));
