@@ -1788,6 +1788,50 @@ fn real_net_wine_bundled_vkd3d_proton_installs_and_removes() {
     real_net_wine_bundled_installs_and_removes("vkd3d-proton");
 }
 
+/// Offline (so CI's `e2e_real_wine` filter runs it): the REAL bundled vkd3d-proton entry (paths, overrides, format)
+/// applied to a fixture `.tar.zst` of the same layout, installed into a real Wine 10.0 prefix.
+#[test]
+#[ignore = "needs Wine and the mingw fixtures"]
+fn e2e_real_wine_vkd3d_manifest_shape() {
+    let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/build/exports64.dll");
+    let dll = fs::read(&dll).expect("fixture missing: run sh tools/build-fixtures.sh");
+    let mut p = crate::Manifest::bundled()
+        .get("vkd3d-proton")
+        .expect("bundled vkd3d-proton")
+        .clone();
+    let Install::Archive { format, extract, .. } = &p.install else {
+        panic!("vkd3d-proton is not an archive package")
+    };
+    assert_eq!(*format, ArchiveFormat::TarZst);
+    let names: Vec<(String, Vec<u8>)> = extract.iter().map(|e| (e.from.clone(), dll.clone())).collect();
+    let files: Vec<(&str, &[u8])> = names.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    let bytes = files_in(ArchiveFormat::TarZst, &files);
+    let launcher = Launcher::new();
+    let backend = crate::real_wine_backend(&launcher);
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Store::new(tmp.path().join("apps"))
+        .unwrap()
+        .create(&AppId::parse("vkd3d").unwrap())
+        .unwrap();
+    backend.prepare(&env).unwrap();
+    let file = tmp.path().join("pkg");
+    fs::write(&file, &bytes).unwrap();
+    p.size = bytes.len() as u64;
+    let done = install_archive(&p, &file, &env, &backend, &launcher).unwrap();
+    eprintln!("vkd3d-proton fixture: {done:?}");
+    for name in ["d3d12", "d3d12core"] {
+        let f = env.drive_c().join(format!("windows/system32/{name}.dll"));
+        assert_eq!(fs::read(&f).unwrap(), dll, "{name}");
+    }
+    backend.stop(&env).unwrap();
+    let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
+    for name in ["d3d12", "d3d12core"] {
+        assert!(user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")), "{name}");
+    }
+    remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
+    backend.stop(&env).unwrap();
+}
+
 // ------------------------------------------------------------------------------------------------ interrupted installs
 
 /// Runs `install` and simulates SIGKILL after `steps` steps (a panic that skips every rollback): 0 = right after the

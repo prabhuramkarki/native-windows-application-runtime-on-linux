@@ -64,8 +64,10 @@ Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
 - **DXVK 3.1.1** (Zlib, no consent): d3d8, d3d9, d3d10core, d3d11 and dxgi, x64 DLLs with `native,builtin` overrides.
 - **VKD3D-Proton 3.0.1** (LGPL-2.1-or-later, no consent, needs DXVK): d3d12 and d3d12core, x64 DLLs with
   `native,builtin` overrides, read from upstream's `.tar.zst` by the bounded zstd reader. Installing works on any host;
-  actually rendering Direct3D 12 needs a GPU and driver with Vulkan 1.3, which CI does not have, so rendering is not
-  verified in CI (only the download, install and overrides are, on real Wine). `runtime graphics info` shows what
+  actually rendering Direct3D 12 needs a GPU and driver with Vulkan 1.3 and is not verified anywhere. CI verifies
+  the `.tar.zst` install path and the manifest entry's paths and overrides on real Wine with a fixture archive;
+  the pin's download is re-verified weekly by `verify-pins`; installing the real downloaded package on Wine is a
+  manual `--ignored real_net_*` run. `runtime graphics info` shows what
   the host offers (Vulkan loader, devices and API versions, from a bounded `vulkaninfo` run), and `deps` marks
   `dxvk` and `vkd3d-proton` as blocked, with the reason, when Vulkan is unusable.
 - **VC++ 2015-2022 redistributable x64 14.44.35211** (Microsoft, consent): Microsoft's installer, run offline in the
