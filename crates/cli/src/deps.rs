@@ -109,7 +109,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     }
     let manifest = Manifest::bundled();
     let md = store.read_metadata(&env)?;
-    let plan = rt_deps::plan_for_app(&env, &md, manifest);
+    let plan = rt_deps::plan_for_app(&env, &md, manifest, &crate::graphics::verdict_for);
     crate::emit(&format_plan(env.id().as_str(), &plan, manifest, install))?;
     if !install {
         return Ok(0);
@@ -458,7 +458,10 @@ fn cache(dir: &Path, clear: bool) -> Result<u8, CmdError> {
 /// One line when the app's plan has packages that are not installed: computed with `plan_for_app` only (reads
 /// the metadata and the executable; no network, no writes, no `Fetcher`).
 pub(crate) fn missing_hint(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> Option<String> {
-    hint_for(env.id().as_str(), &rt_deps::plan_for_app(env, md, manifest))
+    hint_for(
+        env.id().as_str(),
+        &rt_deps::plan_for_app(env, md, manifest, &crate::graphics::verdict_for),
+    )
 }
 
 /// The hint line for `app`'s plan (see [`missing_hint`]).

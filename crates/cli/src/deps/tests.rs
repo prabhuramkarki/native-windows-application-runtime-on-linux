@@ -36,6 +36,7 @@ fn archive(id: &str, gated: bool, requires: &[&str], provides: &[&str]) -> (Pack
         requires_consent: gated,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format: ArchiveFormat::Zip,
             extract: vec![Extract {
@@ -566,7 +567,7 @@ fn the_hint_is_one_line_and_only_when_something_is_missing() {
     assert_eq!(h, "hint: 3 dependencies missing: run `runtime deps app`");
     // Installed: no hint.
     let (text, _) = r.install(
-        &rt_deps::plan_for_app(&r.env, &md, &r.manifest),
+        &rt_deps::plan_for_app(&r.env, &md, &r.manifest, &|_| rt_core::VulkanVerdict::Unknown),
         &FakeFetcher::default(),
         &consent(&strings(&["gated"]), &Shared::default(), None),
     );
@@ -575,7 +576,7 @@ fn the_hint_is_one_line_and_only_when_something_is_missing() {
     assert_eq!(missing_hint(&r.env, &md, &r.manifest), None);
     // A second --install finds everything there: full success, not "skipped".
     let (text, code) = r.install(
-        &rt_deps::plan_for_app(&r.env, &md, &r.manifest),
+        &rt_deps::plan_for_app(&r.env, &md, &r.manifest, &|_| rt_core::VulkanVerdict::Unknown),
         &FakeFetcher::default(),
         &consent(&[], &Shared::default(), None),
     );

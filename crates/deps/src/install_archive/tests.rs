@@ -292,6 +292,7 @@ fn pkg_with(format: ArchiveFormat, extract: &[(&str, &str)], overrides: &[&str],
         requires_consent: false,
         requires: vec![],
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format,
             extract: extract

@@ -867,3 +867,45 @@ fn distinct_destinations_accepted() {
         + &archive_to("b", &["w/s/xy.dll", "w/x.dll", "ws/x.dll"]);
     assert_eq!(Manifest::parse(&text).unwrap().packages.len(), 2);
 }
+
+/// One archive package `p` whose `min_vulkan` line is `line` (none if empty).
+fn with_min_vulkan(line: &str) -> String {
+    archive("p", &[], &["p"]).replacen(
+        "requires_consent = false",
+        &format!("requires_consent = false\n{line}"),
+        1,
+    )
+}
+
+#[test]
+fn min_vulkan_parses_major_dot_minor() {
+    let m = Manifest::parse(&with_min_vulkan("min_vulkan = \"1.3\"")).unwrap();
+    assert_eq!(m.get("p").unwrap().min_vulkan, Some((1, 3)));
+    assert_eq!(m.max_min_vulkan(), Some((1, 3)));
+}
+
+#[test]
+fn min_vulkan_rejects_junk() {
+    for v in [
+        "1",
+        "1.3.0",
+        "a.b",
+        "",
+        "1.99999999999",
+        "-1.3",
+        "1. 3",
+        "+1.3",
+        "1.",
+        ".3",
+    ] {
+        let e = err(&with_min_vulkan(&format!("min_vulkan = {v:?}")));
+        assert!(matches!(e, ManifestError::BadMinVulkan { .. }), "{v}: {e:?}");
+    }
+}
+
+#[test]
+fn min_vulkan_is_optional() {
+    let m = Manifest::parse(&with_min_vulkan("")).unwrap();
+    assert_eq!(m.get("p").unwrap().min_vulkan, None);
+    assert_eq!(m.max_min_vulkan(), None);
+}

@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -116,7 +116,18 @@ fn run_tool(program: &OsStr, timeout: Duration) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-pub(crate) fn probe() -> HostVulkan {
+/// The host's Vulkan, probed on first use and then shared, so one invocation runs `vulkaninfo` at most once.
+pub(crate) fn host() -> &'static HostVulkan {
+    static HOST: OnceLock<HostVulkan> = OnceLock::new();
+    HOST.get_or_init(probe)
+}
+
+/// The verdict `plan_for_app` asks for, lazily: the probe only runs if some package needs Vulkan.
+pub(crate) fn verdict_for(min: Option<(u32, u32)>) -> VulkanVerdict {
+    host_verdict(host(), min)
+}
+
+fn probe() -> HostVulkan {
     let loader = VULKAN_DIRS
         .iter()
         .any(|d| HostFs.exists(&Path::new(d).join("libvulkan.so.1")));
@@ -124,9 +135,14 @@ pub(crate) fn probe() -> HostVulkan {
 }
 
 pub fn info() -> Result<u8, CmdError> {
-    let h = probe();
+    crate::emit(&format_info(host(), rt_deps::Manifest::bundled().max_min_vulkan()))?;
+    Ok(0)
+}
+
+/// The report for `h`; `need` is the highest Vulkan version a bundled package requires, if any does.
+fn format_info(h: &HostVulkan, need: Option<(u32, u32)>) -> String {
     let mut out = String::new();
-    match host_verdict(&h, None) {
+    match host_verdict(h, None) {
         VulkanVerdict::Usable => {
             out.push_str("Vulkan: usable\n");
             for (i, d) in h.devices.iter().enumerate() {
@@ -152,8 +168,10 @@ pub fn info() -> Result<u8, CmdError> {
             out.push_str("Vulkan: unknown  (vulkaninfo not available; the loader is present)\n");
         }
     }
-    crate::emit(&out)?;
-    Ok(0)
+    if let Some((major, minor)) = need {
+        out.push_str(&format!("DXVK and VKD3D-Proton need Vulkan {major}.{minor}.\n"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -171,6 +189,17 @@ mod tests {
         run_tool(tool.as_os_str(), timeout)
     }
     const T: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn info_names_the_needed_version_only_when_a_package_has_one() {
+        let h = HostVulkan {
+            tool_found: false,
+            loader_found: true,
+            devices: vec![],
+        };
+        assert!(format_info(&h, Some((1, 3))).ends_with("DXVK and VKD3D-Proton need Vulkan 1.3.\n"));
+        assert!(!format_info(&h, None).contains("need Vulkan"));
+    }
 
     #[test]
     fn normal_output_is_returned() {

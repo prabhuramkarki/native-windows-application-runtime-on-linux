@@ -46,6 +46,8 @@ pub struct Package {
     pub requires_consent: bool,
     pub requires: Vec<String>,
     pub provides: Vec<String>,
+    /// The lowest Vulkan API version (`major.minor`) the package needs from the host; `None` if it needs no Vulkan.
+    pub min_vulkan: Option<(u32, u32)>,
     pub install: Install,
 }
 
@@ -155,6 +157,8 @@ pub enum ManifestError {
     BadInstall { id: String, reason: &'static str },
     #[error("package {id:?}: invalid marker ({reason})")]
     BadMarker { id: String, reason: &'static str },
+    #[error("package {id:?}: invalid min_vulkan {value:?} (expected major.minor, e.g. \"1.3\")")]
+    BadMinVulkan { id: String, value: String },
     #[error("package {id:?}: invalid provides entry {name:?}")]
     BadProvides { id: String, name: String },
     #[error("{name:?} is provided twice (by {first:?} and {second:?})")]
@@ -210,6 +214,8 @@ struct RawPackage {
     requires_consent: bool,
     requires: Vec<String>,
     provides: Vec<String>,
+    #[serde(default)]
+    min_vulkan: Option<String>,
     install: RawInstall,
 }
 
@@ -244,6 +250,11 @@ impl Manifest {
     // ponytail: linear scan, fine for a bundled manifest of a few dozen packages; index by id if it grows.
     pub fn get(&self, id: &str) -> Option<&Package> {
         self.packages.iter().find(|p| p.id == id)
+    }
+
+    /// The highest `min_vulkan` of any package, if some package has one.
+    pub fn max_min_vulkan(&self) -> Option<(u32, u32)> {
+        self.packages.iter().filter_map(|p| p.min_vulkan).max()
     }
 }
 
@@ -365,6 +376,13 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
             return Err(ManifestError::BadProvides { id, name: clip(name) });
         }
     }
+    let min_vulkan = match &raw.min_vulkan {
+        None => None,
+        Some(v) => Some(parse_min_vulkan(v).ok_or_else(|| ManifestError::BadMinVulkan {
+            id: id.clone(),
+            value: clip(v),
+        })?),
+    };
     let install = install(&id, raw.kind, raw.install, &raw.provides)?;
     if let Install::Archive { format, .. } = install {
         let path = raw
@@ -396,8 +414,17 @@ fn package(raw: RawPackage) -> Result<Package, ManifestError> {
         requires_consent: raw.requires_consent,
         requires: raw.requires,
         provides: raw.provides,
+        min_vulkan,
         install,
     })
+}
+
+/// `major.minor`, each 1 to 4 ASCII digits (so no sign, space or overflow).
+fn parse_min_vulkan(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once('.')?;
+    let num =
+        |t: &str| (matches!(t.len(), 1..=4) && t.bytes().all(|c| c.is_ascii_digit())).then(|| t.parse::<u32>().ok())?;
+    Some((num(a)?, num(b)?))
 }
 
 /// A provided capability or DLL name: `[a-z0-9._+-]{1,64}` (lowercase only, so case variants cannot collide).

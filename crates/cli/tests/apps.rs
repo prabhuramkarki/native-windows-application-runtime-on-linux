@@ -67,6 +67,13 @@ fn script(path: &Path, body: &str) {
     }
 }
 
+/// A `vulkaninfo --summary` body that lists one GPU with the given API version.
+fn vulkaninfo_body(major: u32, minor: u32) -> String {
+    format!(
+        "printf 'GPU0:\\n\\tapiVersion = {major}.{minor}.0\\n\\tdriverVersion = 1\\n\\tdeviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\\n\\tdeviceName = fake\\n\\tdriverName = fake\\n'"
+    )
+}
+
 fn fixture(name: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/build")
@@ -94,6 +101,8 @@ fn rig_with(wineserver_body: &str) -> Rig {
             "if [ -d \"$WINEPREFIX\" ]; then E=yes; else E=no; fi\necho \"wineserver $* WINEPREFIX=$WINEPREFIX exists=$E\" >> @LOG@/calls.txt\n{wineserver_body}"
         )),
     );
+    // A GPU that meets DXVK's minimum, so plans do not depend on the host's real Vulkan (only on its loader).
+    script(&bin.join("vulkaninfo"), &vulkaninfo_body(1, 3));
     Rig {
         _t: t,
         root,
@@ -114,7 +123,7 @@ impl Rig {
     fn cmd(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_runtime"));
         c.env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("RUNTIME_DATA_DIR", &self.data)
             .env(
                 "RUNTIME_WINE",
@@ -2044,6 +2053,24 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     let o = r.rt(&["deps", &id, "--discard-interrupted", "dxvk"]);
     assert_ok(&o);
     assert_eq!(s(&o.stdout), "Nothing to discard for dxvk.\n");
+}
+
+#[test]
+fn deps_shows_a_vulkan_only_package_as_blocked_when_vulkan_is_too_old() {
+    let r = rig();
+    // Only a Vulkan 1.1 GPU: DXVK (min 1.3) cannot work. Without the loader the host is unusable all the same.
+    script(&r.bin.join("vulkaninfo"), &vulkaninfo_body(1, 1));
+    let (id, _) = install_d3d11(&r);
+    let (tree, calls) = (r.tree(), r.calls());
+    let o = r.rt(&["deps", &id]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("blocked") && out.contains("Wine's built-in Direct3D"),
+        "{out}"
+    );
+    assert!(!out.contains("): to install"), "{out}");
+    assert_eq!((r.tree(), r.calls()), (tree, calls), "nothing written, no network");
 }
 
 #[test]

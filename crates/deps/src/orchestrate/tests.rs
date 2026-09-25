@@ -74,6 +74,7 @@ fn archive(id: &str, gated: bool, requires: &[&str], provides: &[&str]) -> (Pack
         requires_consent: gated,
         requires: requires.iter().map(|s| (*s).to_owned()).collect(),
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Archive {
             format: ArchiveFormat::Zip,
             extract: vec![Extract {
@@ -99,6 +100,7 @@ fn installer(id: &str, provides: &[&str]) -> (Package, Vec<u8>) {
         requires_consent: false,
         requires: vec![],
         provides: provides.iter().map(|s| (*s).to_owned()).collect(),
+        min_vulkan: None,
         install: Install::Installer {
             silent_args: vec!["/S".into()],
             marker: Marker::File(format!("windows/system32/{id}-marker.dll")),
@@ -1212,7 +1214,7 @@ fn a_d3d11_import_plans_dxvk_without_warnings_for_a_64_bit_app() {
             .any(|i| i.dll.eq_ignore_ascii_case("d3d11.dll"))
     );
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries.len(), 1);
     assert_eq!(app.plan.entries[0].package, "dxvk");
     assert_eq!(app.plan.entries[0].action, Action::Install);
@@ -1223,7 +1225,7 @@ fn a_d3d11_import_plans_dxvk_without_warnings_for_a_64_bit_app() {
 fn a_32_bit_app_gets_the_x64_only_warning() {
     let exe = patch_import(fixture("hello32.exe"), "msvcrt.dll", "d3d11.dll");
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries[0].package, "dxvk");
     assert!(
         app.warnings
@@ -1239,7 +1241,9 @@ fn a_32_bit_d3d8_app_gets_the_x64_only_warning_too() {
     let exe = patch_import(fixture("hello32.exe"), "msvcrt.dll", "d3d8.dll");
     let r = app_with_exe(Some(&exe));
     let (d8, _) = archive("dxvk8", false, &[], &["d3d8"]);
-    let app = plan_for_app(&r.env, &r.md(), &Manifest { packages: vec![d8] });
+    let app = plan_for_app(&r.env, &r.md(), &Manifest { packages: vec![d8] }, &|_| {
+        VulkanVerdict::Unknown
+    });
     assert_eq!(app.plan.entries[0].package, "dxvk8");
     assert!(
         app.warnings
@@ -1254,7 +1258,7 @@ fn a_32_bit_d3d8_app_gets_the_x64_only_warning_too() {
 fn an_unsatisfied_capability_is_a_warning() {
     let exe = patch_import(fixture("hello64.exe"), "KERNEL32.dll", "mscoree.dll");
     let r = app_with_exe(Some(&exe));
-    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+    let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
     assert!(app.plan.entries.is_empty());
     assert!(app.warnings.iter().any(|w| w.contains("dotnet")), "{:?}", app.warnings);
 }
@@ -1279,7 +1283,7 @@ fn an_unreadable_executable_is_a_warning_and_an_empty_plan() {
     for (i, setup) in cases.iter().enumerate() {
         let r = app_with_exe(None);
         setup(&r);
-        let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest());
+        let app = plan_for_app(&r.env, &r.md(), &dxvk_manifest(), &|_| VulkanVerdict::Unknown);
         assert!(app.plan.entries.is_empty(), "case {i}: {:?}", app.plan);
         assert_eq!(app.facts, Facts::default(), "case {i}");
         assert!(
@@ -1310,7 +1314,7 @@ fn installed_packages_come_from_metadata() {
         },
     )
     .unwrap();
-    let app = plan_for_app(&r.env, &md, &m);
+    let app = plan_for_app(&r.env, &md, &m, &|_| VulkanVerdict::Unknown);
     assert_eq!(app.plan.entries[0].action, Action::AlreadyInstalled);
 }
 

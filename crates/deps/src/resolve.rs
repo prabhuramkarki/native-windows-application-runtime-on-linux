@@ -6,6 +6,7 @@
 
 use crate::capabilities::capability_for;
 use crate::manifest::{Manifest, Package, clip};
+use rt_core::VulkanVerdict;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 
@@ -207,6 +208,42 @@ pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manif
         })
         .collect();
     Plan { entries, unsatisfied }
+}
+
+/// Blocks the `Install` entries that need a Vulkan the host cannot give (and, since entries are dependency-first,
+/// whatever requires them), so `deps` says so instead of installing DLLs that would not work. Kept out of
+/// [`resolve`] because the verdict is a fact about the host: the caller supplies it, and it is asked for once per
+/// distinct `min_vulkan` (never, if no entry needs Vulkan). Only `Unusable` blocks; an installed package stays.
+pub fn block_for_vulkan(
+    plan: &mut Plan,
+    manifest: &Manifest,
+    verdict_for: &dyn Fn(Option<(u32, u32)>) -> VulkanVerdict,
+) {
+    let mut cache: HashMap<(u32, u32), VulkanVerdict> = HashMap::new();
+    let mut blocked: HashSet<String> = HashSet::new();
+    for e in &mut plan.entries {
+        if e.action != Action::Install {
+            continue;
+        }
+        let Some(p) = manifest.get(&e.package) else { continue };
+        if let Some(min) = p.min_vulkan
+            && let VulkanVerdict::Unusable(why) = cache.entry(min).or_insert_with(|| verdict_for(Some(min)))
+        {
+            e.action = Action::Blocked {
+                // Only the host's text is clipped; the fixed part must survive.
+                reason: format!(
+                    "Vulkan is unusable: {}; Wine's built-in Direct3D will be used",
+                    clip(why)
+                ),
+            };
+            blocked.insert(e.package.clone());
+        } else if p.requires.iter().any(|r| blocked.contains(r)) {
+            e.action = Action::Blocked {
+                reason: "needs a package that is blocked (Vulkan is unusable)".into(),
+            };
+            blocked.insert(e.package.clone());
+        }
+    }
 }
 
 #[cfg(test)]
