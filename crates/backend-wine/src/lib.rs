@@ -36,9 +36,14 @@ pub mod harden;
 /// [`CompatBackend::id`] of [`WineBackend`]: what `metadata.json` records as `backend.id`.
 pub const BACKEND_ID: &str = "wine";
 
-/// Wine's own `WINEDLLOVERRIDES` for every process: no menu spam, no Mono/Gecko download dialogs (.NET apps
-/// fail until a .NET package exists (not planned in Phase 4); `doctor` says so).
+/// Wine's own `WINEDLLOVERRIDES` for every process but a managed app's program: no menu spam, no Mono/Gecko
+/// download dialogs. `mscoree=d` also keeps Wine's own Mono prompt (and any Mono) off installers, helpers,
+/// `prepare` and native programs.
 pub const WINEDLLOVERRIDES: &str = "winemenubuilder.exe=d;mscoree=d;mshtml=d";
+
+/// [`WINEDLLOVERRIDES`] without `mscoree=d`: only for the program of an app with Wine Mono recorded
+/// ([`RunOpts::dotnet`], used by `command()` alone), so its `mscoree` loads the installed Mono.
+pub const WINEDLLOVERRIDES_DOTNET: &str = "winemenubuilder.exe=d;mshtml=d";
 
 /// [`CompatBackend::settle`]'s shell wrapper: a FIXED script text, never built with `format!` or any other
 /// string-interpolation of caller-supplied data — the same "untrusted data only ever arrives as argv, never
@@ -297,13 +302,22 @@ impl WineBackend {
 
     /// `<wine>` with the variables every Wine process of this app gets. `Launcher::finalize` re-applies them
     /// after clearing the environment.
-    fn wine_command(&self, env: &AppEnv, winedebug: &str) -> Command {
+    /// `dotnet` selects [`WINEDLLOVERRIDES_DOTNET`]: `true` only in `command()`, from [`RunOpts::dotnet`]; every
+    /// helper passes `false`.
+    fn wine_command(&self, env: &AppEnv, winedebug: &str, dotnet: bool) -> Command {
         let mut cmd = Command::new(&self.wine);
         cmd.env("WINEPREFIX", env.prefix())
             .env("HOME", app_home(env))
             .env("WINEARCH", "win64")
             .env("WINEDEBUG", winedebug)
-            .env("WINEDLLOVERRIDES", WINEDLLOVERRIDES)
+            .env(
+                "WINEDLLOVERRIDES",
+                if dotnet {
+                    WINEDLLOVERRIDES_DOTNET
+                } else {
+                    WINEDLLOVERRIDES
+                },
+            )
             .env("WINESERVER", &self.wineserver);
         cmd
     }
@@ -335,7 +349,7 @@ impl CompatBackend for WineBackend {
         // Wine follows links: refuse before it writes anything through one.
         harden::precheck(&prefix).map_err(|e| harden_error("prefix", e))?;
         ensure_app_home(env)?;
-        let mut cmd = self.wine_command(env, "-all");
+        let mut cmd = self.wine_command(env, "-all", false);
         cmd.args(["wineboot", "-u"]);
         let booted = self.launcher.run_helper(cmd, self.timeouts.prepare);
         let stopped = self.stop(env);
@@ -373,7 +387,7 @@ impl CompatBackend for WineBackend {
         // Wine gets the NORMALISED paths (`drive_c` + the verified components), not the caller's spelling.
         let exe_unix = check_inside(&root, exe_unix, "executable", Want::File)?;
         let cwd_unix = check_inside(&root, cwd_unix, "working directory", Want::Dir)?;
-        let mut cmd = self.wine_command(env, if opts.debug { "err+all,fixme-all" } else { "-all" });
+        let mut cmd = self.wine_command(env, if opts.debug { "err+all,fixme-all" } else { "-all" }, opts.dotnet);
         cmd.arg(&exe_unix).args(args).current_dir(&cwd_unix);
         Ok(cmd)
     }
@@ -1184,7 +1198,18 @@ esac
         let (exe, dir) = r.exe("Program Files/t/hello64.exe");
         let b = r.backend();
         let args = [OsString::from("--flag"), OsString::from("value")];
-        let cmd = b.command(&r.env, &exe, &dir, &args, &RunOpts { debug: false }).unwrap();
+        let cmd = b
+            .command(
+                &r.env,
+                &exe,
+                &dir,
+                &args,
+                &RunOpts {
+                    debug: false,
+                    dotnet: false,
+                },
+            )
+            .unwrap();
         assert_eq!(cmd.get_program(), r.bin.join("wine").as_os_str());
         assert_eq!(
             cmd.get_args().collect::<Vec<_>>(),
@@ -1208,10 +1233,75 @@ esac
         want.sort();
         assert_eq!(envs(&cmd), want);
 
-        let cmd = b.command(&r.env, &exe, &dir, &[], &RunOpts { debug: true }).unwrap();
+        let cmd = b
+            .command(
+                &r.env,
+                &exe,
+                &dir,
+                &[],
+                &RunOpts {
+                    debug: true,
+                    dotnet: false,
+                },
+            )
+            .unwrap();
         let debug = envs(&cmd).into_iter().find(|(k, _)| k == "WINEDEBUG").unwrap().1;
         assert_eq!(debug, "err+all,fixme-all");
         assert_eq!(cmd.get_args().count(), 1);
+    }
+
+    fn overrides(cmd: &Command) -> String {
+        envs(cmd).into_iter().find(|(k, _)| k == "WINEDLLOVERRIDES").unwrap().1
+    }
+
+    #[test]
+    fn dotnet_enables_mscoree_for_the_program_only() {
+        let r = rig();
+        let (exe, dir) = r.exe("Program Files/t/hello64.exe");
+        let b = r.backend();
+        let on = b
+            .command(
+                &r.env,
+                &exe,
+                &dir,
+                &[],
+                &RunOpts {
+                    debug: false,
+                    dotnet: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(overrides(&on), "winemenubuilder.exe=d;mshtml=d");
+        assert_eq!(WINEDLLOVERRIDES_DOTNET, "winemenubuilder.exe=d;mshtml=d");
+        let off = b.command(&r.env, &exe, &dir, &[], &RunOpts::default()).unwrap();
+        assert_eq!(overrides(&off), "winemenubuilder.exe=d;mscoree=d;mshtml=d");
+        assert_eq!(WINEDLLOVERRIDES, "winemenubuilder.exe=d;mscoree=d;mshtml=d");
+        // Only the flag differs, and settle carries it over unchanged.
+        let mut a = envs(&on);
+        a.retain(|(k, _)| k != "WINEDLLOVERRIDES");
+        let mut c = envs(&off);
+        c.retain(|(k, _)| k != "WINEDLLOVERRIDES");
+        assert_eq!(a, c);
+        assert_eq!(overrides(&b.settle(on)), "winemenubuilder.exe=d;mshtml=d");
+    }
+
+    /// Every Wine command constructor: `prepare` (helper) and `command` (the program) are the only
+    /// `wine_command` users, and only `command` passes anything but a literal `false`. Installers, `settle`,
+    /// `stop` and `version` build their commands through them or bypass `wine_command` entirely.
+    #[test]
+    fn only_command_can_pass_dotnet_to_wine_command() {
+        let lib = include_str!("lib.rs");
+        let prod = &lib[..lib.find("#[cfg(test)]").unwrap()];
+        // Whitespace-normalised, so a rustfmt line split cannot hide a call; every source file of the crate.
+        let all = [prod, include_str!("harden.rs"), include_str!("discover.rs")].join("\n");
+        let flat = all.split_whitespace().collect::<Vec<_>>().join(" ");
+        let calls: Vec<&str> = flat.split("self.wine_command(").skip(1).collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls.iter().any(|l| l.starts_with("env, \"-all\", false)")),
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|l| l.contains("opts.dotnet);")), "{calls:?}");
     }
 
     // ---- settle ----

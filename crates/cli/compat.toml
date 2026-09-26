@@ -152,3 +152,29 @@ graphics = true
 gpu = "llvmpipe (LLVM 21.1.8, 256 bits) / llvmpipe Mesa 26.0.8-1ubuntu0.3 (Vulkan 1.4.335)"
 evidence = "manual:2026-09-26"
 notes = "runtime run with the default profile through systemd-run, bwrap and runtime sandbox-init (Landlock + seccomp), DXVK 3.1.1 (x64) on Mesa's CPU (software) Vulkan device: pixel ok, exit 0; frame ms: 0.0041 (informational)."
+
+# Phase 4F: the managed fixture (tools/build-managed-fixture.sh) with Wine Mono 9.4.0 installed by
+# `runtime deps <app> --install` (real download, the MSI in the installer sandbox), then every run under the default
+# sandbox (systemd-run scope, bwrap, runtime sandbox-init: seccomp + Landlock ABI 8), run by hand on 2026-09-26 with
+#   RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-cli --test e2e_dotnet -- --ignored --test-threads=1 --nocapture
+
+[[record]]
+app = ".NET console fixture (hello-managed.cs) under Wine Mono 9.4.0, default sandbox"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "tools/fixtures/hello-managed.cs, default mode, run with arguments `a b`: prints hello from .NET 4.0.30319.42000 args=2 and echoes both arguments, exit 7. Before Wine Mono was installed the same run printed nothing (mscoree disabled, exit 53). No seccomp or Landlock change was needed."
+
+[[record]]
+app = ".NET fixture, threads mode (hello-managed.cs), Wine Mono 9.4.0, default sandbox"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "JIT and 4 managed threads incrementing a counter under a lock: threads total=400000, exit 0."
+
+[[record]]
+app = ".NET fixture, alloc mode (hello-managed.cs), Wine Mono 9.4.0, default sandbox"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-09-26"
+notes = "allocates and touches 64 MiB in 1 MiB arrays, forces a collection, checks every block: alloc ok 64 MiB, exit 0."

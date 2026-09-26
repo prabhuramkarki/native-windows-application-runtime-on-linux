@@ -284,8 +284,8 @@ fn denied_but_installed_is_already_installed() {
 fn unsatisfied_capabilities_are_reported() {
     let m = Manifest::bundled();
     let plan = resolve(&imports(&["MSCOREE.dll", "d3d11.dll"]), &none(), &[], m);
-    assert_eq!(plan.unsatisfied, ["dotnet"]);
-    assert_eq!(ids(&plan), ["dxvk"]);
+    assert!(plan.unsatisfied.is_empty(), "{plan:?}");
+    assert_eq!(ids(&plan), ["dxvk", "wine-mono"]);
     assert!(
         resolve(&imports(&["d3d11.dll"]), &none(), &[], m)
             .unsatisfied
@@ -304,9 +304,9 @@ fn unsatisfied_capabilities_are_reported() {
         extra_capabilities: vec!["zzz".into(), "aaa".into(), "zzz".into(), long.clone(), "d3d9".into()],
     };
     let plan = resolve(&facts, &none(), &[], m);
-    assert_eq!(plan.unsatisfied[..3], ["aaa", "dotnet", "zzz"]);
-    assert_eq!(plan.unsatisfied.len(), 4);
-    assert!(plan.unsatisfied[3].len() < 100);
+    assert_eq!(plan.unsatisfied[..2], ["aaa", "zzz"]);
+    assert_eq!(plan.unsatisfied.len(), 3);
+    assert!(plan.unsatisfied[2].len() < 100);
     assert_eq!(plan, resolve(&facts, &none(), &[], m));
 
     // Two long names that differ only past the clip point collapse to one entry.
@@ -320,12 +320,7 @@ fn unknown_imports_yield_nothing() {
     let facts = imports(&["kernel32.dll", "", "\0", "d3d11\0.dll", "\u{fffd}.dll", "user32", &long]);
     assert!(required_capabilities(&facts).is_empty());
     assert!(resolve(&facts, &none(), &[], Manifest::bundled()).entries.is_empty());
-    // A capability nothing provides (dotnet has no package yet) is not an error either.
-    assert!(
-        resolve(&imports(&["mscoree.dll"]), &none(), &[], Manifest::bundled())
-            .entries
-            .is_empty()
-    );
+    // A capability nothing provides is not an error either.
     assert!(
         resolve(&caps(&["", "nope"]), &none(), &[], Manifest::bundled())
             .entries

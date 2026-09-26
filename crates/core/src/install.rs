@@ -244,10 +244,6 @@ fn check_pe(info: &PeInfo) -> Result<Vec<String>, InstallError> {
         return Err(InstallError::InstallerDetected(installer_label(installer.kind)));
     }
     let mut warnings = Vec::new();
-    if info.dotnet {
-        warnings
-            .push(".NET program: it will not run until .NET support arrives (Phase 4); installing anyway".to_owned());
-    }
     for w in info.warnings.iter().take(5) {
         warnings.push(format!("analysis: {}", quote(w)));
     }
@@ -634,6 +630,7 @@ pub(crate) fn install_with(
         warnings,
         payload,
     } = prepared;
+    let dotnet = info.dotnet;
 
     // Everything that can be decided without touching the disk, decided (and validated) before `create`.
     let name = choose_name(opts.name.as_deref(), &info, &stem)?;
@@ -713,11 +710,20 @@ pub(crate) fn install_with(
     })();
     unwind.armed = false;
     match committed {
-        Ok(executable) => Ok(InstallOutcome {
-            id: env.id().clone(),
-            executable,
-            warnings,
-        }),
+        Ok(executable) => {
+            let mut warnings = warnings;
+            if dotnet {
+                warnings.push(format!(
+                    ".NET program: Wine Mono is not installed for this app; run `runtime deps {} --install`",
+                    env.id()
+                ));
+            }
+            Ok(InstallOutcome {
+                id: env.id().clone(),
+                executable,
+                warnings,
+            })
+        }
         Err(cause) => Err(cleanup(store, backend, &env, cause)),
     }
 }

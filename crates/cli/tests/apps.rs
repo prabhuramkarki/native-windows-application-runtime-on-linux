@@ -2294,26 +2294,40 @@ fn doctor_of_a_file_or_the_system_predicts_no_direct3d_route() {
     assert!(route_lines(&out).is_empty(), "{out}");
 }
 
-#[test]
-fn doctor_warns_about_a_managed_program_and_not_about_a_native_one() {
-    let r = rig();
+/// `hello64.exe` with a CLR header (data directory 14: a non-zero RVA and size), so the analysis calls it managed.
+fn managed_exe() -> Vec<u8> {
     let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
-    // a CLR header: data directory 14 (opt + 112 + 14 * 8 in a PE32+ header) gets a non-zero RVA and size
     let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
     let dir = pe + 24 + 112 + 14 * 8;
     bytes[dir..dir + 4].copy_from_slice(&0x2008u32.to_le_bytes());
     bytes[dir + 4..dir + 8].copy_from_slice(&72u32.to_le_bytes());
-    let p = r.input("managed.exe", &bytes);
+    bytes
+}
+
+fn install_managed(r: &Rig) -> String {
+    let p = r.input("managed.exe", &managed_exe());
     let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
     assert_ok(&o);
     let id = installed_id(&o);
+    let all = format!("{}{}", s(&o.stdout), s(&o.stderr));
+    assert!(all.contains(&format!("run `runtime deps {id} --install`")), "{all}");
+    id
+}
+
+#[test]
+fn doctor_judges_a_managed_program_by_the_recorded_wine_mono_and_ignores_a_native_one() {
+    let r = rig();
+    let id = install_managed(&r);
     let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
     let l = lines_with(&out, ".NET");
     assert_eq!(l.len(), 1, "{out}");
     assert!(
-        l[0].contains("[warn]") && l[0].contains("no .NET runtime is bundled") && l[0].contains("mscoree=d"),
+        l[0].contains("[warn]")
+            && l[0].contains("Wine Mono is not installed for this app")
+            && l[0].contains(&format!("runtime deps {id} --install")),
         "{out}"
     );
+    assert!(!out.contains("mscoree=d"), "{out}");
     let j: serde_json::Value =
         serde_json::from_slice(&r.desktop().args(["doctor", &id, "--json"]).output().unwrap().stdout).unwrap();
     assert!(
@@ -2321,11 +2335,56 @@ fn doctor_warns_about_a_managed_program_and_not_about_a_native_one() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["area"] == "runtime" && c["text"].as_str().unwrap().contains(".NET"))
+            .any(|c| c["area"] == "runtime" && c["status"] == "warn" && c["text"].as_str().unwrap().contains(".NET"))
+    );
+    // Recorded: Ok, with the recorded version.
+    record_installed(&r, &id, "wine-mono");
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = lines_with(&out, ".NET");
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("[ok]") && l[0].contains("Wine Mono 9.4.0 is recorded as installed for this app"),
+        "{out}"
+    );
+    // A file target is not an installed app: told, not warned.
+    let f = r.input("m2.exe", &managed_exe());
+    let out = s(&r.desktop().arg("doctor").arg(&f).output().unwrap().stdout);
+    let l = lines_with(&out, ".NET");
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("[ok]") && l[0].contains("installed per app by `runtime deps`"),
+        "{out}"
     );
     let native = r.install();
     let out = s(&r.desktop().args(["doctor", &native]).output().unwrap().stdout);
     assert!(lines_with(&out, ".NET").is_empty(), "{out}");
+}
+
+#[test]
+fn run_enables_mscoree_only_for_an_app_with_wine_mono_recorded() {
+    let r = rig();
+    let managed = install_managed(&r);
+    let overrides = |id: &str| {
+        assert_eq!(r.rt(&["run", "--unsandboxed", id]).status.code(), Some(0));
+        fs::read_to_string(r.log.join("env.txt"))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("WINEDLLOVERRIDES="))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        overrides(&managed),
+        "WINEDLLOVERRIDES=winemenubuilder.exe=d;mscoree=d;mshtml=d"
+    );
+    record_installed(&r, &managed, "wine-mono");
+    assert_eq!(overrides(&managed), "WINEDLLOVERRIDES=winemenubuilder.exe=d;mshtml=d");
+    // Another app, without the record, keeps mscoree=d.
+    let native = r.install_as("other.exe", &[]);
+    assert_eq!(
+        overrides(&native),
+        "WINEDLLOVERRIDES=winemenubuilder.exe=d;mscoree=d;mshtml=d"
+    );
 }
 
 // ================================================================ deps

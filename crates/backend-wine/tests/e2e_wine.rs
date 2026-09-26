@@ -355,7 +355,16 @@ fn e2e_debug_run_survives_a_lingering_wineserver() {
     let (r_stdin, r_keep) = io::pipe().unwrap();
     let mut r_cmd = sb
         .backend
-        .command(&sb.env, &cmd_exe, &drive_c, &pause, &RunOpts { debug: true })
+        .command(
+            &sb.env,
+            &cmd_exe,
+            &drive_c,
+            &pause,
+            &RunOpts {
+                debug: true,
+                dotnet: false,
+            },
+        )
         .unwrap();
     r_cmd.stdin(Stdio::from(r_stdin));
     let tee = SharedBuf::default();
