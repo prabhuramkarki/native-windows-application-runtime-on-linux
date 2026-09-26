@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const NOTE: &str = "note: Windows applications run WITHOUT a sandbox until Phase 5 (see docs/SECURITY.md)";
+/// What `run --unsandboxed` says on stderr (the rig's fake Wine cannot run in a real sandbox, so the rig runs apps
+/// with `--unsandboxed`; `runtime sandbox`, the refusals and the doctor check are tested below, a real sandboxed
+/// run in `e2e_wine.rs`).
+const NOTE: &str = "warning: running WITHOUT a sandbox (--unsandboxed)";
 const APP_STDERR: &str = "fake-wine stderr line";
 
 const WINE: &str = r#"
@@ -465,7 +468,10 @@ fn install_reports_the_app_and_creates_a_prefix_through_the_backend() {
         "{out}"
     );
     assert!(out.contains("runtime run my-app"), "{out}");
-    assert_eq!(err.matches(NOTE).count(), 1, "exactly one sandbox note: {err}");
+    assert!(
+        !err.contains("sandbox"),
+        "install runs no program: no sandbox note: {err}"
+    );
     assert_tame(&err, "stderr");
     assert_eq!(
         r.calls(),
@@ -653,13 +659,17 @@ fn a_failing_backend_setup_leaves_no_app() {
 #[test]
 fn run_of_an_unknown_id_exits_1_with_a_hint() {
     let r = rig();
-    let o = r.rt(&["run", "nothing"]);
+    let o = r.rt(&["run", "--unsandboxed", "nothing"]);
     let err = assert_fails(&o);
     assert!(err.contains("runtime list") && err.contains("runtime install"), "{err}");
     assert!(r.app_dirs().is_empty());
     assert!(r.calls().is_empty(), "wine was not called: {:?}", r.calls());
     // hostile target: escaped in the message
-    let o = r.cmd().args(["run", "Hello\u{1b}]0;x\u{7}"]).output().unwrap();
+    let o = r
+        .cmd()
+        .args(["run", "--unsandboxed", "Hello\u{1b}]0;x\u{7}"])
+        .output()
+        .unwrap();
     assert_tame(&assert_fails(&o), "stderr");
 }
 
@@ -672,6 +682,7 @@ fn run_an_installed_app_passes_the_exit_code_stdout_and_verbatim_args() {
     let odd = OsString::from_vec(b"non-utf8-\xff\xfe".to_vec());
     cmd.args([
         "run",
+        "--unsandboxed",
         &id,
         "--",
         "a b",
@@ -736,7 +747,7 @@ fn run_an_installed_app_passes_the_exit_code_stdout_and_verbatim_args() {
     assert!(!env.contains("SECRET") && !env.contains("hunter2"), "{env}");
     // exit code 0 passes through as well
     r.hook("exit 0");
-    assert_eq!(r.rt(&["run", &id]).status.code(), Some(0));
+    assert_eq!(r.rt(&["run", "--unsandboxed", &id]).status.code(), Some(0));
 }
 
 #[test]
@@ -747,7 +758,7 @@ fn the_program_gets_the_apps_own_home_not_the_hosts() {
     let out = r
         .cmd()
         .env("HOME", hostile)
-        .args(["run", id.as_str()])
+        .args(["run", "--unsandboxed", id.as_str()])
         .output()
         .unwrap();
     assert_ok(&out);
@@ -763,21 +774,21 @@ fn run_reports_a_signal_death_as_128_plus_the_signal() {
     let r = rig();
     let id = r.install();
     r.hook("kill -TERM $$");
-    assert_eq!(r.rt(&["run", &id]).status.code(), Some(143));
+    assert_eq!(r.rt(&["run", "--unsandboxed", &id]).status.code(), Some(143));
 }
 
 #[test]
 fn run_debug_also_shows_the_apps_stderr_on_the_terminal() {
     let r = rig();
     let id = r.install();
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     assert_ok(&o);
     assert!(
         !s(&o.stderr).contains(APP_STDERR),
         "quiet without --debug: {}",
         s(&o.stderr)
     );
-    let o = r.rt(&["run", "--debug", &id]);
+    let o = r.rt(&["run", "--unsandboxed", "--debug", &id]);
     assert_ok(&o);
     let err = s(&o.stderr);
     assert_eq!(err.matches(APP_STDERR).count(), 1, "{err}");
@@ -796,7 +807,13 @@ fn run_a_file_installs_it_first_and_then_runs_it() {
     r.hook("exit 3");
     let o = r
         .cmd()
-        .args(["run".as_ref(), p.as_os_str(), "--".as_ref(), "one".as_ref()])
+        .args([
+            "run".as_ref(),
+            "--unsandboxed".as_ref(),
+            p.as_os_str(),
+            "--".as_ref(),
+            "one".as_ref(),
+        ])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(3), "stderr: {}", s(&o.stderr));
@@ -821,7 +838,7 @@ fn run_survives_ctrl_c_and_reports_the_childs_status() {
     let id = r.install();
     // SIGINT to the runtime process (the fake's parent) while it waits; the child then exits 5 by itself.
     r.hook("sleep 0.5; kill -INT $PPID; sleep 0.3; exit 5");
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     assert_eq!(
         o.status.code(),
         Some(5),
@@ -840,7 +857,7 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
             .join(format!("{id}/prefix/drive_c/Program Files/{id}/hello64.exe")),
     )
     .unwrap();
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     let err = assert_fails(&o);
     assert!(
         err.contains("cannot be found") && err.contains(&format!("runtime remove {id}")),
@@ -853,19 +870,19 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
     let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&md).unwrap()).unwrap();
     v["environment"] = "evil".into();
     fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
-    assert_tame(&assert_fails(&r.rt(&["run", &id2])), "stderr");
+    assert_tame(&assert_fails(&r.rt(&["run", "--unsandboxed", &id2])), "stderr");
     assert!(!r.log.join("argv.bin").exists());
     // No Wine at all, for an installed app.
     let r2 = rig().no_wine();
     r2.plant("x", "X");
-    let err = assert_fails(&r2.rt(&["run", "x"]));
+    let err = assert_fails(&r2.rt(&["run", "--unsandboxed", "x"]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
 }
 
 #[test]
 fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
     let r = rig().no_wine();
-    let err = assert_fails(&r.rt(&["run", "nothing"]));
+    let err = assert_fails(&r.rt(&["run", "--unsandboxed", "nothing"]));
     assert!(
         err.contains("runtime list") && err.contains("runtime install <file>"),
         "{err}"
@@ -874,12 +891,12 @@ fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
         !err.contains("RUNTIME_WINE"),
         "the Wine error hides the real one: {err}"
     );
-    let err = assert_fails(&r.rt(&["run", "nothing.exe"]));
+    let err = assert_fails(&r.rt(&["run", "--unsandboxed", "nothing.exe"]));
     assert!(err.contains("no such file"), "{err}");
     assert!(!err.contains("RUNTIME_WINE"), "{err}");
     // What does need Wine still says so: a file to install, and an installed app.
     let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
-    let err = assert_fails(&r.rt(&["run".as_ref(), p.as_os_str()]));
+    let err = assert_fails(&r.rt(&["run".as_ref(), "--unsandboxed".as_ref(), p.as_os_str()]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
     assert!(r.app_dirs().is_empty(), "nothing was installed: {:?}", r.app_dirs());
 }
@@ -895,7 +912,7 @@ fn run_of_a_file_whose_start_fails_names_the_app_it_installed() {
     assert!(wine.contains("rm -f"), "the rig text changed");
     script(&r.bin.join("wine"), &wine);
     let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
-    let o = r.rt(&["run".as_ref(), p.as_os_str()]);
+    let o = r.rt(&["run".as_ref(), "--unsandboxed".as_ref(), p.as_os_str()]);
     let err = assert_fails(&o);
     let ids = r.app_dirs();
     assert_eq!(ids.len(), 1, "the install stays: {ids:?}");
@@ -1782,7 +1799,7 @@ fn doctor_of_an_app_without_its_home_fails_and_agrees_with_run() {
         let line = lines_with(&out, "app home")[0];
         assert!(line.contains("[FAIL]") && line.contains(words), "{damage}: {out}");
         // `run` refuses the same app, with the same words.
-        let err = assert_fails(&r.rt(&["run", &id]));
+        let err = assert_fails(&r.rt(&["run", "--unsandboxed", &id]));
         assert!(err.contains("app home") && err.contains(words), "{damage}: {err}");
     }
     // Also when the program itself cannot be resolved: both failures are reported.
@@ -2353,7 +2370,7 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     let d = r.rt(&["doctor", &id]);
     assert!(s(&d.stderr).contains(&hint), "{}", s(&d.stderr));
     // `run` stays cheap: no hint, so the executable is never read for one.
-    let run = r.rt(&["run", &id]);
+    let run = r.rt(&["run", "--unsandboxed", &id]);
     assert_ok(&run);
     assert!(!s(&run.stderr).contains("hint:"), "{}", s(&run.stderr));
     let list = r.rt(&["deps", "list"]);
@@ -2471,7 +2488,7 @@ fn remove_uninstall_run_and_install_refuse_while_a_dependency_install_holds_the_
     assert_eq!(r.app_dirs(), std::slice::from_ref(&id));
     assert_eq!(r.calls(), before, "nothing was stopped, run or removed");
     drop(lock);
-    assert_ok(&r.rt(&["run", &id]));
+    assert_ok(&r.rt(&["run", "--unsandboxed", &id]));
     assert_ok(&r.rt(&["remove", &id]));
     assert!(r.app_dirs().is_empty());
 }
@@ -3196,4 +3213,302 @@ fn permissions_can_remove_a_grant_whose_directory_is_gone() {
             .contains("filesystem")
     );
     assert_ok(&perm(&r, &home, &["papp"]));
+}
+
+// ================================================================ sandbox
+
+/// A `bwrap` in the rig's `bin/` that records its arguments (one call per line in `log/bwrap.txt`) and then runs
+/// what follows `--` UNSANDBOXED (the fake Wine could not run in a real sandbox), or exits 0 (the probe).
+fn fake_bwrap(r: &Rig) {
+    let body = "echo \"$*\" >> @LOG@/bwrap.txt\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                [ $# -gt 0 ] || exit 0\nshift\nexec \"$@\""
+        .replace("@LOG@", r.log.to_str().unwrap());
+    script(&r.bin.join("bwrap"), &body);
+}
+
+fn bwrap_calls(r: &Rig) -> Vec<String> {
+    fs::read_to_string(r.log.join("bwrap.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// `r.cmd()` with only the rig's `bin/` on PATH: no real `bwrap` (the fake scripts need nothing else to refuse).
+fn no_bwrap(r: &Rig) -> Command {
+    let mut c = r.cmd();
+    c.env("PATH", &r.bin);
+    c
+}
+
+const NO_BWRAP: &str = "error: cannot start the sandbox: bwrap is not on PATH. Install bubblewrap (`sudo apt install \
+                        bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)";
+
+#[test]
+fn run_without_bwrap_refuses_before_anything_starts_or_is_installed() {
+    let r = rig();
+    let id = r.install();
+    let before = r.calls();
+    let o = no_bwrap(&r).args(["run", &id]).output().unwrap();
+    assert_eq!(assert_fails(&o).trim_end(), NO_BWRAP);
+    assert_eq!(r.calls(), before, "nothing ran");
+    // A file is not even installed.
+    let p = r.input("other.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let o = no_bwrap(&r).args(["run".as_ref(), p.as_os_str()]).output().unwrap();
+    assert_eq!(assert_fails(&o).trim_end(), NO_BWRAP);
+    assert_eq!(r.app_dirs(), [id]);
+}
+
+#[test]
+fn run_refuses_when_bwrap_cannot_create_a_sandbox() {
+    let r = rig();
+    let id = r.install();
+    script(
+        &r.bin.join("bwrap"),
+        "echo 'bwrap: No permissions to create new namespace, likely because the kernel does not allow' >&2; exit 1",
+    );
+    let before = r.calls();
+    let err = assert_fails(&r.rt(&["run", &id]));
+    assert!(
+        err.starts_with("error: cannot start the sandbox: user namespaces are disabled or restricted on this host")
+            && err.contains(
+                "Install bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)"
+            ),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before, "nothing ran");
+}
+
+#[test]
+fn a_sandboxed_run_starts_the_settled_program_in_bwrap_and_marks_the_app() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    r.hook("exit 6");
+    let root = r.apps().join(&id);
+    assert!(!root.join("ran-sandboxed").exists());
+    let o = r.rt(&["run", &id, "--", "arg one"]);
+    assert_eq!(o.status.code(), Some(6), "stderr: {}", s(&o.stderr));
+    assert_eq!(s(&o.stdout), "app-stdout\n");
+    assert_eq!(
+        s(&o.stderr),
+        "",
+        "no DISPLAY and no network: nothing the profile cannot enforce"
+    );
+    let calls = bwrap_calls(&r);
+    assert_eq!(calls.len(), 2, "the probe, then the program: {calls:?}");
+    assert!(calls[0].starts_with("--unshare-all "), "{calls:?}");
+    let prefix = root.join("prefix");
+    let home = root.join("runtime/home");
+    let run = &calls[1];
+    for want in [
+        "--die-with-parent --new-session --unshare-pid --unshare-uts --unshare-ipc --unshare-net ".to_owned(),
+        format!(
+            " --bind {0} {0} --bind {1} {1} -- /bin/sh -c ",
+            prefix.display(),
+            home.display()
+        ),
+        format!(
+            " {} {} ",
+            r.bin.join("wineserver").display(),
+            r.bin.join("wine").display()
+        ),
+    ] {
+        assert!(run.contains(&want), "{want:?} in {run}");
+    }
+    assert!(run.ends_with("hello64.exe arg one"), "{run}");
+    // Only the prefix and the app's home are bound: never the app root (permissions.toml, the marker).
+    let root_text = root.display().to_string();
+    assert!(
+        !run.split(' ').any(|a| a == root_text || a == format!("{root_text}/")),
+        "{run}"
+    );
+    // The program's argv is exact, the registry was settled (`wineserver -w`) and the app is marked.
+    assert_eq!(r.argv()[1], b"arg one");
+    assert!(
+        r.calls().iter().any(|c| c.starts_with("wineserver -w ")),
+        "{:?}",
+        r.calls()
+    );
+    assert!(root.join("ran-sandboxed").is_file());
+}
+
+#[test]
+fn a_sandboxed_run_prints_what_the_profile_cannot_enforce() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args(["permissions", &id, "--set", "network=allow", "--set", "display=off"])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let o = r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+    assert_ok(&o);
+    let err = s(&o.stderr);
+    let notes: Vec<&str> = err.lines().collect();
+    assert_eq!(notes.len(), 2, "{err}");
+    assert!(
+        notes[0].starts_with("note: network=allow shares the host network namespace"),
+        "{err}"
+    );
+    assert!(
+        notes[1].starts_with("note: display=off cannot be enforced with network=allow"),
+        "{err}"
+    );
+    assert!(!bwrap_calls(&r)[1].contains("--unshare-net"));
+}
+
+#[test]
+fn a_profile_that_is_refused_stops_the_run() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    fs::write(r.apps().join(&id).join("permissions.toml"), "version = 1\nbogus = 1\n").unwrap();
+    let before = r.calls();
+    let err = assert_fails(&r.rt(&["run", &id]));
+    assert!(
+        err.starts_with("error: cannot start the sandbox: the app's permissions.toml is refused")
+            && err.contains(&format!("runtime permissions {id} --reset")),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before);
+    assert_eq!(bwrap_calls(&r).len(), 1, "only the probe ran");
+}
+
+#[test]
+fn sandbox_prints_the_profile_and_the_bwrap_command_line_without_running_anything() {
+    let r = rig();
+    let id = r.install();
+    let before = r.calls();
+    let o = r.rt(&["sandbox", &id]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("profile (default): network deny, display on, audio on, gpu on, 0 host directories"),
+        "{out}"
+    );
+    assert!(
+        out.contains("skipped: display: neither DISPLAY nor WAYLAND_DISPLAY is set"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("warning: `runtime run --unsandboxed {id}` would run")),
+        "{out}"
+    );
+    let line = lines_with(&out, "command: ")[0];
+    let root = r.apps().join(&id);
+    let prefix = root.join("prefix");
+    assert!(line.contains(" '--unshare-net' "), "{line}");
+    assert!(
+        line.contains(&format!(" '--bind' '{0}' '{0}' ", prefix.display())),
+        "{line}"
+    );
+    assert!(
+        !line.contains(&format!("'{}'", root.display())),
+        "never the app root: {line}"
+    );
+    assert!(line.ends_with("hello64.exe'"), "{line}");
+    assert_eq!(r.calls(), before, "no Wine process");
+    assert_tame(&out, "stdout");
+
+    // network=allow: no --unshare-net, and the caveat is shown.
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args(["permissions", &id, "--set", "network=allow"])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["sandbox", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(out.contains("profile (permissions.toml): network allow"), "{out}");
+    assert!(
+        out.contains("note: network=allow shares the host network namespace"),
+        "{out}"
+    );
+    assert!(!lines_with(&out, "command: ")[0].contains("--unshare-net"), "{out}");
+    // No bwrap: still exit 0, and says so.
+    let o = no_bwrap(&r).env("HOME", &home).args(["sandbox", &id]).output().unwrap();
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).starts_with("bubblewrap: UNAVAILABLE: bwrap is not on PATH"),
+        "{}",
+        s(&o.stdout)
+    );
+}
+
+#[test]
+fn doctor_reports_the_sandbox_for_the_system_and_summarises_an_apps_profile() {
+    let r = rig();
+    let id = r.install();
+    let o = no_bwrap(&r).args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[warn]") && line.contains("bwrap is not on PATH"),
+        "{out}"
+    );
+    let v = json(&no_bwrap(&r).args(["doctor", "--json"]).output().unwrap());
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["text"].as_str().unwrap().contains("sandbox"))
+        .unwrap();
+    assert_eq!(
+        (check["area"].as_str(), check["status"].as_str()),
+        (Some("runtime"), Some("warn"))
+    );
+    fake_bwrap(&r);
+    let out = s(&r.rt(&["doctor"]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(line.contains("[ok]") && line.contains("bubblewrap works"), "{out}");
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[ok]")
+            && line.ends_with("profile: network deny, display on, audio on, gpu on, 0 host directories"),
+        "{out}"
+    );
+}
+
+#[test]
+fn once_an_app_ran_sandboxed_its_registry_helpers_run_in_its_sandbox() {
+    let r = rig();
+    let prefix = display_app(&r);
+    let id = "dapp";
+    // Never sandboxed: `display` runs reg.exe like any Wine helper.
+    assert_ok(&r.rt(&["display", id, "x11"]));
+    assert!(r.calls().iter().any(|c| c == "wine <app>"), "{:?}", r.calls());
+    assert!(prefix.join("user.reg").exists());
+    fs::write(prefix.parent().unwrap().join("ran-sandboxed"), "").unwrap();
+    // Sandboxed before, and no bwrap: refused, nothing ran.
+    let before = r.calls();
+    let err = assert_fails(&no_bwrap(&r).args(["display", id, "auto"]).output().unwrap());
+    assert!(
+        err.contains(&format!(
+            "{id} has run in the sandbox, so its Wine helpers must run sandboxed too"
+        )) && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before);
+    // With bwrap: reg.exe goes through it (the fake runs it after recording the profile).
+    fake_bwrap(&r);
+    assert_ok(&r.rt(&["display", id, "auto"]));
+    let calls = bwrap_calls(&r);
+    let reg = calls
+        .iter()
+        .find(|c| c.contains("reg.exe"))
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    assert!(reg.contains("--unshare-net") && reg.contains(" delete "), "{reg}");
 }

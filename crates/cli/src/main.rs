@@ -11,15 +11,12 @@ mod permissions;
 mod remove;
 mod run;
 mod safe;
+mod sandbox;
 mod uninstall;
 
 use clap::{Parser, Subcommand};
 use rt_core::{Launcher, Store};
 use std::{ffi::OsString, io::IsTerminal, io::Write, path::PathBuf, process::ExitCode};
-
-/// What every command that runs Windows code tells the user (the real boundary is Phase 5).
-pub(crate) const SANDBOX_NOTE: &str =
-    "note: Windows applications run WITHOUT a sandbox until Phase 5 (see docs/SECURITY.md)";
 
 pub(crate) type CmdError = Box<dyn std::error::Error>;
 
@@ -68,7 +65,8 @@ enum Cmd {
         #[arg(long)]
         network: bool,
     },
-    /// Run an installed app, or install a .exe/.zip file first and run it (needs Wine).
+    /// Run an installed app, or install a .exe/.zip file first and run it (needs Wine and bubblewrap).
+    /// The program runs in the app's sandbox (see `runtime sandbox <app>` and `runtime permissions <app>`).
     /// The exit code is the program's (128+N when it was killed by signal N).
     Run {
         /// An app id from `runtime list`, or a path (contains `/` or ends in .exe/.zip) to install and run
@@ -76,6 +74,9 @@ enum Cmd {
         /// Verbose Wine logging; the program's stderr also goes to the terminal (it is always kept in the log)
         #[arg(long)]
         debug: bool,
+        /// Run WITHOUT the sandbox, with your full access (this run only; says so on stderr)
+        #[arg(long)]
+        unsandboxed: bool,
         /// Arguments for the program, passed as they are (write them after `--`)
         #[arg(last = true)]
         args: Vec<OsString>,
@@ -138,6 +139,12 @@ enum Cmd {
         /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}]}
         #[arg(long)]
         json: bool,
+    },
+    /// Show what an app's sandbox would be (needs no Wine; starts nothing): whether bubblewrap works, the
+    /// profile, what the host lacks, what the profile cannot enforce, and the full bubblewrap command line
+    Sandbox {
+        /// An app id from `runtime list`
+        app: String,
     },
     /// Show what the host's graphics stack offers (`runtime graphics info`)
     #[command(subcommand)]
@@ -212,7 +219,12 @@ fn main() -> ExitCode {
             silent,
             network,
         } => install::run(&file, name, exe, silent, network),
-        Cmd::Run { target, debug, args } => run::run(&target, &args, debug),
+        Cmd::Run {
+            target,
+            debug,
+            unsandboxed,
+            args,
+        } => run::run(&target, &args, debug, unsandboxed),
         Cmd::Doctor { target, json } => doctor::run(target.as_deref(), json),
         Cmd::List { json } => list::run(json).map(|()| 0),
         Cmd::Remove { app } => remove::run(&app).map(|()| 0),
@@ -221,6 +233,7 @@ fn main() -> ExitCode {
         Cmd::Deps(args) => deps::run(args),
         Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
         Cmd::Permissions { app, set, reset, json } => permissions::run(&app, &set, reset, json).map(|()| 0),
+        Cmd::Sandbox { app } => sandbox::run(&app).map(|()| 0),
         Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };

@@ -4,6 +4,7 @@
  *   fs stat <path>    prints EXISTS (exit 0) or MISSING (exit 3) for any Windows path
  *   fs env <NAME>     prints the value of an environment variable, or UNSET; exit 0
  *   fs cwd            prints the current directory; exit 0
+ *   fs spin           prints SPINNING and then waits forever (the Ctrl-C tests end it); never exits by itself
  * Usage errors exit 2. Plain Win32 only. */
 #include <windows.h>
 #include <string.h>
@@ -73,6 +74,10 @@ int main(int argc, char **argv) {
         say(buf);
         return 0;
     }
-    say("usage: fs write <text> | read | stat <path> | env <NAME> | cwd");
+    if (strcmp(mode, "spin") == 0 && argc == 2) {
+        say("SPINNING");
+        for (;;) Sleep(1000);
+    }
+    say("usage: fs write <text> | read | stat <path> | env <NAME> | cwd | spin");
     return 2;
 }

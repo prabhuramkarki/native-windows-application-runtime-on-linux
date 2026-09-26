@@ -136,6 +136,7 @@ struct Sc {
     wine_drivers: Option<Vec<String>>,
     graphics_driver: Option<Result<GraphicsDriver, String>>,
     d3d_routes: Option<Vec<(D3dFamily, D3dRoute)>>,
+    sandbox: Result<Option<String>, String>,
 }
 
 /// A system report on a good desktop.
@@ -156,6 +157,7 @@ fn sc() -> Sc {
         wine_drivers: None,
         graphics_driver: None,
         d3d_routes: None,
+        sandbox: Ok(None),
     }
 }
 
@@ -221,6 +223,7 @@ impl Sc {
                 .as_ref()
                 .map(|r| r.clone().map_err(|e| &*Box::leak(e.into_boxed_str()))),
             d3d_routes: self.d3d_routes.as_deref(),
+            sandbox: self.sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
         })
     }
 }
@@ -362,6 +365,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         wine_drivers: None,
         graphics_driver: None,
         d3d_routes: None,
+        sandbox: Ok(None),
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -391,6 +395,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         wine_drivers: None,
         graphics_driver: None,
         d3d_routes: None,
+        sandbox: Ok(None),
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
@@ -1906,6 +1911,7 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         wine_drivers: None,
         graphics_driver: None,
         d3d_routes: None,
+        sandbox: Ok(None),
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);
@@ -2117,4 +2123,41 @@ fn a_non_actionable_built_in_route_is_ok_and_keeps_the_verdict_good() {
         },
     )]);
     assert_eq!(routes_of(&s.run())[0].status, Status::Warn);
+}
+
+#[test]
+fn the_sandbox_check_is_ok_with_the_profile_or_a_warning_with_the_reason() {
+    let mut s = sc();
+    let r = s.run();
+    let c = one(&r, Area::Runtime, "sandbox");
+    assert_eq!(c.status, Status::Ok);
+    assert_eq!(
+        c.text,
+        "sandbox: bubblewrap works (`runtime run` starts programs in it)"
+    );
+
+    s.sandbox = Ok(Some(
+        "network deny, display on, audio on, gpu off, 2 host directories".into(),
+    ));
+    let r = s.run();
+    let c = one(&r, Area::Runtime, "sandbox");
+    assert_eq!(c.status, Status::Ok);
+    assert!(
+        c.text
+            .ends_with("profile: network deny, display on, audio on, gpu off, 2 host directories"),
+        "{}",
+        c.text
+    );
+
+    s.sandbox = Err(format!("bwrap is not on PATH\x1b]0;x\x07\u{202e}{}", "z".repeat(600)));
+    let r = s.run();
+    let c = one(&r, Area::Runtime, "sandbox");
+    assert_eq!(c.status, Status::Warn);
+    assert!(
+        c.text.contains("bwrap is not on PATH") && c.text.contains("--unsandboxed"),
+        "{}",
+        c.text
+    );
+    assert_tame(&c.text);
+    assert!(c.text.chars().count() <= 300, "{}", c.text.chars().count());
 }

@@ -108,6 +108,11 @@ impl Rig {
         }
     }
 
+    /// The data directory (`RUNTIME_DATA_DIR` of every `runtime` this rig runs).
+    pub fn data(&self) -> &Path {
+        &self.data
+    }
+
     pub fn apps(&self) -> PathBuf {
         self.data.join("apps")
     }

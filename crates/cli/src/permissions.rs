@@ -11,7 +11,7 @@ use rt_core::AppEnv;
 use rt_sandbox::{Access, GrantCtx, Network, Permissions, account_home, load_opt, load_opt_raw, reset, store};
 use std::path::PathBuf;
 
-fn ctx() -> Result<GrantCtx, CmdError> {
+pub(crate) fn ctx() -> Result<GrantCtx, CmdError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|h| h.is_absolute())
