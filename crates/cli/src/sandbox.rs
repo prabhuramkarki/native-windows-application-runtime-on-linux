@@ -138,7 +138,8 @@ pub(crate) fn helper_launcher(
     }
     let refuse = |why: String| {
         format!(
-            "{} has run in the sandbox, so its Wine helpers must run sandboxed too, but {why}; nothing was changed",
+            "{} has run in the sandbox (its prefix was written by a sandboxed program or installer), so its Wine helpers \
+             must run sandboxed too, but {why}; nothing was changed",
             env.id()
         )
     };

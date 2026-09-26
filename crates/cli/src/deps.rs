@@ -116,6 +116,18 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     }
     check_yes(&plan.plan, yes)?;
     crate::sandbox::print_hardening_caveat();
+    // An installer package gets a read-write prefix in the installer sandbox, and the helper launcher below is chosen
+    // ONCE for every archive package of this run: mark the app first, so an archive package's `reg.exe` that runs
+    // after an installer package in the same run is sandboxed too (fail closed: nothing installs without the mark).
+    if may_run_installer(&plan.plan, manifest) {
+        rt_sandbox::mark(env.root()).map_err(|e| {
+            format!(
+                "cannot record that {}'s prefix is about to be written by a sandboxed installer ({e}); nothing was \
+                 installed",
+                env.id()
+            )
+        })?;
+    }
     let launcher = Launcher::new();
     let backend = crate::backend(&launcher)?;
     // `reg.exe` of archive packages; installer packages replace it with the installer sandbox.
@@ -151,6 +163,14 @@ pub(crate) fn install_report(o: &Orchestrator, plan: &AppPlan) -> Result<(String
 
 /// Every `--yes` must name a package the plan installs that needs consent: anything else is a mistake (a typo, or
 /// a package that needs no consent), refused before anything happens.
+/// Whether this `--install` run may start an installer package (any `Installer` package the plan installs, consent
+/// not yet asked: conservative).
+fn may_run_installer(plan: &Plan, manifest: &Manifest) -> bool {
+    plan.entries
+        .iter()
+        .any(|e| e.action == Action::Install && manifest.get(&e.package).is_some_and(|p| p.kind == Kind::Installer))
+}
+
 pub(crate) fn check_yes(plan: &Plan, yes: &[String]) -> Result<(), String> {
     for y in yes {
         let gated = plan
