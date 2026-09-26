@@ -64,9 +64,12 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 - **Cleanup**: `remove` stops the app's `wineserver` first; the e2e tests start a persistent `wineserver` for an
   app and require that `runtime remove` alone ends it.
 
-## What Phase 2 does NOT do
+## What is still NOT covered (Phase 2–5A)
 
-(Everything here is still true of a `--unsandboxed` run; for a sandboxed run see "App sandbox (Phase 5A)".)
+This list describes a program that runs WITHOUT the app sandbox: a `runtime run --unsandboxed` run (and every run
+before Phase 5A). The app sandbox removes the first two items for a sandboxed run (its host view has no host files
+to reach through `\\?\unix\`, and its devices and sockets are only those the profile grants); the rest still
+apply. What the app sandbox itself does not protect is listed in "App sandbox (Phase 5A)".
 
 - **No sandbox boundary.** No seccomp, namespaces, Landlock or bubblewrap. The program shares the host's
   network (it can connect anywhere), GPU, audio and display sockets.
@@ -133,9 +136,8 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 
 `rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
 through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
-not to Wine app runs in general**: a plain `runtime run` still has none of this (the "What Phase 2 does NOT do"
-list above is still the truth for it) until a later phase attaches a sandbox to every app's `Launcher`, not
-just the installer's. It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
+not to Wine app runs in general**: app runs have their own, per-app profile since Phase 5A ("App sandbox
+(Phase 5A)" below). It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
 `Sandbox` trait a `Launcher` can optionally carry, rather than a hard-coded identity function), so a sandboxed
 run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::spawn` path.
 
@@ -208,7 +210,8 @@ other apps' data or any other host path, and (by default) has no network at all,
   exploitable already on the host; this profile does not vet, pin or checksum it.
 - **The app's own prefix is fully read-write**, on purpose (installers write there) — a malicious installer can
   still plant anything it wants inside its own prefix, corrupt its own registry hives, or write a `.lnk`/`.exe`
-  that a LATER, unsandboxed `runtime run` of that same app would execute. The sandbox boundary is the real
+  that a later Wine session of that app outside a sandbox would execute (`runtime run --unsandboxed`, or a
+  helper session of an app that never ran sandboxed: see "Wine helpers in a prefix the app has written"). The sandbox boundary is the real
   filesystem outside the app, not "this installer cannot do anything bad to this app".
 - **No output/resource caps of its own.** `run_helper`'s own timeout and capped-output rules still apply (they
   are `Launcher`'s, not the sandbox's), but the sandbox adds no additional CPU, memory or disk-space limit; a
@@ -396,10 +399,10 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
   them at the vendor.
 - **Path-based operations (TOCTOU).** Extraction, backups, removal and staging check and use paths, not held
   directory descriptors; `O_NOFOLLOW` covers only the last component. A process running inside `drive_c` at the same
-  time could race a check and redirect a write or delete. Today apps are not sandboxed anyway (they can reach the host
-  directly): the prefix hardening removes the `Z:` drive, but NT paths like `\\?\unix\...` still reach any host file
-  of the same user, so `deps-backup` is reachable from inside the prefix too. Before Phase 5 makes the prefix a boundary, these must move to `openat`/`renameat`/`unlinkat` against
-  held parent descriptors.
+  time could race a check and redirect a write or delete (an install refuses while the app runs, see below, which
+  narrows but does not close this). An `--unsandboxed` app reaches the host directly anyway (`\\?\unix\...`), so
+  `deps-backup` is reachable from inside the prefix too. Now that the prefix is the sandbox's only writable path,
+  these must move to `openat`/`renameat`/`unlinkat` against held parent descriptors (Phase 5B).
 - **Busy-prefix and lock limits.** An install refuses while any `wineserver` serves the prefix (checked before the
   download and again before installing) and holds `<app>/deps.lock` exclusively. `run` holds the lock shared only
   while it starts the app and releases it once the app has started; after that the running-`wineserver` check is what
@@ -532,9 +535,11 @@ still has its `display`/archive-package `reg.exe` sessions run unsandboxed (as b
 the latter.
 
 **A running sandboxed app is invisible to `wineserver -k`.** Its `wineserver` keeps its socket in the sandbox's
-private `/tmp`, so `runtime remove`/`uninstall`'s stop does not reach it (the `/proc` scan that `deps`, `display`
-and `permissions` use to refuse a running app does see it). Quit the program (or Ctrl-C its `runtime run`) before
-removing it.
+private `/tmp`, so the stop of `runtime remove`/`uninstall` cannot reach it. Both therefore check the host's `/proc`
+after the stop (the scan `deps`, `display` and `permissions` use too, by `WINEPREFIX` and Wine's server directory)
+and REFUSE while a `wineserver` still serves the prefix, or when `/proc` cannot be read: `<id> is running
+(wineserver pid N); quit it (Ctrl-C its runtime run) first; nothing was removed`. Nothing is deleted and no
+uninstaller runs (real-Wine test: `e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program`).
 
 ## Roadmap
 
@@ -544,4 +549,4 @@ resource limits, and moves the dependency engine's path-based prefix operations 
 ## Reporting
 
 Please report a hole in any of the measures above as an issue or privately to the maintainer. Bypasses of the
-"does NOT do" and "does NOT protect" lists are known and are not vulnerabilities.
+"still NOT covered" and "does NOT protect" lists are known and are not vulnerabilities.

@@ -216,8 +216,9 @@ pub struct DoctorInput<'a> {
     /// recorded as installed for a file, so no route is predicted).
     pub d3d_routes: Option<&'a [(D3dFamily, D3dRoute)]>,
     /// The sandbox `runtime run` starts programs in: `Ok(None)` bubblewrap works, `Ok(Some(profile))` it works and
-    /// this is the app's profile in a few words, `Err` why it cannot be used (`run` then refuses unless
-    /// `--unsandboxed`). One Runtime check.
+    /// this is the app's profile in a few words, `Err` why it cannot be used (a whole phrase: `unavailable: ...`,
+    /// `cannot read the profile: ...`); `run` then refuses
+    /// unless `--unsandboxed`. One Runtime check.
     pub sandbox: Result<Option<&'a str>, &'a str>,
 }
 
@@ -731,7 +732,7 @@ fn sandbox(input: &DoctorInput<'_>, out: &mut Out) {
             Area::Runtime,
             Status::Warn,
             format!(
-                "sandbox unavailable: {}; `runtime run` refuses to start programs until it works (or with \
+                "sandbox: {}; `runtime run` refuses to start programs until this is fixed (or with \
                  --unsandboxed, NOT sandboxed)",
                 clean(why, 150)
             ),

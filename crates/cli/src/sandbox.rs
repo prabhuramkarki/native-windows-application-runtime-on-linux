@@ -20,7 +20,7 @@
 //! run in the installer sandbox. `wineserver -k` is not a Wine session (no Windows code runs). What stays
 //! unsandboxed: `runtime run --unsandboxed` (it says so), and apps that never ran sandboxed. See docs/SECURITY.md.
 use crate::CmdError;
-use crate::safe::{safe, safe_lines};
+use crate::safe::safe;
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
 use rt_sandbox::{Access, AppSandbox, Network, Permissions, RealHost, load, load_opt_raw};
 use std::ffi::OsStr;
@@ -135,7 +135,8 @@ pub(crate) fn helper_launcher(
     launcher: &Launcher,
     backend: &dyn CompatBackend,
 ) -> Result<Launcher, CmdError> {
-    if std::fs::symlink_metadata(env.root().join(MARKER)).is_err() {
+    let refuse_unknown = |why: String| format!("cannot tell whether {} has run in the sandbox: {why}", env.id());
+    if !marked(std::fs::symlink_metadata(env.root().join(MARKER))).map_err(refuse_unknown)? {
         return Ok(launcher.clone());
     }
     let refuse = |why: String| {
@@ -151,10 +152,23 @@ pub(crate) fn helper_launcher(
         .with_sandbox(Arc::new(app_sandbox(bwrap, perms, backend))))
 }
 
+/// Whether the app is marked, from the marker's `lstat`: only "it does not exist" is unmarked. Anything at that
+/// path (a file, or something the runtime never writes there: a directory, a link) counts as marked, the safe
+/// answer; an error other than NotFound cannot be judged and is refused (fail closed).
+fn marked(lstat: std::io::Result<std::fs::Metadata>) -> Result<bool, String> {
+    match lstat {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// `doctor`'s sandbox input: bwrap works (with `env`: and the app's profile in a few words), or why not.
 pub(crate) fn doctor_state(env: Option<&AppEnv>) -> Result<Option<String>, String> {
-    working_bwrap()?;
-    env.map(|env| profile(env).map(|(p, _)| summary(&p))).transpose()
+    working_bwrap().map_err(|why| format!("unavailable: {why}"))?;
+    env.map(|env| profile(env).map(|(p, _)| summary(&p)))
+        .transpose()
+        .map_err(|why| format!("cannot read the profile: {why}"))
 }
 
 /// `'text'` for a POSIX shell.
@@ -170,11 +184,14 @@ pub fn run(app: &str) -> Result<(), CmdError> {
     let mut out = String::new();
     let bwrap = match working_bwrap() {
         Ok(b) => {
-            out += &format!("bubblewrap: {} works\n", b.display());
+            out += &format!("bubblewrap: {} works\n", safe(&b.to_string_lossy()));
             b
         }
         Err(why) => {
-            out += &format!("bubblewrap: UNAVAILABLE: {why}; `runtime run` refuses to start this app\n");
+            out += &format!(
+                "bubblewrap: UNAVAILABLE: {}; `runtime run` refuses to start this app\n",
+                safe(&why)
+            );
             rt_sandbox::find_bwrap_on_path().unwrap_or_else(|| PathBuf::from("bwrap"))
         }
     };
@@ -182,7 +199,7 @@ pub fn run(app: &str) -> Result<(), CmdError> {
     out += &format!("profile ({source}): {}\n", summary(&perms));
     for g in &perms.filesystem {
         let access = if g.access == Access::Rw { "rw" } else { "ro" };
-        out += &format!("  host directory {} ({access})\n", g.path.display());
+        out += &format!("  host directory {} ({access})\n", safe(&g.path.to_string_lossy()));
     }
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(&store, env.id(), backend_wine::BACKEND_ID)?;
@@ -193,7 +210,10 @@ pub fn run(app: &str) -> Result<(), CmdError> {
             b.dll_dirs(),
         ),
         Err(e) => {
-            out += &format!("Wine: not found ({e}); the command below shows `wine` and no Wine directories\n");
+            out += &format!(
+                "Wine: not found ({}); the command below shows `wine` and no Wine directories\n",
+                safe(&e.to_string())
+            );
             let mut c = Command::new("wine");
             c.arg(&p.exe)
                 .current_dir(&p.cwd)
@@ -205,27 +225,41 @@ pub fn run(app: &str) -> Result<(), CmdError> {
     let cmd = launcher.finalize(cmd);
     let sb = AppSandbox::new(bwrap, perms, dll_dirs, Arc::new(RealHost));
     if let Err(e) = sb.render(&cmd) {
-        out += &format!("REFUSED: {e}\n");
+        out += &format!("REFUSED: {}\n", safe(&e.to_string()));
     }
     for s in sb.skipped(&cmd) {
-        out += &format!("skipped: {s}\n");
+        out += &format!("skipped: {}\n", safe(&s));
     }
     for c in sb.caveats(&cmd) {
-        out += &format!("note: {c}\n");
+        out += &format!("note: {}\n", safe(&c));
     }
     out += &format!(
         "warning: `runtime run --unsandboxed {}` would run whatever this app wrote into its prefix (registry Run \
          keys, DLL overrides) with your full access\n",
         env.id()
     );
-    let argv: Vec<String> = sb.argv_preview(&cmd).iter().map(|a| shell_quote(a)).collect();
+    // Each argument escaped on its own: a newline inside one can never start a line of its own.
+    let argv: Vec<String> = sb.argv_preview(&cmd).iter().map(|a| safe(&shell_quote(a))).collect();
     out += &format!("command: {}\n", argv.join(" "));
-    crate::emit(&safe_lines(&out))
+    // Every untrusted piece above went through `safe`; the line breaks are this function's own.
+    crate::emit(&out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_marker_is_unmarked_and_other_errors_refuse() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(marked(Err(Error::from(ErrorKind::NotFound))), Ok(false));
+        assert!(marked(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+        assert_eq!(
+            marked(std::fs::symlink_metadata("/")),
+            Ok(true),
+            "a directory counts as marked"
+        );
+    }
 
     #[test]
     fn shell_quote_survives_quotes_and_spaces() {

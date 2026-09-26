@@ -35,6 +35,8 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
             "{e}; removing without stopping any running Wine process of this app"
         )),
     }
+    // A sandboxed app's wineserver survives `wineserver -k` (see `refuse_if_running`): never delete under it.
+    crate::refuse_if_running(&env)?;
     // Best-effort: an app installed via the Task 6 installer pipeline may have a `.desktop` entry/icons
     // (`installer::pipeline` -> `rt_desktop::entry::write`); `remove` must clean those up too, exactly like
     // `uninstall` does (`crate::remove_desktop_entry`), or they orphan a `runtime run <id>` that no longer works.

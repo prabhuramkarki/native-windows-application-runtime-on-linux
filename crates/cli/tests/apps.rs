@@ -3469,7 +3469,23 @@ fn doctor_reports_the_sandbox_for_the_system_and_summarises_an_apps_profile() {
         (check["area"].as_str(), check["status"].as_str()),
         (Some("runtime"), Some("warn"))
     );
+    assert!(
+        check["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("sandbox: unavailable: bwrap is not on PATH"),
+        "{check}"
+    );
     fake_bwrap(&r);
+    // A profile that needs HOME to be checked, without HOME (the rig's environment is cleared): the real reason.
+    fs::write(r.apps().join(&id).join("permissions.toml"), "version = 1\n").unwrap();
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[warn]") && line.contains("sandbox: cannot read the profile: HOME is not set"),
+        "{out}"
+    );
+    fs::remove_file(r.apps().join(&id).join("permissions.toml")).unwrap();
     let out = s(&r.rt(&["doctor"]).stdout);
     let line = lines_with(&out, "sandbox")[0];
     assert!(line.contains("[ok]") && line.contains("bubblewrap works"), "{out}");
@@ -3511,4 +3527,71 @@ fn once_an_app_ran_sandboxed_its_registry_helpers_run_in_its_sandbox() {
         .find(|c| c.contains("reg.exe"))
         .unwrap_or_else(|| panic!("{calls:?}"));
     assert!(reg.contains("--unshare-net") && reg.contains(" delete "), "{reg}");
+    // Something else at the marker's path (the runtime only ever writes a file) still counts as marked.
+    let marker = prefix.parent().unwrap().join("ran-sandboxed");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    fs::remove_file(r.bin.join("bwrap")).unwrap();
+    let err = assert_fails(&no_bwrap(&r).args(["display", id, "x11"]).output().unwrap());
+    assert!(err.contains("has run in the sandbox"), "{err}");
+}
+
+#[test]
+fn remove_and_uninstall_refuse_while_the_app_still_runs_and_work_once_it_is_gone() {
+    // A sandboxed app's wineserver survives `wineserver -k` (its socket is in the sandbox's private /tmp); the
+    // host's /proc still shows it, like this fake one.
+    let r = rig();
+    let id = r.install();
+    let root = r.apps().join(&id);
+    let mut server = fake_wineserver(&r, &root.join("prefix"));
+    for cmd in ["remove", "uninstall"] {
+        let before = r.calls().len();
+        let err = assert_fails(&r.rt(&[cmd, &id]));
+        assert!(
+            err.contains(&format!("{id} is running (wineserver pid {})", server.id()))
+                && err.contains("quit it (Ctrl-C its `runtime run`) first; nothing was removed"),
+            "{cmd}: {err}"
+        );
+        assert!(root.join("metadata.json").is_file(), "{cmd} removed the app");
+        let calls = &r.calls()[before..];
+        assert_eq!(calls.len(), 1, "{cmd}: only the stop, no uninstaller: {calls:?}");
+        assert!(calls[0].starts_with("wineserver -k"), "{calls:?}");
+    }
+    server.kill().unwrap();
+    server.wait().unwrap();
+    assert_ok(&r.rt(&["remove", &id]));
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn sandbox_output_cannot_be_split_by_a_newline_in_a_path() {
+    let r = rig();
+    // A data directory whose name holds a newline, an escape sequence and a forged line.
+    let data = r.root.join("da\nta\u{1b}[2J\ncommand: 'forged'");
+    let run = |args: &[&std::ffi::OsStr]| r.cmd().env("RUNTIME_DATA_DIR", &data).args(args).output().unwrap();
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    assert_ok(&run(&["install".as_ref(), p.as_os_str()]));
+    let o = run(&["sandbox".as_ref(), "runtime-fixture".as_ref()]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert_tame(&out, "stdout");
+    let known = [
+        "bubblewrap: ",
+        "profile ",
+        "  host directory ",
+        "Wine: ",
+        "REFUSED: ",
+        "skipped: ",
+        "note: ",
+        "warning: ",
+        "command: ",
+    ];
+    for line in out.lines() {
+        assert!(
+            known.iter().any(|k| line.starts_with(k)),
+            "a forged line {line:?} in:\n{out}"
+        );
+    }
+    assert_eq!(lines_with(&out, "command: ").len(), 1, "{out}");
+    assert!(out.contains("da\\nta\\u{1b}[2J\\ncommand"), "{out}");
 }
