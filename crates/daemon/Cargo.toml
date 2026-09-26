@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "rt_daemon"
 path = "src/lib.rs"
 
+[[bin]]
+name = "runtimed"
+path = "src/main.rs"
+
 [dependencies]
 runtime-api = { path = "../api" }
 runtime-core = { path = "../core" }

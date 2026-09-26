@@ -23,6 +23,8 @@ pub(crate) mod testutil {
         let id = AppId::parse(id).unwrap();
         let env = store.create(&id).unwrap();
         std::fs::create_dir_all(env.drive_c().join("app")).unwrap();
+        // The per-app HOME `runtime run` prepares (the sandbox command binds it).
+        std::fs::create_dir_all(env.root().join("runtime/home")).unwrap();
         std::fs::write(env.drive_c().join("app/a.exe"), b"MZ").unwrap();
         let exe = WinPath::parse(r"C:\app\a.exe").unwrap();
         let backend = BackendInfo {
