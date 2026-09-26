@@ -18,6 +18,8 @@ runtime-backend-wine = { path = "../backend-wine" }
 runtime-deps = { path = "../deps" }
 runtime-sandbox = { path = "../sandbox" }
 runtime-api = { path = "../api" }
+# The `runtimed` client (`runtime rpc`, `runtime daemon-status`) only; no other command needs the daemon.
+runtime-daemon = { path = "../daemon" }
 clap = { version = "4", features = ["derive"] }
 libc.workspace = true
 serde.workspace = true

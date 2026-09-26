@@ -727,6 +727,7 @@ dependencies = [
  "runtime-api",
  "runtime-backend-wine",
  "runtime-core",
+ "runtime-daemon",
  "runtime-deps",
  "runtime-desktop",
  "runtime-installer",

@@ -49,7 +49,7 @@ pub enum ClientError {
     #[error("bad reply from the daemon: {0}")]
     Protocol(&'static str),
     /// A JSON-RPC error reply. `message` is the daemon's text (bounded, not cleaned).
-    #[error("{message} (code {code})")]
+    #[error("{message} (code {code}{})", kind.as_ref().map(|k| format!(", kind {k}")).unwrap_or_default())]
     Rpc {
         code: i64,
         message: String,
