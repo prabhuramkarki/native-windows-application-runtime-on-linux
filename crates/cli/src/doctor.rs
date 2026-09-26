@@ -85,7 +85,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             .as_ref()
             .map(|r| r.as_ref().map(|_| ()).map_err(String::as_str)),
         prefix_root: facts.prefix_root.as_deref(),
-        vulkan: Some(crate::graphics::host()),
+        vulkan: Some(rt_api::host::graphics::host()),
         vulkan_min: rt_deps::Manifest::bundled().max_min_vulkan(),
         wine_drivers: wine_drivers.as_deref(),
         graphics_driver: facts.graphics_driver.as_ref().map(|r| match r {
@@ -189,7 +189,7 @@ impl Facts {
                     &p.metadata,
                     exe,
                     rt_deps::Manifest::bundled(),
-                    &crate::graphics::verdict_for,
+                    &rt_api::host::graphics::verdict_for,
                 );
                 rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
                 let d3d_routes = match &pe {
@@ -303,7 +303,7 @@ fn d3d_routes(app: &str, info: &PeInfo, plan: &rt_deps::AppPlan) -> Vec<(D3dFami
                 Some(rt_deps::Action::Blocked { reason }) => builtin(reason.clone()),
                 Some(rt_deps::Action::AlreadyInstalled) => {
                     let min = rt_deps::Manifest::bundled().get(pkg).and_then(|p| p.min_vulkan);
-                    match crate::graphics::verdict_for(min) {
+                    match rt_api::host::graphics::verdict_for(min) {
                         // Recorded DLLs win over Wine's and nothing at launch consults Vulkan, so this app fails.
                         // (`runtime deps` does not warn about an installed package: block_for_vulkan skips it.)
                         rt_core::VulkanVerdict::Unusable(why) => D3dRoute::Broken { reason: why },

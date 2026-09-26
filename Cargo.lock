@@ -695,9 +695,8 @@ dependencies = [
 name = "runtime-api"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "runtime-core",
- "runtime-deps",
- "runtime-installer",
  "runtime-sandbox",
  "serde",
  "serde_json",
