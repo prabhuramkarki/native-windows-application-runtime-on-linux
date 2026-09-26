@@ -473,6 +473,28 @@ fn explicit_limits_fail_closed_and_the_default_degrades_with_a_caveat() {
         assert_eq!(s.wrap(app_cmd()).get_program(), "/bin/sh", "{sets:?}: fail closed");
         assert!(s.caveats(&app_cmd()).is_empty());
     }
+    // the hint follows the cause
+    for (why, hint) in [
+        (
+            crate::OLD_SYSTEMD.to_owned(),
+            "resource limits need systemd 254 or newer",
+        ),
+        (
+            "systemd-run is not on PATH".to_owned(),
+            "Start the app from a desktop or user session with systemd",
+        ),
+    ] {
+        let h = FakeHost {
+            no_scopes: Some(why.clone()),
+            ..host()
+        };
+        let text = sb(limited(&["cpu=50"]), h).render(&app_cmd()).unwrap_err().to_string();
+        assert!(text.contains(&why) && text.contains(hint), "{text}");
+        assert!(
+            text.contains("runtime permissions a --set memory=off --set cpu=off --set tasks=default"),
+            "{text}"
+        );
+    }
     // a controller the user manager does not delegate counts as unavailable, for what needs it
     let no_mem = FakeHost {
         controllers: Some(vec!["cpu", "pids"]),
@@ -482,6 +504,8 @@ fn explicit_limits_fail_closed_and_the_default_degrades_with_a_caveat() {
         .render(&app_cmd())
         .unwrap_err();
     assert!(e.to_string().contains("`memory` controller"), "{e}");
+    assert!(e.to_string().contains("Delegate="), "{e}");
+    assert!(!e.to_string().contains("desktop or user session"), "{e}");
     assert_eq!(
         scope_of(&sb(limited(&["cpu=50"]), no_mem).render(&app_cmd()).unwrap()),
         want_scope(&["TasksMax=4096", "CPUQuota=50%"])

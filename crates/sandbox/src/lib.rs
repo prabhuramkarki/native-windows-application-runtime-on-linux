@@ -66,6 +66,9 @@ pub struct ScopeSupport {
     pub controllers: Vec<String>,
 }
 
+/// [`probe_limits`]'s reason when `systemd-run` does not know `--expand-environment` (added in systemd 254).
+pub const OLD_SYSTEMD: &str = "systemd-run does not support --expand-environment=no (systemd older than 254)";
+
 /// The options every scope is started with (`render`, "Limits"); the probe uses the same ones.
 pub const SCOPE_ARGS: [&str; 5] = ["--user", "--scope", "--collect", "--quiet", "--expand-environment=no"];
 
@@ -97,6 +100,9 @@ pub fn probe_limits(systemd_run: &Path, runtime_dir: Option<&std::ffi::OsStr>) -
     };
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     if !out.status.success() {
+        if text.contains("--expand-environment") {
+            return Err(OLD_SYSTEMD.to_owned());
+        }
         return Err(format!("systemd-run --user --scope failed ({})", line(lines.next())));
     }
     let last = lines.next_back();
@@ -335,6 +341,16 @@ mod tests {
     fn probe_limits_reports_a_systemd_run_that_cannot_run_or_fails() {
         let e = probe_limits(Path::new("/nonexistent/systemd-run"), None).unwrap_err();
         assert!(e.contains("could not be run"), "{e}");
+        // systemd older than 254 does not know `--expand-environment`: named as such
+        let td = tempfile::tempdir().unwrap();
+        let old = td.path().join("systemd-run");
+        std::fs::write(
+            &old,
+            "#!/bin/sh\necho \"systemd-run: unrecognized option '--expand-environment=no'\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&old, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(probe_limits(&old, None).unwrap_err(), OLD_SYSTEMD);
         let e = probe_limits(Path::new("/bin/false"), None).unwrap_err();
         assert_eq!(e, "systemd-run --user --scope failed (no output)");
         // `true` succeeds without printing the controllers

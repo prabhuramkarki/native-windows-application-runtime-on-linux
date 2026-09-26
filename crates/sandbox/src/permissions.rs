@@ -11,7 +11,7 @@
 //!
 //! [limits]                                 # optional, every key too
 //! memory_mb = 2048                         # MemoryMax (and no swap), 64..=1048576
-//! cpu_percent = 150                        # CPUQuota, 1..=100 x CPUs
+//! cpu_percent = 150                        # CPUQuota, 1..=409600 (--set: 1..=100 x this host's CPUs)
 //! tasks = 512                              # TasksMax, 16..=65536, or "unlimited"
 //!
 //! [[filesystem]]
@@ -23,13 +23,15 @@
 //! best effort (applied when `systemd-run --user` works, skipped with a caveat otherwise). A key the file HAS is a
 //! request, mandatory at run time (see `crate::render`, "Limits"), even `tasks = 4096`: [`Limits`] keeps that
 //! difference ([`Tasks::Default`] vs [`Tasks::Max`]). Bounds are checked on every parse and every `--set`; out of
-//! range is [`PermError::Limit`], never clamped. The `--set` forms ([`Permissions::apply_set`]):
+//! range is [`PermError::Limit`], never clamped. The CPU bound differs: a parse checks only the fixed
+//! [`CPU_PERCENT_MAX`] (a profile must load on any host, under any affinity, so `--set cpu=off` can always repair
+//! it), `--set cpu=` also checks this host's CPU count. The `--set` forms ([`Permissions::apply_set`]):
 //!
 //! | `--set` | Effect on `[limits]` |
 //! |---|---|
 //! | `memory=<MiB>` | `memory_mb = <MiB>` (64..=1048576) |
 //! | `memory=off`, `memory=default` | removes `memory_mb` (no memory limit) |
-//! | `cpu=<percent>` | `cpu_percent = <percent>` (1..=100 x CPUs) |
+//! | `cpu=<percent>` | `cpu_percent = <percent>` (1..=100 x the CPUs `runtime` may use, at most 409600) |
 //! | `cpu=off`, `cpu=default` | removes `cpu_percent` (no CPU limit) |
 //! | `tasks=<n>` | `tasks = <n>` (16..=65536), mandatory |
 //! | `tasks=unlimited` | `tasks = "unlimited"`: no task limit at all |
@@ -144,10 +146,20 @@ pub const MEMORY_MB: std::ops::RangeInclusive<u64> = 64..=1024 * 1024;
 /// `tasks` bounds.
 pub const TASKS: std::ops::RangeInclusive<u32> = 16..=65536;
 
-/// The largest `cpu_percent`: 100 per CPU this host has.
+/// The largest `cpu_percent` a profile may hold (100 x 4096 CPUs): the only bound a LOAD checks, so a profile never
+/// stops loading because of the host it is read on. A quota above the host's CPUs is harmless (it never throttles).
+pub const CPU_PERCENT_MAX: u32 = 409_600;
+
+/// What `--set cpu=` accepts on a host with `cpus` CPUs: 1 to 100 per CPU, at most [`CPU_PERCENT_MAX`].
+fn cpu_range(cpus: usize) -> std::ops::RangeInclusive<u32> {
+    let per_host = u32::try_from(cpus.max(1)).unwrap_or(u32::MAX).saturating_mul(100);
+    1..=per_host.min(CPU_PERCENT_MAX)
+}
+
+/// The largest `cpu_percent` `--set cpu=` accepts here: 100 per CPU this process may use
+/// (`available_parallelism`, which follows its affinity and cgroup quota).
 pub fn max_cpu_percent() -> u32 {
-    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
-    u32::try_from(n).unwrap_or(u32::MAX / 100).saturating_mul(100)
+    *cpu_range(std::thread::available_parallelism().map_or(1, |n| n.get())).end()
 }
 
 /// The task limit (module docs, "Limits").
@@ -174,6 +186,21 @@ impl Limits {
     /// The file asks for a limit: the run must get it or not start.
     pub fn explicit(&self) -> bool {
         self.memory_mb.is_some() || self.cpu_percent.is_some() || matches!(self.tasks, Tasks::Max(_))
+    }
+
+    /// The cgroup controllers these limits need (`pids` for the task limit, `memory`, `cpu`).
+    pub fn controllers(&self) -> Vec<&'static str> {
+        let mut c = Vec::new();
+        if self.tasks_max().is_some() {
+            c.push("pids");
+        }
+        if self.memory_mb.is_some() {
+            c.push("memory");
+        }
+        if self.cpu_percent.is_some() {
+            c.push("cpu");
+        }
+        c
     }
 
     /// The `TasksMax` to apply, default or explicit; `None` with `tasks = "unlimited"`.
@@ -537,7 +564,7 @@ impl RawLimits {
                 .transpose()?,
             cpu_percent: self
                 .cpu_percent
-                .map(|n| bounded("cpu_percent", n, 1..=max_cpu_percent(), " percent"))
+                .map(|n| bounded("cpu_percent", n, 1..=CPU_PERCENT_MAX, " percent"))
                 .transpose()?,
             tasks,
         })
@@ -1040,13 +1067,12 @@ mod tests {
         ] {
             assert!(limits_of(bad).is_err(), "{bad:?}");
         }
-        let cpu_max = max_cpu_percent();
         for bad in [
             "memory_mb = 63".to_owned(),
             "memory_mb = 1048577".into(),
             "memory_mb = -1".into(),
             "cpu_percent = 0".into(),
-            format!("cpu_percent = {}", cpu_max + 1),
+            "cpu_percent = 409601".into(),
             "tasks = 15".into(),
             "tasks = 65537".into(),
             "tasks = -4096".into(),
@@ -1060,12 +1086,50 @@ mod tests {
             "memory_mb = 64".to_owned(),
             "memory_mb = 1048576".into(),
             "cpu_percent = 1".into(),
-            format!("cpu_percent = {cpu_max}"),
+            // a load never depends on this host's CPUs (or the affinity/quota `runtime` was started under)
+            "cpu_percent = 1500".into(),
+            "cpu_percent = 409600".into(),
             "tasks = 16".into(),
             "tasks = 65536".into(),
         ] {
             assert!(limits_of(&format!("[limits]\n{ok}\n")).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn the_cpu_bound_of_set_follows_the_cpu_count_and_the_fixed_ceiling() {
+        assert_eq!(cpu_range(1), 1..=100);
+        assert_eq!(cpu_range(12), 1..=1200);
+        assert_eq!(cpu_range(4096), 1..=409600);
+        assert_eq!(cpu_range(100_000), 1..=409600, "never above what a load accepts");
+        assert_eq!(cpu_range(0), 1..=100, "at least one CPU");
+        // `--set cpu=1500` on a 12-CPU host is refused, a 16-CPU host takes it
+        let bad = bounded("cpu", 1500, cpu_range(12), " percent").unwrap_err();
+        assert!(bad.to_string().contains("1..=1200"), "{bad}");
+        assert_eq!(bounded("cpu", 1500, cpu_range(16), " percent"), Ok(1500));
+    }
+
+    #[test]
+    fn cpu_off_repairs_a_profile_whose_cpu_exceeds_this_host() {
+        let x = t();
+        let app = x.dir("app");
+        let over = CPU_PERCENT_MAX;
+        assert!(over > max_cpu_percent());
+        fs::write(
+            app.join(FILE_NAME),
+            format!("version = 1\n[limits]\ncpu_percent = {over}\n"),
+        )
+        .unwrap();
+        let mut p = load(&app, &x.ctx).unwrap();
+        assert_eq!(p.limits.cpu_percent, Some(over));
+        p.apply_set("cpu=off", &x.ctx).unwrap();
+        store(&app, &p).unwrap();
+        assert_eq!(load(&app, &x.ctx).unwrap(), Permissions::default());
+        // but it cannot be set again here
+        assert!(matches!(
+            p.apply_set(&format!("cpu={over}"), &x.ctx),
+            Err(PermError::Limit(_))
+        ));
     }
 
     #[test]

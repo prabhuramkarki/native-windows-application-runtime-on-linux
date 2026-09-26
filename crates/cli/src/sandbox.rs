@@ -79,12 +79,13 @@ fn summary(p: &Permissions) -> String {
     )
 }
 
-/// The sandbox of `runtime run` for `found` (module docs), or the error that stops the run.
+/// The sandbox of `runtime run` for `found` (module docs), or the error that stops the run, and whether it sets a
+/// memory limit (a run it renders then has one: an explicit limit is applied or the run is refused).
 pub(crate) fn for_run(
     store: &Store,
     found: &Target,
     backend: &dyn CompatBackend,
-) -> Result<Arc<dyn Sandbox>, CmdError> {
+) -> Result<(Arc<dyn Sandbox>, bool), CmdError> {
     let bwrap = working_bwrap().map_err(|why| format!("cannot start the sandbox: {why}. {INSTALL_HINT}"))?;
     let perms = match found {
         Target::Installed(id) => {
@@ -94,7 +95,8 @@ pub(crate) fn for_run(
         }
         Target::File(_) => Permissions::default(),
     };
-    Ok(Arc::new(RunSandbox(app_sandbox(bwrap, perms, backend))))
+    let memory = perms.limits.memory_mb.is_some();
+    Ok((Arc::new(RunSandbox(app_sandbox(bwrap, perms, backend))), memory))
 }
 
 /// `runtime run`'s sandbox: [`AppSandbox`] plus the notes and the marker (module docs).
@@ -210,23 +212,39 @@ fn limits_section(l: &Limits, scopes: &Result<rt_sandbox::ScopeSupport, String>)
 /// `doctor`'s limits input: `systemd-run --user` scopes work, or why not and what that means (with `env`: for that
 /// app, whose explicit limits then refuse every run).
 pub(crate) fn doctor_limits(env: Option<&AppEnv>) -> Result<String, String> {
+    // An unreadable profile is the sandbox check's warning; here it counts as the default.
+    let limits = env
+        .and_then(|e| profile(e).ok())
+        .map(|(p, _)| p.limits)
+        .unwrap_or_default();
+    let refused = |e: &AppEnv| format!("runs of {} will be refused", e.id());
+    let not_applied = "the default task limit (fork-bomb guard) is not applied";
     match RealHost.scopes() {
-        Ok(s) => Ok(format!(
-            "limits: systemd-run --user available (cgroup controllers: {})",
-            s.controllers.join(" ")
-        )),
-        Err(why) => {
-            let explicit = env
-                .and_then(|e| profile(e).ok())
-                .is_some_and(|(p, _)| p.limits.explicit());
-            Err(match env {
-                Some(e) if explicit => format!(
-                    "limits: unavailable: {why}; runs of {} will be refused (its permissions.toml sets limits)",
-                    e.id()
+        Ok(s) => match limits
+            .controllers()
+            .into_iter()
+            .find(|c| !s.controllers.iter().any(|h| h == c))
+        {
+            None => Ok(format!(
+                "limits: systemd-run --user available (cgroup controllers: {})",
+                s.controllers.join(" ")
+            )),
+            Some(c) => Err(match env {
+                Some(e) if limits.explicit() => format!(
+                    "limits: systemd-run --user available, but {}: the {c} cgroup controller is not available to \
+                     your user session",
+                    refused(e)
                 ),
-                _ => format!("limits: unavailable: {why}; the default task limit (fork-bomb guard) is not applied"),
-            })
-        }
+                _ => format!("limits: the {c} cgroup controller is not available to your user session; {not_applied}"),
+            }),
+        },
+        Err(why) => Err(match env {
+            Some(e) if limits.explicit() => format!(
+                "limits: unavailable: {why}; {} (its permissions.toml sets limits)",
+                refused(e)
+            ),
+            _ => format!("limits: unavailable: {why}; {not_applied}"),
+        }),
     }
 }
 

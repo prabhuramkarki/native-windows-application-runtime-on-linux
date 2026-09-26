@@ -697,7 +697,13 @@ with a fork bomb (or, when asked for, by eating the memory or the CPU).
 |---|---|---|---|
 | `tasks = <n>` (16..65536) or `"unlimited"` | `tasks=<n>\|unlimited\|default` | `TasksMax=<n>` | 4096, best effort |
 | `memory_mb = <MiB>` (64..1048576) | `memory=<MiB>\|off` | `MemoryMax=<MiB>M`, `MemorySwapMax=0` | none |
-| `cpu_percent = <p>` (1..100 x CPUs) | `cpu=<percent>\|off` | `CPUQuota=<p>%` | none |
+| `cpu_percent = <p>` (1..409600; `--set`: 1..100 x CPUs) | `cpu=<percent>\|off` | `CPUQuota=<p>%` | none |
+
+**Needs systemd 254 or newer** (for `--expand-environment`): on older systemd the default task limit is skipped
+with a note and a `doctor` warning, and explicit limits refuse the run. The CPU bound of a stored profile is fixed
+(409600, i.e. 4096 CPUs), so a profile loads on any host and under any CPU affinity or quota `runtime` is started
+with; `--set cpu=` also checks the CPUs this process may use, and a quota above the host's total just never
+throttles. A 143 exit under a memory limit prints a note pointing at `journalctl --user -u 'run-p*.scope'`.
 
 **Default vs requested.** Without a `tasks` key every run gets `TasksMax=4096`, best effort: when `systemd-run --user`
 does not work (no user manager: a container, an SSH session without lingering; no cgroup v2; systemd older than 254,
