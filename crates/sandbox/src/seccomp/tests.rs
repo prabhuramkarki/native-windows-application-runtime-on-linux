@@ -200,6 +200,30 @@ fn another_architecture_or_the_x32_abi_is_refused_whatever_the_call() {
             assert_eq!(run(&prog, &d), RET_EPERM, "arch {arch:#x} nr {nr}");
         }
     }
+    // the one i386 call Wine needs (its 32-bit %fs selector), and nothing else of i386
+    #[cfg(target_arch = "x86_64")]
+    {
+        let i386_call = |nr: u32| {
+            let d = Data {
+                nr: nr as i32,
+                arch: i386,
+                ip: 0,
+                args: [G; 6],
+            };
+            run(&prog, &d)
+        };
+        assert_eq!(i386_call(I386_SET_THREAD_AREA), RET_ALLOW);
+        for nr in [244, 242, 11, 20, 26, 120, 172, 0, u32::MAX] {
+            assert_eq!(i386_call(nr), RET_EPERM, "i386 {nr}");
+        }
+        let arm = Data {
+            nr: I386_SET_THREAD_AREA as i32,
+            arch: arm,
+            ip: 0,
+            args: [0; 6],
+        };
+        assert_eq!(run(&prog, &arm), RET_EPERM, "243 of another arch");
+    }
     #[cfg(target_arch = "x86_64")]
     for nr in [libc::SYS_read, libc::SYS_getpid, libc::SYS_execve, 512, 547] {
         assert_eq!(
@@ -346,6 +370,40 @@ fn the_deny_list_is_consistent_and_its_reasons_are_one_line() {
     }
     #[cfg(target_arch = "x86_64")]
     assert!(names.contains(&"iopl") && names.contains(&"ioperm"));
+}
+
+#[test]
+fn the_confined_filter_differs_only_in_letting_wines_ptrace_requests_through() {
+    let own = host_arch().unwrap();
+    let strict = filter();
+    let confined = build_filter_confined_ptrace(own).unwrap();
+    validate(&confined).unwrap();
+    let pt = |prog: &[SockFilter], req: u64| call(prog, libc::SYS_ptrace, [req, 1, 0, 0, 0, 0]);
+    for &req in WINE_PTRACE {
+        assert_eq!(pt(&confined, u64::from(req)), RET_ALLOW, "{req}");
+        assert_eq!(pt(&confined, garbage_high(req)), RET_ALLOW, "{req} (high garbage)");
+        assert_eq!(pt(&strict, u64::from(req)), RET_EPERM, "{req}");
+    }
+    for req in [
+        libc::PTRACE_TRACEME,
+        libc::PTRACE_SEIZE,
+        libc::PTRACE_INTERRUPT,
+        libc::PTRACE_GETREGS,
+        libc::PTRACE_SETREGS,
+        libc::PTRACE_GETSIGINFO,
+        libc::PTRACE_SETOPTIONS,
+        libc::PTRACE_SYSCALL,
+    ] {
+        assert_eq!(pt(&confined, u64::from(req)), RET_EPERM, "{req}");
+        assert_eq!(pt(&strict, u64::from(req)), RET_EPERM, "{req}");
+    }
+    // everything else is the same program: every other denied call still fails, the allowed ones still pass
+    for d in DENIED.iter().filter(|d| d.nr != libc::SYS_ptrace) {
+        for args in [[0; 6], [G; 6]] {
+            assert_eq!(call(&confined, d.nr, args), call(&strict, d.nr, args), "{}", d.name);
+        }
+    }
+    assert_eq!(call(&confined, libc::SYS_read, [0; 6]), RET_ALLOW);
 }
 
 /// The module documentation's table row for `d`.

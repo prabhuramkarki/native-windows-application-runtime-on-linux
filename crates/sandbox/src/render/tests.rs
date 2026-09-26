@@ -14,6 +14,10 @@ struct FakeHost {
     files: BTreeSet<PathBuf>,
     links: HashMap<PathBuf, PathBuf>,
     uid: u32,
+    /// `runtime_exe` is `None` (default: [`EXE`]).
+    no_exe: bool,
+    /// `runtime_exe` is this instead of [`EXE`].
+    exe_at: Option<PathBuf>,
 }
 
 impl Host for FakeHost {
@@ -37,6 +41,9 @@ impl Host for FakeHost {
     }
     fn uid(&self) -> u32 {
         self.uid
+    }
+    fn runtime_exe(&self) -> Option<PathBuf> {
+        (!self.no_exe).then(|| self.exe_at.clone().unwrap_or_else(|| EXE.into()))
     }
 }
 
@@ -78,6 +85,8 @@ const PREFIX: &str = "/data/apps/a/prefix";
 const APP_HOME: &str = "/data/apps/a/runtime/home";
 const APP_ROOT: &str = "/data/apps/a";
 const RT: &str = "/run/user/1000";
+/// The fake host's runtime executable (the shim).
+const EXE: &str = "/opt/runtime/bin/runtime";
 
 /// This dev machine's shape: Wayland + Xwayland, a Pulse-compatible socket, AMD + NVIDIA nodes.
 fn host() -> FakeHost {
@@ -145,6 +154,73 @@ fn pos(a: &[String], seq: &[&str]) -> Option<usize> {
         .position(|w| w.iter().zip(seq).all(|(x, y)| x == y))
 }
 
+/// The Landlock rules of the default profile on [`host`], mirroring its binds (gpu on or off).
+fn default_rules(gpu: bool) -> Vec<&'static str> {
+    let mut r = vec![
+        "rw:/proc",
+        "rw:/dev/null",
+        "rw:/dev/zero",
+        "rw:/dev/full",
+        "rw:/dev/random",
+        "rw:/dev/urandom",
+        "rw:/dev/tty",
+        "rw:/dev/pts",
+        "rw:/dev/shm",
+        "rw:/tmp",
+        "ro:/usr",
+        "ro:/bin",
+        "ro:/lib",
+        "ro:/lib64",
+        "ro:/etc/alternatives",
+        "ro:/etc/passwd",
+        "ro:/etc/group",
+        "ro:/etc/nsswitch.conf",
+        "ro:/etc/ld.so.cache",
+        "ro:/etc/localtime",
+        "ro:/etc/fonts",
+        "ro:/etc/ssl",
+        "ro:/etc/pki",
+        "ro:/etc/ca-certificates",
+        "ro:/etc/vulkan",
+        "ro:/etc/glvnd",
+        "ro:/opt/wine/lib",
+        "rw:/run/user/1000",
+    ];
+    if gpu {
+        r.extend([
+            "rw:/dev/dri",
+            "rw:/dev/nvidiactl",
+            "rw:/dev/nvidia0",
+            "ro:/sys/dev/char",
+            "ro:/sys/devices",
+            "ro:/sys/class/drm",
+            "ro:/run/opengl-driver",
+        ]);
+    }
+    r.extend([
+        "ro:/opt/runtime/bin/runtime",
+        "rw:/data/apps/a/prefix",
+        "rw:/data/apps/a/runtime/home",
+    ]);
+    r
+}
+
+/// The shim invocation after bwrap's `--`: (the shim's rules, the program and its arguments).
+fn shim_part(a: &[String]) -> (Vec<String>, Vec<String>) {
+    let dd = a.iter().position(|x| x == "--").unwrap();
+    assert_eq!(a[dd + 1..dd + 4], [EXE, "sandbox-init", "--v1"], "{a:?}");
+    let block = &a[dd + 3..];
+    let end = block.iter().position(|x| x == "--").unwrap();
+    let rules = block[1..end]
+        .chunks(2)
+        .map(|c| {
+            assert_eq!(c[0], "--rule");
+            c[1].clone()
+        })
+        .collect();
+    (rules, block[end + 1..].to_vec())
+}
+
 fn rendered(p: Permissions, h: FakeHost) -> Command {
     sb(p, h).render(&app_cmd()).unwrap()
 }
@@ -210,8 +286,13 @@ fn the_default_profile_is_exactly_this() {
     for d in ["/sys/dev/char", "/sys/devices", "/sys/class/drm", "/run/opengl-driver"] {
         want.extend(["--ro-bind-try", d, d]);
     }
+    want.extend(["--ro-bind", EXE, EXE]);
     want.extend(["--bind", PREFIX, PREFIX, "--bind", APP_HOME, APP_HOME]);
     want.extend(["--remount-ro", "/"]);
+    want.extend(["--", EXE, "sandbox-init", "--v1"]);
+    for r in default_rules(true) {
+        want.extend(["--rule", r]);
+    }
     want.extend(["--", "/usr/bin/wine", "C:\\x.exe", "--flag"]);
     assert_eq!(argv(&c), want);
     let e = envs(&c);
@@ -345,6 +426,119 @@ fn pulse_server_is_kept_only_when_it_names_the_bound_socket() {
         .render(&cmd)
         .unwrap();
     assert!(!envs(&c).contains_key("PULSE_SERVER"));
+}
+
+#[test]
+fn the_shim_runs_the_original_program_under_rules_that_mirror_the_binds() {
+    for gpu in [true, false] {
+        let a = argv(&rendered(perms(|p| p.gpu = gpu), host()));
+        let (rules, program) = shim_part(&a);
+        assert_eq!(rules, default_rules(gpu), "gpu {gpu}");
+        assert_eq!(program, ["/usr/bin/wine", "C:\\x.exe", "--flag"]);
+        // the shim itself is bound read-only at its own path, after every other mount but the app's own dirs
+        let exe = pos(&a, &["--ro-bind", EXE, EXE]).expect("the runtime executable is bound");
+        assert_eq!(pos(&a, &["--bind", PREFIX, PREFIX]), Some(exe + 3));
+        // the parsed block is exactly these rules and this program
+        let dd = a.iter().position(|x| x == "--").unwrap();
+        let block: Vec<OsString> = a[dd + 3..].iter().map(OsString::from).collect();
+        let parsed = crate::init::parse(&block).unwrap();
+        assert_eq!(parsed.program, Path::new("/usr/bin/wine"));
+        assert_eq!(parsed.landlock.len(), default_rules(gpu).len());
+    }
+    // network=allow: its /etc files are rules too
+    let a = argv(&rendered(perms(|p| p.network = Network::Allow), host()));
+    let (rules, _) = shim_part(&a);
+    let glvnd = rules.iter().position(|r| r == "ro:/etc/glvnd").unwrap();
+    assert_eq!(rules[glvnd + 1..glvnd + 3], ["ro:/etc/hosts", "ro:/etc/resolv.conf"]);
+}
+
+#[test]
+fn awkward_program_arguments_reach_the_shim_unchanged() {
+    let mut cmd = app_cmd();
+    let odd = [
+        OsString::from("--"),
+        OsString::from("--rule"),
+        OsString::from("rw:/"),
+        OsString::from(""),
+        OsString::from("a\nb"),
+        OsString::from(std::ffi::OsStr::from_bytes(b"\xff")),
+    ];
+    cmd.args(&odd);
+    let c = sb(Permissions::default(), host()).render(&cmd).unwrap();
+    let a: Vec<OsString> = c.get_args().map(OsString::from).collect();
+    let dd = a.iter().position(|x| x == "--").unwrap();
+    let parsed = crate::init::parse(&a[dd + 3..]).unwrap();
+    let mut want: Vec<OsString> = ["C:\\x.exe", "--flag"].iter().map(OsString::from).collect();
+    want.extend(odd);
+    assert_eq!(parsed.argv, want);
+    assert_eq!(parsed.landlock.len(), default_rules(true).len());
+}
+
+#[test]
+fn grants_become_landlock_rules_with_their_access() {
+    let td = crate::grant_tempdir();
+    let root = td.path().canonicalize().unwrap();
+    let (ro, rw) = (root.join("ro"), root.join("rw"));
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::create_dir_all(&rw).unwrap();
+    let p = perms(|p| {
+        p.filesystem = vec![
+            FsGrant {
+                path: ro.clone(),
+                access: Access::Ro,
+            },
+            FsGrant {
+                path: rw.clone(),
+                access: Access::Rw,
+            },
+        ]
+    });
+    let (rules, _) = shim_part(&argv(&rendered(p, host())));
+    let exe = rules.iter().position(|r| r == &format!("ro:{EXE}")).unwrap();
+    assert_eq!(
+        rules[exe - 2..exe],
+        [format!("ro:{}", ro.display()), format!("rw:{}", rw.display())]
+    );
+}
+
+#[test]
+fn a_runtime_executable_that_cannot_be_resolved_refuses_the_run() {
+    let h = FakeHost { no_exe: true, ..host() };
+    let s = sb(Permissions::default(), h);
+    assert_eq!(s.render(&app_cmd()).unwrap_err(), RenderError::RuntimeExe);
+    let w = s.wrap(app_cmd());
+    assert_eq!(w.get_program(), "/bin/sh", "the fail-closed stub");
+    assert!(
+        argv(&w).iter().any(|a| a.contains("runtime executable")),
+        "{:?}",
+        argv(&w)
+    );
+    // a runtime inside the data directory is refused (by the written and the resolved data root)
+    let h = FakeHost {
+        exe_at: Some("/data/bin/runtime".into()),
+        ..host()
+    };
+    let e = sb(Permissions::default(), h).render(&app_cmd()).unwrap_err();
+    assert_eq!(e, RenderError::RuntimeExeInData("/data/bin/runtime".into()));
+    // a block the shim would refuse (here: a Wine dll directory with `..`) is refused at render
+    let s = AppSandbox::new(
+        "/usr/bin/bwrap".into(),
+        Permissions::default(),
+        vec!["/opt/wine/../lib".into()],
+        Arc::new(host()),
+    );
+    let e = s.render(&app_cmd()).unwrap_err();
+    assert!(
+        matches!(e, RenderError::Shim(crate::init::InitError::NotAbsolute(_))),
+        "{e:?}"
+    );
+    // a program that is not an absolute path is refused before the shim would refuse it
+    let mut rel = Command::new("wine");
+    for (k, v) in app_cmd().get_envs() {
+        rel.env(k, v.unwrap());
+    }
+    let e = sb(Permissions::default(), host()).render(&rel).unwrap_err();
+    assert_eq!(e, RenderError::Program("wine".into()));
 }
 
 #[test]
@@ -936,6 +1130,16 @@ fn real_bwrap(test: &str) -> Option<PathBuf> {
 /// run by `/bin/sh -c` inside the sandbox with `$1` = the real `$HOME`, `$2` = the app root, `$3` = the temp root.
 /// Returns (stdout, stderr, temp root).
 fn run_real(bwrap: PathBuf, p: Permissions, script: &str) -> (String, String, tempfile::TempDir) {
+    run_real_with(bwrap, p, script, vec![])
+}
+
+/// [`run_real`] with test-only extra read-only binds that get NO Landlock rule (`AppSandbox::hole`).
+fn run_real_with(
+    bwrap: PathBuf,
+    p: Permissions,
+    script: &str,
+    hole: Vec<PathBuf>,
+) -> (String, String, tempfile::TempDir) {
     let td = tempfile::tempdir().unwrap();
     let root = td.path().canonicalize().unwrap();
     let app = root.join("apps/a");
@@ -963,7 +1167,8 @@ fn run_real(bwrap: PathBuf, p: Permissions, script: &str) -> (String, String, te
             cmd.env(k, v);
         }
     }
-    let s = AppSandbox::new(bwrap, p, vec![], Arc::new(crate::RealHost));
+    let mut s = AppSandbox::new(bwrap, p, vec![], Arc::new(crate::RealHost));
+    s.hole = hole;
     let out = s.wrap(cmd).output().unwrap();
     let (so, se) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -989,7 +1194,9 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
         for f in "$2/secret" "$3/secret"; do [ -r "$f" ] && echo "SECRET-READ $f"; done
         touch /usr/rt-sandbox-probe 2>/dev/null && echo "USR-WRITABLE"
         touch /rt-sandbox-probe 2>/dev/null && echo "ROOT-WRITABLE"
-        mkdir -p "$1" 2>/dev/null && echo "HOME-PATH-WRITABLE"
+        # (the path itself may exist: bwrap makes empty parent directories for the runtime executable's bind)
+        mkdir -p "$1" 2>/dev/null && touch "$1/.rt-sandbox-probe" 2>/dev/null && echo "HOME-PATH-WRITABLE"
+        mkdir "$1/.rt-sandbox-probe-dir" 2>/dev/null && echo "HOME-PATH-WRITABLE"
         touch "$WINEPREFIX/w" && echo prefix-rw
         touch "$HOME/w" && echo home-rw
         touch /dev/shm/w && echo shm-rw
@@ -1007,7 +1214,20 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
     let app = root.join("apps/a");
     let lines: Vec<&str> = so.lines().collect();
     assert_eq!(lines[0], "ok", "{so}\n{se}");
-    assert_eq!(lines[1], "--home-end", "the real home is listed inside: {so}");
+    // Nothing of the real home is listed, except (without Landlock, which refuses the listing) the empty directory
+    // bwrap makes for the runtime executable's bind when the runtime lives below the home.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let skeleton = exe
+        .strip_prefix(home.canonicalize().unwrap_or(home))
+        .ok()
+        .and_then(|rest| rest.iter().next())
+        .map(|c| c.to_string_lossy().into_owned());
+    let end = lines.iter().position(|l| *l == "--home-end").unwrap();
+    assert!(
+        lines[1..end].iter().all(|l| Some(*l) == skeleton.as_deref()),
+        "the real home is listed inside: {so}"
+    );
     for want in ["prefix-rw", "home-rw", "shm-rw", "tmp-private", "net:lo,", "xauth-ok"] {
         assert!(lines.contains(&want), "{want}: {so}\n{se}");
     }
@@ -1062,4 +1282,93 @@ fn real_bwrap_with_network_allow_reads_the_resolver_config() {
     let (so, se, _td) = run_real(bwrap, perms(|p| p.network = Network::Allow), script);
     assert!(so.contains("dns-ok") && so.contains("hosts-ok"), "{so}\n{se}");
     assert!(!so.contains("RESOLVE-DIR-VISIBLE"), "{so}");
+}
+
+fn required() -> bool {
+    std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty())
+}
+
+/// Prints `<what> <ptrace result> <errno>` for: PTRACE_ATTACH of its own child, of pid 1 (bwrap's own init,
+/// outside the Landlock domain) and PTRACE_TRACEME.
+const PTRACE_PY: &str = r#"
+import ctypes, os, signal
+c = ctypes.CDLL(None, use_errno=True)
+c.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+def pt(what, req, pid):
+    ctypes.set_errno(0)
+    r = c.ptrace(req, pid, None, None)
+    print(what, r, ctypes.get_errno())
+    return r
+child = os.fork()
+if child == 0:
+    import time
+    time.sleep(10)
+    os._exit(0)
+if pt("attach-child", 16, child) == 0:
+    os.waitpid(child, 0)
+    c.ptrace(17, child, None, None)
+os.kill(child, signal.SIGKILL)
+pt("attach-pid1", 16, 1)
+pt("traceme", 0, 0)
+"#;
+
+/// Through the real shim (this test binary, see `init::TEST_SHIM`) inside real bwrap: the program has the seccomp
+/// filter and no new privileges, and Landlock refuses a file the MOUNT layer exposes but no rule covers (a
+/// test-only bind punches that hole on purpose).
+#[test]
+fn real_bwrap_runs_the_program_through_the_shim_and_landlock_backs_the_mounts() {
+    let Some(bwrap) = real_bwrap("real_bwrap_runs_the_program_through_the_shim_and_landlock_backs_the_mounts") else {
+        return;
+    };
+    let hole_dir = crate::grant_tempdir();
+    let hole = hole_dir.path().canonicalize().unwrap().join("hole.txt");
+    std::fs::write(&hole, "exposed").unwrap();
+    let script = format!(
+        r#"
+        grep -E '^(Seccomp|NoNewPrivs):' /proc/self/status | tr -d '\t '
+        [ -e '{h}' ] && echo hole-exists
+        cat '{h}' 2>/dev/null && echo || echo hole-denied
+        cat /etc/passwd >/dev/null && echo etc-ok
+        touch "$WINEPREFIX/w2" && echo prefix-rw
+        echo x >/dev/null && echo devnull-ok
+        [ -x /usr/bin/python3 ] && /usr/bin/python3 -c '{py}'
+        true
+    "#,
+        h = hole.display(),
+        py = PTRACE_PY
+    );
+    let (so, se, _td) = run_real_with(bwrap, Permissions::default(), &script, vec![hole.clone()]);
+    let lines: Vec<&str> = so.lines().collect();
+    assert_eq!(lines[..2], ["NoNewPrivs:1", "Seccomp:2"], "{so}\n{se}");
+    for want in ["hole-exists", "etc-ok", "prefix-rw", "devnull-ok"] {
+        assert!(lines.contains(&want), "{want}: {so}\n{se}");
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        assert!(
+            !required(),
+            "RUNTIME_REQUIRE_BWRAP=1 but /usr/bin/python3 (the ptrace probe) is missing"
+        );
+        eprintln!("SKIPPED the ptrace half: no /usr/bin/python3");
+    } else if crate::landlock::abi_version().is_ok() {
+        // Landlock enforced: Wine's ptrace requests reach the program's own children and nothing outside its
+        // domain (bwrap's pid 1); other requests stay refused.
+        for want in ["attach-child 0 0", "attach-pid1 -1 1", "traceme -1 1"] {
+            assert!(lines.contains(&want), "{want}: {so}\n{se}");
+        }
+    } else {
+        assert!(
+            lines.contains(&"attach-child -1 1"),
+            "ptrace is refused without Landlock: {so}"
+        );
+    }
+    match crate::landlock::abi_version() {
+        Ok(_) => assert!(
+            lines.contains(&"hole-denied") && !so.contains("exposed"),
+            "LANDLOCK HOLE: {so}\n{se}"
+        ),
+        Err(e) => {
+            assert!(so.contains("exposed"), "without Landlock the mount decides: {so}");
+            eprintln!("SKIPPED the Landlock half: {e}");
+        }
+    }
 }

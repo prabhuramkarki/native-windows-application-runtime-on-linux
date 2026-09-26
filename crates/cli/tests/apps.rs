@@ -3230,11 +3230,20 @@ fn permissions_can_remove_a_grant_whose_directory_is_gone() {
 
 /// A `bwrap` in the rig's `bin/` that records its arguments (one call per line in `log/bwrap.txt`) and then runs
 /// what follows `--` UNSANDBOXED (the fake Wine could not run in a real sandbox), or exits 0 (the probe).
+/// Logs its arguments and runs the program after `--` without any sandbox. The `sandbox-init` shim is skipped too
+/// (to its own `--`): its Landlock rules name paths as they are INSIDE a real sandbox (`/lib` is a bind there, a
+/// symlink on a merged-/usr host), so it cannot run on the host; the real-bwrap tests run it.
 fn fake_bwrap(r: &Rig) {
     let body = "echo \"$*\" >> @LOG@/bwrap.txt\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-                [ $# -gt 0 ] || exit 0\nshift\nexec \"$@\""
+                [ $# -gt 0 ] || exit 0\nshift\n\
+                if [ \"$2\" = sandbox-init ]; then while [ \"$1\" != -- ]; do shift; done; shift; fi\nexec \"$@\""
         .replace("@LOG@", r.log.to_str().unwrap());
     script(&r.bin.join("bwrap"), &body);
+}
+
+/// The `runtime` under test, as the sandbox names it (its shim).
+fn runtime_exe() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap()
 }
 
 fn bwrap_calls(r: &Rig) -> Vec<String> {
@@ -3315,7 +3324,13 @@ fn a_sandboxed_run_starts_the_settled_program_in_bwrap_and_marks_the_app() {
     for want in [
         "--die-with-parent --new-session --unshare-pid --unshare-uts --unshare-ipc --unshare-net ".to_owned(),
         format!(
-            " --bind {0} {0} --bind {1} {1} --remount-ro / -- /bin/sh -c ",
+            " --bind {0} {0} --bind {1} {1} --remount-ro / -- {2} sandbox-init --v1 --rule ",
+            prefix.display(),
+            home.display(),
+            runtime_exe().display()
+        ),
+        format!(
+            " --rule rw:{} --rule rw:{} -- /bin/sh -c ",
             prefix.display(),
             home.display()
         ),
@@ -3588,6 +3603,9 @@ fn sandbox_output_cannot_be_split_by_a_newline_in_a_path() {
     assert_tame(&out, "stdout");
     let known = [
         "bubblewrap: ",
+        "seccomp: ",
+        "landlock: ",
+        "shim: ",
         "profile ",
         "  host directory ",
         "Wine: ",
@@ -3658,4 +3676,50 @@ fn every_exclusive_command_is_refused_while_a_runtime_run_of_the_app_lives() {
             .unwrap(),
     );
     assert_ok(&r.rt(&["remove", &id]));
+}
+
+/// `runtime sandbox-init` itself (hidden): a program that cannot be executed is a 126 refusal (not 127), and the
+/// program's arguments arrive byte for byte, clap's own syntax (`--`, `--help`) included.
+#[test]
+fn sandbox_init_refuses_with_126_and_passes_arguments_unchanged() {
+    let rt = || Command::new(env!("CARGO_BIN_EXE_runtime"));
+    let o = rt()
+        .args(["sandbox-init", "--v1", "--", "/nonexistent/program"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(126), "{o:?}");
+    assert!(
+        s(&o.stderr).starts_with("runtime: sandbox-init: cannot run \"/nonexistent/program\": No such file"),
+        "{o:?}"
+    );
+    let o = rt().args(["sandbox-init", "--help"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(126), "no help, a refused block: {o:?}");
+    assert!(!s(&o.stdout).contains("Usage"), "{o:?}");
+    // hidden from the help
+    let help = rt().arg("--help").output().unwrap();
+    assert!(!s(&help.stdout).contains("sandbox-init"), "{help:?}");
+
+    let odd: Vec<OsString> = vec![
+        "--".into(),
+        "--help".into(),
+        "-h".into(),
+        "".into(),
+        "a b".into(),
+        "line\nbreak".into(),
+        OsString::from_vec(b"\xff\xfe".to_vec()),
+    ];
+    // Landlock rules name canonical host paths (`/usr/bin/sh` and its libraries live below /usr here).
+    let o = rt()
+        .args(["sandbox-init", "--v1", "--rule", "ro:/usr", "--rule", "ro:/etc", "--"])
+        .args(["/usr/bin/sh", "-c", "printf '%s\\0' \"$@\"", "sh"])
+        .args(&odd)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let mut want = Vec::new();
+    for a in &odd {
+        want.extend_from_slice(a.as_encoded_bytes());
+        want.push(0);
+    }
+    assert_eq!(o.stdout, want);
 }

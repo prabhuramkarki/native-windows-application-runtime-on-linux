@@ -234,16 +234,40 @@ fn finish(rules: &[Rule], skipped: &[bool], outcome: Result<Outcome, Fail>) -> R
                 .map(|(r, _)| r.path.clone())
                 .collect(),
         }),
-        Ok(Outcome::Unavailable(e)) => Ok(Applied::Unavailable(if e == libc::ENOSYS {
-            "the kernel has no Landlock (Linux 5.13+ built with CONFIG_SECURITY_LANDLOCK is needed)".to_owned()
-        } else {
-            "Landlock is disabled on this host (not in the boot-time LSM list, /sys/kernel/security/lsm)".to_owned()
-        })),
+        Ok(Outcome::Unavailable(e)) => Ok(Applied::Unavailable(unavailable_why(e))),
         Err(Fail::Step(step, e)) => Err(syscall_error(step, e)),
         Err(Fail::Rule(i, e)) => Err(LandlockError::Rule {
             path: rules[i].path.clone(),
             source: std::io::Error::from_raw_os_error(e),
         }),
+    }
+}
+
+/// Why Landlock is unavailable, for the probe's `ENOSYS` or `EOPNOTSUPP`.
+fn unavailable_why(e: i32) -> String {
+    if e == libc::ENOSYS {
+        "the kernel has no Landlock (Linux 5.13+ built with CONFIG_SECURITY_LANDLOCK is needed)".to_owned()
+    } else {
+        "Landlock is disabled on this host (not in the boot-time LSM list, /sys/kernel/security/lsm)".to_owned()
+    }
+}
+
+/// What [`apply`] would find on this host, probed from outside the sandbox (for `runtime sandbox` and `doctor`).
+#[derive(Debug)]
+pub enum HostState {
+    /// Enforced at this ABI.
+    Abi(u32),
+    /// [`Applied::Unavailable`], and why.
+    Unavailable(String),
+    /// The probe failed otherwise: [`apply`] would fail with this, so every sandboxed run is refused.
+    Error(LandlockError),
+}
+
+pub fn host_state() -> HostState {
+    match kernel_abi() {
+        Ok(v) => HostState::Abi(v),
+        Err(e @ (libc::ENOSYS | libc::EOPNOTSUPP)) => HostState::Unavailable(unavailable_why(e)),
+        Err(e) => HostState::Error(syscall_error("landlock_create_ruleset(VERSION)", e)),
     }
 }
 

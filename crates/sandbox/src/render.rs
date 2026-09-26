@@ -40,6 +40,26 @@
 //! elsewhere, is a render error, not skipped), two grants may not nest (the later would silently override part
 //! of the earlier, e.g. `rw` inside `ro`), and an `rw` grant may not overlap a Wine dll directory.
 //!
+//! **The shim.** bwrap does not start the program itself: it starts `<runtime exe> sandbox-init --v1 <rules> --
+//! <program> <args>` ([`crate::init`]), which applies the Landlock rules below and the seccomp deny-list and then
+//! `execve`s the ORIGINAL program with its arguments unchanged. `<runtime exe>` is this runtime's own executable
+//! ([`Host::runtime_exe`]: resolved, and refused when it was replaced or deleted since it started), bound read-only at
+//! its own path after the grants (so no grant can replace it) and before the app's own dirs. It cannot be resolved,
+//! the filter cannot be built for this architecture, or the program is not an absolute path: a render error (fail
+//! closed here rather than as the shim's 126 inside).
+//!
+//! **Landlock.** The rule list mirrors the mounts, in mount order, each rule for the path as it appears INSIDE the
+//! sandbox (the shim opens them there): a bind's destination is a real directory or file bwrap made, never a symlink,
+//! even where the host's `/lib` is one, and it is the same inode as the source, so no resolving is needed; a
+//! `--ro-bind-try` source the host lacks leaves no path, and the shim skips that rule. Read+execute
+//! (`ro:`) for every read-only bind (the system set, `/etc` files, network files, dll dirs, gpu `/sys` parts, `ro`
+//! grants, the runtime executable); read-write (`rw:`: every right the kernel's ABI handles, device ioctls included)
+//! for what bwrap makes writable: `/proc`, bwrap's own `/dev` nodes and its `pts`/`shm` directories ([`DEV_RW`], not
+//! `/dev` itself: that would also allow creating entries in it), `/tmp`, the runtime dir, the gpu nodes, `rw`
+//! grants, the prefix and the home. The sockets, the X11 directory and the cookie get no rule of their own: they are
+//! inside `/tmp` or the runtime dir, and Landlock does not govern `connect` on a socket file (measured on ABI 8).
+//! bwrap's skeleton directories (the parents of a bound path) have no rule, so they cannot be listed inside.
+//!
 //! **Environment.** Exactly the finalized command's variables that `rt_core::allowed_env` or the Wine backend
 //! ([`BACKEND_ENV`]) may set (the launcher already filtered; re-applied here as defence in depth), minus those of a
 //! switch that is off (display: `DISPLAY WAYLAND_DISPLAY XAUTHORITY`; audio: `PULSE_SERVER`) and minus
@@ -65,6 +85,8 @@
 //! `get_envs`, `get_current_dir`). [`AppSandbox::skipped`], [`AppSandbox::caveats`] and
 //! [`AppSandbox::argv_preview`] each re-render; a launch computes the plan two or three times, which is cheap.
 use crate::host::Host;
+use crate::init::{self, InitArgs};
+use crate::landlock::{self, Rule};
 use crate::permissions::{
     Access, GrantCtx, Network, PermError, Permissions, account_home, related, validate_grant_for,
 };
@@ -104,6 +126,19 @@ pub const GPU_DEV: [&str; 5] = [
     "/dev/nvidia-modeset",
 ];
 const MAX_NVIDIA: u32 = 64;
+/// The nodes and directories of bwrap's own `--dev` that get a Landlock read-write rule (module docs, "Landlock").
+/// Not `/dev` itself: its symlinks (`fd`, `stdin`, `ptmx`, `core`) resolve elsewhere, and a rule on the directory
+/// would also allow creating and removing entries there.
+pub const DEV_RW: [&str; 8] = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+    "/dev/pts",
+    "/dev/shm",
+];
 /// What Mesa and the NVIDIA driver read besides the nodes (`/run/opengl-driver`: NixOS driver libraries).
 pub const GPU_RO: [&str; 4] = ["/sys/dev/char", "/sys/devices", "/sys/class/drm", "/run/opengl-driver"];
 /// What the Wine backend sets on its command (`backend-wine`'s `wine_command`), besides the host allowlist.
@@ -149,6 +184,18 @@ pub enum RenderError {
     GrantOverlap(String, String),
     #[error("the host directory grant {0:?} now resolves to another directory; grant it again")]
     GrantMoved(String),
+    #[error(
+        "the runtime executable (the sandbox's `sandbox-init` launcher) cannot be resolved, or it was replaced or deleted since this `runtime` started: run the command again"
+    )]
+    RuntimeExe,
+    #[error("the seccomp filter cannot be built: {0}")]
+    Seccomp(String),
+    #[error("the program {0:?} is not an absolute path")]
+    Program(String),
+    #[error("the runtime executable {0:?} is inside the runtime's data directory, which the sandbox never shows")]
+    RuntimeExeInData(String),
+    #[error("the sandbox launcher would refuse its arguments: {0}")]
+    Shim(init::InitError),
 }
 
 /// See the module docs. `ro_binds` are the backend's dll directories (bound read-only).
@@ -157,6 +204,10 @@ pub struct AppSandbox {
     perms: Permissions,
     ro_binds: Vec<PathBuf>,
     host: Arc<dyn Host>,
+    /// Test-only read-only binds WITHOUT a Landlock rule: a hole in the rule set on purpose, so a test can see
+    /// Landlock refuse what the mount layer exposes. Never in the production API.
+    #[cfg(test)]
+    pub(crate) hole: Vec<PathBuf>,
 }
 
 /// One rendering: the command, what was left out and what cannot be enforced.
@@ -255,6 +306,8 @@ impl AppSandbox {
             perms,
             ro_binds,
             host,
+            #[cfg(test)]
+            hole: Vec::new(),
         }
     }
 
@@ -342,6 +395,29 @@ impl AppSandbox {
         let p = &self.perms;
         // Grants first: a stale one refuses the whole run before anything else is looked at.
         let grants = self.grants(dirs.data_root.clone())?;
+        // The shim (module docs, "The shim"): fail closed here, not with a 126 from inside the sandbox.
+        let exe = self.host.runtime_exe().ok_or(RenderError::RuntimeExe)?;
+        if [&dirs.data_root, &self.host.resolve(&dirs.data_root).unwrap_or_default()]
+            .iter()
+            .any(|d| !d.as_os_str().is_empty() && exe.starts_with(d))
+        {
+            return Err(RenderError::RuntimeExeInData(lossy(&exe)));
+        }
+        crate::seccomp::host_arch()
+            .and_then(crate::seccomp::build_filter)
+            .map_err(|e| RenderError::Seccomp(e.to_string()))?;
+        if !plain_abs(Path::new(cmd.get_program())) {
+            return Err(RenderError::Program(lossy(Path::new(cmd.get_program()))));
+        }
+        // Landlock rules, in mount order, each for a path as it appears INSIDE (module docs, "Landlock").
+        let mut rules: Vec<Rule> = Vec::new();
+        let rule = |rules: &mut Vec<Rule>, path: &Path, access| {
+            rules.push(Rule {
+                path: path.to_path_buf(),
+                access,
+            })
+        };
+        use landlock::Access::{ReadExec as Ro, ReadWrite as Rw};
         let mut skipped = Vec::new();
         let mut caveats = Vec::new();
         let rt_env = env_of(cmd, "XDG_RUNTIME_DIR")
@@ -363,27 +439,40 @@ impl AppSandbox {
             out.arg("--unshare-net");
         }
         out.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-        let ro_try = |out: &mut Command, d: &Path| {
+        rule(&mut rules, Path::new("/proc"), Rw);
+        for d in DEV_RW {
+            rule(&mut rules, Path::new(d), Rw);
+        }
+        rule(&mut rules, Path::new("/tmp"), Rw);
+        // Every read-only bind is also a read-only rule, so the system binds and their rules come from one list.
+        let ro_try = |out: &mut Command, rules: &mut Vec<Rule>, d: &Path| {
             out.arg("--ro-bind-try").arg(d).arg(d);
+            rule(rules, d, Ro);
         };
         for d in RO_BINDS.iter().chain(&ETC_RO) {
-            ro_try(&mut out, Path::new(d));
+            ro_try(&mut out, &mut rules, Path::new(d));
         }
         if p.network == Network::Allow {
             for d in NET_RO {
-                ro_try(&mut out, Path::new(d));
+                ro_try(&mut out, &mut rules, Path::new(d));
             }
         }
         for d in &self.ro_binds {
-            ro_try(&mut out, d);
+            ro_try(&mut out, &mut rules, d);
         }
         // Empty and private: only what is bound below appears in it (bwrap creates the parent directories).
         out.args(["--perms", "0700", "--tmpfs"]).arg(&rt);
+        rule(&mut rules, &rt, Rw);
 
         // `<what> path <p> is not a socket`, or bound.
+        // The sockets, the X11 directory and the cookie get no rule of their own: they are inside `/tmp` or the
+        // runtime dir, whose rules already cover them (and Landlock does not govern `connect` on a socket file).
+        let bind_try = |out: &mut Command, d: &Path| {
+            out.arg("--ro-bind-try").arg(d).arg(d);
+        };
         let socket = |out: &mut Command, skipped: &mut Vec<String>, what: &str, s: &Path| {
             if self.host.is_socket(s) {
-                ro_try(out, s);
+                bind_try(out, s);
                 true
             } else {
                 skipped.push(format!(
@@ -417,7 +506,7 @@ impl AppSandbox {
             }
             if display.is_some() {
                 if self.host.exists(Path::new(X11_DIR)) {
-                    ro_try(&mut out, Path::new(X11_DIR));
+                    bind_try(&mut out, Path::new(X11_DIR));
                     caveats.push(X11_CAVEAT.to_owned());
                 } else {
                     skipped.push(format!("display: X11 socket directory {X11_DIR} does not exist"));
@@ -463,28 +552,46 @@ impl AppSandbox {
             }
             for n in &nodes {
                 out.arg("--dev-bind-try").arg(n).arg(n);
+                rule(&mut rules, n, Rw);
             }
             for d in GPU_RO {
-                ro_try(&mut out, Path::new(d));
+                ro_try(&mut out, &mut rules, Path::new(d));
             }
         }
         for (g, access) in &grants {
             out.arg(if *access == Access::Rw { "--bind" } else { "--ro-bind" })
                 .arg(g)
                 .arg(g);
+            rule(&mut rules, g, if *access == Access::Rw { Rw } else { Ro });
+        }
+        // The shim, at its own path; after the grants so none can replace it (a grant containing it is the same
+        // host file anyway), before the app's own dirs (a runtime inside a prefix is not a supported layout).
+        out.arg("--ro-bind").arg(&exe).arg(&exe);
+        rule(&mut rules, &exe, Ro);
+        #[cfg(test)]
+        for h in &self.hole {
+            out.arg("--ro-bind").arg(h).arg(h);
         }
         // Last, so no other mount can hide or replace them (module docs, "Mount order"); the resolved directory at
         // the launcher's path.
         out.arg("--bind").arg(&dirs.prefix_src).arg(&dirs.prefix_dst);
         out.arg("--bind").arg(&dirs.home_src).arg(&dirs.home_dst);
+        rule(&mut rules, &dirs.prefix_dst, Rw);
+        rule(&mut rules, &dirs.home_dst, Rw);
         // bwrap's new root is a writable tmpfs holding the skeleton directories of every mount point (the parents of
         // the prefix, i.e. the app root and data root paths, or the real home's path): without this a write to
         // `<app root>/permissions.toml` or `$HOME/x` "succeeds" in memory (found by the escape suite). Read-only root
         // mount only: the binds, `/tmp`, `/dev` (with `/dev/shm`) and the runtime dir are their own mounts.
         out.args(["--remount-ro", "/"]);
-        out.arg("--");
-        out.arg(cmd.get_program());
-        out.args(cmd.get_args());
+        let block = init::encode(&InitArgs {
+            landlock: rules,
+            program: PathBuf::from(cmd.get_program()),
+            argv: cmd.get_args().map(OsStr::to_owned).collect(),
+        });
+        // The shim's own check, here: too many rules (grants, NVIDIA nodes) or a path it would refuse is a render
+        // error, not a 126 from inside the sandbox.
+        init::parse(&block).map_err(RenderError::Shim)?;
+        out.arg("--").arg(&exe).arg("sandbox-init").args(block);
 
         // A new `Command` inherits THIS process's environment: clear it, then replay only what is allowed.
         out.env_clear();

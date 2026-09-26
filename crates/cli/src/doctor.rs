@@ -57,6 +57,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         _ => None,
     };
     let sandbox = crate::sandbox::doctor_state(sandbox_env.as_ref());
+    let hardening = crate::sandbox::doctor_hardening();
     let report = doctor(DoctorInput {
         subject: facts.subject,
         host_arch: std::env::consts::ARCH,
@@ -92,6 +93,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         }),
         d3d_routes: facts.d3d_routes.as_deref(),
         sandbox: sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
+        hardening: hardening.as_deref().map_err(String::as_str),
     });
     crate::emit(&if as_json {
         render_json(&report)?

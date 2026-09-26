@@ -4,9 +4,11 @@
 //! so a program that probes for a feature gets an ordinary error.
 //!
 //! **Program shape.** First the architecture: `seccomp_data.arch` must be this build's audit architecture, or the
-//! call fails with `EPERM`. On x86-64 that refuses the whole i386 ABI (`int 0x80`, a 32-bit ELF), whose syscall
-//! numbers differ and would slip past the table; Wine runs 32-bit Windows programs in 64-bit processes (new
-//! WoW64), so it never enters it. Then, on x86-64, any number with the x32 bit (`0x40000000`) set fails with
+//! call fails with `EPERM`. On x86-64 that refuses the i386 ABI (`int 0x80`, a 32-bit ELF), whose syscall
+//! numbers differ and would slip past the table, with ONE exception: i386 `set_thread_area` (243). Wine runs 32-bit
+//! Windows programs in 64-bit processes (new WoW64), but it allocates the 32-bit `%fs` TLS selector with that call
+//! through `int 0x80` (found by running `hello32.exe` under the filter: without it Wine 10.0 fails with "failed to
+//! allocate %fs selector" and crashes). It only sets a TLS descriptor of the calling thread. Then, on x86-64, any number with the x32 bit (`0x40000000`) set fails with
 //! `EPERM` (the x32 ABI shares the x86-64 audit architecture but numbers its calls differently; the same test also
 //! refuses a raw `syscall(-1)`, whose number has every bit set, which the kernel would answer with `ENOSYS`). Then each entry
 //! of [`DENIED`] is compared by number; an entry with an argument condition jumps to its own check. Everything
@@ -20,6 +22,16 @@
 //! `socket` rule is deliberately narrow: Wine uses `AF_UNIX`, `AF_INET`/`AF_INET6` and `AF_NETLINK` (routing, for
 //! adapter enumeration), which stay allowed, and neither architecture has the `socketcall` multiplexer.
 //! `io_uring_setup` is denied because io_uring requests never pass through seccomp.
+//!
+//! **`ptrace` and Landlock.** wineserver implements `ReadProcessMemory`/`WriteProcessMemory` on ANOTHER process
+//! (and so psapi's `GetModuleFileNameEx`, .NET's process list, debuggers) with `ptrace` (`PTRACE_ATTACH`,
+//! `PEEKDATA`/`POKEDATA`, `DETACH`; found by running the escape suite's `readmem`/`writemem` probes). So the shim
+//! builds one of two filters: [`build_filter`] (the table as written, `ptrace` always refused) when Landlock is
+//! unavailable, and [`build_filter_confined_ptrace`] when a Landlock domain is enforced, which lets exactly
+//! [`WINE_PTRACE`] through. Landlock refuses `ptrace` of any process outside the tracer's domain, i.e. anything but
+//! the program's own process tree (bubblewrap's own pid 1 inside the sandbox is dumpable, carries no filter, and
+//! would otherwise be a way around it on a host whose Yama `ptrace_scope` is 0). Every other request
+//! (`PTRACE_TRACEME`, `SEIZE`, `GETREGS`, ...) stays refused.
 //!
 //! | syscall | refused when | why |
 //! |---|---|---|
@@ -125,6 +137,10 @@ const AUDIT_ARCH_64BIT: u32 = 0x8000_0000;
 const AUDIT_ARCH_LE: u32 = 0x4000_0000;
 const AUDIT_ARCH_X86_64: u32 = libc::EM_X86_64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
 const AUDIT_ARCH_AARCH64: u32 = libc::EM_AARCH64 as u32 | AUDIT_ARCH_64BIT | AUDIT_ARCH_LE;
+/// i386's audit architecture (`int 0x80` on x86-64) and its `set_thread_area` number (`<asm/unistd_32.h>`), the only
+/// i386 call the filter allows (module docs).
+const AUDIT_ARCH_I386: u32 = libc::EM_386 as u32 | AUDIT_ARCH_LE;
+pub const I386_SET_THREAD_AREA: u32 = 243;
 /// x86-64's `__X32_SYSCALL_BIT` (libc defines it only for the x32 target itself).
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
@@ -138,6 +154,17 @@ const CLONE_NEW_ANY: u32 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNET
     | libc::CLONE_NEWTIME) as u32;
+/// The `ptrace` requests wineserver's cross-process memory and thread-context code makes, allowed only by
+/// [`build_filter_confined_ptrace`] (module docs).
+pub const WINE_PTRACE: &[u32] = &[
+    libc::PTRACE_PEEKDATA,
+    libc::PTRACE_PEEKUSER,
+    libc::PTRACE_POKEDATA,
+    libc::PTRACE_POKEUSER,
+    libc::PTRACE_CONT,
+    libc::PTRACE_ATTACH,
+    libc::PTRACE_DETACH,
+];
 /// `<linux/personality.h>` values libc lacks: `PER_LINUX` (0), `PER_LINUX32` and the query value.
 const PERSONALITY_ALLOWED: &[u32] = &[0, 0x0008, 0xffff_ffff];
 
@@ -440,17 +467,29 @@ pub fn host_arch() -> Result<Arch, SeccompError> {
     BUILT_FOR.ok_or(SeccompError::UnsupportedArch(std::env::consts::ARCH))
 }
 
-/// The filter program for `arch`, which must be the architecture this build's syscall numbers belong to. There is
-/// no way to let the i386 ABI through: Wine's 32-bit programs do not need it, and it would need an i386 copy of
-/// the deny-list.
+/// The filter program for `arch`, which must be the architecture this build's syscall numbers belong to. Of the
+/// i386 ABI only [`I386_SET_THREAD_AREA`] gets through (module docs).
 pub fn build_filter(arch: Arch) -> Result<Vec<SockFilter>, SeccompError> {
+    build(arch, false)
+}
+
+/// [`build_filter`] with `ptrace` allowed for the [`WINE_PTRACE`] requests only. For a process confined by an
+/// enforced Landlock domain ONLY (module docs): Landlock is what keeps those requests inside the program's own
+/// process tree.
+pub fn build_filter_confined_ptrace(arch: Arch) -> Result<Vec<SockFilter>, SeccompError> {
+    build(arch, true)
+}
+
+fn build(arch: Arch, confined_ptrace: bool) -> Result<Vec<SockFilter>, SeccompError> {
     if BUILT_FOR != Some(arch) {
         return Err(SeccompError::UnsupportedArch(arch.name()));
     }
     let mut b = Builder::default();
     let (deny, nosys, allow) = (b.label(), b.label(), b.label());
+    let i386 = b.label();
     b.stmt(LD_W_ABS, ARCH);
-    b.jump(JEQ, arch.audit(), None, Some(deny));
+    let other_arch = if arch == Arch::X86_64 { i386 } else { deny };
+    b.jump(JEQ, arch.audit(), None, Some(other_arch));
     b.stmt(LD_W_ABS, NR);
     if arch == Arch::X86_64 {
         // Also refuses a raw `syscall(-1)` (every bit set), harmlessly: the kernel would answer ENOSYS anyway.
@@ -458,7 +497,15 @@ pub fn build_filter(arch: Arch) -> Result<Vec<SockFilter>, SeccompError> {
     }
     let mut checks = Vec::new();
     for d in DENIED {
-        let target = match d.when {
+        let when = if confined_ptrace && d.nr == libc::SYS_ptrace {
+            When::ArgNotIn {
+                arg: 0,
+                values: WINE_PTRACE,
+            }
+        } else {
+            d.when
+        };
+        let target = match when {
             When::Always => deny,
             When::NoSys => nosys,
             when => {
@@ -494,6 +541,13 @@ pub fn build_filter(arch: Arch) -> Result<Vec<SockFilter>, SeccompError> {
             }
             When::Always | When::NoSys => unreachable!("numbers only"),
         }
+    }
+    b.bind(i386);
+    if arch == Arch::X86_64 {
+        // The accumulator still holds the arch.
+        b.jump(JEQ, AUDIT_ARCH_I386, None, Some(deny));
+        b.stmt(LD_W_ABS, NR);
+        b.jump(JEQ, I386_SET_THREAD_AREA, Some(allow), Some(deny));
     }
     b.bind(deny);
     b.stmt(RET, RET_EPERM);

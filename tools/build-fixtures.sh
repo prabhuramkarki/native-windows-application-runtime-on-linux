@@ -18,7 +18,7 @@ for arch in x86_64 i686; do
   if [ "$arch" = x86_64 ]; then
     "$cc" $flags -o "$out/d3d11_64.exe" tools/fixtures/d3d11.c -ld3d11 -ldxgi -ldxguid
     # The sandbox escape probe (e2e_sandbox.rs).
-    "$cc" $flags -o "$out/probe64.exe" tools/fixtures/probe.c -lws2_32
+    "$cc" $flags -o "$out/probe64.exe" tools/fixtures/probe.c -lws2_32 -lntdll
   fi
   rm -f "$out/hello$tag.res.o"
 done
