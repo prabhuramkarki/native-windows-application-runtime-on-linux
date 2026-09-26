@@ -1,0 +1,18 @@
+# runtimed's socket, for systemd socket activation (a user unit). Not installed by the build: copy this file and
+# runtimed.service to ~/.config/systemd/user/, then `systemctl --user enable --now runtimed.socket`.
+#
+# The daemon checks what it inherits (LISTEN_PID, exactly one fd, a listening Unix stream socket) and refuses
+# anything else. The socket file belongs to this unit: runtimed never removes an inherited socket.
+[Unit]
+Description=runtime read-only API socket
+
+[Socket]
+ListenStream=%t/runtime/runtimed.sock
+SocketMode=0600
+DirectoryMode=0700
+# One daemon serves every connection (it limits them itself); never one process per connection.
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
