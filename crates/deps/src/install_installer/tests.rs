@@ -125,6 +125,18 @@ fn require_real_bwrap() -> Option<PathBuf> {
     }
 }
 
+/// The installer sandbox for `bwrap`: its shim is the built `runtime` ([`crate::test_runtime_exe`]), except with
+/// [`NO_RUN_BWRAP`], where nothing may run: then any real file passes the pre-flight check (this test binary), and
+/// the missing bwrap is what keeps anything from running.
+fn sandbox(bwrap: &Path) -> InstallerSandbox {
+    let exe = if bwrap == Path::new(NO_RUN_BWRAP) {
+        std::env::current_exe().unwrap()
+    } else {
+        crate::test_runtime_exe()
+    };
+    InstallerSandbox::new(bwrap, exe)
+}
+
 fn run_with(f: &Fx, p: &Package, b: &FakeBackend, bwrap: &Path) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     install_with(
         p,
@@ -132,7 +144,7 @@ fn run_with(f: &Fx, p: &Package, b: &FakeBackend, bwrap: &Path) -> Result<Instal
         &f.env,
         b,
         &launcher(),
-        Some(bwrap.to_path_buf()),
+        Some(sandbox(bwrap)),
         Duration::from_secs(60),
     )
 }
@@ -669,7 +681,7 @@ fn a_cache_file_of_the_wrong_size_or_a_symlink_is_refused() {
         &f.env,
         &backend(MAKE_MARKER),
         &launcher(),
-        Some(NO_RUN_BWRAP.into()),
+        Some(sandbox(Path::new(NO_RUN_BWRAP))),
         Duration::from_secs(5),
     )
     .unwrap_err();
@@ -804,7 +816,7 @@ fn a_hanging_installer_is_killed_at_the_deadline() {
         &f.env,
         &b,
         &launcher(),
-        Some(bwrap),
+        Some(sandbox(&bwrap)),
         Duration::from_secs(1),
     )
     .unwrap_err();
@@ -1088,7 +1100,7 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
             &env,
             &backend,
             &launcher,
-            Some(bwrap.clone()),
+            Some(sandbox(&bwrap)),
             INSTALLER_DEADLINE,
         )
         .unwrap();
@@ -1178,7 +1190,7 @@ impl RealWine {
             &self.env,
             &self.backend,
             &self.launcher,
-            Some(bwrap),
+            Some(sandbox(&bwrap)),
             deadline,
         )
     }
@@ -1303,7 +1315,16 @@ fn e2e_real_wine_an_installer_registered_service_never_runs_outside_the_sandbox_
         *dll_overrides = vec!["rtdepsx".into()];
     }
     let bwrap = rt_installer::find_bwrap_on_path().expect("bwrap must be installed");
-    let got = install_with(&p, &cache, &env, &backend, &launcher, Some(bwrap), INSTALLER_DEADLINE).unwrap();
+    let got = install_with(
+        &p,
+        &cache,
+        &env,
+        &backend,
+        &launcher,
+        Some(sandbox(&bwrap)),
+        INSTALLER_DEADLINE,
+    )
+    .unwrap();
     eprintln!("sc as installer: {got:?}");
     assert!(got.marker_confirmed);
     let user = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
@@ -1362,7 +1383,7 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
     backend.stop(&env).unwrap();
     assert!(!marker_present(&env, marker).unwrap(), "marker in a fresh prefix");
     let t = std::time::Instant::now();
-    let got = install_installer_pkg(vc, &file, &env, &backend, &launcher).unwrap();
+    let got = install_installer_pkg(vc, &file, &env, &backend, &launcher, &crate::test_runtime_exe()).unwrap();
     eprintln!("vcrun2022: {got:?} in {:?}", t.elapsed());
     assert!(got.marker_confirmed && got.staged_removed);
     assert!(marker_present(&env, marker).unwrap(), "marker absent after the run");
@@ -1523,4 +1544,82 @@ fn cleanup_leaves_a_directory_the_installer_put_at_the_staged_path() {
     assert!(!got.staged_removed);
     assert!(got.warnings.iter().any(|w| w.contains("staged")), "{:?}", got.warnings);
     assert!(f.c("windows/temp/rt-deps/testpkg/testpkg.exe").is_dir());
+}
+
+/// Phase 5B Task 6 fix round 1: a runtime executable the installer sandbox cannot use is a typed refusal that names
+/// the reason, before anything is staged or run (never `NonZeroAndNoMarker { code: 126 }`), and the orchestrator
+/// reports it as "nothing ran", not as a vendor installer's partial state.
+#[test]
+fn an_unusable_runtime_executable_is_refused_before_anything_is_staged() {
+    let f = fx(BODY);
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    let err = install_with(
+        &p,
+        &f.cache,
+        &f.env,
+        &backend(MAKE_MARKER),
+        &launcher(),
+        Some(InstallerSandbox::new(NO_RUN_BWRAP, "runtime")),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(matches!(err, InstallerPkgError::SandboxRefused(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("not an absolute path") && text.contains("nothing was run"),
+        "{text}"
+    );
+    assert!(!f.ran());
+    assert!(!f.staging_left());
+}
+
+/// Phase 5B final review IMPORTANT 1: the installer sandbox has read-write access to the prefix, so a vendor
+/// installer package marks the app "ran sandboxed" (`rt_sandbox::MARKER` in the app root, which no sandbox binds)
+/// BEFORE its Windows code starts and before every `reg.exe` override step, so the app's later Wine helpers run
+/// sandboxed too. Here: the marker is present after a successful install with overrides, and it was written before
+/// the reg steps (the installer command comes first in the log, and the marker is written before each sandboxed
+/// command).
+#[test]
+fn a_successful_installer_package_marks_the_app_ran_sandboxed_before_its_reg_steps() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let marker = f.env.root().join("ran-sandboxed"); // rt_sandbox::MARKER
+    assert!(!marker.exists(), "not marked before the install");
+    let b = reg_backend(&f, "exit 0", MAKE_MARKER);
+    let p = pkg_with_overrides(&["/S"], &["vcruntime140"], &["vcruntime140"]);
+    let got = run_with(&f, &p, &b, &bwrap).unwrap();
+    assert!(got.marker_confirmed);
+    assert!(
+        marker.exists(),
+        "the app root must be marked (rt_sandbox::MARKER) after a sandboxed installer package install"
+    );
+    // The installer command ran first, then the reg override: the marker (written before every sandboxed command)
+    // was therefore set before the reg step.
+    let calls = b.calls();
+    let cmds: Vec<&Call> = calls.iter().filter(|c| matches!(c, Call::Command { .. })).collect();
+    assert!(
+        matches!(cmds[0], Call::Command { exe, .. } if exe.ends_with(EXPLORER_RELATIVE)),
+        "{cmds:?}"
+    );
+    assert!(
+        reg_calls(&b).contains(&"add vcruntime140".to_owned()),
+        "{:?}",
+        reg_calls(&b)
+    );
+}
+
+/// The mark fails closed: if the app root is read-only when the installer would run, nothing runs.
+#[test]
+fn a_marker_that_cannot_be_written_stops_the_install() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    fs::set_permissions(f.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    let err = run_with(&f, &p, &backend(MAKE_MARKER), &bwrap).unwrap_err();
+    fs::set_permissions(f.env.root(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&err, InstallerPkgError::Sandbox(m) if m.contains("runs sandboxed")),
+        "{err:?}"
+    );
+    assert!(!f.ran(), "nothing ran when the marker could not be written");
 }

@@ -9,7 +9,9 @@
 //! command's `WINEPREFIX` and refuses a command of another shape, so a profile loaded for one app can never be
 //! rendered around another's prefix. [`RunSandbox`] renders BEFORE the spawn (`Sandbox::try_wrap`: a refusal is
 //! an error, never the fail-closed stub), prints what the profile cannot enforce (`note: ...`, one line each) and
-//! records [`MARKER`].
+//! records [`MARKER`]. The profile's resource limits wrap the run in a `systemd-run --user` scope (`rt_sandbox`'s
+//! renderer, "Limits"); whether scopes work is probed once per command (`RealHost::scopes`) and shown by `runtime
+//! sandbox` (a `limits:` section) and `doctor` (one check, a warning at worst).
 //!
 //! **Helpers in a prefix the app has written.** A sandboxed program can write its own prefix: registry `Run` keys
 //! and services, `DllOverrides` naming a native DLL it dropped. The next Wine session in that prefix runs them, and
@@ -22,16 +24,14 @@
 use crate::CmdError;
 use crate::safe::safe;
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
-use rt_sandbox::{Access, AppSandbox, Network, Permissions, RealHost, load, load_opt_raw};
+use rt_sandbox::{Access, AppSandbox, Host, Limits, Network, Permissions, RealHost, Tasks, load, load_opt_raw};
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-/// In the app root: this app has run in the sandbox at least once (module docs).
-pub(crate) const MARKER: &str = "ran-sandboxed";
+/// In the app root: sandboxed Windows code has run in this app's prefix (module docs; `rt_sandbox::MARKER`).
+pub(crate) use rt_sandbox::MARKER;
 
 const INSTALL_HINT: &str =
     "Install bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)";
@@ -77,12 +77,13 @@ fn summary(p: &Permissions) -> String {
     )
 }
 
-/// The sandbox of `runtime run` for `found` (module docs), or the error that stops the run.
+/// The sandbox of `runtime run` for `found` (module docs), or the error that stops the run, and whether it sets a
+/// memory limit (a run it renders then has one: an explicit limit is applied or the run is refused).
 pub(crate) fn for_run(
     store: &Store,
     found: &Target,
     backend: &dyn CompatBackend,
-) -> Result<Arc<dyn Sandbox>, CmdError> {
+) -> Result<(Arc<dyn Sandbox>, bool), CmdError> {
     let bwrap = working_bwrap().map_err(|why| format!("cannot start the sandbox: {why}. {INSTALL_HINT}"))?;
     let perms = match found {
         Target::Installed(id) => {
@@ -92,7 +93,8 @@ pub(crate) fn for_run(
         }
         Target::File(_) => Permissions::default(),
     };
-    Ok(Arc::new(RunSandbox(app_sandbox(bwrap, perms, backend))))
+    let memory = perms.limits.memory_mb.is_some();
+    Ok((Arc::new(RunSandbox(app_sandbox(bwrap, perms, backend))), memory))
 }
 
 /// `runtime run`'s sandbox: [`AppSandbox`] plus the notes and the marker (module docs).
@@ -105,20 +107,15 @@ impl Sandbox for RunSandbox {
 
     fn try_wrap(&self, cmd: Command) -> Result<Command, String> {
         let out = self.0.render(&cmd).map_err(|e| e.to_string())?;
+        print_hardening_caveat();
         for c in self.0.caveats(&cmd) {
             eprintln!("note: {}", safe(&c));
         }
         // `render` accepted the shape `<root>/prefix`, so the parent is the app root.
         let root = env_of(&cmd, "WINEPREFIX").and_then(|p| Path::new(p).parent());
-        let marked = root.ok_or_else(|| "no app root".to_owned()).and_then(|r| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(r.join(MARKER))
-                .map_err(|e| e.to_string())
-        });
+        let marked = root
+            .ok_or_else(|| "no app root".to_owned())
+            .and_then(|r| rt_sandbox::mark(r).map_err(|e| e.to_string()));
         marked.map_err(|e| format!("cannot record that the app runs sandboxed ({e})"))?;
         Ok(out)
     }
@@ -141,7 +138,8 @@ pub(crate) fn helper_launcher(
     }
     let refuse = |why: String| {
         format!(
-            "{} has run in the sandbox, so its Wine helpers must run sandboxed too, but {why}; nothing was changed",
+            "{} has run in the sandbox (its prefix was written by a sandboxed program or installer), so its Wine helpers \
+             must run sandboxed too, but {why}; nothing was changed",
             env.id()
         )
     };
@@ -160,6 +158,103 @@ fn marked(lstat: std::io::Result<std::fs::Metadata>) -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `doctor`'s hardening input: seccomp and Landlock in one phrase, `Err` when either is not fully there.
+pub(crate) fn doctor_hardening() -> Result<String, String> {
+    let h = rt_sandbox::hardening();
+    let text = match &h.caveat {
+        // First, so the 300-byte cut never drops it.
+        Some(c) => format!("{c}; {}; {}", h.seccomp, h.landlock),
+        None => format!("{}; {}", h.seccomp, h.landlock),
+    };
+    if h.complete && h.caveat.is_none() {
+        Ok(text)
+    } else {
+        Err(text)
+    }
+}
+
+/// The one-line hardening caveat to print at the start of any command that runs Windows code (`rt_sandbox::hardening`
+/// finds it): on a host with no Landlock and Yama `ptrace_scope` 0 the seccomp filter can be shed through
+/// `/proc/1/mem` ([`rt_sandbox::BYPASS_CAVEAT`]). `None` when the host has no such gap. Pure (takes the probed
+/// `Hardening`) so it is unit-tested without the host.
+fn hardening_note(h: &rt_sandbox::Hardening) -> Option<String> {
+    h.caveat.as_deref().map(|c| format!("note: {}", safe(c)))
+}
+
+/// Prints [`hardening_note`] for this host, if any, once. Called at the start of a run and of every command that runs
+/// Windows code in the installer sandbox, so the caveat is not buried in `doctor`/`runtime sandbox` alone.
+pub(crate) fn print_hardening_caveat() {
+    if let Some(note) = hardening_note(&rt_sandbox::hardening()) {
+        eprintln!("{note}");
+    }
+}
+
+/// `runtime sandbox`'s limits section: whether scopes work here, then each limit and where it comes from.
+fn limits_section(l: &Limits, scopes: &Result<rt_sandbox::ScopeSupport, String>) -> String {
+    let mut out = match scopes {
+        Ok(s) => format!(
+            "limits: systemd-run --user works ({}; cgroup controllers: {})\n",
+            safe(&s.systemd_run.to_string_lossy()),
+            safe(&s.controllers.join(" "))
+        ),
+        Err(why) => format!("limits: UNAVAILABLE: {}\n", safe(why)),
+    };
+    let set = "permissions.toml, mandatory";
+    out += &match l.tasks {
+        Tasks::Default => format!("  tasks: {} (default, best effort)\n", rt_sandbox::DEFAULT_TASKS),
+        Tasks::Max(n) => format!("  tasks: {n} ({set})\n"),
+        Tasks::Unlimited => "  tasks: no limit (permissions.toml)\n".to_owned(),
+    };
+    out += &match l.memory_mb {
+        Some(m) => format!("  memory: {m} MiB, no swap ({set})\n"),
+        None => "  memory: no limit\n".to_owned(),
+    };
+    out += &match l.cpu_percent {
+        Some(c) => format!("  cpu: {c}% of one CPU ({set})\n"),
+        None => "  cpu: no limit\n".to_owned(),
+    };
+    out
+}
+
+/// `doctor`'s limits input: `systemd-run --user` scopes work, or why not and what that means (with `env`: for that
+/// app, whose explicit limits then refuse every run).
+pub(crate) fn doctor_limits(env: Option<&AppEnv>) -> Result<String, String> {
+    // An unreadable profile is the sandbox check's warning; here it counts as the default.
+    let limits = env
+        .and_then(|e| profile(e).ok())
+        .map(|(p, _)| p.limits)
+        .unwrap_or_default();
+    let refused = |e: &AppEnv| format!("runs of {} will be refused", e.id());
+    let not_applied = "the default task limit (fork-bomb guard) is not applied";
+    match RealHost.scopes() {
+        Ok(s) => match limits
+            .controllers()
+            .into_iter()
+            .find(|c| !s.controllers.iter().any(|h| h == c))
+        {
+            None => Ok(format!(
+                "limits: systemd-run --user available (cgroup controllers: {})",
+                s.controllers.join(" ")
+            )),
+            Some(c) => Err(match env {
+                Some(e) if limits.explicit() => format!(
+                    "limits: systemd-run --user available, but {}: the {c} cgroup controller is not available to \
+                     your user session",
+                    refused(e)
+                ),
+                _ => format!("limits: the {c} cgroup controller is not available to your user session; {not_applied}"),
+            }),
+        },
+        Err(why) => Err(match env {
+            Some(e) if limits.explicit() => format!(
+                "limits: unavailable: {why}; {} (its permissions.toml sets limits)",
+                refused(e)
+            ),
+            _ => format!("limits: unavailable: {why}; {not_applied}"),
+        }),
     }
 }
 
@@ -195,12 +290,27 @@ pub fn run(app: &str) -> Result<(), CmdError> {
             rt_sandbox::find_bwrap_on_path().unwrap_or_else(|| PathBuf::from("bwrap"))
         }
     };
+    let h = rt_sandbox::hardening();
+    out += &format!("{}\n{}\n", safe(&h.seccomp), safe(&h.landlock));
+    if let Some(c) = &h.caveat {
+        out += &format!("note: {}\n", safe(c));
+    }
+    match RealHost.runtime_exe() {
+        Some(exe) => {
+            out += &format!(
+                "shim: {} sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)\n",
+                safe(&exe.to_string_lossy())
+            )
+        }
+        None => out += "shim: UNAVAILABLE: the runtime executable cannot be resolved; `runtime run` refuses\n",
+    }
     let (perms, source) = profile(&env)?;
     out += &format!("profile ({source}): {}\n", summary(&perms));
     for g in &perms.filesystem {
         let access = if g.access == Access::Rw { "rw" } else { "ro" };
         out += &format!("  host directory {} ({access})\n", safe(&g.path.to_string_lossy()));
     }
+    out += &limits_section(&perms.limits, &RealHost.scopes());
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(&store, env.id(), backend_wine::BACKEND_ID)?;
     // The command `run` builds (backend command, settled, host environment rules); without Wine, its shape.
@@ -259,6 +369,16 @@ mod tests {
             Ok(true),
             "a directory counts as marked"
         );
+    }
+
+    #[test]
+    fn the_hardening_note_is_shown_only_when_the_host_has_the_bypass_gap() {
+        let mut h = rt_sandbox::hardening();
+        h.caveat = Some(rt_sandbox::BYPASS_CAVEAT.to_owned());
+        let note = hardening_note(&h).expect("a note when the caveat is present");
+        assert!(note.starts_with("note: ") && note.contains(rt_sandbox::BYPASS_CAVEAT));
+        h.caveat = None;
+        assert_eq!(hardening_note(&h), None);
     }
 
     #[test]

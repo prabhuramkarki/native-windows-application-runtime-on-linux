@@ -11,7 +11,7 @@
 //! [`MAX_DLL_DIRS`] Wine directories); a check text is at most 300 characters, a list of names (the import and the
 //! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
 //! code, not by the input: one Graphics session check, one Vulkan check, one more for the app's graphics driver setting (an
-//! app report only: its setting, or why it could not be read), one Audio check, one Runtime check for the sandbox, at most one Runtime check for a
+//! app report only: its setting, or why it could not be read), one Audio check, three Runtime checks for the sandbox (bubblewrap, then seccomp and Landlock, then resource limits), at most one Runtime check for a
 //! managed (.NET) program and at most [`MAX_D3D_ROUTES`] (5) Graphics checks that predict the Direct3D route per
 //! family (an installed app report only: `d3d_routes`).
 //!
@@ -220,6 +220,14 @@ pub struct DoctorInput<'a> {
     /// `cannot read the profile: ...`); `run` then refuses
     /// unless `--unsandboxed`. One Runtime check.
     pub sandbox: Result<Option<&'a str>, &'a str>,
+    /// The sandbox's in-kernel hardening as one phrase (`seccomp: enforced (x86_64, 63 rules); landlock: ABI 8
+    /// (fs)`): `Ok` all there, `Err` something is missing or failing (Landlock unavailable, a probe error). One
+    /// Runtime check.
+    pub hardening: Result<&'a str, &'a str>,
+    /// Whether the sandbox's resource limits (`systemd-run --user` scopes) can be applied, as one phrase (`limits:
+    /// systemd-run --user available (...)`): `Ok` they can, `Err` why not and what that means for runs. One Runtime
+    /// check, a warning at worst (like an unreadable profile).
+    pub limits: Result<&'a str, &'a str>,
 }
 
 /// A Direct3D family an app imports.
@@ -395,6 +403,14 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     }
     wine(&input, &mut out);
     sandbox(&input, &mut out);
+    match input.hardening {
+        Ok(text) => out.add(Area::Runtime, Status::Ok, clean(text, 300)),
+        Err(text) => out.add(Area::Runtime, Status::Warn, clean(text, 300)),
+    }
+    match input.limits {
+        Ok(text) => out.add(Area::Runtime, Status::Ok, clean(text, 300)),
+        Err(text) => out.add(Area::Runtime, Status::Warn, clean(text, 300)),
+    }
     vulkan(&input, &mut out);
     display(&input, &mut out);
     graphics_setting(&input, &mut out);

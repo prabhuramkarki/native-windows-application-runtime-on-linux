@@ -49,6 +49,11 @@ fn require_real_bwrap() -> Option<std::path::PathBuf> {
     }
 }
 
+/// This test binary: it runs the real `sandbox-init` shim (`crate::sandbox`'s `TEST_SHIM`).
+fn runtime_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap()
+}
+
 fn launcher() -> Launcher {
     Launcher::with_host_env([("PATH", "/usr/bin:/bin")])
 }
@@ -144,7 +149,14 @@ fn no_uninstall_command_recorded_is_none_with_no_warnings() {
         "gui",
     );
     assert_eq!(portable.installer, None);
-    let outcome = uninstall(&backend, &launcher(), &env, &portable, SandboxOpts::default());
+    let outcome = uninstall(
+        &backend,
+        &launcher(),
+        &env,
+        &portable,
+        SandboxOpts::default(),
+        &runtime_exe(),
+    );
     assert_eq!(outcome, UninstallOutcome::default());
     assert_eq!(outcome.uninstaller_succeeded, None);
     assert!(outcome.warnings.is_empty());
@@ -158,6 +170,7 @@ fn no_uninstall_command_recorded_is_none_with_no_warnings() {
         &env,
         &with_family_no_command,
         SandboxOpts::default(),
+        &runtime_exe(),
     );
     assert_eq!(outcome, UninstallOutcome::default());
 }
@@ -170,7 +183,7 @@ fn an_unresolvable_uninstall_command_is_a_warning_not_a_panic() {
     let backend = FakeBackend::new();
     for bad in ["", "   ", "D:\\outside\\uninstall.exe", "not-even-a-windows-path"] {
         let md = md_with_uninstall(&env, Some(bad));
-        let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+        let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
         assert_eq!(outcome.uninstaller_succeeded, Some(false), "{bad:?}: {outcome:?}");
         assert_eq!(outcome.warnings.len(), 1, "{bad:?}: {outcome:?}");
     }
@@ -181,7 +194,7 @@ fn a_command_naming_a_missing_program_is_a_warning_not_a_panic() {
     let (_tmp, env) = env_with_msiexec();
     let backend = FakeBackend::new();
     let md = md_with_uninstall(&env, Some("C:\\Program Files\\t\\does-not-exist.exe"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false));
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
 }
@@ -194,7 +207,7 @@ fn a_real_msiexec_uninstall_command_runs_sandboxed_and_reports_success() {
     let (_tmp, env) = env_with_msiexec();
     let backend = fake_backend("exit 0");
     let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(true), "{outcome:?}");
     assert!(outcome.warnings.is_empty(), "{outcome:?}");
 }
@@ -208,7 +221,7 @@ fn a_real_exe_uninstall_command_that_fails_reports_failure_not_a_panic() {
     fs::write(uninstaller.join("uninstall.exe"), b"MZ").unwrap();
     let backend = fake_backend("exit 7");
     let md = md_with_uninstall(&env, Some("\"C:\\Program Files\\t\\uninstall.exe\" /S"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
     assert!(outcome.warnings[0].contains("exited with"), "{outcome:?}");
@@ -223,7 +236,131 @@ fn missing_bwrap_is_a_warning_not_a_panic() {
     let (_tmp, env) = env_with_msiexec();
     let backend = FakeBackend::new();
     let md = md_with_uninstall(&env, Some("C:\\Windows\\..\\..\\etc\\passwd"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false));
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
+}
+
+/// Phase 5B Task 6 fix round 1: an unusable runtime executable is reported as the sandbox's refusal, and the
+/// uninstaller is never started.
+#[test]
+fn an_unusable_runtime_executable_is_reported_as_the_sandboxs_refusal_and_nothing_runs() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let backend = fake_backend("exit 0");
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    let outcome = uninstall(
+        &backend,
+        &launcher(),
+        &env,
+        &md,
+        opts_for(&backend),
+        Path::new("runtime"),
+    );
+    assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("refused") && w.contains("not an absolute path")),
+        "{outcome:?}"
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, rt_core::Call::Command { .. })),
+        "{:?}",
+        backend.calls()
+    );
+}
+
+/// A backend that records, at each `command()` (the step right before the uninstaller is spawned), whether the app
+/// root already held the `ran-sandboxed` marker.
+struct MarkerProbe {
+    inner: FakeBackend,
+    seen: std::sync::Mutex<Vec<bool>>,
+}
+
+impl CompatBackend for MarkerProbe {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn version(&self) -> Result<String, rt_core::BackendError> {
+        self.inner.version()
+    }
+    fn prepare(&self, env: &AppEnv) -> Result<(), rt_core::BackendError> {
+        self.inner.prepare(env)
+    }
+    fn command(
+        &self,
+        env: &AppEnv,
+        exe: &std::path::Path,
+        cwd: &std::path::Path,
+        args: &[OsString],
+        opts: &RunOpts,
+    ) -> Result<std::process::Command, rt_core::BackendError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(env.root().join(rt_sandbox::MARKER).exists());
+        self.inner.command(env, exe, cwd, args, opts)
+    }
+    fn stop(&self, env: &AppEnv) -> Result<(), rt_core::BackendError> {
+        self.inner.stop(env)
+    }
+    fn dll_dirs(&self) -> Vec<PathBuf> {
+        self.inner.dll_dirs()
+    }
+}
+
+/// Phase 5B final review: the vendor uninstaller runs sandboxed Windows code with a read-write prefix, so the app is
+/// marked BEFORE the uninstaller command is built and spawned.
+#[test]
+fn the_app_is_marked_before_the_uninstaller_starts() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let inner = fake_backend("exit 0");
+    let opts = opts_for(&inner);
+    let backend = MarkerProbe {
+        inner,
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    assert!(!env.root().join(rt_sandbox::MARKER).exists());
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts, &runtime_exe());
+    assert_eq!(outcome.uninstaller_succeeded, Some(true), "{outcome:?}");
+    assert_eq!(
+        *backend.seen.lock().unwrap(),
+        [true],
+        "marked before the uninstaller command"
+    );
+}
+
+/// The mark fails closed: when it cannot be written, the uninstaller is never started.
+#[test]
+fn a_marker_that_cannot_be_written_prevents_the_uninstaller() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let backend = fake_backend("exit 0");
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    fs::set_permissions(env.root(), std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
+    fs::set_permissions(env.root(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not record") && w.contains("was not run")),
+        "{outcome:?}"
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, rt_core::Call::Command { .. })),
+        "{:?}",
+        backend.calls()
+    );
 }

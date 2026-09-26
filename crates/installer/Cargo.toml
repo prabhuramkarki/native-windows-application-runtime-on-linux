@@ -12,6 +12,8 @@ name = "rt_installer"
 runtime-core = { path = "../core" }
 runtime-pe = { path = "../pe" }
 runtime-desktop = { path = "../desktop" }
+# The `sandbox-init` shim's argument block, Landlock rules and refusal (the same code as the app sandbox).
+runtime-sandbox = { path = "../sandbox" }
 thiserror.workspace = true
 libc.workspace = true
 

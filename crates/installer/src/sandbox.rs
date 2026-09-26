@@ -17,15 +17,39 @@
 //! The prefix bind and the `$HOME` tmpfs are ordered relative to each other at runtime (never a fixed order):
 //! see [`InstallerSandbox::wrap`]'s own comment on why.
 //!
+//! **The shim (Phase 5B Task 6).** bwrap does not start the program itself: it starts `<runtime exe> sandbox-init
+//! --v1 <rules> -- <program> <args>`, the same `rt_sandbox::init` shim as the app sandbox (its encoder, its parser
+//! as a render-time check, its Landlock and seccomp code): `RLIMIT_CORE = 0`, the Landlock rules (best effort), the
+//! seccomp deny-list (mandatory; `ptrace` only for Wine's requests and only inside an enforced Landlock domain), then
+//! `execve` of the ORIGINAL program and arguments. The runtime executable is an explicit input of the only
+//! constructor ([`InstallerSandbox::new`]; the CLI passes its `current_exe()`), bound read-only at its resolved path
+//! after the system binds and before the prefix. One that is not absolute, was replaced or deleted, does not resolve
+//! to a file or lies inside the data directory makes [`InstallerSandbox::wrap`] return `rt_sandbox`'s refusal
+//! command (exit 126, the reason on stderr): an installer never runs without the shim.
+//!
+//! **Landlock rules** mirror the mounts, in mount order, each for its path as it appears INSIDE the sandbox (a bind's
+//! destination is a real directory bwrap made even where the host's `/lib` is a symlink to `/usr/lib`; the same
+//! inode, so no resolving is needed, exactly as the app renderer): read-write for `/proc` (as bwrap mounts it, like
+//! the app sandbox), bwrap's own `/dev` nodes and its `pts`/`shm` directories (`rt_sandbox::render::DEV_RW`; not
+//! `/dev` itself, and not `/dev/ptmx`, a symlink to `pts/ptmx` that the `pts` rule covers), `/tmp`, the prefix and
+//! the `$HOME` tmpfs; read-execute for [`RO_BINDS`], [`SandboxOpts::extra_ro_binds`] and the runtime executable.
+//! Nothing else: no display, audio, GPU, `/sys` or `/etc` beyond `/etc/alternatives`. No systemd scope: installers
+//! have no cgroup limits (the callers' deadlines and `--die-with-parent` bound them in time only).
+//!
 //! [`InstallerSandbox::wrap`] is a pure argv-builder: given the already-finalized [`Command`] (final program,
 //! args, env and cwd — see `rt_core::launch`'s module docs), it returns a NEW `Command` that runs `bwrap` with
 //! that program/args after `--`, and the exact same env (minus [`SANDBOX_ENV_DENYLIST`]'s display/audio/D-Bus
 //! variables) and cwd carried over (a brand-new `Command` otherwise inherits the calling process's own
-//! environment, which must never leak into the sandboxed child). It never
-//! spawns anything itself, so it is unit-testable with only `Command` introspection (`get_program`, `get_args`,
+//! environment, which must never leak into the sandboxed child). It never spawns anything itself (its only
+//! filesystem access is resolving the runtime executable), so it is unit-testable with only `Command` introspection (`get_program`, `get_args`,
 //! `get_envs`, `get_current_dir`), the same pattern `backend-wine`'s `command()` tests use.
 use rt_core::{AppEnv, Sandbox};
+use rt_sandbox::init::{self, InitArgs};
+use rt_sandbox::landlock::Access::{ReadExec as Ro, ReadWrite as Rw};
+use rt_sandbox::landlock::Rule;
+use rt_sandbox::render::{DEV_RW, refusal, ro_bind_target};
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -96,12 +120,33 @@ pub struct SandboxOpts {
 #[derive(Debug, Clone)]
 pub struct InstallerSandbox {
     bwrap: PathBuf,
+    runtime_exe: PathBuf,
+    #[cfg(test)]
+    pub(crate) hole: Vec<PathBuf>,
 }
 
 impl InstallerSandbox {
-    /// `bwrap` is the path to the `bwrap` binary (see [`find_bwrap`] to locate it).
-    pub fn new(bwrap: impl Into<PathBuf>) -> InstallerSandbox {
-        InstallerSandbox { bwrap: bwrap.into() }
+    /// `bwrap` is the path to the `bwrap` binary (see [`find_bwrap`] to locate it); `runtime_exe` is this runtime's
+    /// own executable (the CLI's `std::env::current_exe()`), run inside as the `sandbox-init` shim. The only
+    /// constructor: there is no sandbox without the shim (module docs, "The shim").
+    pub fn new(bwrap: impl Into<PathBuf>, runtime_exe: impl Into<PathBuf>) -> InstallerSandbox {
+        InstallerSandbox {
+            bwrap: bwrap.into(),
+            runtime_exe: runtime_exe.into(),
+            #[cfg(test)]
+            hole: Vec::new(),
+        }
+    }
+
+    /// The pre-flight check: whether [`InstallerSandbox::wrap`] can render a runnable command for `env`'s app with
+    /// `opts`, or why not. It renders a dummy command (`/bin/true`) through the SAME [`InstallerSandbox::render`], so
+    /// it catches everything a real render's `refusal` would (an unusable shim exe via [`shim_exe`], AND the shim's
+    /// own argument checks: a relative dll directory, more than [`init`]'s rule cap, a NUL byte), before anything runs
+    /// — a refusal reaches the user as a sandbox error instead of the installer's exit 126 in a log.
+    pub fn check(&self, env: &AppEnv, opts: &SandboxOpts) -> Result<(), String> {
+        let mut dummy = Command::new("/bin/true");
+        dummy.env_clear();
+        self.render(&dummy, env, opts).map(drop)
     }
 
     pub fn bwrap_path(&self) -> &Path {
@@ -110,9 +155,24 @@ impl InstallerSandbox {
 
     /// The pure argv-builder (module docs). `cmd` must already be finalized (its env, minus
     /// [`SANDBOX_ENV_DENYLIST`], and cwd are copied over); `env` names the app whose `prefix` is bound read-write.
+    /// Fails closed: when the shim cannot run (see [`shim_exe`]) or would refuse its arguments, the result is
+    /// `rt_sandbox`'s refusal command (exit 126, the reason on stderr), never the installer without the shim.
     pub fn wrap(&self, cmd: Command, env: &AppEnv, opts: &SandboxOpts) -> Command {
-        let home = home_path(&cmd);
+        self.render(&cmd, env, opts).unwrap_or_else(|why| refusal(&why))
+    }
+
+    fn render(&self, cmd: &Command, env: &AppEnv, opts: &SandboxOpts) -> Result<Command, String> {
+        let exe = shim_exe(&self.runtime_exe, env)?;
+        let home = home_path(cmd);
         let prefix = env.prefix();
+        // The Landlock rules mirror the mounts, in mount order, each for the path as it appears INSIDE (module docs).
+        let mut rules: Vec<Rule> = Vec::new();
+        let mut rule = |path: &Path, access| {
+            rules.push(Rule {
+                path: path.to_path_buf(),
+                access,
+            })
+        };
 
         let mut out = Command::new(&self.bwrap);
         out.arg("--die-with-parent");
@@ -130,11 +190,27 @@ impl InstallerSandbox {
         out.arg("--proc").arg("/proc");
         out.arg("--dev").arg("/dev");
         out.arg("--tmpfs").arg("/tmp");
-        for dir in RO_BINDS {
-            out.arg("--ro-bind-try").arg(dir).arg(dir);
+        rule(Path::new("/proc"), Rw);
+        for d in DEV_RW {
+            rule(Path::new(d), Rw);
         }
+        rule(Path::new("/tmp"), Rw);
+        // A dll dir that is a symlink under a bound tree is bound and ruled at its resolved path (`ro_bind_target`).
+        let mut bound: Vec<PathBuf> = RO_BINDS.iter().map(PathBuf::from).collect();
         for dir in &opts.extra_ro_binds {
+            let target = ro_bind_target(dir, std::fs::canonicalize(dir).ok(), &bound);
+            bound.push(target);
+        }
+        for dir in &bound {
             out.arg("--ro-bind-try").arg(dir).arg(dir);
+            rule(dir, Ro);
+        }
+        // The shim at its own (resolved) path, before the prefix: nothing the installer can write replaces it.
+        out.arg("--ro-bind").arg(&exe).arg(&exe);
+        rule(&exe, Ro);
+        #[cfg(test)]
+        for h in &self.hole {
+            out.arg("--ro-bind").arg(h).arg(h);
         }
         // Order matters: a LATER bwrap mount wins over an EARLIER one at the same or a nested path (verified
         // against real bwrap 0.11.1). `home` is normally unrelated to `prefix` (`backend_wine::app_home` makes
@@ -147,13 +223,22 @@ impl InstallerSandbox {
         if prefix.starts_with(&home) {
             out.arg("--tmpfs").arg(&home);
             out.arg("--bind").arg(&prefix).arg(&prefix);
+            rule(&home, Rw);
+            rule(&prefix, Rw);
         } else {
             out.arg("--bind").arg(&prefix).arg(&prefix);
             out.arg("--tmpfs").arg(&home);
+            rule(&prefix, Rw);
+            rule(&home, Rw);
         }
-        out.arg("--");
-        out.arg(cmd.get_program());
-        out.args(cmd.get_args());
+        let block = init::encode(&InitArgs {
+            landlock: rules,
+            program: PathBuf::from(cmd.get_program()),
+            argv: cmd.get_args().map(OsStr::to_owned).collect(),
+        });
+        // The shim's own check, here: a refusal now rather than a 126 from inside the sandbox.
+        init::parse(&block).map_err(|e| format!("the sandbox launcher would refuse its arguments: {e}"))?;
+        out.arg("--").arg(&exe).arg("sandbox-init").args(block);
 
         // A brand-new `Command` otherwise inherits THIS process's real environment (cargo's, the CLI's, ...);
         // it must see exactly what `cmd` was finalized to, nothing more. `get_envs()` is the complete map after
@@ -175,7 +260,7 @@ impl InstallerSandbox {
         if let Some(dir) = cmd.get_current_dir() {
             out.current_dir(dir);
         }
-        out
+        Ok(out)
     }
 
     /// Adapts this sandbox to `rt_core`'s [`Sandbox`] hook, bound to one app and one set of options: `Sandbox`'s
@@ -199,6 +284,37 @@ impl Sandbox for Bound {
     fn wrap(&self, cmd: Command) -> Command {
         self.sandbox.wrap(cmd, &self.env, &self.opts)
     }
+}
+
+/// `runtime_exe` as the shim is bound and run, or why it cannot be: absolute, not replaced or deleted since it
+/// started (`/proc/self/exe` then reads `<path> (deleted)`), resolved to a regular file, and not inside the runtime's
+/// data directory (`<data>/apps/<app>`: the prefix and everything else an installer could write are there). The same
+/// checks as the app sandbox (`rt_sandbox::Host::runtime_exe` and its renderer).
+fn shim_exe(exe: &Path, env: &AppEnv) -> Result<PathBuf, String> {
+    let e = |why: &str| format!("the runtime executable {exe:?} (the sandbox's `sandbox-init` launcher) {why}");
+    if !exe.is_absolute() {
+        return Err(e("is not an absolute path"));
+    }
+    if exe.as_os_str().as_bytes().ends_with(b" (deleted)") {
+        return Err(e(
+            "was replaced or deleted since this `runtime` started: run the command again",
+        ));
+    }
+    let real = std::fs::canonicalize(exe)
+        .ok()
+        .filter(|r| std::fs::metadata(r).is_ok_and(|m| m.is_file()))
+        .ok_or_else(|| e("cannot be resolved to a file"))?;
+    let data = env.root().parent().and_then(Path::parent).unwrap_or(env.root());
+    let data_real = std::fs::canonicalize(data).unwrap_or_default();
+    if [data, data_real.as_path()]
+        .iter()
+        .any(|d| !d.as_os_str().is_empty() && (real.starts_with(d) || exe.starts_with(d)))
+    {
+        return Err(e(
+            "is inside the runtime's data directory, which holds what the installer may write",
+        ));
+    }
+    Ok(real)
 }
 
 /// `cmd`'s own finalized `HOME`, or [`FALLBACK_HOME`] if it set none.
@@ -235,6 +351,30 @@ pub fn find_bwrap(
 /// the real-`bwrap` tests skip loudly rather than failing the suite on a machine without it).
 pub fn find_bwrap_on_path() -> Option<PathBuf> {
     find_bwrap(&|k| std::env::var_os(k), &is_executable_file)
+}
+
+/// In this crate's TEST binary only: `<test binary> sandbox-init <block>` behaves like `runtime sandbox-init` (the
+/// same `rt_sandbox::init::main`), so the real-bwrap tests here, in `crate::pipeline` and in `crate::uninstall` run
+/// the real shim with this binary as the runtime executable. The same `.init_array` hook as `rt_sandbox::init`'s
+/// (glibc calls it before `main` with `(argc, argv, envp)`; for any other argv it returns).
+#[cfg(test)]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static TEST_SHIM: extern "C" fn(libc::c_int, *const *const libc::c_char, *const *const libc::c_char) = test_shim;
+
+#[cfg(test)]
+extern "C" fn test_shim(argc: libc::c_int, argv: *const *const libc::c_char, _envp: *const *const libc::c_char) {
+    use std::os::unix::ffi::OsStringExt;
+    let argc = usize::try_from(argc).unwrap_or(0);
+    // SAFETY: glibc passes the process's own argc and argv: `argc` live NUL-terminated strings.
+    let arg = |i: usize| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_bytes();
+    if argc < 2 || arg(1) != b"sandbox-init" {
+        return;
+    }
+    let args: Vec<std::ffi::OsString> = (2..argc)
+        .map(|i| std::ffi::OsString::from_vec(arg(i).to_vec()))
+        .collect();
+    rt_sandbox::init::main(&args)
 }
 
 #[cfg(test)]

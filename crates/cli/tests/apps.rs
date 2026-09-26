@@ -88,6 +88,12 @@ fn fixture(name: &str) -> PathBuf {
     p
 }
 
+/// A `systemd-run` whose scopes work and offer every controller: logs its arguments, answers the probe (the
+/// controllers line) and otherwise runs the command after `--` in place, like `--scope` does.
+const FAKE_SYSTEMD_RUN: &str = "echo \"$*\" >> @LOG@/systemd-run.txt\n\
+    case \" $* \" in *' TasksMax=100 -- /bin/sh -c '*) echo 'cpu io memory pids'; exit 0;; esac\n\
+    while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"";
+
 fn rig() -> Rig {
     rig_with("exit 0")
 }
@@ -109,6 +115,7 @@ fn rig_with(wineserver_body: &str) -> Rig {
     );
     // A GPU that meets DXVK's minimum (`cmd` also says the loader is present): plans do not depend on the host.
     script(&bin.join("vulkaninfo"), &vulkaninfo_body(1, 3));
+    script(&bin.join("systemd-run"), &fill(FAKE_SYSTEMD_RUN));
     Rig {
         _t: t,
         root,
@@ -3230,11 +3237,36 @@ fn permissions_can_remove_a_grant_whose_directory_is_gone() {
 
 /// A `bwrap` in the rig's `bin/` that records its arguments (one call per line in `log/bwrap.txt`) and then runs
 /// what follows `--` UNSANDBOXED (the fake Wine could not run in a real sandbox), or exits 0 (the probe).
+/// Logs its arguments and runs the program after `--` without any sandbox. The `sandbox-init` shim is skipped too
+/// (to its own `--`): its Landlock rules name paths as they are INSIDE a real sandbox (`/lib` is a bind there, a
+/// symlink on a merged-/usr host), so it cannot run on the host; the real-bwrap tests run it.
 fn fake_bwrap(r: &Rig) {
     let body = "echo \"$*\" >> @LOG@/bwrap.txt\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-                [ $# -gt 0 ] || exit 0\nshift\nexec \"$@\""
+                [ $# -gt 0 ] || exit 0\nshift\n\
+                if [ \"$2\" = sandbox-init ]; then while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done; shift; fi\nexec \"$@\""
         .replace("@LOG@", r.log.to_str().unwrap());
     script(&r.bin.join("bwrap"), &body);
+}
+
+/// The `runtime` under test, as the sandbox names it (its shim).
+fn runtime_exe() -> PathBuf {
+    Path::new(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap()
+}
+
+fn systemd_run_calls(r: &Rig) -> Vec<String> {
+    fs::read_to_string(r.log.join("systemd-run.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// `systemd-run` fails like it does without a user manager.
+fn no_user_manager(r: &Rig) {
+    script(
+        &r.bin.join("systemd-run"),
+        "echo 'Failed to connect to user scope bus via local transport: No such file or directory' >&2; exit 1",
+    );
 }
 
 fn bwrap_calls(r: &Rig) -> Vec<String> {
@@ -3268,6 +3300,340 @@ fn run_without_bwrap_refuses_before_anything_starts_or_is_installed() {
     let o = no_bwrap(&r).args(["run".as_ref(), p.as_os_str()]).output().unwrap();
     assert_eq!(assert_fails(&o).trim_end(), NO_BWRAP);
     assert_eq!(r.app_dirs(), [id]);
+}
+
+#[test]
+fn permissions_set_limits_writes_them_and_json_shows_default_and_explicit() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let v: serde_json::Value = serde_json::from_slice(&perm(&r, &home, &["papp", "--json"]).stdout).unwrap();
+    assert_eq!(
+        v["limits"],
+        serde_json::json!({"memory_mb": null, "cpu_percent": null, "tasks": 4096, "tasks_default": true})
+    );
+    let o = perm(
+        &r,
+        &home,
+        &["papp", "--set", "memory=2048", "--set", "cpu=100", "--set", "tasks=512"],
+    );
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).contains("\n[limits]\nmemory_mb = 2048\ncpu_percent = 100\ntasks = 512\n"),
+        "{}",
+        s(&o.stdout)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&perm(&r, &home, &["papp", "--json"]).stdout).unwrap();
+    assert_eq!(
+        v["limits"],
+        serde_json::json!({"memory_mb": 2048, "cpu_percent": 100, "tasks": 512, "tasks_default": false})
+    );
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", "tasks=unlimited", "--set", "cpu=off"],
+    ));
+    let v: serde_json::Value = serde_json::from_slice(&perm(&r, &home, &["papp", "--json"]).stdout).unwrap();
+    assert_eq!(
+        v["limits"],
+        serde_json::json!({"memory_mb": 2048, "cpu_percent": null, "tasks": "unlimited", "tasks_default": false})
+    );
+    // out of range or malformed: refused as a whole, the file untouched
+    let file = app.join("permissions.toml");
+    let before = fs::read_to_string(&file).unwrap();
+    for (bad, why) in [
+        ("memory=10", "64..=1048576 MiB"),
+        ("tasks=8", "16..=65536"),
+        ("cpu=0", "percent"),
+        ("tasks=off", "tasks=<n>|unlimited|default"),
+    ] {
+        let err = assert_fails(&perm(&r, &home, &["papp", "--set", "gpu=off", "--set", bad]));
+        assert!(err.contains(why) && err.contains("nothing was changed"), "{bad}: {err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), before, "{bad}");
+    }
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", "tasks=default", "--set", "memory=off"],
+    ));
+    assert!(!fs::read_to_string(&file).unwrap().contains("limits"));
+}
+
+#[test]
+fn a_sandboxed_run_starts_bwrap_in_a_scope_with_the_apps_limits() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    r.hook("exit 6");
+    let o = r.rt(&["run", &id]);
+    assert_eq!(
+        o.status.code(),
+        Some(6),
+        "the program's status through the scope: {}",
+        s(&o.stderr)
+    );
+    assert_eq!(s(&o.stderr), "");
+    let bwrap = r.bin.join("bwrap");
+    let calls = systemd_run_calls(&r);
+    assert_eq!(calls.len(), 2, "the probe, then the run: {calls:?}");
+    let scope = "--user --scope --collect --quiet --expand-environment=no";
+    assert!(
+        calls[0].starts_with(&format!("{scope} -p TasksMax=100 -- /bin/sh -c ")),
+        "{calls:?}"
+    );
+    assert!(
+        calls[1].starts_with(&format!(
+            "{scope} -p TasksMax=4096 -- {} --die-with-parent ",
+            bwrap.display()
+        )),
+        "{calls:?}"
+    );
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args([
+            "permissions",
+            &id,
+            "--set",
+            "memory=128",
+            "--set",
+            "tasks=64",
+            "--set",
+            "cpu=50",
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let o = r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+    assert_eq!(o.status.code(), Some(6));
+    let calls = systemd_run_calls(&r);
+    assert!(
+        calls[3].starts_with(&format!(
+            "{scope} -p TasksMax=64 -p MemoryMax=128M -p MemorySwapMax=0 -p CPUQuota=50% -- {} ",
+            bwrap.display()
+        )),
+        "{calls:?}"
+    );
+    assert_eq!(bwrap_calls(&r).len(), 4, "two probes, two runs");
+}
+
+#[test]
+fn a_143_under_a_memory_limit_points_at_the_journal() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    r.hook("exit 143");
+    let note = "note: the program was terminated (exit 143); if it exceeded its memory limit see `journalctl --user -u \
+                'run-p*.scope'`\n";
+    let o = r.rt(&["run", &id]);
+    assert_eq!(o.status.code(), Some(143));
+    assert_eq!(s(&o.stderr), "", "no memory limit: no note");
+    let home = r.grants.path().canonicalize().unwrap();
+    let run = || r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+    let set = |e: &str| {
+        let o = r
+            .cmd()
+            .env("HOME", &home)
+            .args(["permissions", &id, "--set", e])
+            .output()
+            .unwrap();
+        assert_ok(&o);
+    };
+    set("memory=128");
+    let o = run();
+    assert_eq!(o.status.code(), Some(143));
+    assert_eq!(s(&o.stderr), note);
+    r.hook("exit 3");
+    let o = run();
+    assert_eq!(
+        (o.status.code(), s(&o.stderr)),
+        (Some(3), String::new()),
+        "another status: no note"
+    );
+}
+
+#[test]
+fn explicit_limits_refuse_the_run_without_a_user_manager_and_the_default_degrades_with_a_note() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    no_user_manager(&r);
+    let o = r.rt(&["run", &id]);
+    assert_ok(&o);
+    assert_eq!(
+        s(&o.stderr),
+        "note: resource limits unavailable: systemd-run --user --scope failed (Failed to connect to user scope bus \
+         via local transport: No such file or directory); the default task limit (4096) is not applied\n"
+    );
+    assert!(bwrap_calls(&r)[1].starts_with("--die-with-parent "), "no scope");
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = |e: &str| {
+        r.cmd()
+            .env("HOME", &home)
+            .args(["permissions", &id, "--set", e])
+            .output()
+            .unwrap()
+    };
+    // an explicit value, even the default one, is a request: no scope, no run
+    for e in ["tasks=4096", "memory=512"] {
+        assert_ok(&set(e));
+        let before = (r.calls(), bwrap_calls(&r).len());
+        let o = r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+        let err = assert_fails(&o);
+        assert!(
+            err.contains("sets resource limits, but they cannot be applied: systemd-run --user --scope failed")
+                && err.contains(&format!(
+                    "runtime permissions {id} --set memory=off --set cpu=off --set tasks=default"
+                )),
+            "{err}"
+        );
+        assert_eq!(
+            (r.calls(), bwrap_calls(&r).len()),
+            (before.0, before.1 + 1),
+            "only the bwrap probe ran"
+        );
+    }
+    // no systemd-run at all
+    fs::remove_file(r.bin.join("systemd-run")).unwrap();
+    let o = r
+        .cmd()
+        .env("HOME", &home)
+        .env("PATH", &r.bin)
+        .args(["run", &id])
+        .output()
+        .unwrap();
+    assert!(
+        assert_fails(&o).contains("cannot be applied: systemd-run is not on PATH"),
+        "{}",
+        s(&o.stderr)
+    );
+}
+
+#[test]
+fn sandbox_shows_the_limits_and_the_systemd_run_command_line() {
+    let r = rig();
+    let id = r.install();
+    let out = s(&r.rt(&["sandbox", &id]).stdout);
+    let sr = r.bin.join("systemd-run");
+    for want in [
+        format!(
+            "limits: systemd-run --user works ({}; cgroup controllers: cpu io memory pids)\n",
+            sr.display()
+        ),
+        "  tasks: 4096 (default, best effort)\n  memory: no limit\n  cpu: no limit\n".to_owned(),
+    ] {
+        assert!(out.contains(&want), "{want:?} in {out}");
+    }
+    let line = lines_with(&out, "command: ")[0];
+    assert!(
+        line.starts_with(&format!(
+            "command: '{}' '--user' '--scope' '--collect' '--quiet' '--expand-environment=no' '-p' 'TasksMax=4096' \
+             '--' '",
+            sr.display()
+        )),
+        "{line}"
+    );
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args(["permissions", &id, "--set", "memory=256", "--set", "tasks=unlimited"])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["sandbox", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(
+        out.contains(
+            "  tasks: no limit (permissions.toml)\n  memory: 256 MiB, no swap (permissions.toml, mandatory)\n"
+        ),
+        "{out}"
+    );
+    no_user_manager(&r);
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["sandbox", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(
+        out.contains("limits: UNAVAILABLE: systemd-run --user --scope failed (Failed to connect"),
+        "{out}"
+    );
+    assert!(
+        out.contains("REFUSED: the app's permissions.toml sets resource limits"),
+        "{out}"
+    );
+    assert_tame(&out, "stdout");
+}
+
+#[test]
+fn doctor_reports_whether_limits_can_be_applied() {
+    let r = rig();
+    let id = r.install();
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "limits: ")[0];
+    assert!(
+        line.contains("[ok]")
+            && line.contains("limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"),
+        "{out}"
+    );
+    no_user_manager(&r);
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "limits: ")[0];
+    assert!(
+        line.contains("[warn]")
+            && line.contains("limits: unavailable: systemd-run --user --scope failed")
+            && line.contains("the default task limit (fork-bomb guard) is not applied"),
+        "{out}"
+    );
+    let home = r.grants.path().canonicalize().unwrap();
+    fs::write(
+        r.apps().join(&id).join("permissions.toml"),
+        "version = 1\n[limits]\nmemory_mb = 512\n",
+    )
+    .unwrap();
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["doctor", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    let line = lines_with(&out, "limits: ")[0];
+    assert!(
+        line.contains("[warn]") && line.contains(&format!("runs of {id} will be refused")),
+        "{out}"
+    );
+    // scopes work, but not the controller this app's limit needs: not "available"
+    script(
+        &r.bin.join("systemd-run"),
+        &FAKE_SYSTEMD_RUN
+            .replace("cpu io memory pids", "cpu io pids")
+            .replace("@LOG@", r.log.to_str().unwrap()),
+    );
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["doctor", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    let line = lines_with(&out, "limits: ")[0];
+    assert!(
+        line.contains("[warn]")
+            && line.contains(&format!(
+                "limits: systemd-run --user available, but runs of {id} will be refused: the memory cgroup \
+                 controller is not available to your user session"
+            )),
+        "{out}"
+    );
 }
 
 #[test]
@@ -3315,7 +3681,13 @@ fn a_sandboxed_run_starts_the_settled_program_in_bwrap_and_marks_the_app() {
     for want in [
         "--die-with-parent --new-session --unshare-pid --unshare-uts --unshare-ipc --unshare-net ".to_owned(),
         format!(
-            " --bind {0} {0} --bind {1} {1} --remount-ro / -- /bin/sh -c ",
+            " --bind {0} {0} --bind {1} {1} --remount-ro / -- {2} sandbox-init --v1 --rule ",
+            prefix.display(),
+            home.display(),
+            runtime_exe().display()
+        ),
+        format!(
+            " --rule rw:{} --rule rw:{} -- /bin/sh -c ",
             prefix.display(),
             home.display()
         ),
@@ -3523,9 +3895,9 @@ fn once_an_app_ran_sandboxed_its_registry_helpers_run_in_its_sandbox() {
     let before = r.calls();
     let err = assert_fails(&no_bwrap(&r).args(["display", id, "auto"]).output().unwrap());
     assert!(
-        err.contains(&format!(
-            "{id} has run in the sandbox, so its Wine helpers must run sandboxed too"
-        )) && err.contains("nothing was changed"),
+        err.contains(&format!("{id} has run in the sandbox"))
+            && err.contains("its Wine helpers must run sandboxed too")
+            && err.contains("nothing was changed"),
         "{err}"
     );
     assert_eq!(r.calls(), before);
@@ -3588,8 +3960,15 @@ fn sandbox_output_cannot_be_split_by_a_newline_in_a_path() {
     assert_tame(&out, "stdout");
     let known = [
         "bubblewrap: ",
+        "seccomp: ",
+        "landlock: ",
+        "shim: ",
         "profile ",
         "  host directory ",
+        "limits: ",
+        "  tasks: ",
+        "  memory: ",
+        "  cpu: ",
         "Wine: ",
         "REFUSED: ",
         "skipped: ",
@@ -3658,4 +4037,127 @@ fn every_exclusive_command_is_refused_while_a_runtime_run_of_the_app_lives() {
             .unwrap(),
     );
     assert_ok(&r.rt(&["remove", &id]));
+}
+
+/// `runtime sandbox-init` itself (hidden): a program that cannot be executed is a 126 refusal (not 127), and the
+/// program's arguments arrive byte for byte, clap's own syntax (`--`, `--help`) included.
+#[test]
+fn sandbox_init_refuses_with_126_and_passes_arguments_unchanged() {
+    let rt = || Command::new(env!("CARGO_BIN_EXE_runtime"));
+    let o = rt()
+        .args(["sandbox-init", "--v1", "--", "/nonexistent/program"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(126), "{o:?}");
+    assert!(
+        s(&o.stderr).starts_with("runtime: sandbox-init: cannot run \"/nonexistent/program\": No such file"),
+        "{o:?}"
+    );
+    let o = rt().args(["sandbox-init", "--help"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(126), "no help, a refused block: {o:?}");
+    assert!(!s(&o.stdout).contains("Usage"), "{o:?}");
+    // hidden from the help
+    let help = rt().arg("--help").output().unwrap();
+    assert!(!s(&help.stdout).contains("sandbox-init"), "{help:?}");
+
+    let odd: Vec<OsString> = vec![
+        "--".into(),
+        "--help".into(),
+        "-h".into(),
+        "".into(),
+        "a b".into(),
+        "line\nbreak".into(),
+        OsString::from_vec(b"\xff\xfe".to_vec()),
+    ];
+    // Landlock rules name canonical host paths (`/usr/bin/sh` and its libraries live below /usr here).
+    let o = rt()
+        .args(["sandbox-init", "--v1", "--rule", "ro:/usr", "--rule", "ro:/etc", "--"])
+        .args(["/usr/bin/sh", "-c", "printf '%s\\0' \"$@\"", "sh"])
+        .args(&odd)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let mut want = Vec::new();
+    for a in &odd {
+        want.extend_from_slice(a.as_encoded_bytes());
+        want.push(0);
+    }
+    assert_eq!(o.stdout, want);
+}
+
+/// Phase 5B final review: `deps --install` picks the helper launcher ONCE for all archive packages of the run, so
+/// when the plan may run an installer package (which gets a read-write prefix in the installer sandbox) the app is
+/// marked BEFORE that choice: an archive package's `reg.exe` after the installer package is then sandboxed (or,
+/// without bwrap, refused) instead of running through a launcher chosen while the app was unmarked. The download
+/// cache is a file here, so nothing can ever be downloaded (the fetch fails on it first).
+#[test]
+fn deps_install_marks_the_app_before_choosing_the_helper_launcher_when_an_installer_package_may_run() {
+    let r = rig();
+    let id = install_msvcp140(&r); // plan: vcrun2022, an installer package
+    let marker = r.apps().join(&id).join("ran-sandboxed");
+    assert!(!marker.exists());
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+
+    // Without bwrap: marked, so the helper launcher refuses before anything is fetched or run.
+    let before = r.calls();
+    let o = no_bwrap(&r).args(["deps", &id, "--install"]).output().unwrap();
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("has run in the sandbox") && err.contains("must run sandboxed too") && err.contains("bwrap"),
+        "{err}"
+    );
+    assert!(marker.is_file(), "marked before the launcher was chosen");
+    assert_eq!(r.calls(), before, "nothing ran");
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
+
+    // With bwrap: the launcher chosen for the run's archive packages is the app sandbox (the marker is there).
+    fake_bwrap(&r);
+    let o = r.rt(&["deps", &id, "--install"]);
+    assert!(!s(&o.stderr).contains("must run sandboxed too"), "{}", s(&o.stderr));
+    assert!(marker.is_file());
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
+}
+
+/// An archive-only plan on a never-sandboxed app writes no marker: its `reg.exe` runs like any Wine helper, the
+/// documented residual for apps no sandboxed code has touched.
+#[test]
+fn deps_install_of_archive_packages_only_does_not_mark_the_app() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r); // plan: dxvk, an archive package
+    fs::write(r.data.join("deps-cache"), b"not a directory").unwrap();
+    let _ = r.rt(&["deps", &id, "--install"]);
+    assert!(!r.apps().join(&id).join("ran-sandboxed").exists());
+}
+
+/// The mark fails closed: when it cannot be written, nothing is fetched or installed.
+#[test]
+fn deps_install_refuses_when_the_marker_cannot_be_written() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+    let root = r.apps().join(&id);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = r.rt(&["deps", &id, "--install"]);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("cannot record") && err.contains("nothing was installed"),
+        "{err}"
+    );
+    assert!(!root.join("ran-sandboxed").exists());
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
 }

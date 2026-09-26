@@ -36,6 +36,42 @@ fn finalized(program: &str) -> Command {
     c
 }
 
+/// This test binary, resolved: it stands in for `runtime` (`<it> sandbox-init <block>` runs the real shim, see
+/// `TEST_SHIM` in the parent module), so the real-bwrap tests below go through the real seccomp/Landlock code.
+fn shim() -> PathBuf {
+    std::env::current_exe().unwrap().canonicalize().unwrap()
+}
+
+fn sb(bwrap: impl Into<PathBuf>) -> InstallerSandbox {
+    InstallerSandbox::new(bwrap, shim())
+}
+
+fn strs(c: &Command) -> Vec<String> {
+    c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+}
+
+/// `boxed` with the shim's words cut out: the same bwrap command (binds, namespaces, env, cwd) with no Landlock and
+/// no seccomp. The control of the tests that show the shim is what refuses.
+fn bwrap_only(boxed: &Command) -> Command {
+    let all: Vec<&OsStr> = boxed.get_args().collect();
+    let at = all
+        .iter()
+        .position(|a| *a == "sandbox-init")
+        .expect("the shim is in the command");
+    let end = at + all[at..].iter().position(|a| *a == "--").expect("the shim's `--`");
+    let mut bare = Command::new(boxed.get_program());
+    bare.args(&all[..at - 1]).args(&all[end + 1..]).env_clear();
+    for (k, v) in boxed.get_envs() {
+        if let Some(v) = v {
+            bare.env(k, v);
+        }
+    }
+    if let Some(d) = boxed.get_current_dir() {
+        bare.current_dir(d);
+    }
+    bare
+}
+
 fn network_opts(allow_network: bool) -> SandboxOpts {
     SandboxOpts {
         allow_network,
@@ -54,7 +90,7 @@ fn the_exact_argv_for_a_typical_command() {
     cmd.env("WINEPREFIX", env.prefix());
     cmd.current_dir(env.drive_c());
 
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(false));
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(false));
 
     assert_eq!(out.get_program(), "/usr/bin/bwrap");
     let prefix = env.prefix();
@@ -91,11 +127,47 @@ fn the_exact_argv_for_a_typical_command() {
     .into_iter()
     .map(OsString::from)
     .chain([
+        OsString::from("--ro-bind"),
+        shim().into_os_string(),
+        shim().into_os_string(),
         OsString::from("--bind"),
         prefix.clone().into_os_string(),
-        prefix.into_os_string(),
+        prefix.clone().into_os_string(),
         OsString::from("--tmpfs"),
-        home.into_os_string(),
+        home.clone().into_os_string(),
+        OsString::from("--"),
+        shim().into_os_string(),
+        OsString::from("sandbox-init"),
+        OsString::from("--v1"),
+    ])
+    .chain(
+        [
+            "rw:/proc",
+            "rw:/dev/null",
+            "rw:/dev/zero",
+            "rw:/dev/full",
+            "rw:/dev/random",
+            "rw:/dev/urandom",
+            "rw:/dev/tty",
+            "rw:/dev/pts",
+            "rw:/dev/shm",
+            "rw:/tmp",
+            "ro:/usr",
+            "ro:/bin",
+            "ro:/lib",
+            "ro:/lib64",
+            "ro:/etc/alternatives",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain([
+            format!("ro:{}", shim().display()),
+            format!("rw:{}", prefix.display()),
+            format!("rw:{}", home.display()),
+        ])
+        .flat_map(|r| [OsString::from("--rule"), OsString::from(r)]),
+    )
+    .chain([
         OsString::from("--"),
         OsString::from("/opt/wine/bin/wine64"),
         OsString::from("C:\\installer.exe"),
@@ -116,7 +188,7 @@ fn allow_network_true_omits_unshare_net_and_false_includes_it() {
     let (_tmp, env) = fx();
     for (allow, expect_present) in [(false, true), (true, false)] {
         let cmd = finalized("/bin/true");
-        let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow));
+        let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow));
         let has_flag = out.get_args().any(|a| a == OsStr::new("--unshare-net"));
         assert_eq!(has_flag, expect_present, "allow_network={allow}");
     }
@@ -126,7 +198,7 @@ fn allow_network_true_omits_unshare_net_and_false_includes_it() {
 fn new_session_is_always_present() {
     let (_tmp, env) = fx();
     let cmd = finalized("/bin/true");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     assert!(out.get_args().any(|a| a == OsStr::new("--new-session")));
 }
 
@@ -138,7 +210,7 @@ fn extra_ro_binds_are_emitted_after_the_fixed_set_with_ro_bind_try() {
         extra_ro_binds: vec![PathBuf::from("/opt/wine-stable")],
         ..Default::default()
     };
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &opts);
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &opts);
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let extra = args
         .windows(3)
@@ -151,13 +223,95 @@ fn extra_ro_binds_are_emitted_after_the_fixed_set_with_ro_bind_try() {
     let prefix_bind = args.iter().position(|a| a == "--bind").unwrap();
     assert!(extra > last_fixed, "{args:?}");
     assert!(extra < prefix_bind, "{args:?}");
+    assert!(
+        args.windows(2).any(|w| w == ["--rule", "ro:/opt/wine-stable"]),
+        "{args:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------ the shim (no bwrap run)
+
+#[test]
+fn the_runtime_executable_is_bound_read_only_at_its_resolved_path_after_every_system_bind() {
+    let (_tmp, env) = fx();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("runtime");
+    std::os::unix::fs::symlink(shim(), &link).unwrap();
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![PathBuf::from("/opt/wine-stable")],
+        ..Default::default()
+    };
+    let out = InstallerSandbox::new("/usr/bin/bwrap", &link).wrap(finalized("/bin/true"), &env, &opts);
+    let args = strs(&out);
+    let s = shim().display().to_string();
+    let bind = args
+        .windows(3)
+        .position(|w| w == ["--ro-bind", s.as_str(), s.as_str()])
+        .unwrap_or_else(|| panic!("{args:?}"));
+    let extra = args.iter().position(|a| a == "/opt/wine-stable").unwrap();
+    let prefix_bind = args.iter().position(|a| a == "--bind").unwrap();
+    assert!(extra < bind && bind < prefix_bind, "{args:?}");
+    // bwrap starts the shim (by its resolved path), never the program itself.
+    let sep = args.iter().position(|a| a == "--").unwrap();
+    assert_eq!(args[sep + 1..sep + 4], [s.as_str(), "sandbox-init", "--v1"]);
+    assert!(!args.iter().any(|a| *a == link.display().to_string()), "{args:?}");
+}
+
+/// Runs a refusal command and returns (exit code, stderr).
+fn refused(c: Command) -> (Option<i32>, String) {
+    let mut c = c;
+    let out = c.output().unwrap();
+    (out.status.code(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+#[test]
+fn a_missing_relative_deleted_or_data_root_runtime_executable_refuses_instead_of_running_unhardened() {
+    let (tmp, env) = fx();
+    let in_data = tmp.path().join("runtime");
+    fs::copy(shim(), &in_data).unwrap();
+    let deleted = format!("{} (deleted)", shim().display());
+    for (exe, why) in [
+        (PathBuf::new(), "not an absolute path"),
+        (PathBuf::from("target/debug/runtime"), "not an absolute path"),
+        (PathBuf::from("/nonexistent/runtime"), "cannot be resolved"),
+        (PathBuf::from(&deleted), "replaced or deleted"),
+        (in_data.clone(), "data directory"),
+    ] {
+        let mut cmd = finalized("/opt/wine/bin/wine64");
+        cmd.arg("C:\\installer.exe").env("SECRET_MARKER", "x");
+        let out = InstallerSandbox::new("/usr/bin/bwrap", &exe).wrap(cmd, &env, &SandboxOpts::default());
+        assert_eq!(out.get_program(), "/bin/sh", "{exe:?}");
+        let args = strs(&out);
+        assert!(
+            !args.iter().any(|a| a.contains("installer.exe") || a.contains("bwrap")),
+            "{args:?}"
+        );
+        assert!(envs(&out).is_empty(), "{exe:?}");
+        let (code, stderr) = refused(out);
+        assert_eq!(code, Some(126), "{exe:?}");
+        assert!(
+            stderr.contains("runtime: the sandbox refused to start the program"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(why), "{exe:?}: {stderr}");
+    }
+}
+
+#[test]
+fn a_program_the_shim_would_refuse_is_refused_here() {
+    let (_tmp, env) = fx();
+    let out = sb("/usr/bin/bwrap").wrap(finalized("wine64"), &env, &SandboxOpts::default());
+    assert_eq!(out.get_program(), "/bin/sh");
+    let (code, stderr) = refused(out);
+    assert_eq!(code, Some(126));
+    assert!(stderr.contains("wine64"), "{stderr}");
 }
 
 #[test]
 fn no_dev_bind_flag_is_ever_emitted() {
     let (_tmp, env) = fx();
     let cmd = finalized("/bin/true");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     assert!(
         !out.get_args().any(|a| {
             let a = a.to_string_lossy();
@@ -172,7 +326,7 @@ fn no_dev_bind_flag_is_ever_emitted() {
 fn a_missing_home_falls_back_to_the_fixed_scratch_path() {
     let (_tmp, env) = fx();
     let cmd = finalized("/bin/true"); // env_clear(): no HOME at all
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let i = args.iter().rposition(|a| a == "--tmpfs").unwrap();
     assert_eq!(args[i + 1], FALLBACK_HOME);
@@ -183,7 +337,7 @@ fn the_wrapped_commands_own_home_is_used_for_the_scratch_tmpfs_not_the_fallback(
     let (_tmp, env) = fx();
     let mut cmd = finalized("/bin/true");
     cmd.env("HOME", "/apps/t/runtime/home");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let i = args.iter().rposition(|a| a == "--tmpfs").unwrap();
     assert_eq!(args[i + 1], "/apps/t/runtime/home");
@@ -198,7 +352,7 @@ fn hostile_arguments_stay_single_argv_entries_and_no_shell_is_involved() {
     for a in hostile {
         cmd.arg(a);
     }
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     // Each hostile string is exactly one argv entry, in order, at the tail (after `--`).
     let tail = &args[args.len() - hostile.len()..];
@@ -211,7 +365,7 @@ fn an_explicit_env_removal_on_the_wrapped_command_is_kept() {
     let mut cmd = finalized("/bin/true");
     cmd.env("KEPT", "1");
     cmd.env_remove("GONE");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let e = envs(&out);
     assert_eq!(e["KEPT"], some("1"));
     // `env_remove` records an explicit removal (`None`), distinct from "never mentioned": either way the
@@ -229,7 +383,7 @@ fn display_audio_and_dbus_variables_are_never_replayed_into_the_sandbox() {
             cmd.env(k, "host-value");
         }
         cmd.env("LANG", "C.UTF-8");
-        let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow_network));
+        let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &network_opts(allow_network));
         let e = envs(&out);
         for k in SANDBOX_ENV_DENYLIST {
             assert!(!e.contains_key(k), "{k} leaked (allow_network={allow_network})");
@@ -248,7 +402,7 @@ fn wrap_never_touches_the_current_processs_real_environment() {
     );
     let (_tmp, env) = fx();
     let cmd = finalized("/bin/true");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     assert!(!envs(&out).contains_key("CARGO_MANIFEST_DIR"));
 }
 
@@ -256,7 +410,7 @@ fn wrap_never_touches_the_current_processs_real_environment() {
 fn with_no_current_dir_set_the_wrapped_command_also_sets_none() {
     let (_tmp, env) = fx();
     let cmd = finalized("/bin/true");
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     assert_eq!(out.get_current_dir(), None);
 }
 
@@ -270,7 +424,7 @@ fn when_home_is_an_ancestor_of_the_prefix_the_home_tmpfs_is_mounted_first() {
     let ancestor = env.root(); // a strict ancestor of env.prefix() == env.root().join("prefix")
     let mut cmd = finalized("/bin/true");
     cmd.env("HOME", ancestor);
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let tmpfs_home = args
         .windows(2)
@@ -288,7 +442,7 @@ fn when_home_equals_the_prefix_exactly_the_prefix_bind_still_wins() {
     let (_tmp, env) = fx();
     let mut cmd = finalized("/bin/true");
     cmd.env("HOME", env.prefix());
-    let out = InstallerSandbox::new("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
+    let out = sb("/usr/bin/bwrap").wrap(cmd, &env, &SandboxOpts::default());
     let args: Vec<String> = out.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     let tmpfs_home = args
         .windows(2)
@@ -405,8 +559,7 @@ fn check_bwrap_returns_the_path_when_found_regardless_of_require() {
 }
 
 fn sandboxed_launcher(bwrap: &Path, env: &AppEnv, opts: SandboxOpts) -> Launcher {
-    Launcher::with_host_env(Vec::<(&str, &str)>::new())
-        .with_sandbox(InstallerSandbox::new(bwrap).for_launcher(env.clone(), opts))
+    Launcher::with_host_env(Vec::<(&str, &str)>::new()).with_sandbox(sb(bwrap).for_launcher(env.clone(), opts))
 }
 
 #[test]
@@ -488,6 +641,72 @@ fn real_sandbox_can_read_and_write_inside_its_own_prefix() {
     assert_eq!(fs::read_to_string(env.prefix().join("f.txt")).unwrap(), "hi\n");
 }
 
+fn run(mut c: Command) -> (bool, String) {
+    let out = c.output().unwrap();
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), text)
+}
+
+#[test]
+fn real_sandbox_the_installer_runs_under_the_seccomp_filter_with_no_new_privileges() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = fx();
+    let launcher = sandboxed_launcher(&bwrap, &env, SandboxOpts::default());
+    let mut cmd = Command::new("/usr/bin/sh");
+    cmd.arg("-c").arg("grep -E '^(Seccomp|NoNewPrivs):' /proc/self/status");
+    let out = launcher.run_helper(cmd, Duration::from_secs(10)).unwrap();
+    let text = String::from_utf8_lossy(&out.output);
+    assert!(out.status.success(), "{text}");
+    let fields: Vec<String> = text
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(fields, ["NoNewPrivs: 1", "Seccomp: 2"], "{text}");
+}
+
+#[test]
+fn real_sandbox_a_nested_user_namespace_is_refused_by_the_shim() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = fx();
+    let mut cmd = finalized("/usr/bin/unshare");
+    cmd.args(["-U", "/usr/bin/true"]);
+    let boxed = sb(&bwrap).wrap(cmd, &env, &SandboxOpts::default());
+    let control = run(bwrap_only(&boxed));
+    let (ok, text) = run(boxed);
+    assert!(!ok && text.contains("Operation not permitted"), "{text}");
+    // bwrap alone lets it through wherever host policy does (Phase 5B Task 5's finding on this project's host).
+    eprintln!("bwrap only (the control): success={} {}", control.0, control.1.trim());
+}
+
+#[test]
+fn real_sandbox_landlock_denies_a_path_the_mounts_expose_without_a_rule() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    if let Err(e) = rt_sandbox::landlock::abi_version() {
+        let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
+        assert!(
+            !require,
+            "RUNTIME_REQUIRE_BWRAP is set but Landlock is unavailable: {e}"
+        );
+        eprintln!("SKIP: Landlock is unavailable here: {e}");
+        return;
+    }
+    let (_tmp, env) = fx();
+    // Not under `/tmp` (the sandbox's own `/tmp` has a read-write rule): next to this test binary.
+    let hole = tempfile::tempdir_in(shim().parent().unwrap()).unwrap();
+    let dir = hole.path().canonicalize().unwrap();
+    fs::write(dir.join("f.txt"), "exposed").unwrap();
+    let mut s = sb(&bwrap);
+    s.hole = vec![dir.clone()];
+    let mut cmd = finalized("/usr/bin/cat");
+    cmd.arg(dir.join("f.txt"));
+    let boxed = s.wrap(cmd, &env, &SandboxOpts::default());
+    let (ok, text) = run(bwrap_only(&boxed));
+    assert!(ok && text == "exposed", "the control must read it: {text}");
+    let (ok, text) = run(boxed);
+    assert!(!ok && text.contains("Permission denied"), "LANDLOCK HOLE: {text}");
+}
+
 /// A loopback TCP listener on the host; used to test network-namespace isolation without DNS (this sandbox
 /// binds neither `/etc/resolv.conf` nor `/etc/nsswitch.conf`, so a getaddrinfo-based probe would fail for a
 /// reason unrelated to `--unshare-net`) and without a real internet call.
@@ -533,4 +752,60 @@ fn real_sandbox_network_is_unshared_by_default_and_shared_when_allowed() {
         out.output
     );
     accepted.join().unwrap().unwrap();
+}
+
+/// A dll directory whose last component is a host symlink under an already-bound tree stays a symlink inside the
+/// sandbox, and a Landlock rule on it fails with ELOOP (the shim then refuses every run). Here the bound tree is an
+/// earlier extra bind (a scratch tree: `/usr` cannot be written): the link's resolved directory is bound and ruled
+/// instead, and the program reads through the link.
+#[test]
+fn real_sandbox_a_symlinked_dll_dir_under_a_bound_tree_works_through_the_shim() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = fx();
+    let tree = tempfile::tempdir_in(shim().parent().unwrap()).unwrap();
+    let t = tree.path().canonicalize().unwrap();
+    fs::create_dir(t.join("real")).unwrap();
+    fs::write(t.join("real/f.txt"), "dll").unwrap();
+    std::os::unix::fs::symlink(t.join("real"), t.join("link")).unwrap();
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![t.clone(), t.join("link")],
+        ..Default::default()
+    };
+    let mut cmd = finalized("/usr/bin/cat");
+    cmd.arg(t.join("link/f.txt"));
+    let boxed = sb(&bwrap).wrap(cmd, &env, &opts);
+    let args = strs(&boxed);
+    let (ok, text) = run(boxed);
+    assert!(ok && text == "dll", "{text}");
+    let real = format!("ro:{}", t.join("real").display());
+    assert!(
+        args.contains(&real) && !args.contains(&format!("ro:{}", t.join("link").display())),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn check_refuses_a_relative_dll_dir_before_anything_runs() {
+    let (_tmp, env) = fx();
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![PathBuf::from("relative/wine/x86_64-windows")],
+        ..Default::default()
+    };
+    // The shim's own parse (in render) rejects a non-absolute rule path: check surfaces it as a reason.
+    let why = sb("/usr/bin/bwrap").check(&env, &opts).unwrap_err();
+    assert!(
+        why.contains("refuse its arguments") && why.contains("absolute"),
+        "{why}"
+    );
+    // A good exe with only absolute binds passes.
+    assert!(sb("/usr/bin/bwrap").check(&env, &SandboxOpts::default()).is_ok());
+}
+
+#[test]
+fn check_refuses_an_unusable_runtime_executable() {
+    let (_tmp, env) = fx();
+    let why = InstallerSandbox::new("/usr/bin/bwrap", "relative/runtime")
+        .check(&env, &SandboxOpts::default())
+        .unwrap_err();
+    assert!(why.contains("not an absolute path"), "{why}");
 }

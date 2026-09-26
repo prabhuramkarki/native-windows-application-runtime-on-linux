@@ -103,7 +103,7 @@ use crate::manifest::{self, ArchiveFormat, Extract, Install, Kind, MAX_LIST_LEN,
 use crate::tarball::{self, Codec, Selection, TarEntryKind, TarError, TarLimits};
 use rt_core::unzip;
 use rt_core::{AppEnv, CompatBackend, Detail, Launcher, ResolveError, RunOpts, WinPath, join_new, resolve_under};
-use rt_installer::{SandboxOpts, run_sandboxed};
+use rt_installer::{InstallerSandbox, SandboxOpts, run_sandboxed};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -1064,9 +1064,9 @@ fn rollback_error(original: &ArchiveError, failures: &[ArchiveError]) -> Archive
 /// Runs Wine's `reg.exe` in the prefix with `args` (each one argv element), settled and bounded. Returns whether it
 /// exited 0, and its output.
 ///
-/// `sandbox: Some(bwrap)` runs it in the installer sandbox, offline (Ruling 17): after a vendor installer ran, the
-/// Wine session `reg.exe` starts also starts whatever that installer registered (auto-start services, ...), which
-/// must not get the host's network or files from the runtime's own step. The registry still flushes (the settle
+/// `sandbox: Some(..)` runs it in that installer sandbox (bwrap and the `sandbox-init` shim), offline (Ruling 17):
+/// after a vendor installer ran, the Wine session `reg.exe` starts also starts whatever that installer registered
+/// (auto-start services, ...), which must not get the host's network or files from the runtime's own step. The registry still flushes (the settle
 /// wait runs inside the sandbox); the output is not captured there, only the exit status. `None` (archive packages)
 /// runs it like any other Wine helper of the backend.
 pub(crate) fn reg(
@@ -1074,19 +1074,19 @@ pub(crate) fn reg(
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
-    sandbox: Option<&Path>,
+    sandbox: Option<&InstallerSandbox>,
 ) -> Result<(bool, String), ArchiveError> {
     let drive_c = env.drive_c();
     let exe = WinPath::parse(r"C:\windows\system32\reg.exe")
         .map_err(|e| ArchiveError::Registry(e.to_string()))
         .and_then(|w| resolve_under(&drive_c, &w).map_err(|e| ArchiveError::Registry(format!("reg.exe: {e}"))))?;
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    if let Some(bwrap) = sandbox {
+    if let Some(sandbox) = sandbox {
         let opts = SandboxOpts {
             allow_network: false,
             extra_ro_binds: backend.dll_dirs(),
         };
-        let status = run_sandboxed(backend, launcher, env, bwrap, &exe, &args, opts, Some(REG_TIMEOUT))
+        let status = run_sandboxed(backend, launcher, env, sandbox, &exe, &args, opts, Some(REG_TIMEOUT))
             .map_err(|e| ArchiveError::Registry(clip(&e.to_string())))?
             .ok_or_else(|| ArchiveError::Registry(format!("reg.exe timed out after {} s", REG_TIMEOUT.as_secs())))?;
         return Ok((status.success(), format!("{status} (in the sandbox)")));
@@ -1107,7 +1107,7 @@ pub(crate) fn set_override(
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
-    sandbox: Option<&Path>,
+    sandbox: Option<&InstallerSandbox>,
 ) -> Result<(), ArchiveError> {
     let (ok, detail) = reg(
         &["add", OVERRIDES_KEY, "/v", name, "/d", "native,builtin", "/f"],
@@ -1130,7 +1130,7 @@ pub(crate) fn delete_override(
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
-    sandbox: Option<&Path>,
+    sandbox: Option<&InstallerSandbox>,
 ) -> Result<(), ArchiveError> {
     let (ok, detail) = reg(
         &["delete", OVERRIDES_KEY, "/v", name, "/f"],

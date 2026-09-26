@@ -49,7 +49,7 @@ use crate::family::{self, PlanError, Program};
 use crate::lnk::ShellLink;
 use crate::msi::{MsiError, MsiInfo};
 use crate::run::{run_sandboxed, stage_file};
-use crate::sandbox::{SandboxOpts, find_bwrap_on_path};
+use crate::sandbox::{InstallerSandbox, SandboxOpts, find_bwrap_on_path};
 use crate::snapshot::{InstallDiff, Snapshot, UninstallEntry};
 use rt_core::{
     AppEnv, AppId, BackendError, BackendInfo, CompatBackend, InstallerMeta, LaunchError, Launcher, MAX_FIELD_LEN,
@@ -80,9 +80,10 @@ const INSTALLER_STAGING_DIR: &str = "C:\\Windows\\Temp\\rt-installer";
 /// by `crate::uninstall` (an `UninstallString` of `MsiExec.exe /X{GUID}` needs the same resolution).
 pub const MSIEXEC_RELATIVE: &str = "windows/system32/msiexec.exe";
 
-/// What the caller asked for. `silent`/`allow_network` default OFF ("default = show installer GUI", matching
-/// the task brief and this project's stance that Phase 3's target is offline-only installers).
-#[derive(Debug, Clone, Default)]
+/// What the caller asked for. `silent`/`allow_network` are OFF in normal use ("default = show installer GUI",
+/// matching the task brief and this project's stance that Phase 3's target is offline-only installers). No
+/// `Default`: `runtime_exe` must be given.
+#[derive(Debug, Clone)]
 pub struct InstallerOpts {
     pub silent: bool,
     pub allow_network: bool,
@@ -91,6 +92,10 @@ pub struct InstallerOpts {
     /// entirely and this path is used, resolved the same case-insensitive, symlink-refusing way as everything
     /// else under `drive_c` ([`resolve_under`]).
     pub exe_override: Option<String>,
+    /// This runtime's own executable (the CLI passes `std::env::current_exe()`): the installer sandbox runs it as
+    /// its `sandbox-init` shim. One that cannot be used makes the sandbox refuse to run the installer at all
+    /// ([`crate::InstallerSandbox`]), never run it unhardened.
+    pub runtime_exe: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +143,9 @@ pub enum InstallerError {
     MsiExecMissing,
     #[error("bwrap (bubblewrap) was not found on $PATH: install it to run installers sandboxed")]
     BwrapNotFound,
+    /// The installer sandbox's pre-flight check ([`crate::InstallerSandbox::check`]) failed: the reason.
+    #[error("the installer sandbox refused to start: {0} (nothing was run; nothing was installed)")]
+    SandboxRefused(String),
     #[error("the chosen --exe {0} is not a file inside this app's environment")]
     ExeOverrideNotAFile(String),
     #[error("environment setup failed: {0}")]
@@ -414,7 +422,8 @@ fn run_installer_process(
     };
     // No deadline (`None`): an interactive installer GUI may take as long as the user needs, so `Ok(None)`
     // (deadline reached) cannot happen; mapped defensively rather than unwrapped.
-    let status = run_sandboxed(backend, launcher, env, &bwrap, &exe_unix, &args, sandbox_opts, None)?
+    let sandbox = InstallerSandbox::new(bwrap, &opts.runtime_exe);
+    let status = run_sandboxed(backend, launcher, env, &sandbox, &exe_unix, &args, sandbox_opts, None)?
         .ok_or_else(|| io_err("cannot wait for the installer process")(io::ErrorKind::TimedOut.into()))?;
 
     let mut warnings = Vec::new();

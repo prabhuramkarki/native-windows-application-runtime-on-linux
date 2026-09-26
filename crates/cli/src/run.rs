@@ -4,6 +4,9 @@
 //! sandbox stops the run before anything starts, with an install hint. `--unsandboxed` runs it without one (this
 //! run only) and says so on stderr. A sandboxed run prints what its profile cannot enforce (`note: ...`).
 //!
+//! **Out of memory.** With a memory limit, the scope's OOM kill ends the run as systemd stops the scope (SIGTERM to
+//! bwrap: 143); a 143 under a memory limit therefore prints a `note:` pointing at the scope's journal.
+//!
 //! **Ctrl-C, unsandboxed.** The terminal delivers SIGINT to the whole foreground process group, so the program
 //! gets it and decides what to do. This process ignores SIGINT from the moment the child is started until it has
 //! been reaped, so it survives to report the child's exit status (a shell that says "Interrupted" while the app
@@ -56,11 +59,12 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
         Target::File(_) => None,
     };
     // Under that lock: `runtime permissions --set` takes it exclusively, so the profile cannot change meanwhile.
-    let sandbox = if unsandboxed {
+    let (sandbox, memory_limited) = if unsandboxed {
         eprintln!("warning: running WITHOUT a sandbox (--unsandboxed)");
-        None
+        (None, false)
     } else {
-        Some(crate::sandbox::for_run(&store, &found, &backend)?)
+        let (sb, memory) = crate::sandbox::for_run(&store, &found, &backend)?;
+        (Some(sb), memory)
     };
     let sandboxed = sandbox.is_some();
     let started = rt_core::start(
@@ -95,6 +99,13 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
     }
     if outcome.terminal_write_failed {
         warn("the program's stderr could not be written to the terminal");
+    }
+    // An OOM kill in the scope ends it with systemd's SIGTERM, which looks like any other SIGTERM here.
+    if memory_limited && outcome.exit_code == 143 {
+        eprintln!(
+            "note: the program was terminated (exit 143); if it exceeded its memory limit see `journalctl --user -u \
+             'run-p*.scope'`"
+        );
     }
     Ok(u8::try_from(outcome.exit_code & 0xff).unwrap_or(1))
 }

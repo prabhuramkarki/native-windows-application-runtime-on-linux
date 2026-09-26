@@ -48,7 +48,15 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
                     extra_ro_binds: backend.dll_dirs(),
                     ..SandboxOpts::default()
                 };
-                let outcome = rt_installer::uninstall(&backend, &launcher, &env, &md, opts);
+                if md
+                    .installer
+                    .as_ref()
+                    .and_then(|i| i.uninstall_command.as_deref())
+                    .is_some()
+                {
+                    crate::sandbox::print_hardening_caveat();
+                }
+                let outcome = rt_installer::uninstall(&backend, &launcher, &env, &md, opts, &crate::runtime_exe());
                 match outcome.uninstaller_succeeded {
                     None => {} // a documented limit: no uninstall command was recorded for this app
                     Some(true) => {}
