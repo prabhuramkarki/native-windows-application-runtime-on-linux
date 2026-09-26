@@ -143,6 +143,9 @@ pub enum InstallerError {
     MsiExecMissing,
     #[error("bwrap (bubblewrap) was not found on $PATH: install it to run installers sandboxed")]
     BwrapNotFound,
+    /// The installer sandbox's pre-flight check ([`crate::InstallerSandbox::check`]) failed: the reason.
+    #[error("the installer sandbox refused to start: {0} (nothing was run; nothing was installed)")]
+    SandboxRefused(String),
     #[error("the chosen --exe {0} is not a file inside this app's environment")]
     ExeOverrideNotAFile(String),
     #[error("environment setup failed: {0}")]

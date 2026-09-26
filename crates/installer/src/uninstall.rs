@@ -71,9 +71,14 @@ fn run_uninstall_command(
         warnings.push("bwrap (bubblewrap) was not found on $PATH: could not run the uninstaller sandboxed".to_owned());
         return false;
     };
-    let sandboxed = launcher
-        .clone()
-        .with_sandbox(InstallerSandbox::new(bwrap, runtime_exe).for_launcher(env.clone(), opts));
+    let sandbox = InstallerSandbox::new(bwrap, runtime_exe);
+    if let Err(why) = sandbox.check(env) {
+        warnings.push(format!(
+            "the installer sandbox refused to start the uninstaller: {why} (nothing was run)"
+        ));
+        return false;
+    }
+    let sandboxed = launcher.clone().with_sandbox(sandbox.for_launcher(env.clone(), opts));
     let cmd = match backend.command(env, &exe_unix, &env.drive_c(), &args, &RunOpts::default()) {
         Ok(cmd) => cmd,
         Err(e) => {

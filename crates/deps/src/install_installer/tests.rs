@@ -126,10 +126,11 @@ fn require_real_bwrap() -> Option<PathBuf> {
 }
 
 /// The installer sandbox for `bwrap`: its shim is the built `runtime` ([`crate::test_runtime_exe`]), except with
-/// [`NO_RUN_BWRAP`], where nothing may run.
+/// [`NO_RUN_BWRAP`], where nothing may run: then any real file passes the pre-flight check (this test binary), and
+/// the missing bwrap is what keeps anything from running.
 fn sandbox(bwrap: &Path) -> InstallerSandbox {
     let exe = if bwrap == Path::new(NO_RUN_BWRAP) {
-        PathBuf::from("/nonexistent/runtime-must-not-run")
+        std::env::current_exe().unwrap()
     } else {
         crate::test_runtime_exe()
     };
@@ -1543,4 +1544,31 @@ fn cleanup_leaves_a_directory_the_installer_put_at_the_staged_path() {
     assert!(!got.staged_removed);
     assert!(got.warnings.iter().any(|w| w.contains("staged")), "{:?}", got.warnings);
     assert!(f.c("windows/temp/rt-deps/testpkg/testpkg.exe").is_dir());
+}
+
+/// Phase 5B Task 6 fix round 1: a runtime executable the installer sandbox cannot use is a typed refusal that names
+/// the reason, before anything is staged or run (never `NonZeroAndNoMarker { code: 126 }`), and the orchestrator
+/// reports it as "nothing ran", not as a vendor installer's partial state.
+#[test]
+fn an_unusable_runtime_executable_is_refused_before_anything_is_staged() {
+    let f = fx(BODY);
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    let err = install_with(
+        &p,
+        &f.cache,
+        &f.env,
+        &backend(MAKE_MARKER),
+        &launcher(),
+        Some(InstallerSandbox::new(NO_RUN_BWRAP, "runtime")),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    assert!(matches!(err, InstallerPkgError::SandboxRefused(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains("not an absolute path") && text.contains("nothing was run"),
+        "{text}"
+    );
+    assert!(!f.ran());
+    assert!(!f.staging_left());
 }

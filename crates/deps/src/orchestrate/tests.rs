@@ -1009,6 +1009,13 @@ fn installer_failure_reasons() {
     assert!(why.contains(MARKER_PRESENT) && !why.contains(VENDOR_PARTIAL), "{why}");
     let why = installer_reason(InstallerPkgError::BwrapNotFound);
     assert!(!why.contains(VENDOR_PARTIAL), "nothing ran: {why}");
+    let why = installer_reason(InstallerPkgError::SandboxRefused(
+        "the runtime executable ... is not an absolute path".into(),
+    ));
+    assert!(
+        !why.contains(VENDOR_PARTIAL) && why.contains("not an absolute path"),
+        "nothing ran: {why}"
+    );
     let why = installer_reason(InstallerPkgError::Registry("\x1b[31mevil\n".repeat(200)));
     assert!(!why.chars().any(|c| c.is_control()) && why.len() < 1000, "{why:?}");
 }

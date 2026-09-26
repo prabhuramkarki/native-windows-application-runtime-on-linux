@@ -150,8 +150,9 @@ layers add and do not".
 
 ## Installer sandbox (Phase 3 Task 5; seccomp and Landlock since Phase 5B Task 6)
 
-`rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
-through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
+`rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes: `runtime install`'s
+`.exe`/`.msi` installers (msiexec for MSI), `runtime uninstall`'s recorded uninstaller, and `runtime deps --install`'s
+installer packages with the `reg.exe` steps that follow them. **It is scoped to those helpers,
 not to Wine app runs in general**: app runs have their own, per-app profile since Phase 5A ("App sandbox
 (Phase 5A)" below). It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
 `Sandbox` trait a `Launcher` can optionally carry, rather than a hard-coded identity function), so a sandboxed
@@ -205,13 +206,20 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   enforced Landlock domain), then `execve` of the unchanged program. The runtime executable is an explicit input of
   `InstallerSandbox::new(bwrap, runtime_exe)`, the only constructor (the CLI passes its own `current_exe()`), and is
   bound read-only at its resolved path after the system binds and before the prefix. One that is relative, ends in
-  ` (deleted)` (replaced since it started), does not resolve to a file or lies inside the data directory makes the
-  sandbox run a refusal instead (exit 126, `runtime: the sandbox refused to start the program: <why>` on stderr):
-  there is no switch, variable or feature that runs an installer without the shim. The Landlock rules mirror the
+  ` (deleted)` (replaced since it started), does not resolve to a file or lies inside the data directory is refused
+  before anything runs: every caller runs the sandbox's pre-flight check first (`InstallerSandbox::check`), so
+  `runtime install` and `runtime deps --install` fail with `the installer sandbox refused to start: <why> (nothing
+  was run; nothing was installed)`, a `reg.exe` step fails with that text, and `runtime uninstall` warns with it and
+  removes the environment as it does for any uninstaller failure. `wrap` itself still fails closed (a refusal command:
+  exit 126, the reason on stderr) should it ever be reached with such an executable. There is no switch, variable or
+  feature that runs an installer without the shim. The Landlock rules mirror the
   mounts, each for its path inside the sandbox: read-write for `/proc`, bwrap's `/dev/null`, `/dev/zero`,
   `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty` and its `/dev/pts` and `/dev/shm` directories (`/dev/ptmx`
   is a link to `pts/ptmx`, covered by the `pts` rule), `/tmp`, the prefix and the empty `$HOME`; read-execute for
   `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/alternatives`, the backend's dll directories and the runtime executable.
+  A dll directory that is a host symlink under an already-bound tree (e.g. a `*-windows` link inside `/usr`) stays a
+  symlink inside, where bwrap cannot mount over it and a Landlock rule on it fails (ELOOP), so both sandboxes bind
+  and rule its resolved directory instead (`rt_sandbox::render::ro_bind_target`); the link inside resolves into it.
   No display, audio, GPU or `/sys` rule, as there is no such mount. Tests: the frozen argv and rules
   (`the_exact_argv_for_a_typical_command`), the refusals, `Seccomp: 2`/`NoNewPrivs: 1` inside, a nested user
   namespace refused (`unshare -U`: EPERM through the shim, success with bwrap alone on this host), a test-only bind

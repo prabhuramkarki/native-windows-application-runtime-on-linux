@@ -138,6 +138,9 @@ pub enum InstallerPkgError {
     BwrapNotFound,
     #[error("cannot run the installer in the sandbox: {0}")]
     Sandbox(String),
+    /// The installer sandbox's pre-flight check failed (`rt_installer::InstallerSandbox::check`): the reason.
+    #[error("the installer sandbox refused to start: {0} (nothing was run; nothing was installed)")]
+    SandboxRefused(String),
     #[error("the package's marker is already present in this prefix; the installer was not run")]
     MarkerAlreadyPresent,
     #[error(
@@ -221,6 +224,9 @@ fn install_with(
 ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     let (silent_args, marker, overrides) = check_package(pkg)?;
     let sandbox = sandbox.ok_or(InstallerPkgError::BwrapNotFound)?;
+    sandbox
+        .check(env)
+        .map_err(|why| InstallerPkgError::SandboxRefused(bounded(&why)))?;
 
     let stage_err = |e: &dyn Display| InstallerPkgError::Stage(bounded(e));
     let mut src = open_archive(file, pkg.size).map_err(|e| stage_err(&e))?;
@@ -269,8 +275,11 @@ fn install_with(
         allow_network: false,
         extra_ro_binds: backend.dll_dirs(),
     };
-    let status = run_sandboxed(backend, launcher, env, &sandbox, &exe, &args, opts, Some(deadline))
-        .map_err(|e| InstallerPkgError::Sandbox(bounded(&e)))?;
+    let status =
+        run_sandboxed(backend, launcher, env, &sandbox, &exe, &args, opts, Some(deadline)).map_err(|e| match e {
+            rt_installer::InstallerError::SandboxRefused(why) => InstallerPkgError::SandboxRefused(bounded(&why)),
+            e => InstallerPkgError::Sandbox(bounded(&e)),
+        })?;
     let Some(status) = status else {
         // The sandbox tree is already dead; this only makes sure nothing of the prefix is left running outside it.
         let _ = backend.stop(env);

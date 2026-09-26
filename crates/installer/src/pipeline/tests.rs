@@ -741,3 +741,37 @@ exit 0
     assert_eq!(installer.product_name, None);
     assert_eq!(installer.uninstall_command, None);
 }
+
+/// Phase 5B Task 6 fix round 1: a runtime executable the installer sandbox cannot use is a typed error that names the
+/// reason, before anything runs (never an installer "exit 126" warning followed by an empty discovery).
+#[test]
+fn an_unusable_runtime_executable_is_a_sandbox_refusal_and_nothing_runs() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let deleted = format!("{} (deleted)", std::env::current_exe().unwrap().display());
+    for (exe, why) in [
+        (PathBuf::from("runtime"), "not an absolute path"),
+        (PathBuf::from(&deleted), "replaced or deleted"),
+        (PathBuf::from("/nonexistent/runtime"), "cannot be resolved"),
+    ] {
+        let f = fx();
+        let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+        let backend = fake_backend("exit 0");
+        let opts = InstallerOpts {
+            runtime_exe: exe.clone(),
+            ..opts()
+        };
+        let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
+        let cause = match err {
+            InstallerError::WithCleanup { cause, .. } => *cause,
+            e => e,
+        };
+        assert!(matches!(cause, InstallerError::SandboxRefused(_)), "{exe:?}: {cause:?}");
+        let text = cause.to_string();
+        assert!(text.contains(why) && text.contains("nothing was run"), "{text}");
+        assert!(
+            !backend.calls().iter().any(|c| matches!(c, Call::Command { .. })),
+            "{exe:?}: {:?}",
+            backend.calls()
+        );
+    }
+}
