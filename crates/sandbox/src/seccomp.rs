@@ -8,12 +8,13 @@
 //! numbers differ and would slip past the table, with ONE exception: i386 `set_thread_area` (243). Wine runs 32-bit
 //! Windows programs in 64-bit processes (new WoW64), but it allocates the 32-bit `%fs` TLS selector with that call
 //! through `int 0x80` (found by running `hello32.exe` under the filter: without it Wine 10.0 fails with "failed to
-//! allocate %fs selector" and crashes). It only sets a TLS descriptor of the calling thread. Then, on x86-64, any number with the x32 bit (`0x40000000`) set fails with
-//! `EPERM` (the x32 ABI shares the x86-64 audit architecture but numbers its calls differently; the same test also
-//! refuses a raw `syscall(-1)`, whose number has every bit set, which the kernel would answer with `ENOSYS`). Then
-//! each entry of [`DENIED`] is compared by number; an entry with an argument condition jumps to its own check. Everything
-//! else is allowed. Arguments are compared on their low 32 bits: the kernel truncates `clone`'s flags, `ioctl`'s
-//! `cmd`, `personality`'s persona and `socket`'s domain to 32 bits, so garbage in the upper half changes nothing.
+//! allocate %fs selector" and crashes). It only sets a TLS descriptor of the calling thread. Then, on x86-64, any
+//! number with the x32 bit (`0x40000000`) set fails with `EPERM` (the x32 ABI shares the x86-64 audit architecture
+//! but numbers its calls differently; the same test also refuses a raw `syscall(-1)`, whose number has every bit
+//! set, which the kernel would answer with `ENOSYS`). Then each entry of [`DENIED`] is compared by number; an entry
+//! with an argument condition jumps to its own check. Everything else is allowed. Arguments are compared on their
+//! low 32 bits: the kernel truncates `clone`'s flags, `ioctl`'s `cmd`, `personality`'s persona and `socket`'s
+//! domain to 32 bits, so garbage in the upper half changes nothing.
 //! Jump offsets are computed by a small label builder, never counted by hand.
 //!
 //! The syscall numbers are this build's `libc::SYS_*` constants, so the filter is built only for the architecture

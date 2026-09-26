@@ -170,7 +170,8 @@ pub fn filter_for(
 
 /// Hardens this process and becomes the program (module docs). Never returns: the program, or exit 126.
 pub fn run(args: InitArgs) -> ! {
-    // Everything that allocates first; `parse` already refused NUL bytes, so these cannot fail.
+    // The argv first (`parse` already refused NUL bytes, so these cannot fail); the filter is built after Landlock
+    // (`filter_for` depends on its outcome), still before anything is installed.
     let c = |s: &OsStr| CString::new(s.as_bytes()).unwrap_or_else(|_| refuse("an argument contains a NUL byte"));
     let program = c(args.program.as_os_str());
     let argv: Vec<CString> = std::iter::once(program.clone())
