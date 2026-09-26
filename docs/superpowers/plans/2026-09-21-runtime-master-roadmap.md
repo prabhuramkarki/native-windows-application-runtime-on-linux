@@ -39,15 +39,16 @@
 | 4B Graphics | done | Vulkan probe, `runtime graphics info`, DXVK 3.1.1 (x64), VKD3D-Proton 3.0.1, `.tar.zst` reader |
 | 4C Audio + display | done | doctor audio path (PulseAudio-compatible socket), `runtime display` (Wine graphics driver) |
 | 4D/4E Doctor + compat matrix | done | doctor predicts .NET/Direct3D route; `runtime compat`, `docs/COMPAT.md` (TOML records, manual evidence); D3D11 fixture verified on RADV, NVIDIA, llvmpipe |
+| 4F .NET (Wine Mono) | done | bundled `wine-mono` 9.4.0 MSI (`dotnet`), `mscoree` enabled only for apps that record it, state-aware doctor; a C# console fixture (threads, GC) verified under the default sandbox, no filter/rule change |
 | 5A Sandbox + permissions | done | per-app `permissions.toml`, bubblewrap run sandbox, `runtime permissions/sandbox`, `--unsandboxed`, escape suite |
 | 5B seccomp, Landlock, limits | done | hidden `runtime sandbox-init` shim (seccomp deny-list, best-effort Landlock), cgroup limits via `systemd-run --user`, the INSTALLER sandbox uses the same shim |
 | 5C Portal "ask" flows | deferred | a running bubblewrap sandbox cannot gain mounts; needs a different design (per-run grants) |
 | 6 Daemon, API, plugins, GUI | not started | open decisions: GUI toolkit, project name, licence |
 
-**Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are NOT met: no game was recorded, and .NET is not supported (`mscoree=d` is set on every Wine process, so managed programs fail; `doctor` says so). `doctor` predicts a deliberately broken environment (met).
+**Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are only partly met: no game was recorded; .NET runs: met for Mono-compatible console programs (Phase 4F: Wine Mono 9.4.0 per app, a C# console fixture with threads and GC verified under the hardened sandbox); a real .NET Framework 4.8 GUI app is not claimed. `doctor` predicts a deliberately broken environment (met).
 
 **Known follow-ups (from review ledgers; none blocks use):**
-- .NET: bundle Wine Mono (MSI or `.tar.xz`, ~90 MB, version tied to the Wine version) through the deps engine, drop `mscoree=d` per app when it is installed, needs a managed test fixture (none can be built on the dev host: no Mono/`mcs`).
+- .NET: record a real .NET Framework 4.x application (GUI: WinForms/WPF) under Wine Mono; a Wine upgrade needs a new Wine Mono pin.
 - 32-bit apps: DXVK/VKD3D are installed x64-only; a 32-bit app keeps Wine's builtin Direct3D (doctor says so).
 - `runtime deps --remove` (needs the `ArchiveInstalled` record persisted in `Metadata`).
 - Sandbox residuals (all documented in `docs/SECURITY.md`): X11 is shared with the host when `display=on`; `network=allow` shares the host network namespace; the seccomp layer can be shed via `/proc/1/mem` on hosts with neither Landlock nor Yama (disclosed by doctor, `runtime sandbox` and a run-time note; fix = run the shim as a filtered pid 1); helpers (`reg.exe` for `display`/archive `deps`) are sandboxed only for prefixes that ran or installed code sandboxed (marker), unsandboxed runs and pre-5A prefixes stay a residual; a hostile app can hide its wineserver from the `wineservers_for` check (the app lock closes the deps/permissions paths); installers have no cgroup limits.
