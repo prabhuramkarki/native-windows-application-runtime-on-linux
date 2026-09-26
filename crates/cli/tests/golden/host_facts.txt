@@ -1,0 +1,1538 @@
+=== doctor --json, no bwrap (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "warn",
+      "text": "sandbox: unavailable: bwrap is not on PATH; `runtime run` refuses to start programs until this is fixed (or with --unsandboxed, NOT sandboxed)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    }
+  ],
+  "subject": {
+    "kind": "system"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+=== doctor native --json, no bwrap (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "warn",
+      "text": "sandbox: unavailable: bwrap is not on PATH; `runtime run` refuses to start programs until this is fixed (or with --unsandboxed, NOT sandboxed)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture\\hello64.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+=== sandbox native, no bwrap (exit Some(0))
+bubblewrap: UNAVAILABLE: bwrap is not on PATH; `runtime run` refuses to start this app
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor (exit Some(0))
+Runtime Diagnostics
+
+System checks (no application given)
+
+Architecture
+  [ok]   host architecture: x86-64
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works (`runtime run` starts programs in it)
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Result: Looks good.
+--- stderr
+=== doctor --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works (`runtime run` starts programs in it)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    }
+  ],
+  "subject": {
+    "kind": "system"
+  },
+  "verdict": "good"
+}
+--- stderr
+=== doctor --json, no wine (exit Some(1))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "fail",
+      "text": "Wine is not usable: compatibility backend not available: RUNTIME_WINE points to \"<ROOT>/no-such-wine\", which is not an executable file"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works (`runtime run` starts programs in it)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native) (Wine driver modules not verified)"
+    }
+  ],
+  "subject": {
+    "kind": "system"
+  },
+  "verdict": "fail"
+}
+--- stderr
+=== doctor --json, no vulkan loader (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works (`runtime run` starts programs in it)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "warn",
+      "text": "Vulkan unusable: Vulkan loader (libvulkan.so.1) not found"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    }
+  ],
+  "subject": {
+    "kind": "system"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+=== doctor runtime-fixture (exit Some(0))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+  [ok]   program architecture: x86-64
+
+PE
+  [ok]   valid PE file (PE32+)
+  [ok]   console application
+  [ok]   signed: no (not verified); ASLR: yes; NX: yes
+
+Imports
+  [ok]   all imported DLLs were found
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [ok]   program found: C:\Program Files\runtime-fixture\hello64.exe
+
+Result: Looks good.
+--- stderr
+=== doctor runtime-fixture --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture\\hello64.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "good"
+}
+--- stderr
+=== deps runtime-fixture (exit Some(0))
+Dependencies of runtime-fixture:
+  (none that the runtime can provide)
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture (exit Some(0))
+bubblewrap: <ROOT>/bin/bwrap works
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor runtime-fixture-2 (exit Some(0))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-2), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+  [ok]   program architecture: x86-64
+
+PE
+  [ok]   valid PE file (PE32+)
+  [ok]   console application
+  [ok]   signed: no (not verified); ASLR: yes; NX: yes
+
+Imports
+  [ok]   all imported DLLs were found
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+  [warn] Direct3D 11: Wine's built-in wined3d (DXVK not installed: run `runtime deps runtime-fixture-2 --install`)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [ok]   program found: C:\Program Files\runtime-fixture-2\game.exe
+
+Result: Application may fail to start.
+--- stderr
+hint: 1 dependency missing: run `runtime deps runtime-fixture-2`
+=== doctor runtime-fixture-2 --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "graphics",
+      "status": "warn",
+      "text": "Direct3D 11: Wine's built-in wined3d (DXVK not installed: run `runtime deps runtime-fixture-2 --install`)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture-2\\game.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-2",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+hint: 1 dependency missing: run `runtime deps runtime-fixture-2`
+=== deps runtime-fixture-2 (exit Some(0))
+Dependencies of runtime-fixture-2:
+  dxvk 3.1.1 (Zlib): to install
+Install with: runtime deps runtime-fixture-2 --install
+--- stderr
+=== sandbox runtime-fixture-2 (exit Some(0))
+bubblewrap: <ROOT>/bin/bwrap works
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture-2` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor runtime-fixture-3 (exit Some(0))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-3), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+  [ok]   program architecture: x86-64
+
+PE
+  [ok]   valid PE file (PE32+)
+  [ok]   console application
+  [ok]   signed: no (not verified); ASLR: yes; NX: yes
+
+Imports
+  [ok]   all imported DLLs were found
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [warn] managed (.NET) program: Wine Mono is not installed for this app; run `runtime deps runtime-fixture-3 --install`
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [ok]   program found: C:\Program Files\runtime-fixture-3\managed.exe
+
+Result: Application may fail to start.
+--- stderr
+=== doctor runtime-fixture-3 --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "warn",
+      "text": "managed (.NET) program: Wine Mono is not installed for this app; run `runtime deps runtime-fixture-3 --install`"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture-3\\managed.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-3",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+=== deps runtime-fixture-3 (exit Some(0))
+Dependencies of runtime-fixture-3:
+  (none that the runtime can provide)
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture-3 (exit Some(0))
+bubblewrap: <ROOT>/bin/bwrap works
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture-3` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor runtime-fixture-4 (exit Some(0))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-4), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+  [ok]   program architecture: x86-64
+
+PE
+  [ok]   valid PE file (PE32+)
+  [ok]   console application
+  [ok]   signed: no (not verified); ASLR: yes; NX: yes
+
+Imports
+  [ok]   all imported DLLs were found
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   managed (.NET) program: Wine Mono 9.4.0 is recorded as installed for this app
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [ok]   program found: C:\Program Files\runtime-fixture-4\managed.exe
+
+Result: Looks good.
+--- stderr
+=== doctor runtime-fixture-4 --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "managed (.NET) program: Wine Mono 9.4.0 is recorded as installed for this app"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture-4\\managed.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-4",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "good"
+}
+--- stderr
+=== deps runtime-fixture-4 (exit Some(0))
+Dependencies of runtime-fixture-4:
+  (none that the runtime can provide)
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture-4 (exit Some(0))
+bubblewrap: <ROOT>/bin/bwrap works
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture-4` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor runtime-fixture-5 (exit Some(0))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-5), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+  [ok]   program architecture: x86 (32-bit, runs through Wine's WoW64)
+
+PE
+  [ok]   valid PE file (PE32+)
+  [ok]   console application
+  [ok]   signed: no (not verified); ASLR: yes; NX: yes
+
+Imports
+  [ok]   all imported DLLs were found
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+  [ok]   Direct3D 11: Wine's built-in wined3d (DXVK covers 64-bit only; this 32-bit app uses Wine's built-in Direct3D)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [ok]   program found: C:\Program Files\runtime-fixture-5\x86.exe
+
+Result: Looks good.
+--- stderr
+=== doctor runtime-fixture-5 --json (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86 (32-bit, runs through Wine's WoW64)"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Direct3D 11: Wine's built-in wined3d (DXVK covers 64-bit only; this 32-bit app uses Wine's built-in Direct3D)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture-5\\x86.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-5",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "good"
+}
+--- stderr
+=== deps runtime-fixture-5 (exit Some(0))
+Dependencies of runtime-fixture-5:
+  dxvk 3.1.1 (Zlib): already installed
+warning: dxvk is installed for 64-bit only; a 32-bit app keeps using Wine's builtin DLL
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture-5 (exit Some(0))
+bubblewrap: <ROOT>/bin/bwrap works
+<SECCOMP>
+<LANDLOCK>
+shim: <RUNTIME> sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)
+profile (default): network deny, display on, audio on, gpu on, 0 host directories
+limits: systemd-run --user works (<ROOT>/bin/systemd-run; cgroup controllers: cpu io memory pids)
+  tasks: 4096 (default, best effort)
+  memory: no limit
+  cpu: no limit
+warning: `runtime run --unsandboxed runtime-fixture-5` would run whatever this app wrote into its prefix (registry Run keys, DLL overrides) with your full access
+--- stderr
+=== doctor runtime-fixture-6 (exit Some(1))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-6), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [ok]   prefix hardened: dosdevices holds only c: and no link leaves drive_c
+
+Program
+  [FAIL] app runtime-fixture-6: its program "C:\\Program Files\\runtime-fixture-6\\gone.exe" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime-fixture-6` and
+
+Result: Application cannot run: fix the items marked [FAIL].
+--- stderr
+=== doctor runtime-fixture-6 --json (exit Some(1))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "fail",
+      "text": "app runtime-fixture-6: its program \"C:\\\\Program Files\\\\runtime-fixture-6\\\\gone.exe\" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime-fixture-6` and"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-6",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "fail"
+}
+--- stderr
+=== deps runtime-fixture-6 (exit Some(0))
+Dependencies of runtime-fixture-6:
+  (none that the runtime can provide)
+warning: cannot read the app's executable (path does not exist); the plan does not include what it imports
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture-6 (exit Some(1))
+--- stderr
+error: app runtime-fixture-6: its program "C:\\Program Files\\runtime-fixture-6\\gone.exe" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime-fixture-6` and install it again
+=== doctor runtime-fixture-7 (exit Some(1))
+Runtime Diagnostics
+
+Application: Runtime Fixture (runtime-fixture-7), version 1.2.3.4
+
+Architecture
+  [ok]   host architecture: x86-64
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [FAIL] the prefix cannot be examined: drive_c is a symbolic link; refusing to harden through it
+
+Program
+  [FAIL] app runtime-fixture-7: its program "C:\\Program Files\\runtime-fixture-7\\linked.exe" cannot be found or used in the environment (the drive root is a symbolic link); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime
+
+Result: Application cannot run: fix the items marked [FAIL].
+--- stderr
+=== doctor runtime-fixture-7 --json (exit Some(1))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "fail",
+      "text": "the prefix cannot be examined: drive_c is a symbolic link; refusing to harden through it"
+    },
+    {
+      "area": "program",
+      "status": "fail",
+      "text": "app runtime-fixture-7: its program \"C:\\\\Program Files\\\\runtime-fixture-7\\\\linked.exe\" cannot be found or used in the environment (the drive root is a symbolic link); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-7",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "fail"
+}
+--- stderr
+=== deps runtime-fixture-7 (exit Some(0))
+Dependencies of runtime-fixture-7:
+  (none that the runtime can provide)
+warning: cannot read the app's executable (the drive root is a symbolic link); the plan does not include what it imports
+Nothing to install.
+--- stderr
+=== sandbox runtime-fixture-7 (exit Some(1))
+--- stderr
+error: app runtime-fixture-7: its program "C:\\Program Files\\runtime-fixture-7\\linked.exe" cannot be found or used in the environment (the drive root is a symbolic link); `runtime repair` is not implemented yet: remove the app with `runtime remove runtime-fixture-7` and install it again
+=== doctor evil (exit Some(1))
+Runtime Diagnostics
+
+Application: Evil\u{1b}]0;pwned\u{7}\u{202e}\u{9b}[2J name (evil), version 1.2.3
+
+Architecture
+  [ok]   host architecture: x86-64
+
+Graphics
+  [ok]   Vulkan: 1 device usable
+  [ok]   X11 or XWayland display ":0"
+  [ok]   Wine graphics driver: auto (session: DISPLAY)
+
+Audio
+  [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
+
+Runtime
+  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
+  [ok]   <SECCOMP>; <LANDLOCK>
+  [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
+
+Prefix
+  [warn] dosdevices/c: is missing or does not point to drive_c
+
+Program
+  [FAIL] app evil: its program "C:\\Program Files\\x\\x.exe" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove evil` and install it again
+  [FAIL] app runtime directory failed: missing: this app was not prepared by this version, reinstall it
+
+Result: Application cannot run: fix the items marked [FAIL].
+--- stderr
+=== doctor evil --json (exit Some(1))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Vulkan: 1 device usable"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "warn",
+      "text": "dosdevices/c: is missing or does not point to drive_c"
+    },
+    {
+      "area": "program",
+      "status": "fail",
+      "text": "app evil: its program \"C:\\\\Program Files\\\\x\\\\x.exe\" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove evil` and install it again"
+    },
+    {
+      "area": "program",
+      "status": "fail",
+      "text": "app runtime directory failed: missing: this app was not prepared by this version, reinstall it"
+    }
+  ],
+  "subject": {
+    "id": "evil",
+    "kind": "app",
+    "name": "Evil\u001b]0;pwned\u0007\u202e\u009b[2J name",
+    "version": "1.2.3"
+  },
+  "verdict": "fail"
+}
+--- stderr
+=== deps evil (exit Some(0))
+Dependencies of evil:
+  (none that the runtime can provide)
+warning: cannot read the app's executable (path does not exist); the plan does not include what it imports
+Nothing to install.
+--- stderr
+=== sandbox evil (exit Some(1))
+--- stderr
+error: app evil: its program "C:\\Program Files\\x\\x.exe" cannot be found or used in the environment (path does not exist); `runtime repair` is not implemented yet: remove the app with `runtime remove evil` and install it again
+=== deps d3d11, no vulkan loader (exit Some(0))
+Dependencies of runtime-fixture-2:
+  dxvk 3.1.1 (Zlib): blocked: Vulkan is unusable: Vulkan loader (libvulkan.so.1) not found; Wine's built-in Direct3D will be used
+Nothing to install.
+--- stderr
+=== doctor d3d11 --json, no vulkan loader (exit Some(0))
+{
+  "checks": [
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "host architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "valid PE file (PE32+)"
+    },
+    {
+      "area": "architecture",
+      "status": "ok",
+      "text": "program architecture: x86-64"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "console application"
+    },
+    {
+      "area": "pe",
+      "status": "ok",
+      "text": "signed: no (not verified); ASLR: yes; NX: yes"
+    },
+    {
+      "area": "imports",
+      "status": "ok",
+      "text": "all imported DLLs were found"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "Wine: wine-10.0 (Fake 1)"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "<SECCOMP>; <LANDLOCK>"
+    },
+    {
+      "area": "runtime",
+      "status": "ok",
+      "text": "limits: systemd-run --user available (cgroup controllers: cpu io memory pids)"
+    },
+    {
+      "area": "graphics",
+      "status": "warn",
+      "text": "Vulkan unusable: Vulkan loader (libvulkan.so.1) not found"
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "X11 or XWayland display \":0\""
+    },
+    {
+      "area": "graphics",
+      "status": "ok",
+      "text": "Wine graphics driver: auto (session: DISPLAY)"
+    },
+    {
+      "area": "graphics",
+      "status": "warn",
+      "text": "Direct3D 11: Wine's built-in wined3d (Vulkan is unusable: Vulkan loader (libvulkan.so.1) not found; Wine's built-in Direct3D will be used)"
+    },
+    {
+      "area": "audio",
+      "status": "ok",
+      "text": "PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)"
+    },
+    {
+      "area": "prefix",
+      "status": "ok",
+      "text": "prefix hardened: dosdevices holds only c: and no link leaves drive_c"
+    },
+    {
+      "area": "program",
+      "status": "ok",
+      "text": "program found: C:\\Program Files\\runtime-fixture-2\\game.exe"
+    }
+  ],
+  "subject": {
+    "id": "runtime-fixture-2",
+    "kind": "app",
+    "name": "Runtime Fixture",
+    "version": "1.2.3.4"
+  },
+  "verdict": "may_fail"
+}
+--- stderr
+=== graphics info (exit Some(0))
+Vulkan: usable
+  GPU0  fake   Vulkan 1.3   discrete_gpu   driver fake
+Vulkan needed by bundled packages:
+  dxvk 1.3+: met
+  vkd3d-proton 1.3+: met
+DXVK 3.x upstream recommends Vulkan 1.4; older AMD GCN cards work without it.
+--- stderr

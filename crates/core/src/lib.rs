@@ -4,6 +4,7 @@
 //! Everything derived from a file or a user argument is untrusted. The types here are the validation boundary:
 //! an [`AppId`] that exists is safe to use as a single path component.
 pub mod backend;
+pub mod cache;
 pub mod dirs;
 pub mod display;
 pub mod doctor;
@@ -24,6 +25,7 @@ pub mod unzip;
 pub mod winpath;
 
 pub use backend::{BackendError, CompatBackend, Detail, RunOpts, allowed_env};
+pub use cache::Cached;
 pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
 pub use display::{DRIVERS_KEY, GraphicsDriver, driver_from_value};
 #[cfg(any(test, feature = "testing"))]
@@ -44,6 +46,6 @@ pub use run::{
     find_target, resolve_program, run, start,
 };
 pub use store::{AppEnv, ListEntry, Store, StoreError, StoreWarn, unique_id};
-pub use text::is_format;
+pub use text::{clean as clean_text, is_format};
 pub use unzip::{NameError, ZipError};
 pub use winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};
