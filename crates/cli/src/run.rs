@@ -13,6 +13,16 @@
 //! guard is created BEFORE the "installed as ..." report (`report_and_wait`), so a Ctrl-C while that is written
 //! cannot kill the CLI either.
 //!
+//! **App lock.** The app's `deps.lock` is held SHARED from before the start until the program has ended, for
+//! sandboxed and `--unsandboxed` runs alike (a file target's from right after its install), so every exclusive
+//! holder (`deps --install`, `display`/`permissions` changes, `remove`, `uninstall`) refuses with "the app is running
+//! (started by `runtime run`)" for as long as the run lives, whatever the program does inside (a program need not
+//! keep a `wineserver`). The fd is close-on-exec: the program never holds it. Residual: when `bwrap` dies of a
+//! signal (Ctrl-C) this process is woken as it dies and drops the lock while the kernel is still tearing down the
+//! sandbox's PID namespace (`--die-with-parent` SIGKILLs its PID 1); when THIS process is SIGKILLed the kernel
+//! releases the lock as it exits and the sandbox dies right after. Both windows are below a millisecond: the Ctrl-C
+//! e2e test polls every millisecond and never saw a sandbox process after `runtime` had exited (docs/SECURITY.md).
+//!
 //! **Ctrl-C and SIGTERM, sandboxed** (measured with bubblewrap 0.11.1). The program is in a new session
 //! (`--new-session`), so the terminal's SIGINT never reaches it; it reaches `bwrap` itself (still in this process
 //! group), which does not handle or forward it and dies, and with it the sandbox: `--die-with-parent` kills the
@@ -37,11 +47,10 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
     // target needs it.
     let found = rt_core::find_target(&store, target, Path::new("."))?;
     let backend = crate::backend(&launcher)?;
-    // An installed app is started under a SHARED hold of its dependency lock: refused while a dependency install
-    // (or a removal) holds it exclusively, and an install cannot start until the app is running (then its
-    // running-wineserver check refuses). Dropped once the app is started: the fd is close-on-exec, so the app
-    // never inherits it. No missing-dependency hint here: it would read the whole executable on every start
-    // (`install` and `doctor` show it).
+    // The app runs under a SHARED hold of its lock (module docs, "App lock"): refused while a dependency install,
+    // a removal or a settings change holds it exclusively, and those refuse for as long as this run lives. No
+    // missing-dependency hint here: it would read the whole executable on every start (`install` and `doctor`
+    // show it).
     let deps_lock = match &found {
         Target::Installed(id) => crate::deps::lock_or_refuse(&store.get(id)?, true, "start")?,
         Target::File(_) => None,
@@ -62,8 +71,22 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
         args,
         &RunOptions { debug, sandbox },
     )?;
+    // A file target is a new app: its lock exists only now. The program already runs, so a refusal (another
+    // command took the lock within these microseconds) can only be reported.
+    let deps_lock = match deps_lock {
+        None if started.installed.is_some() => store
+            .get(&started.id)
+            .map_err(CmdError::from)
+            .and_then(|env| crate::deps::lock_or_refuse(&env, true, "hold the lock of"))
+            .unwrap_or_else(|e| {
+                warn(&format!("the app runs without its lock: {e}"));
+                None
+            }),
+        held => held,
+    };
+    let outcome = report_and_wait(started, report_on_stderr, sandboxed);
     drop(deps_lock);
-    let outcome = report_and_wait(started, report_on_stderr, sandboxed)?;
+    let outcome = outcome?;
     if outcome.log_write_failed {
         warn(&format!(
             "the log file {} is incomplete (a write failed)",

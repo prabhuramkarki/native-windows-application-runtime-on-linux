@@ -45,11 +45,18 @@ impl Suite {
             return None;
         }
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        // Grants below /tmp are refused and the sandbox's /tmp is a private tmpfs: the suite would prove nothing.
+        assert!(
+            !tmp.canonicalize().unwrap().starts_with("/tmp"),
+            "CARGO_TARGET_TMPDIR {} is under /tmp: run with a target directory outside /tmp (CARGO_TARGET_DIR)",
+            tmp.display()
+        );
         let base = tempfile::tempdir_in(tmp).unwrap();
         let home = base.path().join("home");
         fs::create_dir_all(home.join(".ssh")).unwrap();
         fs::write(home.join(".ssh/id_test"), "secret").unwrap();
         let rig = Rig::new_in(tmp);
+        rig.set_cleanup_env(&[("HOME", home.to_str().unwrap())]);
         let mut s = Suite {
             rig,
             base,
@@ -367,28 +374,23 @@ fn real_net_wine_d3d11_renders_under_the_default_sandbox() {
                 .current_dir(prefix.join("drive_c"));
             c
         };
-        let st = with_prefix(wine.wine_path())
-            .args([
-                "reg",
-                "add",
-                "HKCU\\Environment",
-                "/v",
-                "DXVK_FILTER_DEVICE_NAME",
-                "/d",
-                &filter,
-                "/f",
-            ])
-            .status()
-            .unwrap();
+        let mut reg = with_prefix(wine.wine_path());
+        reg.args([
+            "reg",
+            "add",
+            "HKCU\\Environment",
+            "/v",
+            "DXVK_FILTER_DEVICE_NAME",
+            "/d",
+            &filter,
+            "/f",
+        ]);
+        let st = status_within(reg, Duration::from_secs(120));
         assert!(st.success(), "wine reg add: {st:?}");
         // Flushes the registry to disk before the sandboxed run starts its own wineserver.
-        assert!(
-            with_prefix(wine.wineserver_path())
-                .arg("-w")
-                .status()
-                .unwrap()
-                .success()
-        );
+        let mut wait = with_prefix(wine.wineserver_path());
+        wait.arg("-w");
+        assert!(status_within(wait, Duration::from_secs(60)).success());
     }
 
     let ran = rig.rt(&["run", &id]);
@@ -423,4 +425,21 @@ fn real_net_wine_d3d11_renders_under_the_default_sandbox() {
     eprintln!("RECORDED: pixel ok on {adapter:?} under the default sandbox");
     rig.rt(&["remove", &id]).expect_ok();
     rig.finish();
+}
+
+/// `cmd`'s exit status, killing it (and failing the test) after `limit`.
+fn status_within(mut cmd: std::process::Command, limit: Duration) -> std::process::ExitStatus {
+    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("cannot start {cmd:?}: {e}"));
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{cmd:?} did not finish within {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

@@ -530,11 +530,25 @@ fn e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program() {
             panic!("control: no process {exe:?}: {}", report());
         }
         if sig == libc::SIGINT {
-            // `wineserver -k` cannot reach a sandboxed server: `remove` must refuse, not delete under it.
-            let ran = rig.rt(&["remove", &id]);
-            assert_eq!(ran.code, Some(1), "remove of a running app: {}", ran.report());
-            assert!(ran.err().contains("is running (wineserver pid"), "{}", ran.report());
+            // The run holds the app lock until the program has ended: `remove` and a permissions change refuse.
+            for args in [
+                &["remove", id.as_str()][..],
+                &["permissions", &id, "--set", "network=allow"],
+            ] {
+                let ran = rig.rt(args);
+                assert_eq!(ran.code, Some(1), "{args:?} while it runs: {}", ran.report());
+                assert!(
+                    ran.err()
+                        .contains("the app is running (started by `runtime run`); quit it first"),
+                    "{}",
+                    ran.report()
+                );
+            }
             assert!(rig.drive_c(&id).is_dir(), "the running app's prefix was removed");
+            assert!(
+                !rig.apps().join(&id).join("permissions.toml").exists(),
+                "the profile was changed"
+            );
             assert!(
                 !pids_with(exe).is_empty(),
                 "remove must leave the running program alone"
@@ -551,19 +565,19 @@ fn e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program() {
                 let _ = child.kill();
                 panic!("signal {sig}: the runtime did not end within 10 s: {}", report());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            // Short, so what is left right after the exit is seen.
+            std::thread::sleep(Duration::from_millis(1));
         };
         eprintln!("signal {sig}: runtime ended after {:?} with {status:?}", sent.elapsed());
         assert_eq!(status.code(), Some(code), "signal {sig}: {}", report());
-        while !pids_with(exe).is_empty() || !rig.wineservers().is_empty() {
-            assert!(
-                sent.elapsed() < Duration::from_secs(10),
-                "signal {sig}: the program or its wineserver outlived the run: {:?} {:?}",
-                pids_with(exe),
-                rig.wineservers()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // The app lock is dropped as `runtime` exits: nothing of the sandbox may be left by then (seen within the
+        // millisecond polling above; the kernel's PID-namespace teardown is faster).
+        assert!(
+            pids_with(exe).is_empty() && rig.wineservers().is_empty(),
+            "signal {sig}: the program or its wineserver outlived the run: {:?} {:?}",
+            pids_with(exe),
+            rig.wineservers()
+        );
     }
     rig.remove_app(&id);
     rig.finish();

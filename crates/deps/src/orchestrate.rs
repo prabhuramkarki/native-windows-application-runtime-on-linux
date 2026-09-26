@@ -140,12 +140,16 @@ pub struct RunReport {
 /// Run-level refusals; package failures are in the [`RunReport`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum DepsError {
-    /// Held exclusively by a dependency install, `remove` or `uninstall`, or shared by an app being started.
+    /// Held exclusively by a dependency install, `remove`, `uninstall`, `display` or `permissions`.
     #[error(
-        "another runtime command is using this app (a dependency install, a removal, or an app being started); \
-         wait for it to finish, then try again"
+        "another runtime command is using this app (a dependency install, a removal, or a setting being \
+         changed); wait for it to finish, then try again"
     )]
     LockHeld,
+    /// An exclusive lock was refused while only SHARED holders have it: `runtime run` holds the lock shared for as
+    /// long as the program runs.
+    #[error("the app is running (started by `runtime run`); quit it first")]
+    AppRunning,
     #[error(
         "a Wine program is running in this app's prefix (wineserver pid {pids:?}); close the app first, then \
          install again"
@@ -174,7 +178,8 @@ pub enum DepsError {
 impl DepsError {
     /// No lock on `deps.lock` can be taken by anyone ([`DepsError::LockFileUnusable`], [`DepsError::LockUnsupported`]),
     /// so no dependency install can be running either (an install refuses without the lock): `run`, `remove` and
-    /// `uninstall` may warn and go on. Every other lock error, [`DepsError::LockHeld`] above all, refuses.
+    /// `uninstall` may warn and go on. Every other lock error, [`DepsError::LockHeld`] and [`DepsError::AppRunning`]
+    /// above all, refuses.
     pub fn nobody_can_lock(&self) -> bool {
         matches!(self, DepsError::LockFileUnusable(_) | DepsError::LockUnsupported(_))
     }
@@ -354,8 +359,13 @@ impl Drop for AppLock {
 
 /// Takes `<app root>/deps.lock` exclusively without waiting. The file is created 0600 and never followed if it
 /// is a symlink; the fd is close-on-exec, so no child (a Wine program, an installer) inherits the lock.
+/// Refused while held: [`DepsError::AppRunning`] when the holders are shared ones (a running `runtime run`; told
+/// apart by taking a shared lock for a moment), else [`DepsError::LockHeld`].
 pub fn lock_app(env: &AppEnv) -> Result<AppLock, DepsError> {
-    lock_app_as(env, libc::LOCK_EX)
+    match lock_app_as(env, libc::LOCK_EX) {
+        Err(DepsError::LockHeld) if lock_app_as(env, libc::LOCK_SH).is_ok() => Err(DepsError::AppRunning),
+        other => other,
+    }
 }
 
 /// [`lock_app`] in shared mode: any number of shared holders (apps being started) at once, but never alongside an

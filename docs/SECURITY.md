@@ -105,8 +105,10 @@ apply. What the app sandbox itself does not protect is listed in "App sandbox (P
   under `$HOME/.local/share/vulkan` and `~/.config/vulkan` (`XDG_DATA_HOME` is not allowlisted) no longer sees
   user-installed drivers or layers (system files under `/usr/share/vulkan` still work), and the Wine Mono/Gecko
   download cache in `~/.cache/wine` is not visible, so a dependency mechanism must use an explicit cache path.
-- **Session D-Bus.** `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are allowlisted, so a program that speaks
-  D-Bus can reach the session bus (keyring/secret service, portals). Not tested.
+- **Session D-Bus** (`--unsandboxed` runs; a sandboxed run drops `DBUS_SESSION_BUS_ADDRESS` and never binds the bus
+  socket, so only an ABSTRACT bus address stays reachable, and only with `network = "allow"`).
+  `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are allowlisted, so a program that speaks D-Bus can reach the
+  session bus (keyring/secret service, portals). Not tested.
 - **Races (TOCTOU).** Checks such as "not a symlink" are followed by uses without `openat2`/`O_PATH`
   confinement, and a same-uid process (the app itself) that keeps swapping directories for links can win a race
   against `run`, `logs`, `doctor` or `remove`. Some cases are narrowed (`O_NOFOLLOW`, `O_NONBLOCK`, lstat before
@@ -121,9 +123,12 @@ apply. What the app sandbox itself does not protect is listed in "App sandbox (P
 - **Memory.** `analyze`, `install` and `doctor` read a whole file into memory, up to 4 GiB.
 - **Logs.** One log per run under `logs/`, 20 kept per app, no size limit on a single log (a program can fill the
   disk). `logs` prints only the end of the newest one.
-- **No locking.** `remove` can race `run` (or a second `run`); the last writer wins and a run can lose its
-  prefix. `remove` deletes the app and its prefix even when stopping its `wineserver` failed (it warns), so a
-  Wine process may keep running on a deleted prefix. Do not run several commands on one app at once.
+- **Locking.** Every `runtime run` holds the app's `deps.lock` SHARED from before the start until the program has
+  ended (a file target's from right after its install); `remove`, `uninstall`, `deps --install`, and `display`/
+  `permissions` changes take it EXCLUSIVELY and refuse while any run of the app lives ("the app is running (started
+  by `runtime run`); quit it first"), whatever the program does. Two runs of one app can still run at once (both
+  shared). A program started another way (plain `wine` with the app's `WINEPREFIX`) holds no lock: the `/proc`
+  `wineserver` scan below is the second, weaker check for it, and `remove`/`uninstall` refuse while it sees one.
 - **Interrupted installs.** Ctrl-C or a kill during `install`, and especially during `run <file>` (which installs
   first), can leave a partial app that `remove` cleans up.
 - **Run-by-path installs every time.** `runtime run some.exe` creates a *new* app on each invocation
@@ -403,11 +408,14 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
   narrows but does not close this). An `--unsandboxed` app reaches the host directly anyway (`\\?\unix\...`), so
   `deps-backup` is reachable from inside the prefix too. Now that the prefix is the sandbox's only writable path,
   these must move to `openat`/`renameat`/`unlinkat` against held parent descriptors (Phase 5B).
-- **Busy-prefix and lock limits.** An install refuses while any `wineserver` serves the prefix (checked before the
-  download and again before installing) and holds `<app>/deps.lock` exclusively. `run` holds the lock shared only
-  while it starts the app and releases it once the app has started; after that the running-`wineserver` check is what
-  refuses an install. Detection is a `/proc` scan by `WINEPREFIX` and Wine's server directory: a program started
-  another way can be missed. If `deps.lock` cannot be locked by anyone (a symlink or directory in its place, or a file
+- **Busy-prefix and lock limits.** An install holds `<app>/deps.lock` exclusively, so it refuses while any
+  `runtime run` of the app lives (the run holds the lock shared until the program has ended, sandboxed or not, even
+  when the program keeps no `wineserver`). As a second, weaker check for Wine processes NOT started by `runtime run`,
+  it also refuses while any `wineserver` serves the prefix (checked before the download and again before installing):
+  a `/proc` scan by `WINEPREFIX` and Wine's server directory, which a program started another way can evade. The lock
+  is released as `runtime run` exits; when `bwrap` dies of a signal, or `runtime` itself is SIGKILLed, the kernel
+  tears the sandbox's PID namespace down at the same moment. That window is below what could be observed: polling
+  every millisecond after `runtime` exited (Ctrl-C and SIGKILL, real Wine) never found a process of the sandbox. If `deps.lock` cannot be locked by anyone (a symlink or directory in its place, or a file
   system without `flock`: `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`), `run`, `remove` and `uninstall` warn and continue, and
   dependency installs refuse.
 - **Wine builtin versus native DLLs.** A DLL in `system32` is not necessarily loaded: Wine prefers its own builtins for
@@ -491,8 +499,10 @@ run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
 **What it does NOT protect** (known limits, not vulnerabilities):
 - **X11 is shared with the host.** With display on and `DISPLAY` set, the program is an ordinary X11 client of your
   X server: it can read and inject the keyboard and mouse input of every other X11 window (XTEST, XSendEvent), which
-  reaches code execution as you. `runtime run` prints this as a note. A Wayland session isolates clients; turn
-  display off (`runtime permissions <app> --set display=off`) for a console program.
+  reaches code execution as you. `runtime run` prints this as a note. On a Wayland session with XWayland (`DISPLAY`
+  set) the X11 socket is bound too: `runtime display <app> wayland` makes Wine draw through Wayland (which isolates
+  clients), but the program can still connect to X11 itself; only `runtime permissions <app> --set display=off`
+  removes the socket (and Wayland with it), which suits a console program.
 - **`network = "allow"` is the host network namespace.** Abstract unix sockets live in the network namespace, not
   the filesystem, so X11's `@/tmp/.X11-unix/X<n>`, abstract D-Bus or other session sockets, and every service on the
   host's loopback (CUPS, development servers, a TCP Docker API) are reachable. With network allowed, `display = off`
@@ -509,8 +519,9 @@ run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
 
 ### The escape suite
 
-`crates/cli/tests/e2e_sandbox.rs` (`e2e_real_wine_sandbox_*`, real Wine, real bubblewrap; required in CI with
-`RUNTIME_REQUIRE_BWRAP=1`) runs `probe64.exe` (`tools/fixtures/probe.c`), a Windows console program that attempts
+`crates/cli/tests/e2e_sandbox.rs` (`e2e_real_wine_sandbox_*`, real Wine, real bubblewrap; required with
+`RUNTIME_REQUIRE_BWRAP=1` in the `wine-e2e` CI job, which is `continue-on-error` and has not yet run on a hosted
+runner, so these tests currently gate nothing in CI: they were run locally) runs `probe64.exe` (`tools/fixtures/probe.c`), a Windows console program that attempts
 ONE action and exits 0 if it succeeded, 1 if it failed, printing the Windows error. Host files are named with Wine's
 `\\?\unix\<host path>` NT paths, which reach any host file the process can see (see "Wine's `\\?\unix\` escape"
 above). **The oracle:** each action is run against the same target twice, under the default sandbox, where it must

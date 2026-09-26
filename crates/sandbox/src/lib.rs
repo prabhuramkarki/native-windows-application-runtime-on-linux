@@ -88,7 +88,8 @@ pub(crate) fn grant_tempdir() -> tempfile::TempDir {
     let td = tempfile::tempdir_in(&base).unwrap();
     assert!(
         !td.path().canonicalize().unwrap().starts_with("/tmp"),
-        "{:?}",
+        "the test grant directory {:?} is under /tmp, where every grant is refused: build with a target directory \
+         outside /tmp (CARGO_TARGET_DIR)",
         td.path()
     );
     td
