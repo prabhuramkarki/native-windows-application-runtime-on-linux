@@ -156,6 +156,18 @@ pub fn main(args: &[OsString]) -> ! {
     }
 }
 
+/// The seccomp filter for what Landlock did: ptrace (Wine's requests only) inside an enforced Landlock domain,
+/// which confines it to the program's own processes; the strict filter otherwise (see [`seccomp`]).
+pub fn filter_for(
+    applied: &landlock::Applied,
+    arch: seccomp::Arch,
+) -> Result<Vec<seccomp::SockFilter>, seccomp::SeccompError> {
+    match applied {
+        landlock::Applied::Enforced { .. } => seccomp::build_filter_confined_ptrace(arch),
+        landlock::Applied::Unavailable(_) => seccomp::build_filter(arch),
+    }
+}
+
 /// Hardens this process and becomes the program (module docs). Never returns: the program, or exit 126.
 pub fn run(args: InitArgs) -> ! {
     // Everything that allocates first; `parse` already refused NUL bytes, so these cannot fail.
@@ -167,9 +179,6 @@ pub fn run(args: InitArgs) -> ! {
     let mut ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     let arch = seccomp::host_arch().unwrap_or_else(|e| refuse(&e.to_string()));
-    let (Ok(strict), Ok(confined)) = (seccomp::build_filter(arch), seccomp::build_filter_confined_ptrace(arch)) else {
-        refuse("the seccomp filter cannot be built")
-    };
 
     let no_core = libc::rlimit {
         rlim_cur: 0,
@@ -181,12 +190,9 @@ pub fn run(args: InitArgs) -> ! {
     }
     // Unavailable: the host-side probe reports it (`runtime sandbox`, `doctor`); a missing rule path is expected
     // (a `--ro-bind-try` source the host lacks).
-    // ptrace only inside a Landlock domain, which confines it to the program's own processes (seccomp docs).
-    let filter = match landlock::apply(&args.landlock) {
-        Ok(landlock::Applied::Enforced { .. }) => confined,
-        Ok(landlock::Applied::Unavailable(_)) => strict,
-        Err(e) => refuse(&format!("landlock: {e}")),
-    };
+    // A Landlock error refuses before any filter is chosen: `filter_for` only ever sees an applied state.
+    let applied = landlock::apply(&args.landlock).unwrap_or_else(|e| refuse(&format!("landlock: {e}")));
+    let filter = filter_for(&applied, arch).unwrap_or_else(|e| refuse(&e.to_string()));
     if let Err(e) = seccomp::install(&filter) {
         refuse(&e.to_string());
     }

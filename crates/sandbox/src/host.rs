@@ -22,6 +22,12 @@ pub trait Host: Send + Sync {
     fn runtime_exe(&self) -> Option<PathBuf>;
 }
 
+/// `/proc/self/exe` of a binary replaced or deleted since it started reads `<path> (deleted)`.
+fn replaced(exe: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    exe.as_os_str().as_bytes().ends_with(b" (deleted)")
+}
+
 /// This process's environment and the real filesystem.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealHost;
@@ -48,14 +54,24 @@ impl Host for RealHost {
         unsafe { libc::getuid() }
     }
     fn runtime_exe(&self) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStrExt;
         // `/proc/self/exe` of a binary replaced since (a rebuild, a package upgrade) reads `<path> (deleted)`: the
         // file at that path is not this program, so it is refused rather than run as the shim.
-        let exe = std::env::current_exe().ok()?;
-        if exe.as_os_str().as_bytes().ends_with(b" (deleted)") {
-            return None;
-        }
+        let exe = std::env::current_exe().ok().filter(|e| !replaced(e))?;
         let real = std::fs::canonicalize(exe).ok()?;
         self.is_file(&real).then_some(real)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replaced_or_deleted_runtime_executable_is_refused() {
+        assert!(replaced(Path::new("/usr/bin/runtime (deleted)")));
+        assert!(!replaced(Path::new("/usr/bin/runtime")));
+        assert!(!replaced(Path::new("/usr/bin/runtime (deleted)/x")));
+        // the running test binary resolves
+        assert!(RealHost.runtime_exe().is_some_and(|p| p.is_absolute()));
     }
 }

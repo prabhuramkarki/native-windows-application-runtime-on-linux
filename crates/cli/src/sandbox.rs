@@ -166,8 +166,16 @@ fn marked(lstat: std::io::Result<std::fs::Metadata>) -> Result<bool, String> {
 /// `doctor`'s hardening input: seccomp and Landlock in one phrase, `Err` when either is not fully there.
 pub(crate) fn doctor_hardening() -> Result<String, String> {
     let h = rt_sandbox::hardening();
-    let text = format!("{}; {}", h.seccomp, h.landlock);
-    if h.complete { Ok(text) } else { Err(text) }
+    let text = match &h.caveat {
+        // First, so the 300-byte cut never drops it.
+        Some(c) => format!("{c}; {}; {}", h.seccomp, h.landlock),
+        None => format!("{}; {}", h.seccomp, h.landlock),
+    };
+    if h.complete && h.caveat.is_none() {
+        Ok(text)
+    } else {
+        Err(text)
+    }
 }
 
 /// `doctor`'s sandbox input: bwrap works (with `env`: and the app's profile in a few words), or why not.
@@ -204,6 +212,9 @@ pub fn run(app: &str) -> Result<(), CmdError> {
     };
     let h = rt_sandbox::hardening();
     out += &format!("{}\n{}\n", safe(&h.seccomp), safe(&h.landlock));
+    if let Some(c) = &h.caveat {
+        out += &format!("note: {}\n", safe(c));
+    }
     match RealHost.runtime_exe() {
         Some(exe) => {
             out += &format!(
