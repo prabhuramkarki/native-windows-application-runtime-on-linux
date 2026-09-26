@@ -640,6 +640,30 @@ fn bundled_manifest_invariants() {
     }
 }
 
+/// Phase 4F: Wine Mono is the `dotnet` provider, a plain MSI installer confirmed by a file the MSI lays down.
+#[test]
+fn bundled_wine_mono_entry() {
+    let p = Manifest::bundled().get("wine-mono").expect("wine-mono is bundled");
+    assert_eq!((p.version.as_str(), p.kind), ("9.4.0", Kind::Installer));
+    assert_eq!(p.provides, ["dotnet"]);
+    assert!(p.requires.is_empty() && !p.requires_consent && p.min_vulkan.is_none());
+    assert!(p.url.ends_with("/wine-mono-9.4.0-x86.msi"), "{}", p.url);
+    let Install::Installer {
+        silent_args,
+        marker,
+        dll_overrides,
+    } = &p.install
+    else {
+        panic!("not an installer")
+    };
+    assert_eq!(silent_args, &["/qn"]);
+    assert_eq!(
+        marker,
+        &Marker::File("windows/mono/mono-2.0/bin/libmono-2.0-x86_64.dll".into())
+    );
+    assert!(dll_overrides.is_empty());
+}
+
 /// Task 8: only verified pins ship. A placeholder (size 1, a hash made of one repeated digit or zeros plus a short
 /// counter, a PLACEHOLDER comment, an unversioned aka.ms redirect) fails this.
 #[test]
