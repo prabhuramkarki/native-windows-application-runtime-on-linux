@@ -95,8 +95,15 @@ pub struct Rig {
 
 impl Rig {
     pub fn new() -> Rig {
+        Rig::new_in(&std::env::temp_dir())
+    }
+
+    /// A rig whose tempdir (and so data dir) is below `parent`: the escape suite keeps its data dir out of `/tmp`
+    /// (inside the sandbox `/tmp` is a writable tmpfs, which would make a write next to the app root succeed
+    /// there, in memory, and prove nothing about the host).
+    pub fn new_in(parent: &Path) -> Rig {
         let backend = WineBackend::discover().expect("Wine must be installed for the e2e tests (apt install wine)");
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
         let data = root.path().join("data");
         fs::create_dir(&data).unwrap();
         Rig {
@@ -380,6 +387,23 @@ impl Drop for Rig {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+/// Whether bwrap can create a sandbox here; `false` after saying SKIPPED, a failure with `RUNTIME_REQUIRE_BWRAP=1`.
+pub fn bwrap_works(test: &str) -> bool {
+    let why = match rt_sandbox::find_bwrap_on_path() {
+        None => "bwrap is not on PATH".to_owned(),
+        Some(b) => match rt_sandbox::probe(&b) {
+            Ok(()) => return true,
+            Err(e) => e,
+        },
+    };
+    assert!(
+        std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_none_or(|v| v != "1"),
+        "RUNTIME_REQUIRE_BWRAP=1 but {why}"
+    );
+    eprintln!("SKIPPED {test}: {why}");
+    false
 }
 
 pub fn installed_id(ran: &Ran) -> String {

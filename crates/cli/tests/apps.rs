@@ -3304,7 +3304,7 @@ fn a_sandboxed_run_starts_the_settled_program_in_bwrap_and_marks_the_app() {
     for want in [
         "--die-with-parent --new-session --unshare-pid --unshare-uts --unshare-ipc --unshare-net ".to_owned(),
         format!(
-            " --bind {0} {0} --bind {1} {1} -- /bin/sh -c ",
+            " --bind {0} {0} --bind {1} {1} --remount-ro / -- /bin/sh -c ",
             prefix.display(),
             home.display()
         ),

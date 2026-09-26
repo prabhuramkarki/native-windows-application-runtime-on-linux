@@ -26,7 +26,8 @@
 //! variable rewritten to match; audio = `<runtime dir>/pulse/native` (a socket); gpu = `--dev-bind-try` of
 //! `/dev/dri` and the NVIDIA nodes in [`GPU_DEV`] plus `/dev/nvidia<N>`, and read-only [`GPU_RO`] (Mesa and the
 //! NVIDIA driver read `/sys`); each host directory grant (`--ro-bind` or `--bind`); finally the prefix and the app
-//! home. A requested socket, cookie or node the host lacks is left out and reported by [`AppSandbox::skipped`].
+//! home; last of all the root itself is remounted read-only, so nothing outside those mounts is writable, not even
+//! in memory. A requested socket, cookie or node the host lacks is left out and reported by [`AppSandbox::skipped`].
 //! `--dev-bind` is never used for anything but those GPU nodes.
 //!
 //! **Mount order** (bwrap applies its arguments in order and a LATER mount wins over an EARLIER one at the same
@@ -471,6 +472,11 @@ impl AppSandbox {
         // the launcher's path.
         out.arg("--bind").arg(&dirs.prefix_src).arg(&dirs.prefix_dst);
         out.arg("--bind").arg(&dirs.home_src).arg(&dirs.home_dst);
+        // bwrap's new root is a writable tmpfs holding the skeleton directories of every mount point (the parents of
+        // the prefix, i.e. the app root and data root paths, or the real home's path): without this a write to
+        // `<app root>/permissions.toml` or `$HOME/x` "succeeds" in memory (found by the escape suite). Read-only root
+        // mount only: the binds, `/tmp`, `/dev` (with `/dev/shm`) and the runtime dir are their own mounts.
+        out.args(["--remount-ro", "/"]);
         out.arg("--");
         out.arg(cmd.get_program());
         out.args(cmd.get_args());

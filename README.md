@@ -153,8 +153,10 @@ the app's `C:`), `runtime/home/` (the program's `HOME`, so Wine does not hand it
 ```sh
 tools/build-fixtures.sh                 # test .exe/.dll files into tests/fixtures/build (mingw-w64)
 cargo test --workspace                  # unit, hostile-input and hermetic CLI tests; no Wine needed
-cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
-                                        # real-Wine end-to-end tests (minutes; needs Wine 10 and the fixtures)
+RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --skip real_net_ --test-threads=1
+                                        # real-Wine end-to-end tests and the sandbox escape suite (minutes; Wine 10, bwrap, fixtures)
+DXVK_FILTER_DEVICE_NAME=<device> cargo test -p runtime-cli --test e2e_sandbox -- --ignored real_net_wine_d3d11 --nocapture
+                                        # the D3D11 fixture through DXVK under the default sandbox (internet, Vulkan, display)
 RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1
                                         # dependency engine on real Wine + bwrap (local HTTPS server, no internet)
 cargo test -p runtime-deps --lib -- --ignored real_net --nocapture
@@ -170,6 +172,11 @@ The Wine tests use temporary data directories, stop and kill their `wineserver` 
 `gui64.exe` (a modal message box; run it by hand to look at a window). Run them with `--test-threads=1`.
 On Wine older than 10 their 32-bit steps are skipped with a `SKIPPED 32-bit` message. Each test removes its apps with a
 persistent `wineserver` running and requires that `runtime remove` ends it.
+The escape suite (`crates/cli/tests/e2e_sandbox.rs`) runs a real Windows probe (`probe64.exe`) inside the sandbox
+and tries to read a fake home's `.ssh` secret, write to that home, read another app's prefix, read or rewrite its
+own `permissions.toml`, connect to a local TCP listener, and step outside a granted directory. Each action must fail
+sandboxed AND succeed with `--unsandboxed` on the same target, so the sandbox is shown to be what stops it; what the
+suite does not prove is in `docs/SECURITY.md` ("The escape suite").
 Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
 directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`, `hello.msi` (built with
 `wixl`) and `hello-nsis.exe` (built with `makensis`) for the installer-pipeline tests

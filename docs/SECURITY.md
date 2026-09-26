@@ -469,7 +469,9 @@ sockets; per switch, the Wayland socket, the X11 socket directory and a copy-bou
 socket (audio), the GPU device nodes and the `/sys` parts drivers read (gpu); the granted host directories. New PID,
 UTS and IPC namespaces, a new session (no TIOCSTI into your terminal), no network namespace access unless
 `network = "allow"`, `--die-with-parent`. The environment is the launcher's allowlist again, minus D-Bus always and
-minus the variables of a switch that is off.
+minus the variables of a switch that is off. The sandbox's root is remounted read-only after the mounts, so the
+directories bwrap creates to hold them (the path of the app root, the data root, your home) cannot be written even
+in the sandbox's memory.
 
 **Fail closed.** `bwrap` missing, or unable to create a sandbox (user namespaces disabled or restricted, checked
 with a real throwaway sandbox before every run): `run` exits 1 with `cannot start the sandbox: <reason>. Install
@@ -504,6 +506,45 @@ run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
   grant** (at or below it, by its written and its resolved path): other programs' sockets (tmux, ssh-agent, editor
   and browser IPC) live there under arbitrary names, so no name list could keep them out.
 - **Everything inside the prefix** is the program's: it can rewrite its own registry, DLLs and files.
+
+### The escape suite
+
+`crates/cli/tests/e2e_sandbox.rs` (`e2e_real_wine_sandbox_*`, real Wine, real bubblewrap; required in CI with
+`RUNTIME_REQUIRE_BWRAP=1`) runs `probe64.exe` (`tools/fixtures/probe.c`), a Windows console program that attempts
+ONE action and exits 0 if it succeeded, 1 if it failed, printing the Windows error. Host files are named with Wine's
+`\\?\unix\<host path>` NT paths, which reach any host file the process can see (see "Wine's `\\?\unix\` escape"
+above). **The oracle:** each action is run against the same target twice, under the default sandbox, where it must
+fail, and with `runtime run --unsandboxed`, where it must succeed. A control that also fails fails the test, so
+the result cannot come from Wine, a missing file or file permissions. The "real home" is a fake `HOME` in the
+test's temporary directory, given to `runtime` itself, so the grant checks use it as well. The developer's real
+`~/.ssh` is never touched. The data directory is also outside `/tmp`, like the real `~/.local/share/runtime`.
+
+| Test | Target | What it shows |
+|---|---|---|
+| 1 | read `$HOME/.ssh/id_test` | a secret in the home is not visible |
+| 2 | write `$HOME/escape.txt` | the home cannot be written; the file is not there afterwards |
+| 3 | read another app's `drive_c/canary.txt`; list the apps directory | other prefixes are not visible (inside, the list shows only the app's own id) |
+| 4 | read and write `<app root>/permissions.toml` | the profile can be neither read nor rewritten; it is byte-identical afterwards |
+| 5 | TCP connect to a listener on the host's `127.0.0.1` | no network by default; the same connect works after `--set network=allow` |
+| 6 | read/write in a granted directory; read a file next to it | `ro` reads but cannot write, `rw` writes to the host, and the parent directory's other entries stay hidden |
+| 7 | `runtime permissions --set fs+=$HOME/.ssh:ro` | refused with the reason, nothing written (a harmless grant as the control is accepted) |
+| 8 | `--unsandboxed` | it really is unsandboxed and prints its warning |
+
+Test 4 found a real gap while it was being written. bwrap's root is a writable tmpfs holding the directories it
+creates for its mount points, so the write to `<app root>/permissions.toml` "succeeded" in that memory. The host
+file never changed. The profile now ends with `--remount-ro /`. Forcing every sandboxed run of the suite to
+`--unsandboxed` makes tests 1-6 and 8 fail with `SANDBOX HOLE` (test 7 is a CLI refusal and runs no program).
+
+**What the suite does NOT prove.**
+- **Same uid.** It tests the mount, network and PID views only. There is no seccomp, Landlock or capability
+  filter until Phase 5B, so a kernel bug reachable from an unprivileged user namespace is not covered.
+- **Granted sockets are shared.** The display, audio and GPU pieces are the host's, and the suite does not attack
+  them: the X11 server (shared input), the Wayland compositor, PulseAudio/PipeWire and the GPU driver.
+- **`network = "allow"` is the host network.** Test 5 only shows that the switch changes something. With it on,
+  every loopback service and abstract socket is reachable.
+- **`/tmp` is refused as a grant.** The suite tests grants below the build directory only.
+- **Only the listed paths are tested,** not every host path. The general claim ("only what is bound is visible")
+  rests on bwrap and on the renderer's unit tests of the exact command line.
 
 ### Wine helpers in a prefix the app has written
 

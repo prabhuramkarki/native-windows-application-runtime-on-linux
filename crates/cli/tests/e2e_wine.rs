@@ -41,7 +41,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use support::{Rig, fixture, installed_id};
+use support::{Rig, bwrap_works, fixture, installed_id};
 
 const HELLO: &str = "hello from windows";
 
@@ -431,23 +431,6 @@ fn e2e_hardening_is_visible_from_inside_the_app() {
 
     rig.remove_app(&alpha);
     rig.finish();
-}
-
-/// Whether bwrap can create a sandbox here; `false` after saying SKIPPED, a failure with `RUNTIME_REQUIRE_BWRAP=1`.
-fn bwrap_works(test: &str) -> bool {
-    let why = match rt_sandbox::find_bwrap_on_path() {
-        None => "bwrap is not on PATH".to_owned(),
-        Some(b) => match rt_sandbox::probe(&b) {
-            Ok(()) => return true,
-            Err(e) => e,
-        },
-    };
-    assert!(
-        std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_none_or(|v| v != "1"),
-        "RUNTIME_REQUIRE_BWRAP=1 but {why}"
-    );
-    eprintln!("SKIPPED {test}: {why}");
-    false
 }
 
 #[test]
