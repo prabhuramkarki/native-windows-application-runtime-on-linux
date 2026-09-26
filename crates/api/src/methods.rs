@@ -28,14 +28,16 @@ impl Runtime {
     /// (`invalid_argument`) and installed (`not_found`); everything wrong with the app itself is a check, not an
     /// error (a missing Wine too: a failing check with the install hint).
     pub fn doctor(&self, target: DoctorTarget) -> Result<DoctorView, ApiError> {
+        // The id first: a bad one never starts a host probe.
+        let env = match &target {
+            DoctorTarget::System => None,
+            DoctorTarget::App(id) => Some(self.env(id)?),
+        };
         let vulkan = self.vulkan();
         let verdict = |min| host_verdict(&vulkan, min);
-        let facts = match target {
-            DoctorTarget::System => host::doctor::Facts::system(),
-            DoctorTarget::App(id) => {
-                let env = self.env(&id)?;
-                host::doctor::Facts::app(&self.store, env.id(), &verdict)
-            }
+        let facts = match &env {
+            None => host::doctor::Facts::system(),
+            Some(env) => host::doctor::Facts::app(&self.store, env.id(), &verdict),
         };
         let report = host::doctor::report(&facts, &vulkan);
         Ok(DoctorView::from_report(&report, facts.plan.as_ref()))
@@ -51,7 +53,7 @@ impl Runtime {
     /// answer.
     pub fn sandbox_info(&self, id: &str) -> Result<SandboxView, ApiError> {
         let env = self.env(id)?;
-        let st = host::sandbox::status(&self.store, &env).map_err(unavailable)?;
+        let st = host::sandbox::status(&self.store, &env, self.runtime_exe.as_deref()).map_err(unavailable)?;
         let source = if st.source == "default" {
             PermSource::Default
         } else {
@@ -271,6 +273,14 @@ mod tests {
         assert_eq!(PROBES.load(Ordering::SeqCst), 1, "one probe for three calls");
         // Expiry itself is `rt_core::Cached`'s (tested there with an injected clock); the TTL is 30 s.
         assert_eq!(PROBE_TTL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_bad_or_unknown_doctor_id_is_refused_before_any_probe() {
+        let (_d, rt) = rt(|| panic!("probed for an id that was refused"));
+        for id in ["../x", "nope"] {
+            assert!(rt.doctor(DoctorTarget::App(id.into())).is_err());
+        }
     }
 
     #[test]

@@ -12,7 +12,15 @@ pub struct Runtime {
     pub(crate) vulkan: rt_core::Cached<rt_core::HostVulkan>,
     /// How the host's Vulkan is probed (tests inject one).
     pub(crate) vulkan_probe: fn() -> rt_core::HostVulkan,
+    /// The `runtime` binary `sandbox_info` names as the sandbox's shim; `None`: this process (right for the CLI).
+    pub(crate) runtime_exe: Option<std::path::PathBuf>,
 }
+
+// The daemon shares one `Runtime` between connection threads.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Runtime>()
+};
 
 pub(crate) fn unavailable(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorKind::Unavailable, e.to_string())
@@ -30,7 +38,15 @@ impl Runtime {
             store,
             vulkan: rt_core::Cached::new(crate::methods::PROBE_TTL),
             vulkan_probe: crate::host::graphics::probe,
+            runtime_exe: None,
         }
+    }
+
+    /// Names `exe` (the `runtime` binary) as the sandbox's `sandbox-init` shim in `sandbox_info`. A caller that is
+    /// not `runtime` itself (a daemon, a GUI) must set it: by default the calling executable is named.
+    pub fn with_runtime_exe(mut self, exe: std::path::PathBuf) -> Runtime {
+        self.runtime_exe = Some(exe);
+        self
     }
 
     pub fn version(&self) -> VersionInfo {
