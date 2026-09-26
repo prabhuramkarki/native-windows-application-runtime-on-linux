@@ -103,7 +103,7 @@ fn log(msg: &str) {
     eprintln!("runtimed: {msg}");
 }
 
-fn euid() -> u32 {
+pub(crate) fn euid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -196,6 +196,19 @@ fn lock(path: &Path) -> Result<fs::File, ServeError> {
 /// Whether something accepts connections at `path`: a non-blocking connect, so a full backlog of a socket nobody
 /// accepts on cannot hang the start (it counts as live).
 fn live(path: &Path) -> io::Result<bool> {
+    match connect_nonblocking(path) {
+        Ok(_) => Ok(true),
+        Err(e) => match e.raw_os_error() {
+            Some(libc::ECONNREFUSED) => Ok(false),
+            Some(libc::EAGAIN | libc::EINPROGRESS) => Ok(true),
+            _ => Err(e),
+        },
+    }
+}
+
+/// One non-blocking `connect` to `path`: the connected stream (still non-blocking), or the error as is (`EAGAIN`
+/// when the backlog is full: a blocking connect would wait for as long as nobody accepts).
+pub(crate) fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: `sockaddr_un` is plain data; all zeroes is a valid value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -223,15 +236,10 @@ fn live(path: &Path) -> io::Result<bool> {
     let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
     // SAFETY: `addr` is a valid, NUL-terminated `sockaddr_un` of `len` bytes that outlives the call.
     let r = unsafe { libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) };
-    if r == 0 {
-        return Ok(true);
+    if r != 0 {
+        return Err(io::Error::last_os_error());
     }
-    let e = io::Error::last_os_error();
-    match e.raw_os_error() {
-        Some(libc::ECONNREFUSED) => Ok(false),
-        Some(libc::EAGAIN | libc::EINPROGRESS) => Ok(true),
-        _ => Err(e),
-    }
+    Ok(UnixStream::from(fd))
 }
 
 /// Binds `path` under the rules of the module docs.
