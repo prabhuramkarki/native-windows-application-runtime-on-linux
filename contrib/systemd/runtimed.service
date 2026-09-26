@@ -1,0 +1,36 @@
+# The runtime read-only API daemon (a user unit), started by runtimed.socket on the first connection. See
+# runtimed.socket for installing. It serves the socket until stopped (SIGTERM; exit 0).
+#
+# Hardening: only options that leave what the daemon SEES unchanged, because its answers (doctor, sandbox.info,
+# graphics.info) must equal what `runtime` reports from a terminal, and it runs the same host probes (bwrap's
+# probe, the systemd-run scope probe, vulkaninfo, wine --version).
+# Deliberately omitted:
+# - ProtectSystem=, ProtectHome=, PrivateTmp=, PrivateDevices=, PrivateNetwork=, PrivateUsers=, ProtectKernel*=,
+#   RestrictNamespaces=: each gives the daemon its own mount/user/network namespace (a user manager adds
+#   PrivateUsers= for any of them), so the probes would inspect a different /tmp (the X11 socket), /dev (GPUs) or
+#   namespace setup than `runtime run` meets, and bwrap's probe could fail where the real sandbox works.
+# - SystemCallArchitectures=native: a 32-bit `wine` loader would be killed during `wine --version`.
+# - MemoryDenyWriteExecute=: vulkaninfo and the Wine loader may need W+X mappings.
+[Unit]
+Description=runtime read-only API daemon
+Requires=runtimed.socket
+After=runtimed.socket
+
+[Service]
+Type=simple
+# Edit to where runtimed is installed. The `runtime` binary must sit in the same directory: sandbox.info names it
+# as the sandbox's launcher.
+ExecStart=%h/.cargo/bin/runtimed
+# NoNewPrivileges: on a host whose bwrap is setuid (not the unprivileged-user-namespace kind), bwrap's probe then
+# fails and sandbox.info says bwrap is unavailable; remove this line there.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+# The daemon itself needs only its Unix socket; AF_NETLINK is for bwrap's probe (it sets up the loopback of the
+# sandbox's empty network namespace; without it the probe fails). No IP socket can be opened.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+UMask=0077
+
+[Install]
+Also=runtimed.socket

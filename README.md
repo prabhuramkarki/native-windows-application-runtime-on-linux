@@ -226,6 +226,8 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
   package installers (Phase 4A).
 - `crates/api`: `rt_api`, the typed, sanitised, read-only API (`Runtime`: apps, permissions, doctor, dependency
   plan, sandbox and graphics info, compatibility matrix) and the host-fact gathering the CLI shares (`rt_api::host`).
+- `crates/daemon`: `runtimed`, the read-only API as JSON-RPC 2.0 (NDJSON) over an owner-only Unix socket, with
+  systemd user units in `contrib/systemd/`.
 - `crates/cli`: the `runtime` binary, a thin front end over the above.
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
 
