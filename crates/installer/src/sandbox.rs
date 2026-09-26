@@ -3,7 +3,7 @@
 //!
 //! **Scope.** This is narrower than a general-purpose sandbox: it exists so that Phase 3's installer helpers
 //! (unpacking/copying installer payloads, running a silent `.exe`/`.msi` installer) do not get the run of the
-//! host the way a plain Wine run still does (`docs/SECURITY.md`, "Phase 2 is NOT a sandbox"). It is wired into
+//! host the way an unsandboxed Wine run does (`docs/SECURITY.md`, "What is still NOT covered"). It is wired into
 //! [`rt_core::Launcher::wrap`] via [`InstallerSandbox::for_launcher`], the ONE existing spawn point, so a caller
 //! keeps using `Launcher::spawn`/`run_helper` rather than a second `Command::spawn` path.
 //!

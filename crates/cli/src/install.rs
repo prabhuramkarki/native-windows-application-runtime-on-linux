@@ -14,8 +14,8 @@
 //! **No display in the sandbox by default.** `InstallerSandbox` (Task 5) binds no X11/Wayland socket, so an
 //! installer run WITHOUT `--silent` (the default: "show its own GUI") likely cannot render a window at all; see
 //! the warning `run` prints for that case, and `rt_installer::pipeline`'s own module docs for the full story.
+use crate::CmdError;
 use crate::safe::{safe, warn};
-use crate::{CmdError, SANDBOX_NOTE};
 use rt_core::{AppId, InstallOpts, InstallOutcome, Store};
 use rt_installer::{Candidate, InstallerOpts};
 use std::path::Path;
@@ -32,7 +32,6 @@ pub fn run(
     let store = crate::store()?;
     let launcher = rt_core::Launcher::new();
     let backend = crate::backend(&launcher)?;
-    eprintln!("{SANDBOX_NOTE}");
     eprintln!("note: creating the Wine environment can take up to a minute");
 
     if peek_looks_like_installer(file) {

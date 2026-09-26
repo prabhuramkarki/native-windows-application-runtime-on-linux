@@ -1,9 +1,12 @@
-# Security model (Phase 2)
+# Security model
 
-**Phase 2 is NOT a sandbox.** A Windows program started by `runtime run` runs as your Linux user, with your
-network, GPU, audio and display, and can read and write everything that user can. The measures below make
-accidents less likely and remove Wine's most obvious host exposure. They do not stop a program that wants out.
-The real boundary is planned for Phase 5. Every command that runs Windows code prints a note saying so.
+**Since Phase 5A, `runtime run` starts the program in a bubblewrap sandbox by default** (see "App sandbox (Phase
+5A)" below): a private filesystem view with only the app's own prefix and home writable, no network unless the
+app's `permissions.toml` allows it, and the display, audio and GPU it is given. Without a working `bwrap` it
+refuses to run. `runtime run --unsandboxed` is the per-run escape hatch, and it says so on stderr: such a run (and
+every run before Phase 5A) is what the Phase 2 sections below describe, the program with your full access; Phase 2's
+measures make accidents less likely and remove Wine's most obvious host exposure, and do not stop a program that
+wants out.
 
 ## Threat model
 
@@ -61,7 +64,12 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 - **Cleanup**: `remove` stops the app's `wineserver` first; the e2e tests start a persistent `wineserver` for an
   app and require that `runtime remove` alone ends it.
 
-## What Phase 2 does NOT do
+## What is still NOT covered (Phase 2–5A)
+
+This list describes a program that runs WITHOUT the app sandbox: a `runtime run --unsandboxed` run (and every run
+before Phase 5A). The app sandbox removes the first two items for a sandboxed run (its host view has no host files
+to reach through `\\?\unix\`, and its devices and sockets are only those the profile grants); the rest still
+apply. What the app sandbox itself does not protect is listed in "App sandbox (Phase 5A)".
 
 - **No sandbox boundary.** No seccomp, namespaces, Landlock or bubblewrap. The program shares the host's
   network (it can connect anywhere), GPU, audio and display sockets.
@@ -97,8 +105,10 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
   under `$HOME/.local/share/vulkan` and `~/.config/vulkan` (`XDG_DATA_HOME` is not allowlisted) no longer sees
   user-installed drivers or layers (system files under `/usr/share/vulkan` still work), and the Wine Mono/Gecko
   download cache in `~/.cache/wine` is not visible, so a dependency mechanism must use an explicit cache path.
-- **Session D-Bus.** `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are allowlisted, so a program that speaks
-  D-Bus can reach the session bus (keyring/secret service, portals). Not tested.
+- **Session D-Bus** (`--unsandboxed` runs; a sandboxed run drops `DBUS_SESSION_BUS_ADDRESS` and never binds the bus
+  socket, so only an ABSTRACT bus address stays reachable, and only with `network = "allow"`).
+  `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are allowlisted, so a program that speaks D-Bus can reach the
+  session bus (keyring/secret service, portals). Not tested.
 - **Races (TOCTOU).** Checks such as "not a symlink" are followed by uses without `openat2`/`O_PATH`
   confinement, and a same-uid process (the app itself) that keeps swapping directories for links can win a race
   against `run`, `logs`, `doctor` or `remove`. Some cases are narrowed (`O_NOFOLLOW`, `O_NONBLOCK`, lstat before
@@ -113,9 +123,12 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 - **Memory.** `analyze`, `install` and `doctor` read a whole file into memory, up to 4 GiB.
 - **Logs.** One log per run under `logs/`, 20 kept per app, no size limit on a single log (a program can fill the
   disk). `logs` prints only the end of the newest one.
-- **No locking.** `remove` can race `run` (or a second `run`); the last writer wins and a run can lose its
-  prefix. `remove` deletes the app and its prefix even when stopping its `wineserver` failed (it warns), so a
-  Wine process may keep running on a deleted prefix. Do not run several commands on one app at once.
+- **Locking.** Every `runtime run` holds the app's `deps.lock` SHARED from before the start until the program has
+  ended (a file target's from right after its install); `remove`, `uninstall`, `deps --install`, and `display`/
+  `permissions` changes take it EXCLUSIVELY and refuse while any run of the app lives ("the app is running (started
+  by `runtime run`); quit it first"), whatever the program does. Two runs of one app can still run at once (both
+  shared). A program started another way (plain `wine` with the app's `WINEPREFIX`) holds no lock: the `/proc`
+  `wineserver` scan below is the second, weaker check for it, and `remove`/`uninstall` refuse while it sees one.
 - **Interrupted installs.** Ctrl-C or a kill during `install`, and especially during `run <file>` (which installs
   first), can leave a partial app that `remove` cleans up.
 - **Run-by-path installs every time.** `runtime run some.exe` creates a *new* app on each invocation
@@ -128,9 +141,8 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 
 `rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
 through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
-not to Wine app runs in general**: a plain `runtime run` still has none of this (the "What Phase 2 does NOT do"
-list above is still the truth for it) until a later phase attaches a sandbox to every app's `Launcher`, not
-just the installer's. It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
+not to Wine app runs in general**: app runs have their own, per-app profile since Phase 5A ("App sandbox
+(Phase 5A)" below). It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
 `Sandbox` trait a `Launcher` can optionally carry, rather than a hard-coded identity function), so a sandboxed
 run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::spawn` path.
 
@@ -203,7 +215,8 @@ other apps' data or any other host path, and (by default) has no network at all,
   exploitable already on the host; this profile does not vet, pin or checksum it.
 - **The app's own prefix is fully read-write**, on purpose (installers write there) — a malicious installer can
   still plant anything it wants inside its own prefix, corrupt its own registry hives, or write a `.lnk`/`.exe`
-  that a LATER, unsandboxed `runtime run` of that same app would execute. The sandbox boundary is the real
+  that a later Wine session of that app outside a sandbox would execute (`runtime run --unsandboxed`, or a
+  helper session of an app that never ran sandboxed: see "Wine helpers in a prefix the app has written"). The sandbox boundary is the real
   filesystem outside the app, not "this installer cannot do anything bad to this app".
 - **No output/resource caps of its own.** `run_helper`'s own timeout and capped-output rules still apply (they
   are `Launcher`'s, not the sandbox's), but the sandbox adds no additional CPU, memory or disk-space limit; a
@@ -378,9 +391,10 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
 - **The vendor installer's behaviour.** The sha256 pin proves which file was staged, nothing about what it does. The
   sandbox bounds what it can touch (its own prefix, read-write); inside the prefix it can do anything, including
   registering programs that Wine starts on its own later (services, `RunOnce` entries, ...). **Only the runtime's own
-  steps are sandboxed.** Any later Wine session in the prefix outside the sandbox, `runtime run` above all (and the
-  `reg.exe` runs that set an ARCHIVE package's overrides, and `runtime display <app> <choice>`), starts whatever a vendor installer registered, unsandboxed,
-  with the user's network and files, exactly like the app itself. Success is judged
+  steps are sandboxed.** Any later Wine session in the prefix outside a sandbox (`runtime run --unsandboxed`; and, for
+  an app that has never run sandboxed, the `reg.exe` runs that set an ARCHIVE package's overrides and `runtime display
+  <app> <choice>`: see "Wine helpers in a prefix the app has written" below) starts whatever a vendor installer
+  registered, unsandboxed, with the user's network and files. Success is judged
   by the package's marker (a file or registry value), which is the installer's own claim: a hostile installer can
   write it and exit. The exit status of an exe installer is not even visible (the desktop wrapper exits 0), so marker
   presence is the ONLY success signal. `explorer.exe`, `msiexec.exe` and `reg.exe` are whatever the prefix holds, not
@@ -390,15 +404,18 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
   them at the vendor.
 - **Path-based operations (TOCTOU).** Extraction, backups, removal and staging check and use paths, not held
   directory descriptors; `O_NOFOLLOW` covers only the last component. A process running inside `drive_c` at the same
-  time could race a check and redirect a write or delete. Today apps are not sandboxed anyway (they can reach the host
-  directly): the prefix hardening removes the `Z:` drive, but NT paths like `\\?\unix\...` still reach any host file
-  of the same user, so `deps-backup` is reachable from inside the prefix too. Before Phase 5 makes the prefix a boundary, these must move to `openat`/`renameat`/`unlinkat` against
-  held parent descriptors.
-- **Busy-prefix and lock limits.** An install refuses while any `wineserver` serves the prefix (checked before the
-  download and again before installing) and holds `<app>/deps.lock` exclusively. `run` holds the lock shared only
-  while it starts the app and releases it once the app has started; after that the running-`wineserver` check is what
-  refuses an install. Detection is a `/proc` scan by `WINEPREFIX` and Wine's server directory: a program started
-  another way can be missed. If `deps.lock` cannot be locked by anyone (a symlink or directory in its place, or a file
+  time could race a check and redirect a write or delete (an install refuses while the app runs, see below, which
+  narrows but does not close this). An `--unsandboxed` app reaches the host directly anyway (`\\?\unix\...`), so
+  `deps-backup` is reachable from inside the prefix too. Now that the prefix is the sandbox's only writable path,
+  these must move to `openat`/`renameat`/`unlinkat` against held parent descriptors (Phase 5B).
+- **Busy-prefix and lock limits.** An install holds `<app>/deps.lock` exclusively, so it refuses while any
+  `runtime run` of the app lives (the run holds the lock shared until the program has ended, sandboxed or not, even
+  when the program keeps no `wineserver`). As a second, weaker check for Wine processes NOT started by `runtime run`,
+  it also refuses while any `wineserver` serves the prefix (checked before the download and again before installing):
+  a `/proc` scan by `WINEPREFIX` and Wine's server directory, which a program started another way can evade. The lock
+  is released as `runtime run` exits; when `bwrap` dies of a signal, or `runtime` itself is SIGKILLed, the kernel
+  tears the sandbox's PID namespace down at the same moment. That window is below what could be observed: polling
+  every millisecond after `runtime` exited (Ctrl-C and SIGKILL, real Wine) never found a process of the sandbox. If `deps.lock` cannot be locked by anyone (a symlink or directory in its place, or a file
   system without `flock`: `ENOLCK`, `EOPNOTSUPP`, `ENOSYS`), `run`, `remove` and `uninstall` warn and continue, and
   dependency installs refuse.
 - **Wine builtin versus native DLLs.** A DLL in `system32` is not necessarily loaded: Wine prefers its own builtins for
@@ -445,16 +462,143 @@ size-capped. The write is re-validated under the exclusive app lock and refused 
 prefix (a fail-closed `/proc` scan; the lock alone only excludes other runtime commands). The `reg.exe` arguments
 are fixed (`x11`, `wayland` or a delete), never taken from the prefix or the user's free text.
 
+## App sandbox (Phase 5A)
+
+`runtime run` wraps the program's Wine process in bubblewrap (`crates/sandbox/src/render.rs` has the exact profile
+and why each piece is there; `runtime sandbox <app>` prints the command line for an app). Only the program's own
+spawn is sandboxed: the install of a file target and the backend's `wineboot`/`wineserver -k` helpers are not
+(they run before the program, on a prefix the runtime just created, or are not a Wine session; see below).
+
+**What it gives.** A fresh mount namespace in which the host is invisible except: read-only `/usr`, `/bin`, `/lib*`,
+a small `/etc` set and Wine's DLL directories; the app's `prefix` and `runtime/home`, the ONLY writable host paths
+(the app root itself, with `permissions.toml`, `metadata.json` and the logs, is never bound; nor is the real home,
+another app or the data root); a private `/tmp` and an empty `0700` runtime directory holding only the requested
+sockets; per switch, the Wayland socket, the X11 socket directory and a copy-bound X cookie (display), the PulseAudio
+socket (audio), the GPU device nodes and the `/sys` parts drivers read (gpu); the granted host directories. New PID,
+UTS and IPC namespaces, a new session (no TIOCSTI into your terminal), no network namespace access unless
+`network = "allow"`, `--die-with-parent`. The environment is the launcher's allowlist again, minus D-Bus always and
+minus the variables of a switch that is off. The sandbox's root is remounted read-only after the mounts, so the
+directories bwrap creates to hold them (the path of the app root, the data root, your home) cannot be written even
+in the sandbox's memory.
+
+**Fail closed.** `bwrap` missing, or unable to create a sandbox (user namespaces disabled or restricted, checked
+with a real throwaway sandbox before every run): `run` exits 1 with `cannot start the sandbox: <reason>. Install
+bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)`, and nothing is installed or
+started. A `permissions.toml` that no longer validates (a grant that moved, a new symlink, a nested grant) stops the
+run with its reason; it is never silently narrowed. There is no environment variable that turns the sandbox off.
+
+**Ctrl-C.** The program is in its own session, so the terminal's SIGINT reaches `bwrap` (still in the terminal's
+process group), which dies of it, and `--die-with-parent` plus the PID namespace take the program and its
+`wineserver` down with SIGKILL. SIGINT/SIGTERM sent to `runtime` itself are forwarded to `bwrap` with the same
+effect (real-Wine test `e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program`). The program is killed, not asked: it
+gets no Windows Ctrl-C event and cannot save its state.
+
+**What is printed.** A sandboxed run prints one `note:` line per thing its profile cannot enforce; an unsandboxed
+run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
+
+**What it does NOT protect** (known limits, not vulnerabilities):
+- **X11 is shared with the host.** With display on and `DISPLAY` set, the program is an ordinary X11 client of your
+  X server: it can read and inject the keyboard and mouse input of every other X11 window (XTEST, XSendEvent), which
+  reaches code execution as you. `runtime run` prints this as a note. On a Wayland session with XWayland (`DISPLAY`
+  set) the X11 socket is bound too: `runtime display <app> wayland` makes Wine draw through Wayland (which isolates
+  clients), but the program can still connect to X11 itself; only `runtime permissions <app> --set display=off`
+  removes the socket (and Wayland with it), which suits a console program.
+- **`network = "allow"` is the host network namespace.** Abstract unix sockets live in the network namespace, not
+  the filesystem, so X11's `@/tmp/.X11-unix/X<n>`, abstract D-Bus or other session sockets, and every service on the
+  host's loopback (CUPS, development servers, a TCP Docker API) are reachable. With network allowed, `display = off`
+  CANNOT be enforced (only the X server's cookie check remains). Both are printed as notes.
+- **Display, audio and GPU are attack surface.** The Wayland compositor, PulseAudio/PipeWire and the GPU kernel
+  driver are reachable when switched on (the default), and `/sys/devices` is readable with gpu on.
+- **Same uid, no seccomp, Landlock, capability drop or cgroups** until Phase 5B: a kernel bug reachable from an
+  unprivileged user namespace is an escape, and nothing limits CPU, memory or disk use.
+- **Host directory grants** are what they say: an `rw` grant can be destroyed. `$HOME`, `/`, the data root, secret
+  directories (`~/.ssh`, `~/.gnupg`, ...) and system trees (`rw`) are refused, and **all of `/tmp` is refused as a
+  grant** (at or below it, by its written and its resolved path): other programs' sockets (tmux, ssh-agent, editor
+  and browser IPC) live there under arbitrary names, so no name list could keep them out.
+- **Everything inside the prefix** is the program's: it can rewrite its own registry, DLLs and files.
+
+### The escape suite
+
+`crates/cli/tests/e2e_sandbox.rs` (`e2e_real_wine_sandbox_*`, real Wine, real bubblewrap; required with
+`RUNTIME_REQUIRE_BWRAP=1` in the `wine-e2e` CI job, which is `continue-on-error` and has not yet run on a hosted
+runner, so these tests currently gate nothing in CI: they were run locally) runs `probe64.exe` (`tools/fixtures/probe.c`), a Windows console program that attempts
+ONE action and exits 0 if it succeeded, 1 if it failed, printing the Windows error. Host files are named with Wine's
+`\\?\unix\<host path>` NT paths, which reach any host file the process can see (see "Wine's `\\?\unix\` escape"
+above). **The oracle:** each action is run against the same target twice, under the default sandbox, where it must
+fail, and with `runtime run --unsandboxed`, where it must succeed. A control that also fails fails the test, so
+the result cannot come from Wine, a missing file or file permissions. The "real home" is a fake `HOME` in the
+test's temporary directory, given to `runtime` itself, so the grant checks use it as well. The developer's real
+`~/.ssh` is never touched. The data directory is also outside `/tmp`, like the real `~/.local/share/runtime`.
+
+| Test | Target | What it shows |
+|---|---|---|
+| 1 | read `$HOME/.ssh/id_test` | a secret in the home is not visible |
+| 2 | write `$HOME/escape.txt` | the home cannot be written; the file is not there afterwards |
+| 3 | read another app's `drive_c/canary.txt`; list the apps directory | other prefixes are not visible (inside, the list shows only the app's own id) |
+| 4 | read and write `<app root>/permissions.toml` | the profile can be neither read nor rewritten; it is byte-identical afterwards |
+| 5 | TCP connect to a listener on the host's `127.0.0.1` | no network by default; the same connect works after `--set network=allow` |
+| 6 | read/write in a granted directory; read a file next to it | `ro` reads but cannot write, `rw` writes to the host, and the parent directory's other entries stay hidden |
+| 7 | `runtime permissions --set fs+=$HOME/.ssh:ro` | refused with the reason, nothing written (a harmless grant as the control is accepted) |
+| 8 | `--unsandboxed` | it really is unsandboxed and prints its warning |
+
+Test 4 found a real gap while it was being written. bwrap's root is a writable tmpfs holding the directories it
+creates for its mount points, so the write to `<app root>/permissions.toml` "succeeded" in that memory. The host
+file never changed. The profile now ends with `--remount-ro /`. Forcing every sandboxed run of the suite to
+`--unsandboxed` makes tests 1-6 and 8 fail with `SANDBOX HOLE` (test 7 is a CLI refusal and runs no program).
+
+**What the suite does NOT prove.**
+- **Same uid.** It tests the mount, network and PID views only. There is no seccomp, Landlock or capability
+  filter until Phase 5B, so a kernel bug reachable from an unprivileged user namespace is not covered.
+- **Granted sockets are shared.** The display, audio and GPU pieces are the host's, and the suite does not attack
+  them: the X11 server (shared input), the Wayland compositor, PulseAudio/PipeWire and the GPU driver.
+- **`network = "allow"` is the host network.** Test 5 only shows that the switch changes something. With it on,
+  every loopback service and abstract socket is reachable.
+- **`/tmp` is refused as a grant.** The suite tests grants below the build directory only.
+- **Only the listed paths are tested,** not every host path. The general claim ("only what is bound is visible")
+  rests on bwrap and on the renderer's unit tests of the exact command line.
+
+### Wine helpers in a prefix the app has written
+
+A sandboxed program can write its own prefix, including registry `Run`/`RunOnce` keys, services and `DllOverrides`
+naming a native DLL it dropped. Wine executes those at the start of the NEXT Wine session in that prefix, whatever
+program that session was started for: measured on Wine 10.0, a `Run` key written into a prefix ran as soon as a
+plain `wine reg query ...` started a session there (and on every `wineboot`). Outside a sandbox that is code with
+your full access (`\\?\unix\` paths reach every file). Which commands start a Wine session in an app's prefix:
+
+| Command | Wine session in the prefix | Sandboxed? |
+|---|---|---|
+| `runtime run <app>` | the program | yes, the app sandbox |
+| `runtime run --unsandboxed <app>` | the program | NO, by request (it says so) |
+| `runtime run <file>` | `wineboot -u` in a brand-new prefix, then the program | install: no (nothing app-written yet); program: yes |
+| `runtime display <app> <choice>` | `reg.exe` | once the app ran sandboxed: yes, the app sandbox; before: no |
+| `runtime deps <app> --install` (archive package) | `reg.exe` (DLL overrides, rollback) | once the app ran sandboxed: yes, the app sandbox; before: no |
+| `runtime deps <app> --install` (installer package) | the installer, `reg.exe` | yes, the installer sandbox (offline) |
+| `runtime uninstall <app>` | the recorded uninstaller | yes, the installer sandbox |
+| `runtime remove`/`uninstall` (stop) | `wineserver -k`: not a session, runs no Windows code | no (not needed) |
+| `runtime doctor` | `wine --version`: no prefix | no (not needed) |
+| `runtime install` | `wineboot -u` in a brand-new prefix; installers in the installer sandbox | not app-written yet |
+
+"Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program), written by the
+first sandboxed run; from then on those helpers run through the same `AppSandbox` (the app's own profile, so they
+get nothing the app does not have) and refuse, changing nothing, when bubblewrap is unavailable. Residual risk: an
+app that never ran sandboxed but whose prefix was written by an earlier unsandboxed run or by a vendor installer
+still has its `display`/archive-package `reg.exe` sessions run unsandboxed (as before Phase 5A), and
+`runtime run --unsandboxed` runs whatever the app wrote with your full access; `runtime sandbox <app>` warns about
+the latter.
+
+**A running sandboxed app is invisible to `wineserver -k`.** Its `wineserver` keeps its socket in the sandbox's
+private `/tmp`, so the stop of `runtime remove`/`uninstall` cannot reach it. Both therefore check the host's `/proc`
+after the stop (the scan `deps`, `display` and `permissions` use too, by `WINEPREFIX` and Wine's server directory)
+and REFUSE while a `wineserver` still serves the prefix, or when `/proc` cannot be read: `<id> is running
+(wineserver pid N); quit it (Ctrl-C its runtime run) first; nothing was removed`. Nothing is deleted and no
+uninstaller runs (real-Wine test: `e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program`).
+
 ## Roadmap
 
-Phase 5 adds the actual boundary for ordinary app runs, not just installer helpers: run Wine itself inside
-bubblewrap (mount and PID namespaces, a private filesystem view without the host), Landlock rules as a second
-layer where bubblewrap is unavailable, and a seccomp filter, with the network and device access decided per
-app. The `Launcher::wrap` hook in `rt_core` — now a `Sandbox` trait a `Launcher` can carry, per the installer
-sandbox above — is the seam prepared for it. Until then, this document is the truth and the README says the
-same.
+Phase 5B adds the layers the namespace sandbox lacks: a seccomp filter, Landlock rules as a second layer, and
+resource limits, and moves the dependency engine's path-based prefix operations to held directory descriptors.
 
 ## Reporting
 
 Please report a hole in any of the measures above as an issue or privately to the maintainer. Bypasses of the
-"does NOT do" list are known and are not vulnerabilities in Phase 2.
+"still NOT covered" and "does NOT protect" lists are known and are not vulnerabilities.

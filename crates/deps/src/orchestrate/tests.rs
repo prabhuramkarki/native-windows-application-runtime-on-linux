@@ -1459,10 +1459,11 @@ fn dropping_the_lock_releases_it_even_while_the_open_file_is_shared() {
 fn shared_locks_coexist_and_exclude_an_exclusive_one_both_ways() {
     let r = abc();
     let (s1, s2) = (lock_app_shared(&r.env).unwrap(), lock_app_shared(&r.env).unwrap());
-    assert!(matches!(lock_app(&r.env), Err(DepsError::LockHeld)));
+    // Shared holders are running apps: said so.
+    assert!(matches!(lock_app(&r.env), Err(DepsError::AppRunning)));
     drop(s1);
     assert!(
-        matches!(lock_app(&r.env), Err(DepsError::LockHeld)),
+        matches!(lock_app(&r.env), Err(DepsError::AppRunning)),
         "one shared holder is enough"
     );
     drop(s2);

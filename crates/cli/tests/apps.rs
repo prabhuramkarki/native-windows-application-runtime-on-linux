@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const NOTE: &str = "note: Windows applications run WITHOUT a sandbox until Phase 5 (see docs/SECURITY.md)";
+/// What `run --unsandboxed` says on stderr (the rig's fake Wine cannot run in a real sandbox, so the rig runs apps
+/// with `--unsandboxed`; `runtime sandbox`, the refusals and the doctor check are tested below, a real sandboxed
+/// run in `e2e_wine.rs`).
+const NOTE: &str = "warning: running WITHOUT a sandbox (--unsandboxed)";
 const APP_STDERR: &str = "fake-wine stderr line";
 
 const WINE: &str = r#"
@@ -46,6 +49,9 @@ struct Rig {
     inputs: PathBuf,
     /// `false`: `RUNTIME_WINE` points at a file that does not exist.
     wine_present: bool,
+    /// A second temp directory OUTSIDE `/tmp` (under `CARGO_TARGET_TMPDIR`), for host directories a permission
+    /// grant may name: every grant at or below `/tmp` is refused.
+    grants: tempfile::TempDir,
 }
 
 fn script(path: &Path, body: &str) {
@@ -111,6 +117,7 @@ fn rig_with(wineserver_body: &str) -> Rig {
         log,
         inputs,
         wine_present: true,
+        grants: tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
     }
 }
 
@@ -461,7 +468,10 @@ fn install_reports_the_app_and_creates_a_prefix_through_the_backend() {
         "{out}"
     );
     assert!(out.contains("runtime run my-app"), "{out}");
-    assert_eq!(err.matches(NOTE).count(), 1, "exactly one sandbox note: {err}");
+    assert!(
+        !err.contains("sandbox"),
+        "install runs no program: no sandbox note: {err}"
+    );
     assert_tame(&err, "stderr");
     assert_eq!(
         r.calls(),
@@ -649,13 +659,17 @@ fn a_failing_backend_setup_leaves_no_app() {
 #[test]
 fn run_of_an_unknown_id_exits_1_with_a_hint() {
     let r = rig();
-    let o = r.rt(&["run", "nothing"]);
+    let o = r.rt(&["run", "--unsandboxed", "nothing"]);
     let err = assert_fails(&o);
     assert!(err.contains("runtime list") && err.contains("runtime install"), "{err}");
     assert!(r.app_dirs().is_empty());
     assert!(r.calls().is_empty(), "wine was not called: {:?}", r.calls());
     // hostile target: escaped in the message
-    let o = r.cmd().args(["run", "Hello\u{1b}]0;x\u{7}"]).output().unwrap();
+    let o = r
+        .cmd()
+        .args(["run", "--unsandboxed", "Hello\u{1b}]0;x\u{7}"])
+        .output()
+        .unwrap();
     assert_tame(&assert_fails(&o), "stderr");
 }
 
@@ -668,6 +682,7 @@ fn run_an_installed_app_passes_the_exit_code_stdout_and_verbatim_args() {
     let odd = OsString::from_vec(b"non-utf8-\xff\xfe".to_vec());
     cmd.args([
         "run",
+        "--unsandboxed",
         &id,
         "--",
         "a b",
@@ -732,7 +747,7 @@ fn run_an_installed_app_passes_the_exit_code_stdout_and_verbatim_args() {
     assert!(!env.contains("SECRET") && !env.contains("hunter2"), "{env}");
     // exit code 0 passes through as well
     r.hook("exit 0");
-    assert_eq!(r.rt(&["run", &id]).status.code(), Some(0));
+    assert_eq!(r.rt(&["run", "--unsandboxed", &id]).status.code(), Some(0));
 }
 
 #[test]
@@ -743,7 +758,7 @@ fn the_program_gets_the_apps_own_home_not_the_hosts() {
     let out = r
         .cmd()
         .env("HOME", hostile)
-        .args(["run", id.as_str()])
+        .args(["run", "--unsandboxed", id.as_str()])
         .output()
         .unwrap();
     assert_ok(&out);
@@ -759,21 +774,21 @@ fn run_reports_a_signal_death_as_128_plus_the_signal() {
     let r = rig();
     let id = r.install();
     r.hook("kill -TERM $$");
-    assert_eq!(r.rt(&["run", &id]).status.code(), Some(143));
+    assert_eq!(r.rt(&["run", "--unsandboxed", &id]).status.code(), Some(143));
 }
 
 #[test]
 fn run_debug_also_shows_the_apps_stderr_on_the_terminal() {
     let r = rig();
     let id = r.install();
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     assert_ok(&o);
     assert!(
         !s(&o.stderr).contains(APP_STDERR),
         "quiet without --debug: {}",
         s(&o.stderr)
     );
-    let o = r.rt(&["run", "--debug", &id]);
+    let o = r.rt(&["run", "--unsandboxed", "--debug", &id]);
     assert_ok(&o);
     let err = s(&o.stderr);
     assert_eq!(err.matches(APP_STDERR).count(), 1, "{err}");
@@ -792,7 +807,13 @@ fn run_a_file_installs_it_first_and_then_runs_it() {
     r.hook("exit 3");
     let o = r
         .cmd()
-        .args(["run".as_ref(), p.as_os_str(), "--".as_ref(), "one".as_ref()])
+        .args([
+            "run".as_ref(),
+            "--unsandboxed".as_ref(),
+            p.as_os_str(),
+            "--".as_ref(),
+            "one".as_ref(),
+        ])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(3), "stderr: {}", s(&o.stderr));
@@ -817,7 +838,7 @@ fn run_survives_ctrl_c_and_reports_the_childs_status() {
     let id = r.install();
     // SIGINT to the runtime process (the fake's parent) while it waits; the child then exits 5 by itself.
     r.hook("sleep 0.5; kill -INT $PPID; sleep 0.3; exit 5");
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     assert_eq!(
         o.status.code(),
         Some(5),
@@ -836,7 +857,7 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
             .join(format!("{id}/prefix/drive_c/Program Files/{id}/hello64.exe")),
     )
     .unwrap();
-    let o = r.rt(&["run", &id]);
+    let o = r.rt(&["run", "--unsandboxed", &id]);
     let err = assert_fails(&o);
     assert!(
         err.contains("cannot be found") && err.contains(&format!("runtime remove {id}")),
@@ -849,19 +870,19 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
     let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&md).unwrap()).unwrap();
     v["environment"] = "evil".into();
     fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
-    assert_tame(&assert_fails(&r.rt(&["run", &id2])), "stderr");
+    assert_tame(&assert_fails(&r.rt(&["run", "--unsandboxed", &id2])), "stderr");
     assert!(!r.log.join("argv.bin").exists());
     // No Wine at all, for an installed app.
     let r2 = rig().no_wine();
     r2.plant("x", "X");
-    let err = assert_fails(&r2.rt(&["run", "x"]));
+    let err = assert_fails(&r2.rt(&["run", "--unsandboxed", "x"]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
 }
 
 #[test]
 fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
     let r = rig().no_wine();
-    let err = assert_fails(&r.rt(&["run", "nothing"]));
+    let err = assert_fails(&r.rt(&["run", "--unsandboxed", "nothing"]));
     assert!(
         err.contains("runtime list") && err.contains("runtime install <file>"),
         "{err}"
@@ -870,12 +891,12 @@ fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
         !err.contains("RUNTIME_WINE"),
         "the Wine error hides the real one: {err}"
     );
-    let err = assert_fails(&r.rt(&["run", "nothing.exe"]));
+    let err = assert_fails(&r.rt(&["run", "--unsandboxed", "nothing.exe"]));
     assert!(err.contains("no such file"), "{err}");
     assert!(!err.contains("RUNTIME_WINE"), "{err}");
     // What does need Wine still says so: a file to install, and an installed app.
     let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
-    let err = assert_fails(&r.rt(&["run".as_ref(), p.as_os_str()]));
+    let err = assert_fails(&r.rt(&["run".as_ref(), "--unsandboxed".as_ref(), p.as_os_str()]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
     assert!(r.app_dirs().is_empty(), "nothing was installed: {:?}", r.app_dirs());
 }
@@ -891,7 +912,7 @@ fn run_of_a_file_whose_start_fails_names_the_app_it_installed() {
     assert!(wine.contains("rm -f"), "the rig text changed");
     script(&r.bin.join("wine"), &wine);
     let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
-    let o = r.rt(&["run".as_ref(), p.as_os_str()]);
+    let o = r.rt(&["run".as_ref(), "--unsandboxed".as_ref(), p.as_os_str()]);
     let err = assert_fails(&o);
     let ids = r.app_dirs();
     assert_eq!(ids.len(), 1, "the install stays: {ids:?}");
@@ -1778,7 +1799,7 @@ fn doctor_of_an_app_without_its_home_fails_and_agrees_with_run() {
         let line = lines_with(&out, "app home")[0];
         assert!(line.contains("[FAIL]") && line.contains(words), "{damage}: {out}");
         // `run` refuses the same app, with the same words.
-        let err = assert_fails(&r.rt(&["run", &id]));
+        let err = assert_fails(&r.rt(&["run", "--unsandboxed", &id]));
         assert!(err.contains("app home") && err.contains(words), "{damage}: {err}");
     }
     // Also when the program itself cannot be resolved: both failures are reported.
@@ -2349,7 +2370,7 @@ fn deps_prints_the_plan_without_changing_anything_and_install_run_doctor_hint() 
     let d = r.rt(&["doctor", &id]);
     assert!(s(&d.stderr).contains(&hint), "{}", s(&d.stderr));
     // `run` stays cheap: no hint, so the executable is never read for one.
-    let run = r.rt(&["run", &id]);
+    let run = r.rt(&["run", "--unsandboxed", &id]);
     assert_ok(&run);
     assert!(!s(&run.stderr).contains("hint:"), "{}", s(&run.stderr));
     let list = r.rt(&["deps", "list"]);
@@ -2467,7 +2488,7 @@ fn remove_uninstall_run_and_install_refuse_while_a_dependency_install_holds_the_
     assert_eq!(r.app_dirs(), std::slice::from_ref(&id));
     assert_eq!(r.calls(), before, "nothing was stopped, run or removed");
     drop(lock);
-    assert_ok(&r.rt(&["run", &id]));
+    assert_ok(&r.rt(&["run", "--unsandboxed", &id]));
     assert_ok(&r.rt(&["remove", &id]));
     assert!(r.app_dirs().is_empty());
 }
@@ -2879,4 +2900,762 @@ fn doctor_of_an_app_checks_its_graphics_driver_setting_and_keeps_the_areas() {
         lines_with(&out, "graphics driver setting not verified")[0].contains("[warn]"),
         "{out}"
     );
+}
+
+// ================================================================ permissions
+
+/// An app `papp` and a `$HOME` (`home/`, with a `.ssh` and an ordinary `share/` directory) for `HOME`.
+fn perm_app(r: &Rig) -> (PathBuf, PathBuf) {
+    let app = r.plant("papp", "P");
+    let home = r.grants.path().canonicalize().unwrap().join("home");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(home.join("share")).unwrap();
+    (app, home)
+}
+
+fn perm(r: &Rig, home: &Path, args: &[&str]) -> Output {
+    r.cmd()
+        .env("HOME", home)
+        .arg("permissions")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// A process named `wineserver` for `prefix` (what `wineservers_for` looks for); kill it when done.
+fn fake_wineserver(r: &Rig, prefix: &Path) -> std::process::Child {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = r.root.join("fake-ws/wineserver");
+    fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    fs::write(&exe, "#!/bin/sh\nread _\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = Command::new(&exe);
+    cmd.env_clear().env("WINEPREFIX", prefix).stdin(Stdio::piped());
+    (0..500)
+        .find_map(|_| match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+                None
+            }
+            x => Some(x.unwrap()),
+        })
+        .expect("spawn the fake wineserver")
+}
+
+#[test]
+fn permissions_shows_the_default_and_where_it_came_from() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let o = perm(&r, &home, &["papp"]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.starts_with("version = 1\nnetwork = \"deny\"\ndisplay = true\naudio = true\ngpu = true\n"),
+        "{out}"
+    );
+    assert!(out.ends_with("source: default\n"), "{out}");
+    assert!(!app.join("permissions.toml").exists());
+}
+
+#[test]
+fn permissions_set_writes_once_and_shows_the_result() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let share = home.join("share");
+    let o = perm(
+        &r,
+        &home,
+        &[
+            "papp",
+            "--set",
+            "network=allow",
+            "--set",
+            "gpu=off",
+            "--set",
+            &format!("fs+={}:rw", share.display()),
+        ],
+    );
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("network = \"allow\"") && out.contains("gpu = false") && out.contains("access = \"rw\""),
+        "{out}"
+    );
+    assert!(out.ends_with("source: permissions.toml\n"), "{out}");
+    let file = app.join("permissions.toml");
+    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o600);
+    let shown = s(&perm(&r, &home, &["papp"]).stdout);
+    assert_eq!(shown, out);
+    // removal, and only the app root holds the file (no temp file left)
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", &format!("fs-={}", share.display())],
+    ));
+    assert!(!fs::read_to_string(&file).unwrap().contains("filesystem"));
+    assert!(
+        fs::read_dir(&app)
+            .unwrap()
+            .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".tmp-"))
+    );
+}
+
+#[test]
+fn permissions_set_with_a_bad_expression_or_grant_refuses_all_and_writes_nothing() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    for bad in ["net=allow", "fs+=rel:ro", "fs+=/x:rx", "network=maybe"] {
+        let o = perm(&r, &home, &["papp", "--set", "gpu=off", "--set", bad]);
+        let err = assert_fails(&o);
+        assert!(err.contains("nothing was changed"), "{bad}: {err}");
+        assert!(!app.join("permissions.toml").exists(), "{bad}");
+    }
+    let err = assert_fails(&perm(&r, &home, &["papp", "--set", "net=allow"]));
+    assert!(err.contains("network=allow|deny") && err.contains("fs+="), "{err}");
+    // secrets, $HOME, `/`, and the runtime's data directory are never granted
+    for (dir, why) in [
+        (home.join(".ssh"), "~/.ssh"),
+        (home.clone(), "home directory"),
+        (PathBuf::from("/"), "`/`"),
+        (r.data.clone(), "data directory"),
+        (r.data.join("apps/papp/prefix"), "data directory"),
+    ] {
+        let err = assert_fails(&perm(
+            &r,
+            &home,
+            &["papp", "--set", &format!("fs+={}:ro", dir.display())],
+        ));
+        assert!(
+            err.contains(why) && err.contains("nothing was changed"),
+            "{dir:?}: {err}"
+        );
+        assert!(!app.join("permissions.toml").exists(), "{dir:?}");
+    }
+    assert!(
+        !fs::read_dir(&app)
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().contains("permissions"))
+    );
+}
+
+#[test]
+fn permissions_set_is_refused_while_a_wineserver_runs_and_reset_too() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    assert_ok(&perm(&r, &home, &["papp", "--set", "gpu=off"]));
+    let before = fs::read_to_string(app.join("permissions.toml")).unwrap();
+    let mut server = fake_wineserver(&r, &app.join("prefix"));
+    let set = perm(&r, &home, &["papp", "--set", "network=allow"]);
+    let reset = perm(&r, &home, &["papp", "--reset"]);
+    let _ = server.kill();
+    let _ = server.wait();
+    for o in [&set, &reset] {
+        let err = assert_fails(o);
+        assert!(
+            err.contains("appears to be running") && err.contains("nothing was changed"),
+            "{err}"
+        );
+    }
+    assert_eq!(fs::read_to_string(app.join("permissions.toml")).unwrap(), before);
+    // reading is fine meanwhile, and once it is gone the change works
+    assert_ok(&perm(&r, &home, &["papp", "--set", "network=allow"]));
+}
+
+#[test]
+fn permissions_set_is_refused_while_another_runtime_command_holds_the_app_lock() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse("papp").unwrap()).unwrap();
+    let _running = rt_deps::lock_app_shared(&env).unwrap();
+    assert!(assert_fails(&perm(&r, &home, &["papp", "--set", "gpu=off"])).contains("papp"));
+    assert!(!app.join("permissions.toml").exists());
+}
+
+#[test]
+fn permissions_reset_deletes_the_file_and_json_parses_back() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let share = home.join("share");
+    assert_ok(&perm(
+        &r,
+        &home,
+        &[
+            "papp",
+            "--set",
+            "audio=off",
+            "--set",
+            &format!("fs+={}:ro", share.display()),
+        ],
+    ));
+    let o = perm(&r, &home, &["papp", "--json"]);
+    assert_ok(&o);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["network"], "deny");
+    assert_eq!(
+        (v["display"].as_bool(), v["audio"].as_bool(), v["gpu"].as_bool()),
+        (Some(true), Some(false), Some(true))
+    );
+    assert_eq!(v["filesystem"][0]["path"], share.to_str().unwrap());
+    assert_eq!(v["filesystem"][0]["access"], "ro");
+    assert_ok(&perm(&r, &home, &["papp", "--reset"]));
+    assert!(!app.join("permissions.toml").exists());
+    let v: serde_json::Value = serde_json::from_slice(&perm(&r, &home, &["papp", "--json"]).stdout).unwrap();
+    assert_eq!(v["filesystem"], serde_json::json!([]));
+    assert_ok(&perm(&r, &home, &["papp", "--reset"])); // no file: fine
+    assert!(assert_fails(&perm(&r, &home, &["papp", "--reset", "--set", "gpu=off"])).contains("cannot be combined"));
+}
+
+#[test]
+fn permissions_refuses_a_symlinked_or_oversized_file_and_writes_nothing() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let victim = r.root.join("victim");
+    fs::write(&victim, "keep").unwrap();
+    let f = app.join("permissions.toml");
+    std::os::unix::fs::symlink(&victim, &f).unwrap();
+    for args in [vec!["papp"], vec!["papp", "--set", "gpu=off"]] {
+        let err = assert_fails(&perm(&r, &home, &args));
+        assert!(err.contains("not a plain file"), "{err}");
+    }
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    fs::remove_file(&f).unwrap();
+    let big = format!("version = 1\n#{}\n", "x".repeat(1 << 20));
+    fs::write(&f, &big).unwrap();
+    let err = assert_fails(&perm(&r, &home, &["papp", "--set", "gpu=off"]));
+    assert!(err.contains("larger than"), "{err}");
+    assert_eq!(fs::read_to_string(&f).unwrap(), big);
+    // a hostile file's text is escaped on the way out
+    fs::write(&f, "version = 1\nnetwork = \"\\u001b[2J\"\n").unwrap();
+    let o = perm(&r, &home, &["papp"]);
+    assert!(!o.stderr.contains(&0x1b) && !o.stdout.contains(&0x1b));
+    assert_fails(&o);
+}
+
+#[test]
+fn permissions_rejects_bad_ids_and_unknown_apps() {
+    let r = rig();
+    let (_, home) = perm_app(&r);
+    for bad in ["../x", "/etc", "a/b", ".."] {
+        let err = assert_fails(&perm(&r, &home, &[bad]));
+        assert!(err.contains("not a valid app id"), "{err}");
+        assert_fails(&perm(&r, &home, &[bad, "--set", "gpu=off"]));
+    }
+    assert!(assert_fails(&perm(&r, &home, &["nope"])).contains("no app named"));
+    // without an absolute HOME nothing can be judged
+    let o = r
+        .cmd()
+        .env("HOME", "relative")
+        .args(["permissions", "papp"])
+        .output()
+        .unwrap();
+    assert!(assert_fails(&o).contains("HOME"));
+}
+
+#[test]
+fn permissions_refuses_sockets_files_daemon_dirs_and_rw_system_trees() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    // (a socket path must fit `sun_path`; under /tmp it is refused for where it is)
+    let short = tempfile::tempdir_in("/tmp").unwrap();
+    let sock = short.path().join("agent.sock");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    fs::write(home.join(".bashrc"), "x").unwrap();
+    // The refusal's own wording (a grant path is echoed in the message too, so its text alone proves nothing).
+    let tmp = "/tmp holds other programs' sockets and cannot be granted";
+    let run = "/run holds device nodes and runtime sockets";
+    for (grant, why) in [
+        (format!("{}:rw", sock.display()), tmp),
+        (format!("{}:ro", short.path().display()), tmp),
+        (
+            format!("{}:rw", home.join(".bashrc").display()),
+            "it is not a directory",
+        ),
+        ("/run/docker.sock:rw".into(), run),
+        ("/run/dbus:ro".into(), run),
+        // `/tmp` itself contains this rig's data directory (a /tmp tempdir), which is checked first; the
+        // `/tmp` rule for `/tmp` itself is unit-tested in `rt_sandbox::permissions`.
+        (
+            "/tmp:ro".into(),
+            "it is, contains or is inside the runtime's data directory",
+        ),
+        ("/tmp/.X11-unix:ro".into(), tmp),
+        ("/etc:rw".into(), "never writable"),
+        ("/usr/local:rw".into(), "never writable"),
+    ] {
+        let err = assert_fails(&perm(&r, &home, &["papp", "--set", &format!("fs+={grant}")]));
+        assert!(
+            err.contains(why) && err.contains("nothing was changed"),
+            "{grant}: {err}"
+        );
+        assert!(!app.join("permissions.toml").exists(), "{grant}");
+    }
+    // the account's real home counts even if HOME points elsewhere
+    if let Some(real) = rt_sandbox::account_home().filter(|h| h.join(".ssh").is_dir()) {
+        let o = perm(
+            &r,
+            &home,
+            &["papp", "--set", &format!("fs+={}:ro", real.join(".ssh").display())],
+        );
+        assert!(assert_fails(&o).contains("~/.ssh"));
+    }
+}
+
+#[test]
+fn permissions_can_remove_a_grant_whose_directory_is_gone() {
+    let r = rig();
+    let (app, home) = perm_app(&r);
+    let gone = home.join("gone");
+    fs::create_dir(&gone).unwrap();
+    assert_ok(&perm(
+        &r,
+        &home,
+        &["papp", "--set", &format!("fs+={}:rw", gone.display())],
+    ));
+    fs::remove_dir(&gone).unwrap();
+    // reading refuses, and says how to get out
+    let err = assert_fails(&perm(&r, &home, &["papp"]));
+    assert!(err.contains("does not exist") && err.contains("--reset"), "{err}");
+    assert_ok(&perm(&r, &home, &["papp", "--set", &format!("fs-={}", gone.display())]));
+    assert!(
+        !fs::read_to_string(app.join("permissions.toml"))
+            .unwrap()
+            .contains("filesystem")
+    );
+    assert_ok(&perm(&r, &home, &["papp"]));
+}
+
+// ================================================================ sandbox
+
+/// A `bwrap` in the rig's `bin/` that records its arguments (one call per line in `log/bwrap.txt`) and then runs
+/// what follows `--` UNSANDBOXED (the fake Wine could not run in a real sandbox), or exits 0 (the probe).
+fn fake_bwrap(r: &Rig) {
+    let body = "echo \"$*\" >> @LOG@/bwrap.txt\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                [ $# -gt 0 ] || exit 0\nshift\nexec \"$@\""
+        .replace("@LOG@", r.log.to_str().unwrap());
+    script(&r.bin.join("bwrap"), &body);
+}
+
+fn bwrap_calls(r: &Rig) -> Vec<String> {
+    fs::read_to_string(r.log.join("bwrap.txt"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// `r.cmd()` with only the rig's `bin/` on PATH: no real `bwrap` (the fake scripts need nothing else to refuse).
+fn no_bwrap(r: &Rig) -> Command {
+    let mut c = r.cmd();
+    c.env("PATH", &r.bin);
+    c
+}
+
+const NO_BWRAP: &str = "error: cannot start the sandbox: bwrap is not on PATH. Install bubblewrap (`sudo apt install \
+                        bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)";
+
+#[test]
+fn run_without_bwrap_refuses_before_anything_starts_or_is_installed() {
+    let r = rig();
+    let id = r.install();
+    let before = r.calls();
+    let o = no_bwrap(&r).args(["run", &id]).output().unwrap();
+    assert_eq!(assert_fails(&o).trim_end(), NO_BWRAP);
+    assert_eq!(r.calls(), before, "nothing ran");
+    // A file is not even installed.
+    let p = r.input("other.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let o = no_bwrap(&r).args(["run".as_ref(), p.as_os_str()]).output().unwrap();
+    assert_eq!(assert_fails(&o).trim_end(), NO_BWRAP);
+    assert_eq!(r.app_dirs(), [id]);
+}
+
+#[test]
+fn run_refuses_when_bwrap_cannot_create_a_sandbox() {
+    let r = rig();
+    let id = r.install();
+    script(
+        &r.bin.join("bwrap"),
+        "echo 'bwrap: No permissions to create new namespace, likely because the kernel does not allow' >&2; exit 1",
+    );
+    let before = r.calls();
+    let err = assert_fails(&r.rt(&["run", &id]));
+    assert!(
+        err.starts_with("error: cannot start the sandbox: user namespaces are disabled or restricted on this host")
+            && err.contains(
+                "Install bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)"
+            ),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before, "nothing ran");
+}
+
+#[test]
+fn a_sandboxed_run_starts_the_settled_program_in_bwrap_and_marks_the_app() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    r.hook("exit 6");
+    let root = r.apps().join(&id);
+    assert!(!root.join("ran-sandboxed").exists());
+    let o = r.rt(&["run", &id, "--", "arg one"]);
+    assert_eq!(o.status.code(), Some(6), "stderr: {}", s(&o.stderr));
+    assert_eq!(s(&o.stdout), "app-stdout\n");
+    assert_eq!(
+        s(&o.stderr),
+        "",
+        "no DISPLAY and no network: nothing the profile cannot enforce"
+    );
+    let calls = bwrap_calls(&r);
+    assert_eq!(calls.len(), 2, "the probe, then the program: {calls:?}");
+    assert!(calls[0].starts_with("--unshare-all "), "{calls:?}");
+    let prefix = root.join("prefix");
+    let home = root.join("runtime/home");
+    let run = &calls[1];
+    for want in [
+        "--die-with-parent --new-session --unshare-pid --unshare-uts --unshare-ipc --unshare-net ".to_owned(),
+        format!(
+            " --bind {0} {0} --bind {1} {1} --remount-ro / -- /bin/sh -c ",
+            prefix.display(),
+            home.display()
+        ),
+        format!(
+            " {} {} ",
+            r.bin.join("wineserver").display(),
+            r.bin.join("wine").display()
+        ),
+    ] {
+        assert!(run.contains(&want), "{want:?} in {run}");
+    }
+    assert!(run.ends_with("hello64.exe arg one"), "{run}");
+    // Only the prefix and the app's home are bound: never the app root (permissions.toml, the marker).
+    let root_text = root.display().to_string();
+    assert!(
+        !run.split(' ').any(|a| a == root_text || a == format!("{root_text}/")),
+        "{run}"
+    );
+    // The program's argv is exact, the registry was settled (`wineserver -w`) and the app is marked.
+    assert_eq!(r.argv()[1], b"arg one");
+    assert!(
+        r.calls().iter().any(|c| c.starts_with("wineserver -w ")),
+        "{:?}",
+        r.calls()
+    );
+    assert!(root.join("ran-sandboxed").is_file());
+}
+
+#[test]
+fn a_sandboxed_run_prints_what_the_profile_cannot_enforce() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args(["permissions", &id, "--set", "network=allow", "--set", "display=off"])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let o = r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+    assert_ok(&o);
+    let err = s(&o.stderr);
+    let notes: Vec<&str> = err.lines().collect();
+    assert_eq!(notes.len(), 2, "{err}");
+    assert!(
+        notes[0].starts_with("note: network=allow shares the host network namespace"),
+        "{err}"
+    );
+    assert!(
+        notes[1].starts_with("note: display=off cannot be enforced with network=allow"),
+        "{err}"
+    );
+    assert!(!bwrap_calls(&r)[1].contains("--unshare-net"));
+}
+
+#[test]
+fn a_profile_that_is_refused_stops_the_run() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    fs::write(r.apps().join(&id).join("permissions.toml"), "version = 1\nbogus = 1\n").unwrap();
+    let before = r.calls();
+    let err = assert_fails(&r.rt(&["run", &id]));
+    assert!(
+        err.starts_with("error: cannot start the sandbox: the app's permissions.toml is refused")
+            && err.contains(&format!("runtime permissions {id} --reset")),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before);
+    assert_eq!(bwrap_calls(&r).len(), 1, "only the probe ran");
+}
+
+#[test]
+fn sandbox_prints_the_profile_and_the_bwrap_command_line_without_running_anything() {
+    let r = rig();
+    let id = r.install();
+    let before = r.calls();
+    let o = r.rt(&["sandbox", &id]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert!(
+        out.contains("profile (default): network deny, display on, audio on, gpu on, 0 host directories"),
+        "{out}"
+    );
+    assert!(
+        out.contains("skipped: display: neither DISPLAY nor WAYLAND_DISPLAY is set"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("warning: `runtime run --unsandboxed {id}` would run")),
+        "{out}"
+    );
+    let line = lines_with(&out, "command: ")[0];
+    let root = r.apps().join(&id);
+    let prefix = root.join("prefix");
+    assert!(line.contains(" '--unshare-net' "), "{line}");
+    assert!(
+        line.contains(&format!(" '--bind' '{0}' '{0}' ", prefix.display())),
+        "{line}"
+    );
+    assert!(
+        !line.contains(&format!("'{}'", root.display())),
+        "never the app root: {line}"
+    );
+    assert!(line.ends_with("hello64.exe'"), "{line}");
+    assert_eq!(r.calls(), before, "no Wine process");
+    assert_tame(&out, "stdout");
+
+    // network=allow: no --unshare-net, and the caveat is shown.
+    let home = r.grants.path().canonicalize().unwrap();
+    let set = r
+        .cmd()
+        .env("HOME", &home)
+        .args(["permissions", &id, "--set", "network=allow"])
+        .output()
+        .unwrap();
+    assert_ok(&set);
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["sandbox", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    assert!(out.contains("profile (permissions.toml): network allow"), "{out}");
+    assert!(
+        out.contains("note: network=allow shares the host network namespace"),
+        "{out}"
+    );
+    assert!(!lines_with(&out, "command: ")[0].contains("--unshare-net"), "{out}");
+    // No bwrap: still exit 0, and says so.
+    let o = no_bwrap(&r).env("HOME", &home).args(["sandbox", &id]).output().unwrap();
+    assert_ok(&o);
+    assert!(
+        s(&o.stdout).starts_with("bubblewrap: UNAVAILABLE: bwrap is not on PATH"),
+        "{}",
+        s(&o.stdout)
+    );
+}
+
+#[test]
+fn doctor_reports_the_sandbox_for_the_system_and_summarises_an_apps_profile() {
+    let r = rig();
+    let id = r.install();
+    let o = no_bwrap(&r).args(["doctor", &id]).output().unwrap();
+    let out = s(&o.stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[warn]") && line.contains("bwrap is not on PATH"),
+        "{out}"
+    );
+    let v = json(&no_bwrap(&r).args(["doctor", "--json"]).output().unwrap());
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["text"].as_str().unwrap().contains("sandbox"))
+        .unwrap();
+    assert_eq!(
+        (check["area"].as_str(), check["status"].as_str()),
+        (Some("runtime"), Some("warn"))
+    );
+    assert!(
+        check["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("sandbox: unavailable: bwrap is not on PATH"),
+        "{check}"
+    );
+    fake_bwrap(&r);
+    // A profile that needs HOME to be checked, without HOME (the rig's environment is cleared): the real reason.
+    fs::write(r.apps().join(&id).join("permissions.toml"), "version = 1\n").unwrap();
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[warn]") && line.contains("sandbox: cannot read the profile: HOME is not set"),
+        "{out}"
+    );
+    fs::remove_file(r.apps().join(&id).join("permissions.toml")).unwrap();
+    let out = s(&r.rt(&["doctor"]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(line.contains("[ok]") && line.contains("bubblewrap works"), "{out}");
+    let out = s(&r.rt(&["doctor", &id]).stdout);
+    let line = lines_with(&out, "sandbox")[0];
+    assert!(
+        line.contains("[ok]")
+            && line.ends_with("profile: network deny, display on, audio on, gpu on, 0 host directories"),
+        "{out}"
+    );
+}
+
+#[test]
+fn once_an_app_ran_sandboxed_its_registry_helpers_run_in_its_sandbox() {
+    let r = rig();
+    let prefix = display_app(&r);
+    let id = "dapp";
+    // Never sandboxed: `display` runs reg.exe like any Wine helper.
+    assert_ok(&r.rt(&["display", id, "x11"]));
+    assert!(r.calls().iter().any(|c| c == "wine <app>"), "{:?}", r.calls());
+    assert!(prefix.join("user.reg").exists());
+    fs::write(prefix.parent().unwrap().join("ran-sandboxed"), "").unwrap();
+    // Sandboxed before, and no bwrap: refused, nothing ran.
+    let before = r.calls();
+    let err = assert_fails(&no_bwrap(&r).args(["display", id, "auto"]).output().unwrap());
+    assert!(
+        err.contains(&format!(
+            "{id} has run in the sandbox, so its Wine helpers must run sandboxed too"
+        )) && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(r.calls(), before);
+    // With bwrap: reg.exe goes through it (the fake runs it after recording the profile).
+    fake_bwrap(&r);
+    assert_ok(&r.rt(&["display", id, "auto"]));
+    let calls = bwrap_calls(&r);
+    let reg = calls
+        .iter()
+        .find(|c| c.contains("reg.exe"))
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    assert!(reg.contains("--unshare-net") && reg.contains(" delete "), "{reg}");
+    // Something else at the marker's path (the runtime only ever writes a file) still counts as marked.
+    let marker = prefix.parent().unwrap().join("ran-sandboxed");
+    fs::remove_file(&marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    fs::remove_file(r.bin.join("bwrap")).unwrap();
+    let err = assert_fails(&no_bwrap(&r).args(["display", id, "x11"]).output().unwrap());
+    assert!(err.contains("has run in the sandbox"), "{err}");
+}
+
+#[test]
+fn remove_and_uninstall_refuse_while_the_app_still_runs_and_work_once_it_is_gone() {
+    // A sandboxed app's wineserver survives `wineserver -k` (its socket is in the sandbox's private /tmp); the
+    // host's /proc still shows it, like this fake one.
+    let r = rig();
+    let id = r.install();
+    let root = r.apps().join(&id);
+    let mut server = fake_wineserver(&r, &root.join("prefix"));
+    for cmd in ["remove", "uninstall"] {
+        let before = r.calls().len();
+        let err = assert_fails(&r.rt(&[cmd, &id]));
+        assert!(
+            err.contains(&format!("{id} is running (wineserver pid {})", server.id()))
+                && err.contains("quit it (Ctrl-C its `runtime run`) first; nothing was removed"),
+            "{cmd}: {err}"
+        );
+        assert!(root.join("metadata.json").is_file(), "{cmd} removed the app");
+        let calls = &r.calls()[before..];
+        assert_eq!(calls.len(), 1, "{cmd}: only the stop, no uninstaller: {calls:?}");
+        assert!(calls[0].starts_with("wineserver -k"), "{calls:?}");
+    }
+    server.kill().unwrap();
+    server.wait().unwrap();
+    assert_ok(&r.rt(&["remove", &id]));
+    assert!(r.app_dirs().is_empty());
+}
+
+#[test]
+fn sandbox_output_cannot_be_split_by_a_newline_in_a_path() {
+    let r = rig();
+    // A data directory whose name holds a newline, an escape sequence and a forged line.
+    let data = r.root.join("da\nta\u{1b}[2J\ncommand: 'forged'");
+    let run = |args: &[&std::ffi::OsStr]| r.cmd().env("RUNTIME_DATA_DIR", &data).args(args).output().unwrap();
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    assert_ok(&run(&["install".as_ref(), p.as_os_str()]));
+    let o = run(&["sandbox".as_ref(), "runtime-fixture".as_ref()]);
+    assert_ok(&o);
+    let out = s(&o.stdout);
+    assert_tame(&out, "stdout");
+    let known = [
+        "bubblewrap: ",
+        "profile ",
+        "  host directory ",
+        "Wine: ",
+        "REFUSED: ",
+        "skipped: ",
+        "note: ",
+        "warning: ",
+        "command: ",
+    ];
+    for line in out.lines() {
+        assert!(
+            known.iter().any(|k| line.starts_with(k)),
+            "a forged line {line:?} in:\n{out}"
+        );
+    }
+    assert_eq!(lines_with(&out, "command: ").len(), 1, "{out}");
+    assert!(out.contains("da\\nta\\u{1b}[2J\\ncommand"), "{out}");
+}
+
+#[test]
+fn every_exclusive_command_is_refused_while_a_runtime_run_of_the_app_lives() {
+    // The lock, not /proc, is the signal: the program here is a plain shell (no wineserver process at all).
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let go = r.log.join("go");
+    // Bounded (30 s), so a failing test leaves nothing behind.
+    r.hook(&format!(
+        "i=0; while [ ! -f {} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; exit 4",
+        go.display()
+    ));
+    let mut run = r
+        .cmd()
+        .args(["run", "--unsandboxed", &id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !r.calls().iter().any(|c| c == "wine <app>") {
+        assert!(start.elapsed() < Duration::from_secs(20), "the program never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let home = r.grants.path().canonicalize().unwrap();
+    let before = (r.calls(), r.tree());
+    let commands: [&[&str]; 5] = [
+        &["deps", &id, "--install"],
+        &["display", &id, "x11"],
+        &["permissions", &id, "--set", "network=allow"],
+        &["remove", &id],
+        &["uninstall", &id],
+    ];
+    for args in commands {
+        let err = assert_fails(&r.cmd().env("HOME", &home).args(args).output().unwrap());
+        assert!(
+            err.contains("the app is running (started by `runtime run`); quit it first"),
+            "{args:?}: {err}"
+        );
+    }
+    assert_eq!((r.calls(), r.tree()), before, "nothing ran or changed");
+    // Once the run has ended the same commands work.
+    fs::write(&go, "").unwrap();
+    assert_eq!(run.wait().unwrap().code(), Some(4));
+    assert_ok(
+        &r.cmd()
+            .env("HOME", &home)
+            .args(["permissions", &id, "--set", "network=allow"])
+            .output()
+            .unwrap(),
+    );
+    assert_ok(&r.rt(&["remove", &id]));
 }

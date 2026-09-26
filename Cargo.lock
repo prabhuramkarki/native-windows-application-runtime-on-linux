@@ -713,6 +713,7 @@ dependencies = [
  "runtime-desktop",
  "runtime-installer",
  "runtime-pe",
+ "runtime-sandbox",
  "serde",
  "serde_json",
  "sha2",
@@ -793,6 +794,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "runtime-sandbox"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "runtime-core",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

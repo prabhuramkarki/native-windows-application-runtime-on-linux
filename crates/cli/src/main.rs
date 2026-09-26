@@ -7,18 +7,16 @@ mod graphics;
 mod install;
 mod list;
 mod logs;
+mod permissions;
 mod remove;
 mod run;
 mod safe;
+mod sandbox;
 mod uninstall;
 
 use clap::{Parser, Subcommand};
 use rt_core::{Launcher, Store};
 use std::{ffi::OsString, io::IsTerminal, io::Write, path::PathBuf, process::ExitCode};
-
-/// What every command that runs Windows code tells the user (the real boundary is Phase 5).
-pub(crate) const SANDBOX_NOTE: &str =
-    "note: Windows applications run WITHOUT a sandbox until Phase 5 (see docs/SECURITY.md)";
 
 pub(crate) type CmdError = Box<dyn std::error::Error>;
 
@@ -67,7 +65,8 @@ enum Cmd {
         #[arg(long)]
         network: bool,
     },
-    /// Run an installed app, or install a .exe/.zip file first and run it (needs Wine).
+    /// Run an installed app, or install a .exe/.zip file first and run it (needs Wine and bubblewrap).
+    /// The program runs in the app's sandbox (see `runtime sandbox <app>` and `runtime permissions <app>`).
     /// The exit code is the program's (128+N when it was killed by signal N).
     Run {
         /// An app id from `runtime list`, or a path (contains `/` or ends in .exe/.zip) to install and run
@@ -75,6 +74,9 @@ enum Cmd {
         /// Verbose Wine logging; the program's stderr also goes to the terminal (it is always kept in the log)
         #[arg(long)]
         debug: bool,
+        /// Run WITHOUT the sandbox, with your full access (this run only; says so on stderr)
+        #[arg(long)]
+        unsandboxed: bool,
         /// Arguments for the program, passed as they are (write them after `--`)
         #[arg(last = true)]
         args: Vec<OsString>,
@@ -120,6 +122,30 @@ enum Cmd {
         #[arg(value_parser = ["auto", "x11", "wayland"])]
         choice: Option<String>,
     },
+    /// Show or change what an app's sandbox may reach (`permissions.toml`): network (default deny), display, audio
+    /// and gpu (default on) and host directories (default none). `--set network=allow`, `--set gpu=off`,
+    /// `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir` (repeatable; all are checked before anything is written);
+    /// `--reset` returns to the default. Changing needs the app to be stopped. `$HOME`, `/`, the runtime's data
+    /// directory and secret directories (`~/.ssh`, `~/.gnupg`, ...) can never be granted.
+    Permissions {
+        /// An app id from `runtime list`
+        app: String,
+        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir
+        #[arg(long = "set", value_name = "EXPR")]
+        set: Vec<String>,
+        /// Delete the app's permissions.toml (back to the default)
+        #[arg(long)]
+        reset: bool,
+        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}]}
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what an app's sandbox would be (needs no Wine; starts nothing): whether bubblewrap works, the
+    /// profile, what the host lacks, what the profile cannot enforce, and the full bubblewrap command line
+    Sandbox {
+        /// An app id from `runtime list`
+        app: String,
+    },
     /// Show what the host's graphics stack offers (`runtime graphics info`)
     #[command(subcommand)]
     Graphics(GraphicsCmd),
@@ -160,6 +186,30 @@ pub(crate) fn remove_desktop_entry(id: &rt_core::AppId) {
     }
 }
 
+/// Refuses while a `wineserver` still serves `env`'s prefix after the caller's `wineserver -k`, and when that cannot
+/// be checked (fail closed). A SANDBOXED app's server is out of `-k`'s reach (its socket is in the sandbox's private
+/// `/tmp`) but visible in the host's `/proc`; deleting its prefix under it would leave it running on a deleted tree.
+/// A server that is still shutting down gets two seconds.
+pub(crate) fn refuse_if_running(env: &rt_core::AppEnv) -> Result<(), CmdError> {
+    let id = env.id();
+    for attempt in 0..=20 {
+        let pids = rt_deps::wineservers_for(&env.prefix())
+            .map_err(|e| format!("cannot check whether {id} is running: {e}; nothing was removed"))?;
+        match pids.first() {
+            None => return Ok(()),
+            Some(pid) if attempt == 20 => {
+                return Err(format!(
+                    "{id} is running (wineserver pid {pid}); quit it (Ctrl-C its `runtime run`) first; nothing was \
+                     removed"
+                )
+                .into());
+            }
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
 /// Writes to stdout; a closed pipe (`| head`) is the reader's choice, not an error.
 pub(crate) fn emit(text: &str) -> Result<(), CmdError> {
     let mut out = std::io::stdout().lock();
@@ -193,7 +243,12 @@ fn main() -> ExitCode {
             silent,
             network,
         } => install::run(&file, name, exe, silent, network),
-        Cmd::Run { target, debug, args } => run::run(&target, &args, debug),
+        Cmd::Run {
+            target,
+            debug,
+            unsandboxed,
+            args,
+        } => run::run(&target, &args, debug, unsandboxed),
         Cmd::Doctor { target, json } => doctor::run(target.as_deref(), json),
         Cmd::List { json } => list::run(json).map(|()| 0),
         Cmd::Remove { app } => remove::run(&app).map(|()| 0),
@@ -201,6 +256,8 @@ fn main() -> ExitCode {
         Cmd::Logs { app, lines } => logs::run(&app, lines).map(|()| 0),
         Cmd::Deps(args) => deps::run(args),
         Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
+        Cmd::Permissions { app, set, reset, json } => permissions::run(&app, &set, reset, json).map(|()| 0),
+        Cmd::Sandbox { app } => sandbox::run(&app).map(|()| 0),
         Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
     };
