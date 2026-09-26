@@ -12,7 +12,7 @@
 //! prefix checks) 1200: at most 20 names, each cut to 40 escaped characters. The number of checks is fixed by the
 //! code, not by the input: one Graphics session check, one Vulkan check, one more for the app's graphics driver setting (an
 //! app report only: its setting, or why it could not be read), one Audio check, three Runtime checks for the sandbox (bubblewrap, then seccomp and Landlock, then resource limits), at most one Runtime check for a
-//! managed (.NET) program and at most [`MAX_D3D_ROUTES`] (5) Graphics checks that predict the Direct3D route per
+//! managed (.NET) program (decided by `dotnet`: the recorded Wine Mono, not the prefix) and at most [`MAX_D3D_ROUTES`] (5) Graphics checks that predict the Direct3D route per
 //! family (an installed app report only: `d3d_routes`).
 //!
 //! **Direct3D route.** `d3d_routes` is the CLI's prediction of what each imported Direct3D family will run on
@@ -38,7 +38,7 @@
 use crate::CompatBackend;
 use crate::display::GraphicsDriver;
 use crate::graphics::{HostVulkan, VulkanVerdict, host_verdict};
-use crate::text::{clean, quote_max};
+use crate::text::{clean, escape, quote_max};
 use pe::{Arch, InstallerKind, Kind, PeInfo, Subsystem};
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -228,6 +228,21 @@ pub struct DoctorInput<'a> {
     /// systemd-run --user available (...)`): `Ok` they can, `Err` why not and what that means for runs. One Runtime
     /// check, a warning at worst (like an unreadable profile).
     pub limits: Result<&'a str, &'a str>,
+    /// The program's .NET state: one Runtime check unless `NotManaged`.
+    pub dotnet: DotnetState,
+}
+
+/// Whether the program is managed (.NET) and, for an installed app, whether Wine Mono is recorded for it. The
+/// CLI computes it from `PeInfo::dotnet` and the app's recorded dependencies (never from prefix files).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DotnetState {
+    NotManaged,
+    /// Managed, and Wine Mono is not recorded (or the target is a file, which has no record).
+    ManagedNeedsMono,
+    /// Managed, and the `wine-mono` record says this version (untrusted text: escaped when printed).
+    ManagedMonoInstalled {
+        version: String,
+    },
 }
 
 /// A Direct3D family an app imports.
@@ -399,7 +414,7 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     if let PeState::Analysed(info) = input.pe {
         pe_facts(info, &mut out);
         imports(info, &input, &mut out);
-        runtime_needs(info, &mut out);
+        runtime_needs(info, &input, &mut out);
     }
     wine(&input, &mut out);
     sandbox(&input, &mut out);
@@ -519,13 +534,36 @@ fn pe_facts(info: &PeInfo, out: &mut Out) {
     }
 }
 
-fn runtime_needs(info: &PeInfo, out: &mut Out) {
-    if info.dotnet {
-        out.add(
+fn runtime_needs(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
+    match (&input.dotnet, &input.subject) {
+        (DotnetState::NotManaged, _) => {}
+        // A file is not installed: nothing is recorded, and Wine Mono is added to an app, not to a file.
+        (_, Subject::File { .. }) => out.add(
             Area::Runtime,
-            Status::Warn,
-            ".NET program: no .NET runtime is bundled and Wine's Mono is disabled (mscoree=d), so it fails".into(),
-        );
+            Status::Ok,
+            "managed (.NET) program: Wine Mono is installed per app by `runtime deps` after `runtime install`".into(),
+        ),
+        (DotnetState::ManagedMonoInstalled { version }, _) => out.add(
+            Area::Runtime,
+            Status::Ok,
+            format!(
+                "managed (.NET) program: Wine Mono {} is recorded as installed for this app",
+                escape(version, NAME_WIDTH)
+            ),
+        ),
+        (DotnetState::ManagedNeedsMono, subject) => {
+            let app = match subject {
+                Subject::App { id, .. } => escape(id, NAME_WIDTH),
+                _ => "<app>".into(),
+            };
+            out.add(
+                Area::Runtime,
+                Status::Warn,
+                format!(
+                    "managed (.NET) program: Wine Mono is not installed for this app; run `runtime deps {app} --install`"
+                ),
+            );
+        }
     }
     if let Some(installer) = &info.installer {
         let label = match installer.kind {

@@ -223,7 +223,8 @@ fn an_installed_app_runs_and_its_exit_code_passes_through() {
                 exe: exe.clone(),
                 cwd: exe.parent().unwrap().to_owned(),
                 args: vec![],
-                debug: false
+                debug: false,
+                dotnet: false
             }]
         );
         assert_eq!(f.prepares(), 0, "an installed app is not prepared again");
@@ -307,6 +308,66 @@ fn arguments_are_passed_verbatim() {
     assert_eq!(log, want);
     let env = f.store.get(&AppId::parse("app").unwrap()).unwrap();
     assert!(!env.drive_c().join("Program Files/app/pwned").exists(), "no shell ran");
+}
+
+// ---------------------------------------------------------------- dotnet
+
+fn record(id: &str) -> crate::DependencyRecord {
+    crate::DependencyRecord {
+        id: id.into(),
+        version: "9.4.0".into(),
+        sha256: "0".repeat(64),
+        installed_at: 1_800_000_000,
+        consent: None,
+    }
+}
+
+/// `RunOpts::dotnet` of the one `command()` call of a run of an app that records `ids` (`start_in`, fake backend).
+fn dotnet_of(ids: &[String]) -> bool {
+    let f = fx("exit 0");
+    let env = f.app("app");
+    let mut md = f.store.read_metadata(&env).unwrap();
+    md.dependencies = ids.iter().map(|i| record(i)).collect();
+    f.store.write_metadata(&env, &md).unwrap();
+    f.go("app", &[]).unwrap();
+    let Call::Command { dotnet, .. } = &f.commands()[0] else {
+        unreachable!()
+    };
+    *dotnet
+}
+
+#[test]
+fn dotnet_is_passed_to_the_backend_only_for_a_recorded_wine_mono() {
+    assert!(!dotnet_of(&[]));
+    assert!(dotnet_of(&["wine-mono".to_owned()]));
+    assert!(!dotnet_of(&[
+        "dxvk".to_owned(),
+        "wine-mono2".to_owned(),
+        "Wine-Mono".to_owned()
+    ]));
+    // The largest list `read` accepts: 127 unrelated records, or those and the Mono one.
+    let many: Vec<String> = (0..crate::MAX_DEPENDENCIES - 1).map(|i| format!("pkg{i}")).collect();
+    assert!(!dotnet_of(&many));
+    let mut with = many.clone();
+    with.insert(70, "wine-mono".into());
+    assert!(dotnet_of(&with));
+}
+
+#[test]
+fn an_oversized_or_duplicated_record_list_is_refused_before_any_command() {
+    // `Metadata::read` refuses both (it is never asked twice), so `dotnet` is never derived from them.
+    for ids in [
+        vec!["wine-mono".to_owned(); 2],
+        (0..10_000).map(|i| format!("p{i}")).collect(),
+    ] {
+        let f = fx("exit 0");
+        let env = f.app("app");
+        let mut md = f.store.read_metadata(&env).unwrap();
+        md.dependencies = ids.iter().map(|i| record(i)).collect();
+        fs::write(env.metadata_path(), serde_json::to_vec(&md).unwrap()).unwrap();
+        assert!(f.go("app", &[]).is_err());
+        assert!(f.commands().is_empty());
+    }
 }
 
 // ---------------------------------------------------------------- debug
@@ -584,6 +645,7 @@ fn a_path_target_is_installed_then_run() {
         cwd,
         args,
         debug,
+        ..
     } = &f.commands()[0]
     else {
         unreachable!()

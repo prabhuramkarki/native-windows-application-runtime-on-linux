@@ -519,9 +519,8 @@ fn check_pe_applies_every_rule_and_dotnet_is_only_a_warning() {
     assert!(check_pe(&info).unwrap().is_empty());
     let mut dotnet = info.clone();
     dotnet.dotnet = true;
-    let w = check_pe(&dotnet).unwrap();
-    assert_eq!(w.len(), 1);
-    assert!(w[0].contains(".NET"));
+    // Only a warning, and the hint (which needs the app's id) is added by `install_with` (CLI test).
+    assert!(check_pe(&dotnet).unwrap().is_empty());
     let mut driver = info.clone();
     driver.subsystem = Subsystem::Native;
     assert!(matches!(check_pe(&driver), Err(InstallError::KernelDriver)));

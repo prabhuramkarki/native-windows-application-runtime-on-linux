@@ -35,8 +35,8 @@ pub use id::{AppId, IdError};
 pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, install, read_input};
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{
-    BackendInfo, ConsentRecord, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN, MAX_NAME_LEN,
-    MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
+    BackendInfo, ConsentRecord, DOTNET_PACKAGE_ID, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN,
+    MAX_NAME_LEN, MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
 };
 pub use proc::{HelperOutput, RunError};
 pub use run::{

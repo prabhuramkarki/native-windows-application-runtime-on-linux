@@ -8,7 +8,7 @@
 //!                                                             |
 //!                          winpath::resolve_under(drive_c, metadata.executable) + regular-file check
 //!                                                             |
-//!                  backend.command(env, exe, cwd, args, RunOpts{debug}) --> Launcher::spawn(.., sink) --> wait
+//!                  backend.command(env, exe, cwd, args, RunOpts{debug, dotnet}) --> Launcher::spawn(.., sink) --> wait
 //! ```
 //!
 //! [`find_target`] does the first step alone (no backend needed: a front end reports "no such app" before it looks
@@ -43,8 +43,8 @@
 use crate::text::quote;
 use crate::winpath::{ResolveError, WinPath, WinPathError, resolve_under};
 use crate::{
-    AppEnv, AppId, BackendError, CompatBackend, InstallError, InstallOpts, InstallOutcome, LaunchError, Launcher,
-    LogSink, Metadata, RunOpts, Running, Sandbox, Store, StoreError, install,
+    AppEnv, AppId, BackendError, CompatBackend, DOTNET_PACKAGE_ID, InstallError, InstallOpts, InstallOutcome,
+    LaunchError, Launcher, LogSink, Metadata, RunOpts, Running, Sandbox, Store, StoreError, install,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -259,7 +259,10 @@ fn launch(
 ) -> Result<Running, RunAppError> {
     let p = resolve_program(store, id, backend.id())?;
     // One flag, two effects: the backend's verbosity and the sink.
-    let run_opts = RunOpts { debug: opts.debug };
+    let run_opts = RunOpts {
+        debug: opts.debug,
+        dotnet: p.metadata.has_dependency(DOTNET_PACKAGE_ID),
+    };
     let sink = if opts.debug {
         LogSink::Tee((env.terminal)())
     } else {

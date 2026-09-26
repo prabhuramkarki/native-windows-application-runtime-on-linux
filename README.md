@@ -12,9 +12,10 @@ scope. It is not a VM: same Linux user, and the display, audio and GPU it is giv
 with the host (an X11 display lets a program read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
 protected. `.msi`/`.exe` installers, uninstallers and `runtime deps` installer packages run in their own `bwrap`
 sandbox (Phase 3) behind the same `sandbox-init` launcher (seccomp and Landlock since Phase 5B Task 6; no resource
-limits, only the dependency engine's deadline), and `.NET` programs
-still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
-(see below).
+limits, only the dependency engine's deadline). A C# console program (including threads and garbage collection) was
+verified running through Wine Mono under the `runtime run` sandbox on the development host (see .NET below); other
+frameworks and GUI programs are not claimed. `runtime deps` is the only command that downloads anything, and only
+when asked (see below).
 
 ## Commands
 
@@ -116,8 +117,19 @@ Bundled packages (pins in [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)):
 - **VC++ 2015-2022 redistributable x64 14.44.35211** (Microsoft, consent): Microsoft's installer, run offline in the
   installer sandbox on a one-run null-driver desktop; success is its registry marker; 16 DLL overrides set after.
 
+.NET: the bundled `wine-mono` package is Wine Mono 9.4.0 (the version that matches Wine 10.0; an 85 MB pinned
+download, about 231 MiB in each app that installs it). A managed program imports `mscoree`, so `runtime deps <app>`
+plans it, and once it is recorded for the app `runtime run` enables `mscoree` for that app's program only (a native
+app, and every installer or helper, keep it disabled). Verified on 2026-09-26 (Wine 10.0, kernel 7.0, Landlock ABI 8;
+`crates/cli/tests/e2e_dotnet.rs`): a C# console program (`tools/fixtures/hello-managed.cs`, built with Wine Mono's
+own compiler by `tools/build-managed-fixture.sh`) installed, got Wine Mono through `runtime deps <app> --install`, and
+ran through `runtime run` under the default sandbox (bwrap, seccomp, Landlock, task limit): arguments, exit code,
+four JIT-compiled threads under a lock and 64 MiB of allocation with a forced GC; no seccomp or Landlock change was
+needed. Not claimed: GUI programs (WinForms/WPF), a real .NET Framework 4.8 application, or other frameworks (.NET
+Core / .NET 5+ are not Mono). `runtime doctor <app>` says whether Wine Mono is recorded.
+
 Known gaps: `d3dcompiler_47` (no verifiable redistributable
-source), .NET, Mono and Gecko (no packages; they stay disabled), 32-bit apps (x64 DLLs only; the plan warns), no
+source), Gecko (no package; `mshtml` stays disabled), 32-bit apps (x64 DLLs only; the plan warns), no
 package upgrades (a newer pinned version is refused: recreate the app) and no removal of a single package (removing
 the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
 left alone: the runtime neither installs it nor sets its DLL overrides (`deps` and `doctor` say so).

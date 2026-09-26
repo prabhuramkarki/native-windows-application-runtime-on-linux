@@ -838,6 +838,12 @@ fn an_installer_whose_marker_is_present_is_skipped_before_any_prompt_or_download
     assert_eq!(reason(&rep.skipped, "vc"), MARKER_PRESENT);
     // Ruling 18: says plainly that the runtime set none of its overrides, and how to get the runtime's install.
     assert!(MARKER_PRESENT.contains("did not set its DLL overrides") && MARKER_PRESENT.contains("recreate"));
+    // Generic (not only DLL-override packages): nothing is recorded, and for wine-mono that keeps mscoree off.
+    assert!(
+        MARKER_PRESENT.contains("nothing was recorded")
+            && MARKER_PRESENT.contains("mscoree stays disabled")
+            && !MARKER_PRESENT.contains("builtin copies")
+    );
     // What needs it proceeds: the component is there.
     assert_eq!(rep.completed, ["gdep"]);
     assert!(rep.failed.is_empty(), "{rep:?}");

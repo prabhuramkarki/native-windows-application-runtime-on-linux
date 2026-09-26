@@ -28,6 +28,7 @@ pub enum Call {
         cwd: PathBuf,
         args: Vec<OsString>,
         debug: bool,
+        dotnet: bool,
     },
     Stop {
         app: AppId,
@@ -121,6 +122,7 @@ impl CompatBackend for FakeBackend {
             cwd: cwd_unix.to_owned(),
             args: args.to_vec(),
             debug: opts.debug,
+            dotnet: opts.dotnet,
         });
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
@@ -199,7 +201,10 @@ mod tests {
             Path::new("/x/app.exe"),
             &env.drive_c(),
             &args,
-            &RunOpts { debug: true },
+            &RunOpts {
+                debug: true,
+                dotnet: false,
+            },
         )
         .unwrap();
         b.stop(&env).unwrap();
@@ -211,7 +216,8 @@ mod tests {
                     exe: "/x/app.exe".into(),
                     cwd: env.drive_c(),
                     args,
-                    debug: true
+                    debug: true,
+                    dotnet: false
                 },
                 Call::Stop { app: env.id().clone() }
             ]

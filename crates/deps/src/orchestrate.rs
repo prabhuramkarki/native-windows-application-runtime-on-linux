@@ -67,9 +67,10 @@ const VENDOR_PARTIAL: &str =
     "vendor installers can leave partial changes in the prefix; if the app misbehaves, recreate the environment";
 /// The skip reason of an installer package whose marker is already in the prefix (Ruling 15). Also what
 /// [`plan_for_app`] warns instead of planning it, so the hint does not keep asking for it.
-pub const MARKER_PRESENT: &str = "present in the prefix (probably from the app's own installer); the runtime did not \
-                                  install it and did not set its DLL overrides, so Wine may still load its builtin \
-                                  copies; recreate the environment to let the runtime install it";
+pub const MARKER_PRESENT: &str = "its marker is already in the prefix (probably from the app's own installer), so the \
+                                  installer was not run and nothing was recorded: the runtime did not set its DLL \
+                                  overrides and does not rely on it (for wine-mono, mscoree stays disabled); recreate \
+                                  the environment to let the runtime install it";
 
 /// Where downloads come from. [`NetFetcher`] is the real one; tests inject fakes.
 pub trait Fetcher {

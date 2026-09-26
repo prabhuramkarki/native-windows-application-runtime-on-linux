@@ -130,3 +130,31 @@ dll_overrides = [
 # Bld (the build number) rather than Installed: VC++ 2015-2019 write the same key with Installed=1 but an older
 # Bld and fewer DLLs, so an older runtime in the prefix must not count as this one (it is upgraded in place).
 marker = { registry_value = { key = 'HKLM\Software\Microsoft\VisualStudio\14.0\VC\Runtimes\X64', name = "Bld", min_dword = 35211 } }
+
+# Wine Mono 9.4.0 (the .NET Framework replacement; the `dotnet` capability), the MSI from dl.winehq.org. Verified by
+# downloading on 2026-09-26 (84639232 bytes; the url's Content-Length agrees). Wine 10.0 (the Ubuntu repack checked)
+# asks for exactly Mono 9.4.0 (wine-mono-9.4.0-x86.msi), so a Wine upgrade may need a new pin. The x86 MSI carries
+# both the 32- and 64-bit runtimes; it is installed per app prefix (231 MiB) and also provides the C# compiler
+# (lib/mono/4.5/csc.exe) the managed test fixture is built with. Installer: `msiexec /i <msi> /qn` (about 4 s,
+# needs no window).
+# marker: windows/mono/mono-2.0/bin/libmono-2.0-x86_64.dll; absent in a fresh Wine 10.0 prefix and present after a
+# real `wine msiexec /i wine-mono-9.4.0-x86.msi /qn` (WINEDLLOVERRIDES=mscoree=d, so Wine's own prompt cannot run).
+# licence: no single SPDX id; upstream's COPYING says Mono is variously GPL, LGPL and MIT X11 (all available as LGPL
+# or MIT X11 except a few parts, e.g. SharpZipLib, GPL with an exception), the Visual Basic libraries and winforms
+# are MIT, FNA is MSPL and MIT with zlib dependencies. The value lists those families within the validator's
+# charset rather than claiming one id. Free software fetched from upstream on request, so no consent is required.
+[[package]]
+id = "wine-mono"
+version = "9.4.0"
+sha256 = "cf6173ae94b79e9de13d9a74cdb2560a886fc3d271f9489acb1cfdbd961cacb2"
+size = 84639232
+licence = "MIT AND LGPL AND GPL AND Zlib AND MS-PL"
+url = "https://dl.winehq.org/wine/wine-mono/9.4.0/wine-mono-9.4.0-x86.msi"
+kind = "installer"
+requires_consent = false
+requires = []
+provides = ["dotnet"]
+
+[package.install]
+silent_args = ["/qn"]
+marker = { file = "windows/mono/mono-2.0/bin/libmono-2.0-x86_64.dll" }

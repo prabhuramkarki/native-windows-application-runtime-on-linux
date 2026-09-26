@@ -33,6 +33,7 @@ This table lists direct dependencies only (every `[dependencies]` and `[dev-depe
 | Wine | LGPL-2.1-or-later | 2 | Invoked as a subprocess; keep the process boundary. |
 | DXVK | zlib | 4 | Downloaded on request, see below. |
 | VKD3D-Proton | LGPL-2.1-or-later | 4 | Downloaded on request (`.tar.zst`, read by the bounded zstd reader), see below. |
+| Wine Mono | MIT AND LGPL AND GPL AND Zlib AND MS-PL | 4 | Wine's .NET runtime; downloaded on request (`wine-mono`), see below. |
 | FEX-Emu, Box64 | MIT | 9 | CPU translation backends. |
 | Mesa | MIT | - | System dependency. |
 | mingw-w64 | GPL (compiler), permissive (runtime and headers) | 2 | Test-fixture builds only (`tools/build-fixtures.sh`); its output is never shipped and it is not needed to run the program. |
@@ -56,6 +57,7 @@ recorded. For `vcrun2022` the marker is the build number the redistributable wri
 | DXVK (`dxvk`) | 3.1.1 | Zlib | https://github.com/doitsujin/dxvk/releases/download/v3.1.1/dxvk-3.1.1.tar.gz | `40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608` | 18041512 |
 | VKD3D-Proton (`vkd3d-proton`) | 3.0.1 | LGPL-2.1-or-later | https://github.com/HansKristian-Work/vkd3d-proton/releases/download/v3.0.1/vkd3d-proton-3.0.1.tar.zst | `3cf2315522af5e43605ef6d3c41dad91387040bf97199934f3f7ab76caaa2f0c` | 5163266 |
 | Microsoft Visual C++ 2015-2022 Redistributable x64 (`vcrun2022`) | 14.44.35211 | Microsoft proprietary, redistributable (`proprietary-redistributable`; consent required) | https://download.visualstudio.microsoft.com/download/pr/bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe | `cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b` | 25635768 |
+| Wine Mono (`wine-mono`) | 9.4.0 | MIT AND LGPL AND GPL AND Zlib AND MS-PL | https://dl.winehq.org/wine/wine-mono/9.4.0/wine-mono-9.4.0-x86.msi | `cf6173ae94b79e9de13d9a74cdb2560a886fc3d271f9489acb1cfdbd961cacb2` | 84639232 |
 
 Only DXVK's x64 DLLs (d3d8, d3d9, d3d10core, d3d11, dxgi) and VKD3D-Proton's (d3d12, d3d12core) are
 installed. The VC++ redistributable is Microsoft's own installer, run offline in the installer sandbox on Wine's null-driver desktop; it installs the x64 runtime DLLs into
@@ -66,9 +68,17 @@ the package provides (as winetricks does). Verified by the ignored test
 `real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker`, which loads each DLL by name with
 `rundll32 <name>.dll,rtDepsProbe` under `WINEDEBUG=+loaddll`: all load the redistributable's native copy, except
 mfcm140/mfcm140u, the MFC C++/CLI support DLLs, which import `mscoree.dll` (.NET) and load in no form in a runtime
-prefix (no .NET package; an app that needs them imports `mscoree` itself and is told `dotnet` is unavailable). What
+prefix (the installer session keeps `mscoree` disabled; an app that needs them imports `mscoree` itself, and its plan adds the
+bundled `wine-mono` package, which provides `dotnet`). What
 is NOT done: the overrides are not removed again (there is no removal of dependency packages yet), 32-bit (x86)
 copies are not installed, and only the x64 redistributable is pinned. Not bundled yet: `d3dcompiler_47` (no
 verifiable redistributable source).
+
+Wine Mono (`wine-mono`, provides `dotnet`) is Wine's own .NET Framework replacement, an installer package: the MSI
+runs offline in the installer sandbox as `msiexec /i <msi> /qn` and installs into each app's prefix that needs it
+(`C:\windows\mono\mono-2.0`, about 231 MiB per app); no consent is asked (free software from upstream). Its licence
+has no single SPDX id (upstream's COPYING: GPL, LGPL and MIT X11 parts, MIT Visual Basic/winforms libraries, FNA under
+MS-PL and MIT with zlib dependencies), so the manifest lists the families. It also ships `csc.exe`, used only by
+`tools/build-managed-fixture.sh` to build the test fixture in a scratch prefix.
 
 Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).
