@@ -157,7 +157,9 @@ layers add and do not".
   unchanged. The package is a pinned upstream MSI
   (Wine Mono 9.4.0, SHA-256 checked) installed through the sandboxed installer pipeline, with the installer's own
   `mscoree=d`, like any other package.
-- **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
+- **Installers and MSI run only in the installer sandbox** (Phase 3): a user-supplied `.msi` or installer `.exe` is
+  handled by `runtime install`, and MSI dependency packages (Wine Mono) by the deps engine through `msiexec`, both in
+  the installer sandbox described below.
 
 ## Installer sandbox (Phase 3 Task 5; seccomp and Landlock since Phase 5B Task 6)
 

@@ -12,9 +12,10 @@ scope. It is not a VM: same Linux user, and the display, audio and GPU it is giv
 with the host (an X11 display lets a program read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
 protected. `.msi`/`.exe` installers, uninstallers and `runtime deps` installer packages run in their own `bwrap`
 sandbox (Phase 3) behind the same `sandbox-init` launcher (seccomp and Landlock since Phase 5B Task 6; no resource
-limits, only the dependency engine's deadline). `.NET` console programs run through Wine Mono under that same
-sandbox (see the .NET paragraph below for exactly what was verified). `runtime deps` is the only command that downloads anything, and only when asked
-(see below).
+limits, only the dependency engine's deadline). A C# console program (including threads and garbage collection) was
+verified running through Wine Mono under the `runtime run` sandbox on the development host (see .NET below); other
+frameworks and GUI programs are not claimed. `runtime deps` is the only command that downloads anything, and only
+when asked (see below).
 
 ## Commands
 

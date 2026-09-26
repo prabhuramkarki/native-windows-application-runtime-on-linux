@@ -163,7 +163,7 @@ app = ".NET console fixture (hello-managed.cs) under Wine Mono 9.4.0, default sa
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "tools/fixtures/hello-managed.cs, no arguments mode: prints hello from .NET 4.0.30319.42000 args=2 and echoes both arguments, exit 7. Before Wine Mono was installed the same run printed nothing (mscoree disabled, exit 53). No seccomp or Landlock change was needed."
+notes = "tools/fixtures/hello-managed.cs, default mode, run with arguments `a b`: prints hello from .NET 4.0.30319.42000 args=2 and echoes both arguments, exit 7. Before Wine Mono was installed the same run printed nothing (mscoree disabled, exit 53). No seccomp or Landlock change was needed."
 
 [[record]]
 app = ".NET fixture, threads mode (hello-managed.cs), Wine Mono 9.4.0, default sandbox"
