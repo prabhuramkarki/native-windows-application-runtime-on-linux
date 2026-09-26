@@ -52,7 +52,9 @@
 //! **What the profile cannot enforce** ([`AppSandbox::caveats`]). With the X11 socket directory bound (display on
 //! and `DISPLAY` set), the program is an ordinary X11 client of the host's X server: it can read and inject the
 //! keyboard and mouse input of every other X11 window (XTEST, XSendEvent), which reaches host code execution. This
-//! is the same as Flatpak's `--socket=x11`; a Wayland session isolates clients. With `network = "allow"` the host
+//! is the same as Flatpak's `--socket=x11`. The X11 directory is bound whenever display is on and `DISPLAY` is set,
+//! whatever graphics driver the app's Wine uses: with Wine's Wayland driver (`runtime display <app> wayland`, which
+//! isolates Wine's own windows) a program can still connect to the X11 socket itself (XWayland). With `network = "allow"` the host
 //! network namespace is shared: ABSTRACT unix sockets live in the network namespace, not the filesystem, so X11's
 //! `@/tmp/.X11-unix/X<n>` and any abstract D-Bus or other session socket are reachable whatever is bound, as are
 //! the host's loopback TCP services. So `display = off` with network allowed CANNOT be enforced by bubblewrap (the
@@ -119,7 +121,9 @@ const X11_DIR: &str = "/tmp/.X11-unix";
 const XAUTH_NAME: &str = "Xauthority";
 /// Always given when the X11 socket directory is bound (module docs, "What the profile cannot enforce").
 pub const X11_CAVEAT: &str = "X11 is shared with the host: the program can read and inject keyboard/mouse input of \
-                              other X11 windows (use a Wayland session; Wayland isolates clients)";
+                              other X11 windows. Wine's Wayland driver (`runtime display <app> wayland`) keeps Wine \
+                              itself off X11, but the X11 socket stays reachable to the program until `runtime \
+                              permissions <app> --set display=off`";
 const NET_CAVEAT: &str = "network=allow shares the host network namespace: abstract unix sockets (X11's \
                           @/tmp/.X11-unix/X<n>, any abstract D-Bus or other session socket) and the host's loopback \
                           TCP services (CUPS, development servers, a TCP Docker API) are reachable from inside";
@@ -277,7 +281,8 @@ impl AppSandbox {
 
     /// What this profile, as rendered for `cmd`, cannot enforce; empty when the command cannot be rendered. With
     /// the X11 socket directory bound, always [`X11_CAVEAT`]: X11 is shared with the host, so the program can read
-    /// and inject keyboard/mouse input of other X11 windows (use a Wayland session; Wayland isolates clients).
+    /// and inject keyboard/mouse input of other X11 windows; Wine's Wayland driver does not change that (the socket
+    /// stays bound), only `display = off` does.
     /// With `network = "allow"`: abstract sockets and host loopback services, and that `display = off` cannot be
     /// enforced then.
     pub fn caveats(&self, cmd: &Command) -> Vec<String> {

@@ -3162,14 +3162,25 @@ fn permissions_refuses_sockets_files_daemon_dirs_and_rw_system_trees() {
     let sock = short.path().join("agent.sock");
     let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     fs::write(home.join(".bashrc"), "x").unwrap();
+    // The refusal's own wording (a grant path is echoed in the message too, so its text alone proves nothing).
+    let tmp = "/tmp holds other programs' sockets and cannot be granted";
+    let run = "/run holds device nodes and runtime sockets";
     for (grant, why) in [
-        (format!("{}:rw", sock.display()), "/tmp"),
-        (format!("{}:ro", short.path().display()), "/tmp"),
-        (format!("{}:rw", home.join(".bashrc").display()), "not a directory"),
-        ("/run/docker.sock:rw".into(), "/run"),
-        ("/run/dbus:ro".into(), "/run"),
-        ("/tmp:ro".into(), "/tmp"),
-        ("/tmp/.X11-unix:ro".into(), "/tmp/.X11-unix"),
+        (format!("{}:rw", sock.display()), tmp),
+        (format!("{}:ro", short.path().display()), tmp),
+        (
+            format!("{}:rw", home.join(".bashrc").display()),
+            "it is not a directory",
+        ),
+        ("/run/docker.sock:rw".into(), run),
+        ("/run/dbus:ro".into(), run),
+        // `/tmp` itself contains this rig's data directory (a /tmp tempdir), which is checked first; the
+        // `/tmp` rule for `/tmp` itself is unit-tested in `rt_sandbox::permissions`.
+        (
+            "/tmp:ro".into(),
+            "it is, contains or is inside the runtime's data directory",
+        ),
+        ("/tmp/.X11-unix:ro".into(), tmp),
         ("/etc:rw".into(), "never writable"),
         ("/usr/local:rw".into(), "never writable"),
     ] {
@@ -3594,4 +3605,57 @@ fn sandbox_output_cannot_be_split_by_a_newline_in_a_path() {
     }
     assert_eq!(lines_with(&out, "command: ").len(), 1, "{out}");
     assert!(out.contains("da\\nta\\u{1b}[2J\\ncommand"), "{out}");
+}
+
+#[test]
+fn every_exclusive_command_is_refused_while_a_runtime_run_of_the_app_lives() {
+    // The lock, not /proc, is the signal: the program here is a plain shell (no wineserver process at all).
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let go = r.log.join("go");
+    // Bounded (30 s), so a failing test leaves nothing behind.
+    r.hook(&format!(
+        "i=0; while [ ! -f {} ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; exit 4",
+        go.display()
+    ));
+    let mut run = r
+        .cmd()
+        .args(["run", "--unsandboxed", &id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !r.calls().iter().any(|c| c == "wine <app>") {
+        assert!(start.elapsed() < Duration::from_secs(20), "the program never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let home = r.grants.path().canonicalize().unwrap();
+    let before = (r.calls(), r.tree());
+    let commands: [&[&str]; 5] = [
+        &["deps", &id, "--install"],
+        &["display", &id, "x11"],
+        &["permissions", &id, "--set", "network=allow"],
+        &["remove", &id],
+        &["uninstall", &id],
+    ];
+    for args in commands {
+        let err = assert_fails(&r.cmd().env("HOME", &home).args(args).output().unwrap());
+        assert!(
+            err.contains("the app is running (started by `runtime run`); quit it first"),
+            "{args:?}: {err}"
+        );
+    }
+    assert_eq!((r.calls(), r.tree()), before, "nothing ran or changed");
+    // Once the run has ended the same commands work.
+    fs::write(&go, "").unwrap();
+    assert_eq!(run.wait().unwrap().code(), Some(4));
+    assert_ok(
+        &r.cmd()
+            .env("HOME", &home)
+            .args(["permissions", &id, "--set", "network=allow"])
+            .output()
+            .unwrap(),
+    );
+    assert_ok(&r.rt(&["remove", &id]));
 }
