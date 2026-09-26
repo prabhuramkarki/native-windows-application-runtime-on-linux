@@ -2340,7 +2340,7 @@ fn doctor_judges_a_managed_program_by_the_recorded_wine_mono_and_ignores_a_nativ
     let l = lines_with(&out, ".NET");
     assert_eq!(l.len(), 1, "{out}");
     assert!(
-        l[0].contains("[ok]") && l[0].contains("Wine Mono 9.4.0 is installed for this app"),
+        l[0].contains("[ok]") && l[0].contains("Wine Mono 9.4.0 is recorded as installed for this app"),
         "{out}"
     );
     // A file target is not an installed app: told, not warned.
