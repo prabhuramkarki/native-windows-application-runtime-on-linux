@@ -190,9 +190,12 @@ sandboxed AND succeed with `--unsandboxed` on the same target, so the sandbox is
 suite does not prove is in `docs/SECURITY.md` ("The escape suite"). Since Phase 5B it also checks that the program
 runs under the seccomp filter and that cross-process memory and thread contexts (wineserver's `ptrace` use) still work,
 that a fork bomb and a memory hog stop at the app's limits, and (the `syscall_escape_*` tests, no Wine needed) that a
-Linux helper run through the real `sandbox-init` launcher gets EPERM for 19 denied system calls (`ptrace`, `unshare`
-and `clone` into a new user namespace, `mount`, `keyctl`, `bpf`, `TIOCSTI`, `AF_VSOCK`, `int 0x80`, ...) while the same
-command with bubblewrap alone gets a different answer, and that `ptrace` reaches only the app's own Landlock domain.
+Linux helper run through the real `sandbox-init` launcher is refused 36 denied system calls covering every class the
+spec names (`ptrace`, `unshare`/`clone` into a new user namespace, the mount family, `keyctl`, `bpf`, module and kexec
+loading, `reboot`, `TIOCSTI`, `AF_VSOCK`, `int 0x80`, ...), with EPERM except `clone3` (ENOSYS), while the same command
+with bubblewrap alone answers differently wherever the kernel's own answer is not EPERM too (28 of the 36 on the
+development host), and that `ptrace` reaches only the app's own Landlock domain. With `RUNTIME_REQUIRE_BWRAP=1` these
+tests also require seccomp, Landlock and IA32 emulation instead of skipping.
 Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
 directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`, `hello.msi` (built with
 `wixl`) and `hello-nsis.exe` (built with `makensis`) for the installer-pipeline tests

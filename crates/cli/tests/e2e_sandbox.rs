@@ -21,7 +21,11 @@
 //! ```
 //!
 //! The `syscall_escape_*` tests (Phase 5B, at the end) need no Wine: they run a Linux helper (this test binary)
-//! through the real shim and are NOT ignored; they skip the same way without bwrap.
+//! through the real shim and are NOT ignored (glibc hosts only). They skip visibly without bwrap, seccomp, Landlock
+//! (the Landlock half of `syscall_escape_2`) or IA32 emulation (the `int 0x80` rows); with `RUNTIME_REQUIRE_BWRAP=1`
+//! (which CI's `test` job sets) each of those is a failure instead, so that setting now also requires seccomp,
+//! Landlock and IA32 emulation. One skip stays a skip even then: Yama `ptrace_scope` 2 or 3, where no unprivileged
+//! attach can succeed and `syscall_escape_2` has nothing to observe.
 mod support;
 
 use std::fs;
@@ -769,599 +773,763 @@ fn real_net_wine_d3d11_renders_under_the_default_sandbox() {
 // says so and that row rests on `rt_sandbox`'s interpreter and real-kernel tests.
 // ---------------------------------------------------------------------------------------------------------------
 
-const PROBE_FLAG: &[u8] = b"--rt-syscall-probe";
+/// The syscall-level tests and their helper. The helper is dispatched from `.init_array`, which relies on glibc
+/// passing `(argc, argv, envp)` to its entries; on other C libraries the tests are not compiled (and so not run).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod syscall_escape {
+    use super::*;
 
-/// glibc calls `.init_array` entries before `main` with `(argc, argv, envp)`; for any other argv this returns and
-/// the test harness starts as usual.
-#[used]
-#[unsafe(link_section = ".init_array")]
-static SYSCALL_PROBE: extern "C" fn(libc::c_int, *const *const libc::c_char, *const *const libc::c_char) =
-    syscall_probe_entry;
+    const PROBE_FLAG: &[u8] = b"--rt-syscall-probe";
 
-extern "C" fn syscall_probe_entry(argc: libc::c_int, argv: *const *const libc::c_char, _: *const *const libc::c_char) {
-    let argc = usize::try_from(argc).unwrap_or(0);
-    // SAFETY: glibc passes the process's own argc and argv: `argc` live NUL-terminated strings.
-    let arg = |i: usize| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_bytes();
-    if argc < 3 || arg(1) != PROBE_FLAG {
-        return;
-    }
-    let args: Vec<String> = (2..argc)
-        .map(|i| String::from_utf8_lossy(arg(i)).into_owned())
-        .collect();
-    probe::main(&args)
-}
+    /// glibc calls `.init_array` entries before `main` with `(argc, argv, envp)`; for any other argv this returns and
+    /// the test harness starts as usual.
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static SYSCALL_PROBE: extern "C" fn(libc::c_int, *const *const libc::c_char, *const *const libc::c_char) =
+        syscall_probe_entry;
 
-/// The helper's side. Every call is made in a forked child that reports 0 (success) or the errno through its exit
-/// status, so a call that succeeds (a new user namespace, a tracer) changes nothing for the next one.
-mod probe {
-    use std::io::Write;
-
-    pub type Call = fn() -> i32;
-
-    fn errno() -> i32 {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(255)
-    }
-    fn check(r: libc::c_long) -> i32 {
-        if r < 0 { errno() } else { 0 }
-    }
-    fn check_fd(r: libc::c_long) -> i32 {
-        if r >= 0 {
-            // SAFETY: a descriptor the probe just created and nothing else uses.
-            unsafe { libc::close(r as i32) };
+    extern "C" fn syscall_probe_entry(
+        argc: libc::c_int,
+        argv: *const *const libc::c_char,
+        _: *const *const libc::c_char,
+    ) {
+        let argc = usize::try_from(argc).unwrap_or(0);
+        // SAFETY: glibc passes the process's own argc and argv: `argc` live NUL-terminated strings.
+        let arg = |i: usize| unsafe { std::ffi::CStr::from_ptr(*argv.add(i)) }.to_bytes();
+        if argc < 3 || arg(1) != PROBE_FLAG {
+            return;
         }
-        check(r)
+        let args: Vec<String> = (2..argc)
+            .map(|i| String::from_utf8_lossy(arg(i)).into_owned())
+            .collect();
+        probe::main(&args)
     }
 
-    const THREAD_FLAGS: libc::c_long = (libc::CLONE_VM
-        | libc::CLONE_FS
-        | libc::CLONE_FILES
-        | libc::CLONE_SIGHAND
-        | libc::CLONE_THREAD
-        | libc::CLONE_SYSVSEM
-        | libc::CLONE_SETTLS
-        | libc::CLONE_PARENT_SETTID
-        | libc::CLONE_CHILD_CLEARTID) as libc::c_long;
-    const UFFD_USER_MODE_ONLY: libc::c_long = 1; // <linux/userfaultfd.h>
-    const X32_SYSCALL_BIT: libc::c_long = 0x4000_0000;
+    /// The helper's side. Every call is made in a forked child that reports 0 (success) or the errno through its exit
+    /// status, so a call that succeeds (a new user namespace, a tracer) changes nothing for the next one.
+    mod probe {
+        use std::io::Write;
 
-    // SAFETY (every call below): one raw syscall with integer arguments, NULL, a deliberately invalid pointer the
-    // kernel only validates, or pointers to live locals of the size the kernel reads or writes.
-    fn getpid() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_getpid) })
-    }
-    /// A real thread: glibc tries `clone3` (ENOSYS under the filter) and falls back to `clone` with thread flags.
-    fn thread() -> i32 {
-        match std::thread::Builder::new().spawn(|| 7).map(|h| h.join()) {
-            Ok(Ok(7)) => 0,
-            Ok(_) => 254,
-            Err(e) => e.raw_os_error().unwrap_or(253),
+        pub type Call = fn() -> i32;
+
+        fn errno() -> i32 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(255)
         }
-    }
-    fn mmap_exec() -> i32 {
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                4096,
-                libc::PROT_READ | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            return errno();
+        fn check(r: libc::c_long) -> i32 {
+            if r < 0 { errno() } else { 0 }
         }
-        unsafe { libc::munmap(p, 4096) };
-        0
-    }
-    fn socket(domain: libc::c_int, ty: libc::c_int) -> i32 {
-        check_fd(unsafe { libc::syscall(libc::SYS_socket, domain, ty | libc::SOCK_CLOEXEC, 0) })
-    }
-    fn socket_unix() -> i32 {
-        socket(libc::AF_UNIX, libc::SOCK_STREAM)
-    }
-    fn socket_vsock() -> i32 {
-        socket(libc::AF_VSOCK, libc::SOCK_STREAM)
-    }
-    fn socket_alg() -> i32 {
-        socket(libc::AF_ALG, libc::SOCK_SEQPACKET)
-    }
-    /// A new pty pair, (master, slave).
-    fn pty() -> Result<(i32, i32), i32> {
-        let (mut m, mut s) = (-1, -1);
-        let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
-        if r != 0 { Err(errno()) } else { Ok((m, s)) }
-    }
-    fn tcgets() -> i32 {
-        let (_m, s) = match pty() {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        // SAFETY: an all-zero termios is a valid value.
-        let mut t: libc::termios = unsafe { std::mem::zeroed() };
-        check(unsafe { libc::syscall(libc::SYS_ioctl, s, libc::TCGETS, &mut t) })
-    }
-    /// Terminal injection in its strongest form: a new session whose controlling terminal is the pty, then
-    /// `TIOCSTI` into it (without the filter: allowed where `dev.tty.legacy_tiocsti` is 1, `EIO` where it is 0).
-    fn tiocsti() -> i32 {
-        if unsafe { libc::setsid() } < 0 {
-            return 250;
+        fn check_fd(r: libc::c_long) -> i32 {
+            if r >= 0 {
+                // SAFETY: a descriptor the probe just created and nothing else uses.
+                unsafe { libc::close(r as i32) };
+            }
+            check(r)
         }
-        let (_m, s) = match pty() {
-            Ok(p) => p,
-            Err(_) => return 251,
-        };
-        if unsafe { libc::ioctl(s, libc::TIOCSCTTY, 0) } != 0 {
-            return 252;
+
+        const THREAD_FLAGS: libc::c_long = (libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM
+            | libc::CLONE_SETTLS
+            | libc::CLONE_PARENT_SETTID
+            | libc::CLONE_CHILD_CLEARTID) as libc::c_long;
+        const UFFD_USER_MODE_ONLY: libc::c_long = 1; // <linux/userfaultfd.h>
+        const X32_SYSCALL_BIT: libc::c_long = 0x4000_0000;
+
+        // SAFETY (every call below): one raw syscall with integer arguments, NULL, a deliberately invalid pointer the
+        // kernel only validates, or pointers to live locals of the size the kernel reads or writes.
+        fn getpid() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_getpid) })
         }
-        let c: u8 = b'x';
-        check(unsafe { libc::syscall(libc::SYS_ioctl, s, libc::TIOCSTI, &c) })
-    }
-    fn ptrace_traceme() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_TRACEME, 0, 0, 0) })
-    }
-    fn ptrace_seize_pid0() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_SEIZE, 0, 0, 0) })
-    }
-    fn unshare_newuser() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER) })
-    }
-    /// `CLONE_PARENT` is not an unshare flag: the kernel answers EINVAL before any permission check.
-    fn unshare_newuser_invalid() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_PARENT) })
-    }
-    /// A fork into a new user namespace; the child `_exit`s at once.
-    fn clone_newuser() -> i32 {
-        let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long;
-        let r = unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) };
-        if r == 0 {
-            unsafe { libc::_exit(0) };
+        /// A real thread: glibc tries `clone3` (ENOSYS under the filter) and falls back to `clone` with thread flags.
+        fn thread() -> i32 {
+            match std::thread::Builder::new().spawn(|| 7).map(|h| h.join()) {
+                Ok(Ok(7)) => 0,
+                Ok(_) => 254,
+                Err(e) => e.raw_os_error().unwrap_or(253),
+            }
         }
-        if r > 0 {
-            unsafe { libc::waitpid(r as libc::pid_t, std::ptr::null_mut(), 0) };
+        fn mmap_exec() -> i32 {
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return errno();
+            }
+            unsafe { libc::munmap(p, 4096) };
+            0
         }
-        check(r)
-    }
-    /// Thread flags plus `CLONE_PIDFD` are refused by the kernel with EINVAL before anything is created.
-    fn clone_newuser_invalid() -> i32 {
-        let flags = THREAD_FLAGS | (libc::CLONE_PIDFD | libc::CLONE_NEWUSER) as libc::c_long;
-        check(unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) })
-    }
-    fn clone3_null() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_clone3, 0, 0) })
-    }
-    /// A bad `type` pointer: the kernel copies it (EFAULT) before it checks privileges.
-    fn mount_bad_type() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_mount, c"none".as_ptr(), c"/".as_ptr(), 1usize, 0, 0) })
-    }
-    fn keyctl_unknown() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_keyctl, 9999, 0, 0, 0, 0) })
-    }
-    fn bpf_unknown() -> i32 {
-        check(unsafe { libc::syscall(libc::SYS_bpf, 9999, 0, 0) })
-    }
-    fn perf_event_open_null() -> i32 {
-        check_fd(unsafe { libc::syscall(libc::SYS_perf_event_open, 0, 0, -1, -1, 0) })
-    }
-    fn userfaultfd_user_mode() -> i32 {
-        check_fd(unsafe {
-            libc::syscall(
-                libc::SYS_userfaultfd,
-                UFFD_USER_MODE_ONLY | libc::O_CLOEXEC as libc::c_long,
-            )
-        })
-    }
-    fn open_by_handle_null() -> i32 {
-        check_fd(unsafe { libc::syscall(libc::SYS_open_by_handle_at, libc::AT_FDCWD, 0, libc::O_RDONLY) })
-    }
-    fn io_uring_setup_null() -> i32 {
-        check_fd(unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, 0) })
-    }
-    fn x32_getpid() -> i32 {
-        check(unsafe { libc::syscall(X32_SYSCALL_BIT | libc::SYS_getpid) })
-    }
-    /// An i386 syscall through `int 0x80` with its first argument (`ebx`) 0; 0 or the errno.
-    #[cfg(target_arch = "x86_64")]
-    fn int80(nr: i64) -> i32 {
-        let mut rax = nr;
-        // SAFETY: `int 0x80` enters the i386 ABI; getpid touches no memory and set_thread_area with a NULL
-        // descriptor only makes the kernel fail its copy. rbx (reserved by LLVM) is saved in a scratch register
-        // and restored; the 32-bit entry may not preserve r8-r11, so they are clobbered; no stack is used.
-        unsafe {
-            std::arch::asm!("mov {save}, rbx", "xor ebx, ebx", "int 0x80", "mov rbx, {save}", save = out(reg) _,
+        fn socket(domain: libc::c_int, ty: libc::c_int) -> i32 {
+            check_fd(unsafe { libc::syscall(libc::SYS_socket, domain, ty | libc::SOCK_CLOEXEC, 0) })
+        }
+        fn socket_unix() -> i32 {
+            socket(libc::AF_UNIX, libc::SOCK_STREAM)
+        }
+        fn socket_vsock() -> i32 {
+            socket(libc::AF_VSOCK, libc::SOCK_STREAM)
+        }
+        fn socket_alg() -> i32 {
+            socket(libc::AF_ALG, libc::SOCK_SEQPACKET)
+        }
+        /// A new pty pair, (master, slave).
+        fn pty() -> Result<(i32, i32), i32> {
+            let (mut m, mut s) = (-1, -1);
+            let r = unsafe { libc::openpty(&mut m, &mut s, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
+            if r != 0 { Err(errno()) } else { Ok((m, s)) }
+        }
+        fn tcgets() -> i32 {
+            let (_m, s) = match pty() {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            // SAFETY: an all-zero termios is a valid value.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            check(unsafe { libc::syscall(libc::SYS_ioctl, s, libc::TCGETS, &mut t) })
+        }
+        /// Terminal injection in its strongest form: a new session whose controlling terminal is the pty, then
+        /// `TIOCSTI` into it (without the filter: allowed where `dev.tty.legacy_tiocsti` is 1, `EIO` where it is 0).
+        fn tiocsti() -> i32 {
+            if unsafe { libc::setsid() } < 0 {
+                return 250;
+            }
+            let (_m, s) = match pty() {
+                Ok(p) => p,
+                Err(_) => return 251,
+            };
+            if unsafe { libc::ioctl(s, libc::TIOCSCTTY, 0) } != 0 {
+                return 252;
+            }
+            let c: u8 = b'x';
+            check(unsafe { libc::syscall(libc::SYS_ioctl, s, libc::TIOCSTI, &c) })
+        }
+        fn ptrace_traceme() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_TRACEME, 0, 0, 0) })
+        }
+        fn ptrace_seize_pid0() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_SEIZE, 0, 0, 0) })
+        }
+        fn unshare_newuser() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER) })
+        }
+        /// `CLONE_PARENT` is not an unshare flag: the kernel answers EINVAL before any permission check.
+        fn unshare_newuser_invalid() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_NEWUSER | libc::CLONE_PARENT) })
+        }
+        /// A fork into a new user namespace; the child `_exit`s at once.
+        fn clone_newuser() -> i32 {
+            let flags = (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_long;
+            let r = unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) };
+            if r == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            if r > 0 {
+                unsafe { libc::waitpid(r as libc::pid_t, std::ptr::null_mut(), 0) };
+            }
+            check(r)
+        }
+        /// Thread flags plus `CLONE_PIDFD` are refused by the kernel with EINVAL before anything is created.
+        fn clone_newuser_invalid() -> i32 {
+            let flags = THREAD_FLAGS | (libc::CLONE_PIDFD | libc::CLONE_NEWUSER) as libc::c_long;
+            check(unsafe { libc::syscall(libc::SYS_clone, flags, 0, 0, 0, 0) })
+        }
+        fn clone3_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_clone3, 0, 0) })
+        }
+        /// A bad `type` pointer: the kernel copies it (EFAULT) before it checks privileges.
+        fn mount_bad_type() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_mount, c"none".as_ptr(), c"/".as_ptr(), 1usize, 0, 0) })
+        }
+        fn keyctl_unknown() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_keyctl, 9999, 0, 0, 0, 0) })
+        }
+        fn bpf_unknown() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_bpf, 9999, 0, 0) })
+        }
+        fn perf_event_open_null() -> i32 {
+            check_fd(unsafe { libc::syscall(libc::SYS_perf_event_open, 0, 0, -1, -1, 0) })
+        }
+        fn userfaultfd_user_mode() -> i32 {
+            check_fd(unsafe {
+                libc::syscall(
+                    libc::SYS_userfaultfd,
+                    UFFD_USER_MODE_ONLY | libc::O_CLOEXEC as libc::c_long,
+                )
+            })
+        }
+        fn open_by_handle_null() -> i32 {
+            check_fd(unsafe { libc::syscall(libc::SYS_open_by_handle_at, libc::AT_FDCWD, 0, libc::O_RDONLY) })
+        }
+        fn io_uring_setup_null() -> i32 {
+            check_fd(unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, 0) })
+        }
+        // The rest of spec criterion 1's classes. Arguments are chosen so the call does nothing even if the filter let
+        // it through (and even as root): NULL or bad pointers, fd -1, invalid flags or magic numbers.
+        fn pivot_root_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_pivot_root, 0, 0) })
+        }
+        fn chroot_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_chroot, 0) })
+        }
+        fn setns_bad_fd() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_setns, -1, 0) })
+        }
+        /// 0x100 is no umount flag: EINVAL before anything else.
+        fn umount2_bad_flags() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_umount2, 0, 0x100) })
+        }
+        /// 1000 segments (the limit is 16) and an unknown flag.
+        fn kexec_load_invalid() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_kexec_load, 0, 1000, 0, 0x10) })
+        }
+        /// SYSLOG_ACTION_SIZE_BUFFER: at most reads the log's size.
+        fn syslog_size() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_syslog, 10, 0, 0) })
+        }
+        /// A bad pointer (acct(NULL) would switch accounting off).
+        fn acct_bad_pointer() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_acct, 1usize) })
+        }
+        /// Quota type 0xff is out of range: EINVAL.
+        fn quotactl_bad_type() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_quotactl, 0xff, 0, 0, 0) })
+        }
+        /// Flag bit 31 is no swap flag: EINVAL.
+        fn swapon_bad_flags() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_swapon, 0, 0x8000_0000u32) })
+        }
+        fn swapoff_bad_pointer() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_swapoff, 1usize) })
+        }
+        /// Magic numbers 0: never a reboot.
+        fn reboot_bad_magic() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_reboot, 0, 0, 0, 0) })
+        }
+        fn init_module_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_init_module, 0, 0, 0) })
+        }
+        fn finit_module_bad_fd() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_finit_module, -1, c"".as_ptr(), 0) })
+        }
+        fn delete_module_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_delete_module, 0, 0) })
+        }
+        fn add_key_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_add_key, 0, 0, 0, 0, 0) })
+        }
+        fn request_key_null() -> i32 {
+            check(unsafe { libc::syscall(libc::SYS_request_key, 0, 0, 0, 0) })
+        }
+        fn tioclinux() -> i32 {
+            let (_m, s) = match pty() {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let sub: u8 = 0;
+            check(unsafe { libc::syscall(libc::SYS_ioctl, s, libc::TIOCLINUX, &sub) })
+        }
+        fn x32_getpid() -> i32 {
+            check(unsafe { libc::syscall(X32_SYSCALL_BIT | libc::SYS_getpid) })
+        }
+        /// An i386 syscall through `int 0x80` with its first argument (`ebx`) 0; 0 or the errno.
+        #[cfg(target_arch = "x86_64")]
+        fn int80(nr: i64) -> i32 {
+            let mut rax = nr;
+            // SAFETY: `int 0x80` enters the i386 ABI; getpid touches no memory and set_thread_area with a NULL
+            // descriptor only makes the kernel fail its copy. rbx (reserved by LLVM) is saved in a scratch register
+            // and restored; the 32-bit entry may not preserve r8-r11, so they are clobbered; no stack is used.
+            unsafe {
+                std::arch::asm!("mov {save}, rbx", "xor ebx, ebx", "int 0x80", "mov rbx, {save}", save = out(reg) _,
                 inout("rax") rax, out("r8") _, out("r9") _, out("r10") _, out("r11") _, options(nostack));
+            }
+            let r = rax as i32;
+            if (-4095..0).contains(&r) { -r } else { 0 }
         }
-        let r = rax as i32;
-        if (-4095..0).contains(&r) { -r } else { 0 }
-    }
-    #[cfg(target_arch = "x86_64")]
-    fn int80_getpid() -> i32 {
-        int80(20)
-    }
-    /// The one i386 call the filter lets through (Wine's 32-bit `%fs`); NULL makes the kernel answer EFAULT.
-    #[cfg(target_arch = "x86_64")]
-    fn int80_set_thread_area_null() -> i32 {
-        int80(243)
+        #[cfg(target_arch = "x86_64")]
+        fn int80_getpid() -> i32 {
+            int80(20)
+        }
+        /// The one i386 call the filter lets through (Wine's 32-bit `%fs`); NULL makes the kernel answer EFAULT.
+        #[cfg(target_arch = "x86_64")]
+        fn int80_set_thread_area_null() -> i32 {
+            int80(243)
+        }
+
+        /// Every row: its name and the call. The expectations live in the test (`ROWS`).
+        pub const CALLS: &[(&str, Call)] = &[
+            ("getpid", getpid),
+            ("thread (clone3 -> clone fallback)", thread),
+            ("mmap(PROT_EXEC)", mmap_exec),
+            ("socket(AF_UNIX)", socket_unix),
+            ("ioctl(TCGETS) on a pty", tcgets),
+            #[cfg(target_arch = "x86_64")]
+            ("int 0x80 set_thread_area(NULL)", int80_set_thread_area_null),
+            ("ptrace(TRACEME)", ptrace_traceme),
+            ("ptrace(SEIZE, 0)", ptrace_seize_pid0),
+            ("unshare(NEWUSER)", unshare_newuser),
+            ("unshare(NEWUSER|PARENT)", unshare_newuser_invalid),
+            ("clone(NEWUSER|SIGCHLD)", clone_newuser),
+            ("clone(thread flags|PIDFD|NEWUSER)", clone_newuser_invalid),
+            ("clone3(NULL, 0)", clone3_null),
+            ("mount(bad type)", mount_bad_type),
+            ("keyctl(9999)", keyctl_unknown),
+            ("bpf(9999)", bpf_unknown),
+            ("perf_event_open(NULL)", perf_event_open_null),
+            ("userfaultfd(USER_MODE_ONLY)", userfaultfd_user_mode),
+            ("open_by_handle_at(NULL)", open_by_handle_null),
+            ("io_uring_setup(1, NULL)", io_uring_setup_null),
+            ("ioctl(TIOCSTI) into its own terminal", tiocsti),
+            ("pivot_root(NULL, NULL)", pivot_root_null),
+            ("chroot(NULL)", chroot_null),
+            ("setns(-1, 0)", setns_bad_fd),
+            ("umount2(NULL, bad flags)", umount2_bad_flags),
+            ("kexec_load(1000 segments, bad flag)", kexec_load_invalid),
+            ("syslog(SIZE_BUFFER)", syslog_size),
+            ("acct(bad pointer)", acct_bad_pointer),
+            ("quotactl(bad type)", quotactl_bad_type),
+            ("swapon(NULL, bad flags)", swapon_bad_flags),
+            ("swapoff(bad pointer)", swapoff_bad_pointer),
+            ("reboot(bad magic)", reboot_bad_magic),
+            ("init_module(NULL)", init_module_null),
+            ("finit_module(-1)", finit_module_bad_fd),
+            ("delete_module(NULL)", delete_module_null),
+            ("add_key(NULL)", add_key_null),
+            ("request_key(NULL)", request_key_null),
+            ("ioctl(TIOCLINUX) on a pty", tioclinux),
+            ("socket(AF_VSOCK)", socket_vsock),
+            ("socket(AF_ALG)", socket_alg),
+            #[cfg(target_arch = "x86_64")]
+            ("int 0x80 getpid", int80_getpid),
+            ("x32 getpid", x32_getpid),
+        ];
+
+        /// `f` in a forked child: its 0/errno, or `1000 + signal` when the child was killed.
+        fn in_child(f: Call) -> i32 {
+            // SAFETY: the helper is single-threaded (it runs before the harness starts any thread).
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                let e = f();
+                unsafe { libc::_exit(e.clamp(0, 255)) };
+            }
+            if pid < 0 {
+                return 2000 + errno();
+            }
+            let mut st = 0;
+            unsafe { libc::waitpid(pid, &mut st, 0) };
+            if libc::WIFEXITED(st) {
+                libc::WEXITSTATUS(st)
+            } else {
+                1000 + libc::WTERMSIG(st)
+            }
+        }
+
+        /// `PTRACE_ATTACH` of `pid` and an open of its `/proc/<pid>/mem`, one line each; then `pid` is killed.
+        fn attach(pid: libc::pid_t) -> ! {
+            let r = check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_ATTACH, pid, 0, 0) });
+            if r == 0 {
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_DETACH, pid, 0, 0) };
+            }
+            let mem = std::ffi::CString::new(format!("/proc/{pid}/mem")).unwrap();
+            let m = check_fd(unsafe { libc::open(mem.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) } as _);
+            println!("attach\t{r}\nprocmem\t{m}");
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            std::io::stdout().flush().unwrap();
+            std::process::exit(0)
+        }
+
+        pub fn main(args: &[String]) -> ! {
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            match a.as_slice() {
+                ["calls"] => {
+                    for (name, f) in CALLS {
+                        println!("{name}\t{}", in_child(*f));
+                    }
+                }
+                // A child that lives at most 30 s, then either ptrace it from here (the same Landlock domain) or run
+                // `attach` through a SECOND shim first (a new, nested domain the child is outside of).
+                ["domain", shim, how] => {
+                    let child = unsafe { libc::fork() };
+                    if child == 0 {
+                        unsafe {
+                            libc::sleep(30);
+                            libc::_exit(0)
+                        };
+                    }
+                    std::io::stdout().flush().unwrap();
+                    if *how == "same" {
+                        attach(child);
+                    }
+                    let me = std::env::current_exe().unwrap();
+                    let err = std::os::unix::process::CommandExt::exec(
+                        std::process::Command::new(shim)
+                            .args(["sandbox-init", "--v1", "--rule", "ro:/", "--"])
+                            .arg(me)
+                            .args([std::str::from_utf8(super::PROBE_FLAG).unwrap(), "attach"])
+                            .arg(child.to_string()),
+                    );
+                    eprintln!("exec {shim}: {err}");
+                    std::process::exit(3)
+                }
+                ["attach", pid] => attach(pid.parse().unwrap()),
+                _ => {
+                    eprintln!("unknown probe mode {a:?}");
+                    std::process::exit(2)
+                }
+            }
+            std::io::stdout().flush().unwrap();
+            std::process::exit(0)
+        }
     }
 
-    /// Every row: its name and the call. The expectations live in the test (`ROWS`).
-    pub const CALLS: &[(&str, Call)] = &[
-        ("getpid", getpid),
-        ("thread (clone3 -> clone fallback)", thread),
-        ("mmap(PROT_EXEC)", mmap_exec),
-        ("socket(AF_UNIX)", socket_unix),
-        ("ioctl(TCGETS) on a pty", tcgets),
+    /// The real host, except that the sandbox's shim is the `runtime` binary under test (not this test binary).
+    struct ShimHost(PathBuf);
+
+    impl rt_sandbox::Host for ShimHost {
+        fn env(&self, name: &str) -> Option<std::ffi::OsString> {
+            rt_sandbox::RealHost.env(name)
+        }
+        fn exists(&self, p: &Path) -> bool {
+            rt_sandbox::RealHost.exists(p)
+        }
+        fn is_socket(&self, p: &Path) -> bool {
+            rt_sandbox::RealHost.is_socket(p)
+        }
+        fn is_file(&self, p: &Path) -> bool {
+            rt_sandbox::RealHost.is_file(p)
+        }
+        fn resolve(&self, p: &Path) -> Option<PathBuf> {
+            rt_sandbox::RealHost.resolve(p)
+        }
+        fn uid(&self) -> u32 {
+            rt_sandbox::RealHost.uid()
+        }
+        fn runtime_exe(&self) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+        fn scopes(&self) -> Result<rt_sandbox::ScopeSupport, String> {
+            rt_sandbox::RealHost.scopes()
+        }
+    }
+
+    fn required() -> bool {
+        std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| v == "1")
+    }
+
+    /// Runs the helper with `args` under the default profile exactly as `runtime run` renders it (scope, bwrap, the
+    /// real shim), or with `bwrap_only` the same command line with the shim's words cut out. Returns its stdout,
+    /// checked to have exited 0.
+    fn in_sandbox(args: &[&str], bwrap_only: bool) -> String {
+        let bwrap = rt_sandbox::find_bwrap_on_path().unwrap();
+        let shim = PathBuf::from(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap();
+        let helper = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let td = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let app = td.path().canonicalize().unwrap().join("apps/a");
+        let (prefix, home) = (app.join("prefix"), app.join("runtime/home"));
+        fs::create_dir_all(prefix.join("drive_c")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let mut cmd = std::process::Command::new(&helper);
+        cmd.arg(std::str::from_utf8(PROBE_FLAG).unwrap())
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("WINEPREFIX", &prefix)
+            .env("HOME", &home)
+            .current_dir(prefix.join("drive_c"));
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+            cmd.env("XDG_RUNTIME_DIR", rt); // systemd-run --user needs it
+        }
+        let sb = rt_sandbox::AppSandbox::new(
+            bwrap,
+            rt_sandbox::Permissions::default(),
+            vec![helper],
+            std::sync::Arc::new(ShimHost(shim.clone())),
+        );
+        let boxed = sb.render(&cmd).expect("the default profile renders");
+        eprintln!(
+            "launched by {:?} (systemd-run: the task limit's scope)",
+            boxed.get_program()
+        );
+        let all: Vec<&std::ffi::OsStr> = boxed.get_args().collect();
+        let at = all
+            .iter()
+            .position(|a| *a == "sandbox-init")
+            .expect("the shim is in the command");
+        assert_eq!(Path::new(all[at - 1]), shim, "the shim is the runtime binary");
+        let end = at + all[at..].iter().position(|a| *a == "--").expect("the shim's `--`");
+        let mut bare = std::process::Command::new(boxed.get_program());
+        bare.args(&all[..at - 1]).args(&all[end + 1..]).env_clear();
+        for (k, v) in boxed.get_envs() {
+            if let Some(v) = v {
+                bare.env(k, v);
+            }
+        }
+        if let Some(d) = boxed.get_current_dir() {
+            bare.current_dir(d);
+        }
+        let run = |mut c: std::process::Command, what: &str| {
+            let out = c.output().unwrap();
+            let (so, se) = (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            );
+            assert!(out.status.success(), "{what}: {:?}\n{so}\n{se}", out.status);
+            so
+        };
+        if bwrap_only {
+            run(bare, "bwrap only")
+        } else {
+            run(boxed, "through the shim")
+        }
+    }
+
+    fn rows(out: &str) -> std::collections::BTreeMap<String, i32> {
+        out.lines()
+            .filter_map(|l| l.rsplit_once('\t'))
+            .map(|(k, v)| (k.to_owned(), v.parse().unwrap()))
+            .collect()
+    }
+
+    /// Whether the shim can install a seccomp filter here (it refuses every run otherwise); `false` after SKIPPED,
+    /// a failure under `RUNTIME_REQUIRE_BWRAP=1`.
+    fn seccomp_works(test: &str) -> bool {
+        // SAFETY: PR_GET_SECCOMP only reads this process's mode.
+        if unsafe { libc::prctl(libc::PR_GET_SECCOMP) } >= 0 {
+            return true;
+        }
+        assert!(!required(), "RUNTIME_REQUIRE_BWRAP=1 but this kernel has no seccomp");
+        eprintln!("SKIPPED {test}: this kernel has no seccomp");
+        false
+    }
+
+    /// What a row's call must return.
+    #[derive(Clone, Copy, Debug)]
+    enum Want {
+        Ok,
+        Errno(i32),
+        /// One of these (0 = success).
+        OneOf(&'static [i32]),
+        /// Not EPERM: the kernel answered, whatever it said.
+        NotEperm,
+        /// Host policy decides (Yama, AppArmor's user-namespace restriction, sysctls, loaded modules): anything. The
+        /// row has an oracle only where this differs from the filtered answer, and the test says which.
+        Host,
+    }
+
+    impl Want {
+        fn allows(self, got: i32) -> bool {
+            match self {
+                Want::Ok => got == 0,
+                Want::Errno(e) => got == e,
+                Want::OneOf(v) => v.contains(&got),
+                Want::NotEperm => got != libc::EPERM && got < 1000,
+                Want::Host => got < 1000,
+            }
+        }
+    }
+
+    const EPERM: Want = Want::Errno(libc::EPERM);
+
+    /// (row, through the shim, bwrap only). The allowed rows come first; a denied row is EPERM through the shim and
+    /// something else without it (the distinguishing arguments make the kernel's own answer deterministic).
+    const ROWS: &[(&str, Want, Want)] = &[
+        ("getpid", Want::Ok, Want::Ok),
+        ("thread (clone3 -> clone fallback)", Want::Ok, Want::Ok),
+        ("mmap(PROT_EXEC)", Want::Ok, Want::Ok),
+        ("socket(AF_UNIX)", Want::Ok, Want::Ok),
+        ("ioctl(TCGETS) on a pty", Want::Ok, Want::Ok),
         #[cfg(target_arch = "x86_64")]
-        ("int 0x80 set_thread_area(NULL)", int80_set_thread_area_null),
-        ("ptrace(TRACEME)", ptrace_traceme),
-        ("ptrace(SEIZE, 0)", ptrace_seize_pid0),
-        ("unshare(NEWUSER)", unshare_newuser),
-        ("unshare(NEWUSER|PARENT)", unshare_newuser_invalid),
-        ("clone(NEWUSER|SIGCHLD)", clone_newuser),
-        ("clone(thread flags|PIDFD|NEWUSER)", clone_newuser_invalid),
-        ("clone3(NULL, 0)", clone3_null),
-        ("mount(bad type)", mount_bad_type),
-        ("keyctl(9999)", keyctl_unknown),
-        ("bpf(9999)", bpf_unknown),
-        ("perf_event_open(NULL)", perf_event_open_null),
-        ("userfaultfd(USER_MODE_ONLY)", userfaultfd_user_mode),
-        ("open_by_handle_at(NULL)", open_by_handle_null),
-        ("io_uring_setup(1, NULL)", io_uring_setup_null),
-        ("ioctl(TIOCSTI) into its own terminal", tiocsti),
-        ("socket(AF_VSOCK)", socket_vsock),
-        ("socket(AF_ALG)", socket_alg),
+        (
+            "int 0x80 set_thread_area(NULL)",
+            Want::Errno(libc::EFAULT),
+            Want::Errno(libc::EFAULT),
+        ),
+        ("ptrace(TRACEME)", EPERM, Want::Host),
+        ("ptrace(SEIZE, 0)", EPERM, Want::Errno(libc::ESRCH)),
+        ("unshare(NEWUSER)", EPERM, Want::Host),
+        ("unshare(NEWUSER|PARENT)", EPERM, Want::Errno(libc::EINVAL)),
+        ("clone(NEWUSER|SIGCHLD)", EPERM, Want::Host),
+        ("clone(thread flags|PIDFD|NEWUSER)", EPERM, Want::Errno(libc::EINVAL)),
+        ("clone3(NULL, 0)", Want::Errno(libc::ENOSYS), Want::Host),
+        ("mount(bad type)", EPERM, Want::Errno(libc::EFAULT)),
+        ("keyctl(9999)", EPERM, Want::NotEperm),
+        ("bpf(9999)", EPERM, Want::Host),
+        ("perf_event_open(NULL)", EPERM, Want::NotEperm),
+        ("userfaultfd(USER_MODE_ONLY)", EPERM, Want::Host),
+        ("open_by_handle_at(NULL)", EPERM, Want::Host),
+        ("io_uring_setup(1, NULL)", EPERM, Want::Host),
+        // allowed where `dev.tty.legacy_tiocsti` is 1, EIO where it is 0
+        (
+            "ioctl(TIOCSTI) into its own terminal",
+            EPERM,
+            Want::OneOf(&[0, libc::EIO]),
+        ),
+        // EFAULT on Linux 7.0; older kernels check the capability first (EPERM)
+        ("pivot_root(NULL, NULL)", EPERM, Want::Host),
+        ("chroot(NULL)", EPERM, Want::Errno(libc::EFAULT)),
+        ("setns(-1, 0)", EPERM, Want::Errno(libc::EBADF)),
+        ("umount2(NULL, bad flags)", EPERM, Want::Errno(libc::EINVAL)),
+        // Capability checks come first in these: EPERM without the filter too for an unprivileged user (no oracle)
+        ("kexec_load(1000 segments, bad flag)", EPERM, Want::Host),
+        ("syslog(SIZE_BUFFER)", EPERM, Want::Host),
+        ("acct(bad pointer)", EPERM, Want::Host),
+        ("quotactl(bad type)", EPERM, Want::Errno(libc::EINVAL)),
+        ("swapon(NULL, bad flags)", EPERM, Want::Errno(libc::EINVAL)),
+        ("swapoff(bad pointer)", EPERM, Want::Host),
+        ("reboot(bad magic)", EPERM, Want::Host),
+        ("init_module(NULL)", EPERM, Want::Host),
+        ("finit_module(-1)", EPERM, Want::Host),
+        ("delete_module(NULL)", EPERM, Want::Host),
+        ("add_key(NULL)", EPERM, Want::Errno(libc::EFAULT)),
+        ("request_key(NULL)", EPERM, Want::Errno(libc::EFAULT)),
+        ("ioctl(TIOCLINUX) on a pty", EPERM, Want::NotEperm),
+        ("socket(AF_VSOCK)", EPERM, Want::Host),
+        ("socket(AF_ALG)", EPERM, Want::Host),
         #[cfg(target_arch = "x86_64")]
-        ("int 0x80 getpid", int80_getpid),
-        ("x32 getpid", x32_getpid),
+        ("int 0x80 getpid", EPERM, Want::Ok),
+        // ENOSYS, or success on a kernel built with the x32 ABI
+        ("x32 getpid", EPERM, Want::OneOf(&[0, libc::ENOSYS])),
     ];
 
-    /// `f` in a forked child: its 0/errno, or `1000 + signal` when the child was killed.
-    fn in_child(f: Call) -> i32 {
-        // SAFETY: the helper is single-threaded (it runs before the harness starts any thread).
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            let e = f();
-            unsafe { libc::_exit(e.clamp(0, 255)) };
+    /// Phase 5B, spec criterion 1 at the syscall level: a Linux program in the REAL pipeline (the systemd-run scope
+    /// when available, bwrap, the real `runtime sandbox-init` with Landlock and seccomp) gets EPERM for each denied
+    /// call, and the same command with the shim cut out (bwrap alone) does not: so the filter is what refused, not
+    /// bubblewrap's namespaces or host policy. The allowed rows (what Wine needs: threads through the clone3 fallback,
+    /// executable memory, unix sockets, terminal ioctls, the i386 `set_thread_area`) behave the same both ways.
+    #[test]
+    fn syscall_escape_1_denied_calls_fail_with_eperm_through_the_shim_and_not_without_it() {
+        let test = "syscall_escape_1_denied_calls_fail_with_eperm_through_the_shim_and_not_without_it";
+        if !bwrap_works(test) || !seccomp_works(test) {
+            return;
         }
-        if pid < 0 {
-            return 2000 + errno();
-        }
-        let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) };
-        if libc::WIFEXITED(st) {
-            libc::WEXITSTATUS(st)
-        } else {
-            1000 + libc::WTERMSIG(st)
-        }
-    }
-
-    /// `PTRACE_ATTACH` of `pid` and an open of its `/proc/<pid>/mem`, one line each; then `pid` is killed.
-    fn attach(pid: libc::pid_t) -> ! {
-        let r = check(unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_ATTACH, pid, 0, 0) });
-        if r == 0 {
-            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
-            unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_DETACH, pid, 0, 0) };
-        }
-        let mem = std::ffi::CString::new(format!("/proc/{pid}/mem")).unwrap();
-        let m = check_fd(unsafe { libc::open(mem.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) } as _);
-        println!("attach\t{r}\nprocmem\t{m}");
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
-        std::io::stdout().flush().unwrap();
-        std::process::exit(0)
-    }
-
-    pub fn main(args: &[String]) -> ! {
-        let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        match a.as_slice() {
-            ["calls"] => {
-                for (name, f) in CALLS {
-                    println!("{name}\t{}", in_child(*f));
-                }
-            }
-            // A child that lives at most 30 s, then either ptrace it from here (the same Landlock domain) or run
-            // `attach` through a SECOND shim first (a new, nested domain the child is outside of).
-            ["domain", shim, how] => {
-                let child = unsafe { libc::fork() };
-                if child == 0 {
-                    unsafe {
-                        libc::sleep(30);
-                        libc::_exit(0)
-                    };
-                }
-                std::io::stdout().flush().unwrap();
-                if *how == "same" {
-                    attach(child);
-                }
-                let me = std::env::current_exe().unwrap();
-                let err = std::os::unix::process::CommandExt::exec(
-                    std::process::Command::new(shim)
-                        .args(["sandbox-init", "--v1", "--rule", "ro:/", "--"])
-                        .arg(me)
-                        .args([std::str::from_utf8(super::PROBE_FLAG).unwrap(), "attach"])
-                        .arg(child.to_string()),
+        let (f, u) = (in_sandbox(&["calls"], false), in_sandbox(&["calls"], true));
+        let (f, u) = (rows(&f), rows(&u));
+        assert_eq!(f.len(), ROWS.len(), "{f:?}");
+        assert_eq!(u.len(), ROWS.len(), "{u:?}");
+        let mut bad = Vec::new();
+        for (name, want_f, want_u) in ROWS {
+            let (got_f, got_u) = (f[*name], u[*name]);
+            // IA32 emulation off: `int 0x80` faults (a signal) before seccomp sees it, with or without the filter.
+            if name.starts_with("int 0x80") && got_u >= 1000 {
+                assert!(
+                    !required(),
+                    "RUNTIME_REQUIRE_BWRAP=1 but int 0x80 kills the process ({got_u})"
                 );
-                eprintln!("exec {shim}: {err}");
-                std::process::exit(3)
+                eprintln!("SKIPPED {name}: the kernel has no IA32 emulation");
+                continue;
             }
-            ["attach", pid] => attach(pid.parse().unwrap()),
-            _ => {
-                eprintln!("unknown probe mode {a:?}");
-                std::process::exit(2)
+            let denied = matches!(want_f, Want::Errno(e) if *e == libc::EPERM || *e == libc::ENOSYS);
+            let oracle = if !denied {
+                "allowed"
+            } else if got_u != got_f {
+                "oracle"
+            } else {
+                "NO ORACLE here (bwrap alone answers the same): rests on rt_sandbox's seccomp tests"
+            };
+            eprintln!("{name:40} shim {got_f:4}  bwrap only {got_u:4}  {oracle}");
+            // Every strict bwrap-only expectation of a denied row excludes EPERM, so passing it IS the oracle.
+            if !want_f.allows(got_f) || !want_u.allows(got_u) {
+                bad.push(format!(
+                    "{name}: through the shim {got_f} (want {want_f:?}), bwrap only {got_u} (want {want_u:?})"
+                ));
             }
         }
-        std::io::stdout().flush().unwrap();
-        std::process::exit(0)
+        assert!(bad.is_empty(), "SECCOMP HOLE or broken control:\n{}", bad.join("\n"));
     }
-}
 
-/// The real host, except that the sandbox's shim is the `runtime` binary under test (not this test binary).
-struct ShimHost(PathBuf);
-
-impl rt_sandbox::Host for ShimHost {
-    fn env(&self, name: &str) -> Option<std::ffi::OsString> {
-        rt_sandbox::RealHost.env(name)
-    }
-    fn exists(&self, p: &Path) -> bool {
-        rt_sandbox::RealHost.exists(p)
-    }
-    fn is_socket(&self, p: &Path) -> bool {
-        rt_sandbox::RealHost.is_socket(p)
-    }
-    fn is_file(&self, p: &Path) -> bool {
-        rt_sandbox::RealHost.is_file(p)
-    }
-    fn resolve(&self, p: &Path) -> Option<PathBuf> {
-        rt_sandbox::RealHost.resolve(p)
-    }
-    fn uid(&self) -> u32 {
-        rt_sandbox::RealHost.uid()
-    }
-    fn runtime_exe(&self) -> Option<PathBuf> {
-        Some(self.0.clone())
-    }
-    fn scopes(&self) -> Result<rt_sandbox::ScopeSupport, String> {
-        rt_sandbox::RealHost.scopes()
-    }
-}
-
-fn required() -> bool {
-    std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| v == "1")
-}
-
-/// Runs the helper with `args` twice: under the default profile exactly as `runtime run` renders it (scope, bwrap,
-/// the real shim), and with the shim's words cut out of that same command line (bwrap only). Returns the two
-/// stdouts, each checked to have exited 0.
-fn boxed_and_bwrap_only(args: &[&str]) -> (String, String) {
-    let bwrap = rt_sandbox::find_bwrap_on_path().unwrap();
-    let shim = PathBuf::from(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap();
-    let helper = std::env::current_exe().unwrap().canonicalize().unwrap();
-    let td = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let app = td.path().canonicalize().unwrap().join("apps/a");
-    let (prefix, home) = (app.join("prefix"), app.join("runtime/home"));
-    fs::create_dir_all(prefix.join("drive_c")).unwrap();
-    fs::create_dir_all(&home).unwrap();
-    let mut cmd = std::process::Command::new(&helper);
-    cmd.arg(std::str::from_utf8(PROBE_FLAG).unwrap())
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("WINEPREFIX", &prefix)
-        .env("HOME", &home)
-        .current_dir(prefix.join("drive_c"));
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        cmd.env("XDG_RUNTIME_DIR", rt); // systemd-run --user needs it
-    }
-    let sb = rt_sandbox::AppSandbox::new(
-        bwrap,
-        rt_sandbox::Permissions::default(),
-        vec![helper],
-        std::sync::Arc::new(ShimHost(shim.clone())),
-    );
-    let boxed = sb.render(&cmd).expect("the default profile renders");
-    eprintln!(
-        "launched by {:?} (systemd-run: the task limit's scope)",
-        boxed.get_program()
-    );
-    let all: Vec<&std::ffi::OsStr> = boxed.get_args().collect();
-    let at = all
-        .iter()
-        .position(|a| *a == "sandbox-init")
-        .expect("the shim is in the command");
-    assert_eq!(Path::new(all[at - 1]), shim, "the shim is the runtime binary");
-    let end = at + all[at..].iter().position(|a| *a == "--").expect("the shim's `--`");
-    let mut bare = std::process::Command::new(boxed.get_program());
-    bare.args(&all[..at - 1]).args(&all[end + 1..]).env_clear();
-    for (k, v) in boxed.get_envs() {
-        if let Some(v) = v {
-            bare.env(k, v);
+    /// Phase 5B: the Landlock half of the ptrace decision (`ptrace` is allowed for Wine's requests only inside an
+    /// enforced Landlock domain). In the real pipeline the helper forks a child and then attaches it (PTRACE_ATTACH, one
+    /// of Wine's requests) and opens its `/proc/<pid>/mem`: from the same domain both work (what wineserver does); after
+    /// the helper enters a NEW, nested domain (a second `runtime sandbox-init`) the child is outside it and both are
+    /// refused. Yama is not what refuses: the tracer is the child's parent in both runs, and the same-domain run
+    /// succeeds. This is the only visible process outside the program's domain in production too: bwrap's pid 1.
+    #[test]
+    fn syscall_escape_2_ptrace_reaches_only_the_apps_own_landlock_domain() {
+        let test = "syscall_escape_2_ptrace_reaches_only_the_apps_own_landlock_domain";
+        if !bwrap_works(test) || !seccomp_works(test) {
+            return;
         }
-    }
-    if let Some(d) = boxed.get_current_dir() {
-        bare.current_dir(d);
-    }
-    let run = |mut c: std::process::Command, what: &str| {
-        let out = c.output().unwrap();
-        let (so, se) = (
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        );
-        assert!(out.status.success(), "{what}: {:?}\n{so}\n{se}", out.status);
-        so
-    };
-    (run(boxed, "through the shim"), run(bare, "bwrap only"))
-}
-
-fn rows(out: &str) -> std::collections::BTreeMap<String, i32> {
-    out.lines()
-        .filter_map(|l| l.rsplit_once('\t'))
-        .map(|(k, v)| (k.to_owned(), v.parse().unwrap()))
-        .collect()
-}
-
-/// Whether the shim can install a seccomp filter here (it refuses every run otherwise); `false` after SKIPPED,
-/// a failure under `RUNTIME_REQUIRE_BWRAP=1`.
-fn seccomp_works(test: &str) -> bool {
-    // SAFETY: PR_GET_SECCOMP only reads this process's mode.
-    if unsafe { libc::prctl(libc::PR_GET_SECCOMP) } >= 0 {
-        return true;
-    }
-    assert!(!required(), "RUNTIME_REQUIRE_BWRAP=1 but this kernel has no seccomp");
-    eprintln!("SKIPPED {test}: this kernel has no seccomp");
-    false
-}
-
-/// What a row's call must return.
-#[derive(Clone, Copy, Debug)]
-enum Want {
-    Ok,
-    Errno(i32),
-    /// One of these (0 = success).
-    OneOf(&'static [i32]),
-    /// Not EPERM: the kernel answered, whatever it said.
-    NotEperm,
-    /// Host policy decides (Yama, AppArmor's user-namespace restriction, sysctls, loaded modules): anything. The
-    /// row has an oracle only where this differs from the filtered answer, and the test says which.
-    Host,
-}
-
-impl Want {
-    fn allows(self, got: i32) -> bool {
-        match self {
-            Want::Ok => got == 0,
-            Want::Errno(e) => got == e,
-            Want::OneOf(v) => v.contains(&got),
-            Want::NotEperm => got != libc::EPERM && got < 1000,
-            Want::Host => got < 1000,
-        }
-    }
-}
-
-const EPERM: Want = Want::Errno(libc::EPERM);
-
-/// (row, through the shim, bwrap only). The allowed rows come first; a denied row is EPERM through the shim and
-/// something else without it (the distinguishing arguments make the kernel's own answer deterministic).
-const ROWS: &[(&str, Want, Want)] = &[
-    ("getpid", Want::Ok, Want::Ok),
-    ("thread (clone3 -> clone fallback)", Want::Ok, Want::Ok),
-    ("mmap(PROT_EXEC)", Want::Ok, Want::Ok),
-    ("socket(AF_UNIX)", Want::Ok, Want::Ok),
-    ("ioctl(TCGETS) on a pty", Want::Ok, Want::Ok),
-    #[cfg(target_arch = "x86_64")]
-    (
-        "int 0x80 set_thread_area(NULL)",
-        Want::Errno(libc::EFAULT),
-        Want::Errno(libc::EFAULT),
-    ),
-    ("ptrace(TRACEME)", EPERM, Want::Host),
-    ("ptrace(SEIZE, 0)", EPERM, Want::Errno(libc::ESRCH)),
-    ("unshare(NEWUSER)", EPERM, Want::Host),
-    ("unshare(NEWUSER|PARENT)", EPERM, Want::Errno(libc::EINVAL)),
-    ("clone(NEWUSER|SIGCHLD)", EPERM, Want::Host),
-    ("clone(thread flags|PIDFD|NEWUSER)", EPERM, Want::Errno(libc::EINVAL)),
-    ("clone3(NULL, 0)", Want::Errno(libc::ENOSYS), Want::Host),
-    ("mount(bad type)", EPERM, Want::Errno(libc::EFAULT)),
-    ("keyctl(9999)", EPERM, Want::NotEperm),
-    ("bpf(9999)", EPERM, Want::Host),
-    ("perf_event_open(NULL)", EPERM, Want::NotEperm),
-    ("userfaultfd(USER_MODE_ONLY)", EPERM, Want::Host),
-    ("open_by_handle_at(NULL)", EPERM, Want::Host),
-    ("io_uring_setup(1, NULL)", EPERM, Want::Host),
-    // allowed where `dev.tty.legacy_tiocsti` is 1, EIO where it is 0
-    (
-        "ioctl(TIOCSTI) into its own terminal",
-        EPERM,
-        Want::OneOf(&[0, libc::EIO]),
-    ),
-    ("socket(AF_VSOCK)", EPERM, Want::Host),
-    ("socket(AF_ALG)", EPERM, Want::Host),
-    #[cfg(target_arch = "x86_64")]
-    ("int 0x80 getpid", EPERM, Want::Ok),
-    // ENOSYS, or success on a kernel built with the x32 ABI
-    ("x32 getpid", EPERM, Want::OneOf(&[0, libc::ENOSYS])),
-];
-
-/// Phase 5B, spec criterion 1 at the syscall level: a Linux program in the REAL pipeline (the systemd-run scope
-/// when available, bwrap, the real `runtime sandbox-init` with Landlock and seccomp) gets EPERM for each denied
-/// call, and the same command with the shim cut out (bwrap alone) does not: so the filter is what refused, not
-/// bubblewrap's namespaces or host policy. The allowed rows (what Wine needs: threads through the clone3 fallback,
-/// executable memory, unix sockets, terminal ioctls, the i386 `set_thread_area`) behave the same both ways.
-#[test]
-fn syscall_escape_1_denied_calls_fail_with_eperm_through_the_shim_and_not_without_it() {
-    let test = "syscall_escape_1_denied_calls_fail_with_eperm_through_the_shim_and_not_without_it";
-    if !bwrap_works(test) || !seccomp_works(test) {
-        return;
-    }
-    let (f, u) = boxed_and_bwrap_only(&["calls"]);
-    let (f, u) = (rows(&f), rows(&u));
-    assert_eq!(f.len(), ROWS.len(), "{f:?}");
-    assert_eq!(u.len(), ROWS.len(), "{u:?}");
-    let mut bad = Vec::new();
-    for (name, want_f, want_u) in ROWS {
-        let (got_f, got_u) = (f[*name], u[*name]);
-        // IA32 emulation off: `int 0x80` faults (a signal) before seccomp sees it, with or without the filter.
-        if name.starts_with("int 0x80") && got_u >= 1000 {
-            assert!(
-                !required(),
-                "RUNTIME_REQUIRE_BWRAP=1 but int 0x80 kills the process ({got_u})"
+        // Yama 2 (admin-only attach) or 3 (no attach) refuses even the parent's attach, so neither half can succeed and
+        // the property cannot be observed: a visible skip, also under RUNTIME_REQUIRE_BWRAP=1 (not a failure).
+        let yama = fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").unwrap_or_default();
+        if matches!(yama.trim(), "2" | "3") {
+            eprintln!(
+                "SKIPPED {test}: Yama ptrace_scope is {}, which refuses every unprivileged attach",
+                yama.trim()
             );
-            eprintln!("SKIPPED {name}: the kernel has no IA32 emulation");
-            continue;
+            return;
         }
-        let denied = matches!(want_f, Want::Errno(e) if *e == libc::EPERM || *e == libc::ENOSYS);
-        let oracle = if !denied {
-            "allowed"
-        } else if got_u != got_f {
-            "oracle"
-        } else {
-            "NO ORACLE here (bwrap alone answers the same): rests on rt_sandbox's seccomp tests"
-        };
-        eprintln!("{name:40} shim {got_f:4}  bwrap only {got_u:4}  {oracle}");
-        // Every strict bwrap-only expectation of a denied row excludes EPERM, so passing it IS the oracle.
-        if !want_f.allows(got_f) || !want_u.allows(got_u) {
-            bad.push(format!(
-                "{name}: through the shim {got_f} (want {want_f:?}), bwrap only {got_u} (want {want_u:?})"
-            ));
+        let shim = PathBuf::from(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap();
+        let shim = shim.to_str().unwrap();
+        let same = in_sandbox(&["domain", shim, "same"], false);
+        let same = rows(&same);
+        eprintln!("same domain: {same:?}");
+        if let Err(e) = rt_sandbox::landlock::abi_version() {
+            // No Landlock: the strict filter, ptrace refused outright.
+            assert_eq!(same["attach"], libc::EPERM, "ptrace without Landlock");
+            assert!(!required(), "RUNTIME_REQUIRE_BWRAP=1 but Landlock is unavailable: {e}");
+            eprintln!("SKIPPED the Landlock half of {test}: {e:?}");
+            return;
         }
+        assert_eq!((same["attach"], same["procmem"]), (0, 0), "Wine's own-process ptrace");
+        let nested = in_sandbox(&["domain", shim, "nested"], false);
+        let nested = rows(&nested);
+        eprintln!("nested domain: {nested:?}");
+        assert_eq!(
+            (nested["attach"], nested["procmem"]),
+            (libc::EPERM, libc::EACCES),
+            "LANDLOCK HOLE: a process outside the tracer's domain was reachable"
+        );
     }
-    assert!(bad.is_empty(), "SECCOMP HOLE or broken control:\n{}", bad.join("\n"));
-}
 
-/// Phase 5B: the Landlock half of the ptrace decision (`ptrace` is allowed for Wine's requests only inside an
-/// enforced Landlock domain). In the real pipeline the helper forks a child and then attaches it (PTRACE_ATTACH, one
-/// of Wine's requests) and opens its `/proc/<pid>/mem`: from the same domain both work (what wineserver does); after
-/// the helper enters a NEW, nested domain (a second `runtime sandbox-init`) the child is outside it and both are
-/// refused. Yama is not what refuses: the tracer is the child's parent in both runs, and the same-domain run
-/// succeeds. This is the only visible process outside the program's domain in production too: bwrap's pid 1.
-#[test]
-fn syscall_escape_2_ptrace_reaches_only_the_apps_own_landlock_domain() {
-    let test = "syscall_escape_2_ptrace_reaches_only_the_apps_own_landlock_domain";
-    if !bwrap_works(test) || !seccomp_works(test) {
-        return;
+    /// docs/SECURITY.md's pipeline table lists exactly [`ROWS`], in order, each with its class: `allowed` (not refused
+    /// through the shim), `strict` (a specific non-EPERM answer from bwrap alone is required) or `host` (host policy
+    /// decides bwrap alone's answer, so the row may have no oracle).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_escape_3_the_security_table_is_the_test_list() {
+        let doc = include_str!("../../../docs/SECURITY.md");
+        let start = doc.find("<!-- pipeline-rows:").expect("the start marker");
+        let end = doc.find("<!-- /pipeline-rows -->").expect("the end marker");
+        let got: Vec<(String, String)> = doc[start..end]
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .map(|l| {
+                let cells: Vec<&str> = l.split(" | ").collect();
+                (
+                    cells[0]
+                        .trim_start_matches("| `")
+                        .trim_end_matches('`')
+                        .replace("\\|", "|"),
+                    cells[1].to_owned(),
+                )
+            })
+            .collect();
+        let want: Vec<(String, String)> = ROWS
+            .iter()
+            .map(|(name, f, u)| {
+                let class = match (f, u) {
+                    (Want::Errno(e), _) if *e != libc::EPERM && *e != libc::ENOSYS => "allowed",
+                    (Want::Ok, _) => "allowed",
+                    (_, Want::Host) => "host",
+                    _ => "strict",
+                };
+                (name.to_string(), class.to_owned())
+            })
+            .collect();
+        assert_eq!(got, want, "update the pipeline table in docs/SECURITY.md");
     }
-    let shim = PathBuf::from(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap();
-    let shim = shim.to_str().unwrap();
-    let (same, _) = boxed_and_bwrap_only(&["domain", shim, "same"]);
-    let same = rows(&same);
-    eprintln!("same domain: {same:?}");
-    if let Err(e) = rt_sandbox::landlock::abi_version() {
-        // No Landlock: the strict filter, ptrace refused outright.
-        assert_eq!(same["attach"], libc::EPERM, "ptrace without Landlock");
-        assert!(!required(), "RUNTIME_REQUIRE_BWRAP=1 but Landlock is unavailable: {e}");
-        eprintln!("SKIPPED the Landlock half of {test}: {e:?}");
-        return;
-    }
-    assert_eq!((same["attach"], same["procmem"]), (0, 0), "Wine's own-process ptrace");
-    let (nested, _) = boxed_and_bwrap_only(&["domain", shim, "nested"]);
-    let nested = rows(&nested);
-    eprintln!("nested domain: {nested:?}");
-    assert_eq!(
-        (nested["attach"], nested["procmem"]),
-        (libc::EPERM, libc::EACCES),
-        "LANDLOCK HOLE: a process outside the tracer's domain was reachable"
-    );
 }
 
 /// `cmd`'s exit status, killing it (and failing the test) after `limit`.

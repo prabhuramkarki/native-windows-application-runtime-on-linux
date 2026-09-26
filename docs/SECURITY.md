@@ -224,7 +224,13 @@ other apps' data or any other host path, and (by default) has no network at all,
   `io_uring` and terminal `TIOCSTI` into a terminal they own), no Landlock ruleset (the mounts are the only file
   boundary), no task, memory or CPU limit (no systemd scope: a fork bomb in an installer reaches the desktop) and no
   `RLIMIT_CORE = 0`. What they do have from bubblewrap itself (measured with bubblewrap 0.11.1, not setuid): no
-  capabilities at all (effective, permitted and bounding sets empty) and `no_new_privs`. A kernel exploit or a
+  capabilities at all (effective, permitted and bounding sets empty) and `no_new_privs`. **Because the installer
+  sandbox does NOT use the shim, a hostile installer can create nested user namespaces** (and in them, namespaces
+  of every other kind), the kernel attack surface the app sandbox's filter closes. Measured on this Ubuntu host:
+  `unshare -U` inside bwrap succeeds, but AppArmor's user-namespace restriction confines the new namespace
+  (profile `bwrap//&unpriv_bwrap`: writing `uid_map` fails, `CapEff` 0). On distributions without that
+  restriction, a user namespace with full capabilities inside it is what any user process gets. Closing this is
+  planned as Task 6 of Phase 5B: the installer sandbox goes through the same shim. A kernel exploit or a
   namespace escape is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
   whatever privilege unprivileged user namespaces (or its setuid bit) give it on this machine.
 - **What is bound read-only is still a real, current copy of `/usr` et al.** and could itself contain something
@@ -564,7 +570,7 @@ test's temporary directory, given to `runtime` itself, so the grant checks use i
 | 11 | a CreateProcess loop (100 copies) under `tasks = 64` | stopped after ~23 copies inside the app's scope; the same bounded loop finishes 40 copies under the default limit and unsandboxed; the user manager and a new process still start afterwards |
 | 12 | touching 512 MiB under `memory = 128` | OOM-killed inside the scope (exit 143 and the journal note), a 32 MiB hog under the same limit finishes, 64 MiB unsandboxed finishes; the desktop is unaffected |
 | 13 | two concurrent runs | each is bwrap in its own `run-p<pid>-*.scope`, the program in the same scope, exit statuses pass through |
-| `syscall_escape_1` | 19 denied system calls from a Linux helper | EPERM (`clone3`: ENOSYS) through the real shim, a different answer with the shim cut out; see "Syscall-level escape tests" |
+| `syscall_escape_1` | 36 denied system calls (every class of spec criterion 1) and 6 allowed ones from a Linux helper | EPERM (`clone3`: ENOSYS) through the real shim; with the shim cut out, a different answer for the 28 rows that have an oracle on the test host; see "Syscall-level escape tests" |
 | `syscall_escape_2` | `ptrace`/`/proc/<pid>/mem` of a process outside the Landlock domain | refused; the same process in the same domain is reachable (what wineserver needs) |
 
 Test 4 found a real gap while it was being written. bwrap's root is a writable tmpfs holding the directories it
@@ -890,59 +896,104 @@ or take rights away from descriptors the program inherited (its terminal and pip
 ### Syscall-level escape tests
 
 A Windows program cannot make raw Linux system calls, so `crates/cli/tests/e2e_sandbox.rs` (`syscall_escape_1`,
-`syscall_escape_2`; no Wine needed, so they run in the ordinary `cargo test`, skip visibly without bwrap and are
-required with `RUNTIME_REQUIRE_BWRAP=1`) uses a Linux helper: the test binary itself, re-executed inside the sandbox
-and bound read-only through the renderer's ordinary read-only binds. The command is the one `runtime run` renders
-for the default profile (the systemd-run scope, bwrap, and the real `runtime` binary as `sandbox-init`); nothing
-test-only is added to the production code. Each call runs in its own forked child. **The oracle** is the same
-command with the shim's words cut out: bwrap alone, the same binds and namespaces, no Landlock and no seccomp. A
-denied row passes only when the shim gives EPERM (`clone3`: ENOSYS) and bwrap alone gives a different, expected
-answer; where only host policy decides that answer (marked "host" below), the test prints "NO ORACLE here" instead
-of failing when bwrap alone also gives EPERM, and that row then rests on the `rt_sandbox` seccomp tests. Measured
-on 2026-09-26 (kernel 7.0, bubblewrap 0.11.1, systemd 259, Landlock ABI 8, Yama 1, AppArmor's user-namespace
-restriction on, `dev.tty.legacy_tiocsti` 0): **every denied row had an oracle.** With the shim cut out of the
-"through the shim" run as well, all 19 denied rows fail.
+`syscall_escape_2`; no Wine needed, so they run in the ordinary `cargo test` on glibc hosts) uses a Linux helper: the
+test binary itself, re-executed inside the sandbox and bound read-only through the renderer's ordinary read-only
+binds. The command is the one `runtime run` renders for the default profile (the systemd-run scope, bwrap, and the
+real `runtime` binary as `sandbox-init`); nothing test-only is added to the production code. Each call runs in its
+own forked child with arguments that do nothing even if the filter let the call through (NULL or bad pointers, fd
+-1, invalid flags or magic numbers). **The oracle** is the same command with the shim's words cut out: bwrap alone,
+the same binds and namespaces, no Landlock and no seccomp. The tests skip visibly without bwrap, seccomp, Landlock
+(the Landlock half of `syscall_escape_2`) or IA32 emulation (the `int 0x80` rows); **`RUNTIME_REQUIRE_BWRAP=1` (set
+by CI's `test` job) turns each of those skips into a failure**, so it requires seccomp, Landlock and IA32 emulation
+too. Yama `ptrace_scope` 2 or 3 stays a visible skip of `syscall_escape_2` even then: no unprivileged attach can
+succeed there, so there is nothing to observe.
 
-| Call (distinguishing arguments) | Through the shim | bwrap only | Oracle here |
-|---|---|---|---|
-| `ptrace(TRACEME)` | EPERM | 0 (host: Yama 3 would refuse) | yes |
-| `ptrace(SEIZE, pid 0)` | EPERM | ESRCH | yes |
-| `unshare(CLONE_NEWUSER)` | EPERM | 0 (host: AppArmor or a sysctl may refuse) | yes |
-| `unshare(CLONE_NEWUSER\|CLONE_PARENT)` | EPERM | EINVAL | yes |
-| `clone(CLONE_NEWUSER\|SIGCHLD)` (a real fork) | EPERM | 0 (host) | yes |
-| `clone(thread flags\|CLONE_PIDFD\|CLONE_NEWUSER)` | EPERM | EINVAL | yes |
-| `clone3(NULL, 0)` | ENOSYS | EINVAL (host: ENOSYS before Linux 5.3) | yes |
-| `mount` with a bad `type` pointer | EPERM | EFAULT | yes |
-| `keyctl(9999)` | EPERM | EOPNOTSUPP | yes |
-| `bpf(9999)` | EPERM | EINVAL (host) | yes |
-| `perf_event_open(NULL)` | EPERM | EACCES | yes |
-| `userfaultfd(UFFD_USER_MODE_ONLY)` | EPERM | 0 (host) | yes |
-| `open_by_handle_at(NULL)` | EPERM | EFAULT (host) | yes |
-| `io_uring_setup(1, NULL)` | EPERM | EFAULT (host: `kernel.io_uring_disabled`) | yes |
-| `ioctl(TIOCSTI)` into its own controlling terminal (a new session, `openpty`, `TIOCSCTTY`) | EPERM | EIO (`legacy_tiocsti` 0; 0 where it is 1) | yes |
-| `socket(AF_VSOCK)` | EPERM | 0 (host: the module) | yes |
-| `socket(AF_ALG)` | EPERM | 0 (host) | yes |
-| i386 `getpid` (`int 0x80`) | EPERM | 0 (skipped without IA32 emulation) | yes |
-| x32 `getpid` | EPERM | ENOSYS | yes |
-| allowed: `getpid`, a real thread (glibc's `clone3` falls back to `clone`), `mmap(PROT_EXEC)`, `socket(AF_UNIX)`, `ioctl(TCGETS)` on a pty | 0 | 0 | same answer both ways |
-| allowed: i386 `set_thread_area(NULL)` | EFAULT | EFAULT | the kernel answered, not the filter |
+**Which layer of tests covers what.**
+- **The BPF interpreter** (`crates/sandbox/src/seccomp/tests.rs`): every `DENIED` entry, with all-ones arguments,
+  and every argument rule's refused and allowed values; the only layer that proves, for every entry, that the
+  FILTER refuses it.
+- **Real kernel, outside bubblewrap** (`crates/sandbox/src/seccomp/tests/kernel.rs`):
+  `every_denied_entry_is_refused_by_a_real_filtered_call` calls every `DENIED` entry (63 on x86-64) for real in a
+  filtered child and requires EPERM (`clone3`: ENOSYS). Only the filtered answers are checked. With the filter
+  removed (measured, then reverted) 46 of the 63 answer something else. The other 17 are EPERM for an unprivileged
+  caller anyway, because the kernel checks a capability first: `kexec_load`, `kexec_file_load`, `init_module`,
+  `finit_module`, `delete_module`, `syslog`, `acct`, `swapoff`, `reboot`, `sethostname`, `setdomainname`,
+  `vhangup`, `fanotify_init`, `move_mount`, `fsopen`, `fsmount`, `fspick`. For those, only the interpreter
+  distinguishes the filter from the kernel. A second test there runs 35 probes (on x86-64) WITH and WITHOUT the filter and
+  requires a different answer where the kernel's own is deterministic.
+- **The real pipeline** (`syscall_escape_1`, the table below): 42 rows, 36 of them denied calls covering every class
+  of spec criterion 1, EPERM through the shim except `clone3` (ENOSYS). A **strict** row requires a specific
+  non-EPERM answer from bwrap alone, where the kernel's argument checks answer before any permission check. A
+  **host** row accepts whatever bwrap alone answers, because host policy decides it (Yama, AppArmor's user-namespace
+  restriction, sysctls, loaded modules, the kernel version). When that answer is also EPERM, the test prints "NO
+  ORACLE here" instead of failing, and the row rests on the tests above. The row names and classes below are checked
+  against the test's own list by `syscall_escape_3_the_security_table_is_the_test_list`. Measured on 2026-09-26
+  (kernel 7.0, bubblewrap 0.11.1, systemd 259, Landlock ABI 8, Yama 1, AppArmor's user-namespace restriction on,
+  `dev.tty.legacy_tiocsti` 0): **28 of the 36 denied rows had an oracle.** With the shim also cut out of the
+  "through the shim" run, exactly those 28 fail; the 8 without an oracle pass either way.
+
+<!-- pipeline-rows: the ROWS of crates/cli/tests/e2e_sandbox.rs, checked by syscall_escape_3 -->
+| Row (the helper's call) | Class | Through the shim | bwrap only (here) | Oracle here |
+|---|---|---|---|---|
+| `getpid` | allowed | 0 | 0 | same answer both ways |
+| `thread (clone3 -> clone fallback)` | allowed | 0 | 0 | same answer both ways |
+| `mmap(PROT_EXEC)` | allowed | 0 | 0 | same answer both ways |
+| `socket(AF_UNIX)` | allowed | 0 | 0 | same answer both ways |
+| `ioctl(TCGETS) on a pty` | allowed | 0 | 0 | same answer both ways |
+| `int 0x80 set_thread_area(NULL)` | allowed | EFAULT | EFAULT | the kernel answered, not the filter |
+| `ptrace(TRACEME)` | host | EPERM | 0 | yes |
+| `ptrace(SEIZE, 0)` | strict | EPERM | ESRCH | yes |
+| `unshare(NEWUSER)` | host | EPERM | 0 | yes |
+| `unshare(NEWUSER\|PARENT)` | strict | EPERM | EINVAL | yes |
+| `clone(NEWUSER\|SIGCHLD)` | host | EPERM | 0 | yes |
+| `clone(thread flags\|PIDFD\|NEWUSER)` | strict | EPERM | EINVAL | yes |
+| `clone3(NULL, 0)` | host | ENOSYS | EINVAL | yes |
+| `mount(bad type)` | strict | EPERM | EFAULT | yes |
+| `keyctl(9999)` | strict | EPERM | EOPNOTSUPP | yes |
+| `bpf(9999)` | host | EPERM | EINVAL | yes |
+| `perf_event_open(NULL)` | strict | EPERM | EACCES | yes |
+| `userfaultfd(USER_MODE_ONLY)` | host | EPERM | 0 | yes |
+| `open_by_handle_at(NULL)` | host | EPERM | EFAULT | yes |
+| `io_uring_setup(1, NULL)` | host | EPERM | EFAULT | yes |
+| `ioctl(TIOCSTI) into its own terminal` | strict | EPERM | EIO | yes |
+| `pivot_root(NULL, NULL)` | host | EPERM | EFAULT | yes |
+| `chroot(NULL)` | strict | EPERM | EFAULT | yes |
+| `setns(-1, 0)` | strict | EPERM | EBADF | yes |
+| `umount2(NULL, bad flags)` | strict | EPERM | EINVAL | yes |
+| `kexec_load(1000 segments, bad flag)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `syslog(SIZE_BUFFER)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `acct(bad pointer)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `quotactl(bad type)` | strict | EPERM | EINVAL | yes |
+| `swapon(NULL, bad flags)` | strict | EPERM | EINVAL | yes |
+| `swapoff(bad pointer)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `reboot(bad magic)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `init_module(NULL)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `finit_module(-1)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `delete_module(NULL)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `add_key(NULL)` | strict | EPERM | EFAULT | yes |
+| `request_key(NULL)` | strict | EPERM | EFAULT | yes |
+| `ioctl(TIOCLINUX) on a pty` | strict | EPERM | ENOTTY | yes |
+| `socket(AF_VSOCK)` | host | EPERM | 0 | yes |
+| `socket(AF_ALG)` | host | EPERM | 0 | yes |
+| `int 0x80 getpid` | strict | EPERM | 0 | yes |
+| `x32 getpid` | strict | EPERM | ENOSYS | yes |
+<!-- /pipeline-rows -->
 
 `syscall_escape_2` covers the Landlock half of the `ptrace` decision without Yama in the way: the helper forks a
 child and attaches it (`PTRACE_ATTACH`) and opens its `/proc/<pid>/mem`. From the same Landlock domain both work
-(0, 0: what wineserver does); after the helper enters a new, nested domain through a second `runtime sandbox-init`,
+(0, 0: what wineserver does). After the helper enters a new, nested domain through a second `runtime sandbox-init`,
 the same child is outside it and both are refused (EPERM, EACCES). The tracer is the child's parent both times, so
-Yama at 1 allows it, as the first run shows. With the nested domain removed the test fails.
+Yama at 1 allows it, as the first run shows. With the nested domain removed, the test fails.
 
-Not covered by these tests: the other deny-list entries (the interpreter and real-kernel tests in
-`crates/sandbox/src/seccomp` check every entry, with and without the filter, outside bubblewrap), and `ptrace` of
-bwrap's own pid 1 on a host without Landlock (the residual above; Yama at 1 here hides it).
+Not covered by any of these tests: `ptrace` of bwrap's own pid 1 on a host without Landlock (the residual above;
+Yama at 1 here hides it), and a kernel bug behind an allowed call.
 
 ## Roadmap
 
-Phase 5B (seccomp, Landlock, resource limits and their escape tests) is complete. Open: the dependency engine's
-path-based prefix operations move to held directory descriptors; the shim as the filtered pid 1 (removing the
-unfiltered bubblewrap reaper, and with it the no-Landlock `/proc/1/mem` residual); the installer sandbox has none of
-the Phase 5B layers.
+Phase 5B's layers are in place for the app sandbox (seccomp, Landlock, resource limits and their escape tests).
+Next in Phase 5B: Task 6 runs the installer sandbox through the same shim (today it has none of the 5B layers).
+Later: the dependency engine's path-based prefix operations move to held directory descriptors; the shim as the
+filtered pid 1 (removing the unfiltered bubblewrap reaper, and with it the no-Landlock `/proc/1/mem` residual).
 
 ## Reporting
 
