@@ -7,7 +7,8 @@
 //! call fails with `EPERM`. On x86-64 that refuses the whole i386 ABI (`int 0x80`, a 32-bit ELF), whose syscall
 //! numbers differ and would slip past the table; Wine runs 32-bit Windows programs in 64-bit processes (new
 //! WoW64), so it never enters it. Then, on x86-64, any number with the x32 bit (`0x40000000`) set fails with
-//! `EPERM` (the x32 ABI shares the x86-64 audit architecture but numbers its calls differently). Then each entry
+//! `EPERM` (the x32 ABI shares the x86-64 audit architecture but numbers its calls differently; the same test also
+//! refuses a raw `syscall(-1)`, whose number has every bit set, which the kernel would answer with `ENOSYS`). Then each entry
 //! of [`DENIED`] is compared by number; an entry with an argument condition jumps to its own check. Everything
 //! else is allowed. Arguments are compared on their low 32 bits: the kernel truncates `clone`'s flags, `ioctl`'s
 //! `cmd`, `personality`'s persona and `socket`'s domain to 32 bits, so garbage in the upper half changes nothing.
@@ -48,6 +49,7 @@
 //! | `syslog` | always | reads or clears the kernel log, which leaks kernel addresses and host activity |
 //! | `acct` | always | switches process accounting on or off |
 //! | `quotactl` | always | manages filesystem quotas |
+//! | `quotactl_fd` | always | manages filesystem quotas (by file descriptor) |
 //! | `swapon` | always | enables a swap area |
 //! | `swapoff` | always | disables a swap area |
 //! | `reboot` | always | reboots or halts the machine |
@@ -57,8 +59,9 @@
 //! | `adjtimex` | always | adjusts the system clock |
 //! | `sethostname` | always | renames the host |
 //! | `setdomainname` | always | renames the host's NIS domain |
-//! | `iopl` | always | grants direct access to hardware I/O ports |
-//! | `ioperm` | always | grants direct access to hardware I/O ports |
+//! | `vhangup` | always | hangs up the current terminal |
+//! | `iopl` | always | grants direct access to hardware I/O ports (x86-64) |
+//! | `ioperm` | always | grants direct access to hardware I/O ports (x86-64) |
 //! | `lookup_dcookie` | always | obsolete profiling interface that turns kernel directory cookies into paths |
 //! | `nfsservctl` | always | obsolete NFS server control (removed from Linux in 3.1) |
 //! | `move_pages` | always | moves the memory pages of other processes between NUMA nodes |
@@ -75,6 +78,8 @@
 //! | `fsmount` | always | new mount API: creates a mount from a filesystem context |
 //! | `fspick` | always | new mount API: reconfigures a mounted filesystem |
 //! | `pidfd_getfd` | always | copies a file descriptor out of another process |
+//! | `process_madvise` | always | gives memory advice for another process's address space |
+//! | `uselib` | always | obsolete a.out library loader (x86-64) |
 //! | `io_uring_setup` | always | io_uring runs operations without seccomp seeing them (it could open the sockets denied below) |
 //! | `clone3` | always (`ENOSYS`) | its flags live behind a pointer seccomp cannot read; ENOSYS makes glibc fall back to clone |
 //! | `clone` | arg0 has any bit of 0x7e020080 | creates namespaces (CLONE_NEW* flags); threads and plain forks are allowed |
@@ -258,6 +263,11 @@ pub const DENIED: &[Denied] = &[
     ),
     deny!(SYS_acct, Always, "switches process accounting on or off"),
     deny!(SYS_quotactl, Always, "manages filesystem quotas"),
+    deny!(
+        SYS_quotactl_fd,
+        Always,
+        "manages filesystem quotas (by file descriptor)"
+    ),
     deny!(SYS_swapon, Always, "enables a swap area"),
     deny!(SYS_swapoff, Always, "disables a swap area"),
     deny!(SYS_reboot, Always, "reboots or halts the machine"),
@@ -267,10 +277,15 @@ pub const DENIED: &[Denied] = &[
     deny!(SYS_adjtimex, Always, "adjusts the system clock"),
     deny!(SYS_sethostname, Always, "renames the host"),
     deny!(SYS_setdomainname, Always, "renames the host's NIS domain"),
+    deny!(SYS_vhangup, Always, "hangs up the current terminal"),
     #[cfg(target_arch = "x86_64")]
-    deny!(SYS_iopl, Always, "grants direct access to hardware I/O ports"),
+    deny!(SYS_iopl, Always, "grants direct access to hardware I/O ports (x86-64)"),
     #[cfg(target_arch = "x86_64")]
-    deny!(SYS_ioperm, Always, "grants direct access to hardware I/O ports"),
+    deny!(
+        SYS_ioperm,
+        Always,
+        "grants direct access to hardware I/O ports (x86-64)"
+    ),
     deny!(
         SYS_lookup_dcookie,
         Always,
@@ -327,6 +342,13 @@ pub const DENIED: &[Denied] = &[
         Always,
         "copies a file descriptor out of another process"
     ),
+    deny!(
+        SYS_process_madvise,
+        Always,
+        "gives memory advice for another process's address space"
+    ),
+    #[cfg(target_arch = "x86_64")]
+    deny!(SYS_uselib, Always, "obsolete a.out library loader (x86-64)"),
     deny!(
         SYS_io_uring_setup,
         Always,
@@ -407,20 +429,10 @@ const BUILT_FOR: Option<Arch> = if cfg!(target_arch = "x86_64") {
 pub enum SeccompError {
     #[error("seccomp: no syscall table for the {0} architecture in this build")]
     UnsupportedArch(&'static str),
-    #[error("seccomp: the i386 syscall ABI cannot be allowed: the filter has no i386 deny-list")]
-    I386NotSupported,
     #[error("seccomp: invalid filter program: {0}")]
     Program(&'static str),
     #[error("seccomp: {step} failed: {source}")]
     Install { step: &'static str, source: std::io::Error },
-}
-
-/// Knobs for [`build_filter_with`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FilterOptions {
-    /// Let i386-ABI calls through on x86-64. Refused ([`SeccompError::I386NotSupported`]): Wine's 32-bit programs
-    /// do not need it, and allowing it needs an i386 copy of the deny-list, which does not exist.
-    pub allow_i386: bool,
 }
 
 /// The architecture the runtime was built for, if the filter supports it.
@@ -428,16 +440,10 @@ pub fn host_arch() -> Result<Arch, SeccompError> {
     BUILT_FOR.ok_or(SeccompError::UnsupportedArch(std::env::consts::ARCH))
 }
 
-/// The filter for `arch` with the default options.
+/// The filter program for `arch`, which must be the architecture this build's syscall numbers belong to. There is
+/// no way to let the i386 ABI through: Wine's 32-bit programs do not need it, and it would need an i386 copy of
+/// the deny-list.
 pub fn build_filter(arch: Arch) -> Result<Vec<SockFilter>, SeccompError> {
-    build_filter_with(arch, FilterOptions::default())
-}
-
-/// The filter program for `arch`, which must be the architecture this build's syscall numbers belong to.
-pub fn build_filter_with(arch: Arch, opts: FilterOptions) -> Result<Vec<SockFilter>, SeccompError> {
-    if opts.allow_i386 {
-        return Err(SeccompError::I386NotSupported);
-    }
     if BUILT_FOR != Some(arch) {
         return Err(SeccompError::UnsupportedArch(arch.name()));
     }
@@ -447,6 +453,7 @@ pub fn build_filter_with(arch: Arch, opts: FilterOptions) -> Result<Vec<SockFilt
     b.jump(JEQ, arch.audit(), None, Some(deny));
     b.stmt(LD_W_ABS, NR);
     if arch == Arch::X86_64 {
+        // Also refuses a raw `syscall(-1)` (every bit set), harmlessly: the kernel would answer ENOSYS anyway.
         b.jump(JSET, X32_SYSCALL_BIT, Some(deny), None);
     }
     let mut checks = Vec::new();

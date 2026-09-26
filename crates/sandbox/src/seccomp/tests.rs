@@ -298,7 +298,7 @@ fn the_program_passes_the_kernel_checks_and_fits_its_limit() {
 }
 
 #[test]
-fn only_this_builds_architecture_can_be_built_and_i386_is_never_allowed() {
+fn only_this_builds_architecture_can_be_built() {
     let own = host_arch().unwrap();
     let other = if own == Arch::X86_64 {
         Arch::Aarch64
@@ -306,11 +306,6 @@ fn only_this_builds_architecture_can_be_built_and_i386_is_never_allowed() {
         Arch::X86_64
     };
     assert!(matches!(build_filter(other), Err(SeccompError::UnsupportedArch(n)) if n == other.name()));
-    assert!(matches!(
-        build_filter_with(own, FilterOptions { allow_i386: true }),
-        Err(SeccompError::I386NotSupported)
-    ));
-    assert_eq!(build_filter_with(own, FilterOptions::default()).unwrap(), filter());
     // the hand-typed audit values are the kernel's (<linux/audit.h>)
     assert_eq!(AUDIT_ARCH_X86_64, 0xc000_003e);
     assert_eq!(AUDIT_ARCH_AARCH64, 0xc000_00b7);
@@ -377,7 +372,7 @@ fn the_module_documentation_table_is_the_deny_list() {
         "update the table in seccomp.rs; expected rows:\n{}",
         want.join("\n")
     );
-    // iopl/ioperm are x86-64 only; on x86-64 the table has no stale row
+    // iopl/ioperm/uselib are x86-64 only; on x86-64 the table has no stale row
     #[cfg(target_arch = "x86_64")]
     assert_eq!(
         table.len(),
