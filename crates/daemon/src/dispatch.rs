@@ -19,7 +19,7 @@
 //! object is -32602. Every other name (including anything that would change state: there is no such method in
 //! this version) is -32601. The id's validity and existence are `rt_api`'s to judge (`invalid_argument`,
 //! `not_found`).
-use crate::protocol::{DOMAIN, INTERNAL, INVALID_PARAMS, Id, METHOD_NOT_FOUND, Reply, Request, parse_request};
+use crate::protocol::{DOMAIN, INTERNAL, INVALID_PARAMS, Id, METHOD_NOT_FOUND, Reply, Request};
 use rt_api::{ApiError, DoctorTarget, Runtime};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -99,6 +99,11 @@ fn call(rt: &Runtime, method: &str, p: Option<Value>) -> Result<Value, Fail> {
         "deps.plan" => ok(rt.deps_plan(&id(p)?)),
         #[cfg(test)]
         "test.panic" => panic!("injected panic with a secret /home/someone/path"),
+        #[cfg(test)]
+        "test.sleep" => {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            ok(Ok("slept"))
+        }
         _ => Err(Fail(METHOD_NOT_FOUND, "method not found".into(), None)),
     }
 }
@@ -117,13 +122,9 @@ pub fn dispatch(rt: &Runtime, req: Request) -> Option<Reply> {
     })
 }
 
-/// One frame in, at most one reply out. A panicking method is a generic -32603: its message never reaches the
-/// wire, and the daemon keeps serving (`Runtime` holds no lock a panic could leave poisoned for good).
-pub fn handle(rt: &Runtime, frame: &[u8]) -> Option<Reply> {
-    let req = match parse_request(frame) {
-        Ok(r) => r,
-        Err(reply) => return Some(reply),
-    };
+/// [`dispatch`], except that a panicking method is a generic -32603: its message never reaches the wire, and
+/// the daemon keeps serving (`Runtime` holds no lock a panic could leave poisoned for good).
+pub fn handle(rt: &Runtime, req: Request) -> Option<Reply> {
     let id = req.id.clone();
     catch_unwind(AssertUnwindSafe(|| dispatch(rt, req)))
         .unwrap_or_else(|_| id.map(|id: Id| Reply::error(id, INTERNAL, "internal error")))
@@ -134,8 +135,15 @@ mod tests {
     use super::*;
     use crate::testutil::{plant, rt};
 
+    fn reply(rt: &Runtime, line: &str) -> Option<Reply> {
+        match crate::protocol::parse_request(line.as_bytes()) {
+            Ok(req) => handle(rt, req),
+            Err(r) => Some(r),
+        }
+    }
+
     fn call_line(rt: &Runtime, line: &str) -> Value {
-        let r = handle(rt, line.as_bytes()).expect("a reply");
+        let r = reply(rt, line).expect("a reply");
         serde_json::from_slice(&r.to_line()).unwrap()
     }
 
@@ -256,7 +264,7 @@ mod tests {
         let (_d, rt) = rt();
         for m in ["rpc.version", "no.such", "test.panic", "apps.get"] {
             let line = json!({"jsonrpc": "2.0", "method": m, "params": [1]}).to_string();
-            assert!(handle(&rt, line.as_bytes()).is_none(), "{m}");
+            assert!(reply(&rt, &line).is_none(), "{m}");
         }
         // A frame that is not a valid request is answered even without an id (the id cannot be known).
         let v = call_line(&rt, r#"{"jsonrpc":"1.0","method":"rpc.version"}"#);
