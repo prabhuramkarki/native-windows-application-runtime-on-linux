@@ -103,6 +103,16 @@ fn real_net_wine_dotnet_runs_under_the_default_sandbox() {
         "seccomp and Landlock must both be enforced on this host for this test to mean anything: {}",
         ran.report()
     );
+    // ... and from inside a sandboxed run: the Wine process's own /proc/self/status (native probe, same profile).
+    let probe = rig.install_fixture("probe64.exe", "probe");
+    let ran = rig.run_app(&probe, &["status"]);
+    let status = ran.expect_ok();
+    assert!(
+        status.contains("Seccomp:\t2") && status.contains("NoNewPrivs:\t1"),
+        "{}",
+        ran.report()
+    );
+    rig.rt(&["remove", &probe]).expect_ok();
 
     // Before: Wine Mono is needed, planned, and the program cannot run (mscoree is disabled).
     let ran = rig.rt(&["doctor", &id]);
@@ -118,7 +128,22 @@ fn real_net_wine_dotnet_runs_under_the_default_sandbox() {
     let ran = rig.run_app(&id, &["a", "b"]);
     eprintln!("before Wine Mono: {}", ran.report());
     assert!(!ran.out().contains(GREETING), "ran without Wine Mono: {}", ran.report());
-    assert_ne!(ran.code, Some(7), "{}", ran.report());
+    // The loader refuses the IL-only binary: STATUS_DLL_NOT_FOUND (0xC0000135), whose low byte 53 was the exit code
+    // measured on Wine 10.0; the exact code depends on the Wine version, so Wine's own message counts too (it
+    // reaches the run log or stderr when the Wine debug channels allow it). Any other failure is not this one.
+    let logs = rig.apps().join(&id).join("logs");
+    let log: String = std::fs::read_dir(&logs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()).into_owned())
+        .collect();
+    let said = |t: &str| log.contains(t) || ran.err().contains(t);
+    assert!(
+        ran.code == Some(53) || said("c0000135") || said("mscoree.dll not found"),
+        "not the missing-mscoree failure: {}\nrun log:\n{log}",
+        ran.report()
+    );
 
     // Install through the engine: the real download (host side), then the MSI in the installer sandbox.
     let (ran, timed_out) = rig.exec(&["deps", &id, "--install"], &[], Duration::from_secs(900));

@@ -50,7 +50,10 @@ cleanup() {
   WINEPREFIX="$scratch/prefix" "$wineserver" -k 2>/dev/null || true
   rm -rf "$scratch"
 }
-trap cleanup EXIT INT TERM
+# A signal exits (non-zero), and the exit runs the cleanup.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 msi="$scratch/wine-mono.msi"
 if [ -n "${MONO_MSI:-}" ]; then
@@ -58,7 +61,8 @@ if [ -n "${MONO_MSI:-}" ]; then
 else
   command -v curl >/dev/null || { echo "missing curl: sudo apt install curl" >&2; exit 1; }
   echo "downloading $url"
-  curl -fsSL --max-time 600 -o "$msi" "$url" || {
+  # HTTPS only; a stalled link (under 10 kB/s for 60 s) fails, a slow but live one is not cut off.
+  curl -fsSL --proto =https --tlsv1.2 --speed-limit 10000 --speed-time 60 -o "$msi" "$url" || {
     echo "cannot download $url (this script needs the network)" >&2
     exit 1
   }
