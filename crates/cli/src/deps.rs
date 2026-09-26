@@ -109,7 +109,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     }
     let manifest = Manifest::bundled();
     let md = store.read_metadata(&env)?;
-    let plan = rt_deps::plan_for_app(&env, &md, manifest, &crate::graphics::verdict_for);
+    let plan = rt_deps::plan_for_app(&env, &md, manifest, &rt_api::host::graphics::verdict_for);
     crate::emit(&format_plan(env.id().as_str(), &plan, manifest, install))?;
     if !install {
         return Ok(0);
@@ -147,7 +147,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
         fetcher: &NetFetcher,
         consent: &consent,
         now: rt_deps::unix_now,
-        vulkan: &crate::graphics::verdict_for,
+        vulkan: &rt_api::host::graphics::verdict_for,
         runtime_exe: &crate::runtime_exe(),
     };
     let (text, code) = install_report(&o, &plan)?;
@@ -485,7 +485,7 @@ fn cache(dir: &Path, clear: bool) -> Result<u8, CmdError> {
 pub(crate) fn missing_hint(env: &AppEnv, md: &Metadata, manifest: &Manifest) -> Option<String> {
     hint_for(
         env.id().as_str(),
-        &rt_deps::plan_for_app(env, md, manifest, &crate::graphics::verdict_for),
+        &rt_deps::plan_for_app(env, md, manifest, &rt_api::host::graphics::verdict_for),
     )
 }
 

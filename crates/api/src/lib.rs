@@ -6,6 +6,7 @@
 //! an [`ApiError`] whose [`ErrorKind`] is stable (see [`error`]).
 pub mod compat;
 pub mod error;
+pub mod host;
 pub mod runtime;
 pub mod types;
 

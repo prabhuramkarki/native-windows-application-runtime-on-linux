@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 runtime-core = { path = "../core" }
 runtime-sandbox = { path = "../sandbox" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
