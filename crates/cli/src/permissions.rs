@@ -9,25 +9,10 @@
 use crate::CmdError;
 use crate::safe::{json_safe, safe, safe_lines};
 use rt_core::AppEnv;
-use rt_sandbox::{Access, GrantCtx, Network, Permissions, Tasks, account_home, load_opt, load_opt_raw, reset, store};
-use std::path::PathBuf;
+use rt_sandbox::{Access, GrantCtx, Network, Permissions, Tasks, load_opt, load_opt_raw, reset, store};
 
 pub(crate) fn ctx() -> Result<GrantCtx, CmdError> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|h| h.is_absolute())
-        .ok_or("HOME is not set to an absolute path: cannot tell which directories are private")?;
-    // `$HOME` is the caller's word: the account's real home (password database) is protected too.
-    let extra_homes = account_home().into_iter().filter(|h| *h != home).collect();
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|d| d.is_absolute());
-    Ok(GrantCtx {
-        home,
-        extra_homes,
-        data_root: rt_core::data_root()?,
-        runtime_dir,
-    })
+    Ok(GrantCtx::from_env()?)
 }
 
 /// A profile that cannot be read is fixed by deleting it.

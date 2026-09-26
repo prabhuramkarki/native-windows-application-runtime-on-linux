@@ -1,5 +1,4 @@
 mod analyze;
-mod compat;
 mod deps;
 mod display;
 mod doctor;
@@ -230,6 +229,16 @@ pub(crate) fn refuse_if_running(env: &rt_core::AppEnv) -> Result<(), CmdError> {
     unreachable!("the last attempt returns")
 }
 
+/// `runtime compat [--json]`: the bundled matrix (`rt_api::compat`), rendered.
+fn compat(json: bool) -> Result<(), CmdError> {
+    let c = rt_api::compat::bundled();
+    emit(&if json {
+        rt_api::compat::render_json(c)
+    } else {
+        rt_api::compat::render_table(c)
+    })
+}
+
 /// Writes to stdout; a closed pipe (`| head`) is the reader's choice, not an error.
 pub(crate) fn emit(text: &str) -> Result<(), CmdError> {
     let mut out = std::io::stdout().lock();
@@ -278,7 +287,7 @@ fn main() -> ExitCode {
         Cmd::Display { app, choice } => display::run(&app, choice.as_deref()).map(|()| 0),
         Cmd::Permissions { app, set, reset, json } => permissions::run(&app, &set, reset, json).map(|()| 0),
         Cmd::Sandbox { app } => sandbox::run(&app).map(|()| 0),
-        Cmd::Compat { json } => compat::run(json).map(|()| 0),
+        Cmd::Compat { json } => compat(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
         Cmd::SandboxInit { args } => sandbox_init::run(&args),
     };

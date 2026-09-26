@@ -3,8 +3,7 @@
 //! Parsing is safe for any text: unknown fields, control characters, oversize input and inconsistent records are
 //! errors, never panics.
 
-use crate::CmdError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -17,7 +16,7 @@ const MAX_ECHO: usize = 40;
 const HEADER: &str = "\
 # Compatibility matrix
 
-<!-- Generated from crates/cli/compat.toml; do not edit by hand. Regenerate with:
+<!-- Generated from crates/api/compat.toml; do not edit by hand. Regenerate with:
      cargo run -q -p runtime-cli -- compat > docs/COMPAT.md -->
 
 Each row is something that was really run: `ci:<job>` is a CI job run that passed, `manual:<date>` was run by
@@ -25,7 +24,7 @@ hand on that date on the recorded Wine and GPU. A program that is not listed has
 
 ";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Works,
@@ -94,7 +93,13 @@ pub enum CompatError {
 
 /// Truncate an echoed value so an error never carries unbounded text.
 fn clip(s: &str) -> String {
-    crate::safe::shorten(s, MAX_ECHO)
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(MAX_ECHO).collect();
+    if it.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
 }
 
 /// Non-empty, at most `max` bytes, no control characters.
@@ -237,11 +242,6 @@ pub fn render_json(c: &Compat) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&rows).unwrap_or_default() + "\n"
-}
-
-pub(crate) fn run(json: bool) -> Result<(), CmdError> {
-    let c = bundled();
-    crate::emit(&if json { render_json(c) } else { render_table(c) })
 }
 
 #[cfg(test)]
@@ -443,7 +443,7 @@ evidence = "ci:x"
         let want = render_table(bundled());
         assert!(
             include_str!("../../../docs/COMPAT.md") == want,
-            "docs/COMPAT.md is out of date with crates/cli/compat.toml; regenerate it with:\n  \
+            "docs/COMPAT.md is out of date with crates/api/compat.toml; regenerate it with:\n  \
              cargo run -q -p runtime-cli -- compat > docs/COMPAT.md"
         );
     }
