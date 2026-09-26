@@ -274,3 +274,93 @@ fn an_unusable_runtime_executable_is_reported_as_the_sandboxs_refusal_and_nothin
         backend.calls()
     );
 }
+
+/// A backend that records, at each `command()` (the step right before the uninstaller is spawned), whether the app
+/// root already held the `ran-sandboxed` marker.
+struct MarkerProbe {
+    inner: FakeBackend,
+    seen: std::sync::Mutex<Vec<bool>>,
+}
+
+impl CompatBackend for MarkerProbe {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn version(&self) -> Result<String, rt_core::BackendError> {
+        self.inner.version()
+    }
+    fn prepare(&self, env: &AppEnv) -> Result<(), rt_core::BackendError> {
+        self.inner.prepare(env)
+    }
+    fn command(
+        &self,
+        env: &AppEnv,
+        exe: &std::path::Path,
+        cwd: &std::path::Path,
+        args: &[OsString],
+        opts: &RunOpts,
+    ) -> Result<std::process::Command, rt_core::BackendError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(env.root().join(rt_sandbox::MARKER).exists());
+        self.inner.command(env, exe, cwd, args, opts)
+    }
+    fn stop(&self, env: &AppEnv) -> Result<(), rt_core::BackendError> {
+        self.inner.stop(env)
+    }
+    fn dll_dirs(&self) -> Vec<PathBuf> {
+        self.inner.dll_dirs()
+    }
+}
+
+/// Phase 5B final review: the vendor uninstaller runs sandboxed Windows code with a read-write prefix, so the app is
+/// marked BEFORE the uninstaller command is built and spawned.
+#[test]
+fn the_app_is_marked_before_the_uninstaller_starts() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let inner = fake_backend("exit 0");
+    let opts = opts_for(&inner);
+    let backend = MarkerProbe {
+        inner,
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    assert!(!env.root().join(rt_sandbox::MARKER).exists());
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts, &runtime_exe());
+    assert_eq!(outcome.uninstaller_succeeded, Some(true), "{outcome:?}");
+    assert_eq!(
+        *backend.seen.lock().unwrap(),
+        [true],
+        "marked before the uninstaller command"
+    );
+}
+
+/// The mark fails closed: when it cannot be written, the uninstaller is never started.
+#[test]
+fn a_marker_that_cannot_be_written_prevents_the_uninstaller() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let backend = fake_backend("exit 0");
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    fs::set_permissions(env.root(), std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
+    fs::set_permissions(env.root(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("could not record") && w.contains("was not run")),
+        "{outcome:?}"
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, rt_core::Call::Command { .. })),
+        "{:?}",
+        backend.calls()
+    );
+}

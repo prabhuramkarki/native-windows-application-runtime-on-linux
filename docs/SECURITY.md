@@ -638,10 +638,12 @@ your full access (`\\?\unix\` paths reach every file). Which commands start a Wi
 "Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program: no sandbox binds
 the app root). It is written whenever the runtime runs Windows code from outside your trust in the prefix inside a
 sandbox: the first `runtime run`, AND `runtime install` of an installer (before the installer's own code starts),
-`runtime deps <app> --install` of an installer package (before the installer and before each of its `reg.exe`
-steps), and `runtime uninstall` (before the recorded uninstaller). It is written BEFORE that code runs and its
-failure fails the operation (fail closed: nothing runs if the marker cannot be written), so a prefix a sandboxed
-installer touched can never later be reached by an unsandboxed helper. From then on `display` and archive-package
+`runtime deps <app> --install` whenever its plan may run an installer package (UP FRONT, before any package is
+fetched and before the run's helper launcher is chosen, so an archive package's `reg.exe` that follows an installer
+package in the same run is sandboxed too; and again before the installer and each of its own `reg.exe` steps), and
+`runtime uninstall` (before the recorded uninstaller). It is written BEFORE that code runs and its failure fails the
+operation (fail closed: nothing is fetched, installed or run if the marker cannot be written), so a prefix a
+sandboxed installer or uninstaller touched is never later reached by an unsandboxed helper. From then on `display` and archive-package
 `reg.exe` run through the same `AppSandbox` (the app's own profile, so they get nothing the app does not have) and
 refuse, changing nothing, when bubblewrap is unavailable (a marker-path error other than "not found" also refuses).
 Residual risk: an app that has NEVER run through any of those sandboxed paths is unmarked, so a prefix written by

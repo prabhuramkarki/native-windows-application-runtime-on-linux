@@ -3895,9 +3895,9 @@ fn once_an_app_ran_sandboxed_its_registry_helpers_run_in_its_sandbox() {
     let before = r.calls();
     let err = assert_fails(&no_bwrap(&r).args(["display", id, "auto"]).output().unwrap());
     assert!(
-        err.contains(&format!(
-            "{id} has run in the sandbox, so its Wine helpers must run sandboxed too"
-        )) && err.contains("nothing was changed"),
+        err.contains(&format!("{id} has run in the sandbox"))
+            && err.contains("its Wine helpers must run sandboxed too")
+            && err.contains("nothing was changed"),
         "{err}"
     );
     assert_eq!(r.calls(), before);
@@ -4083,4 +4083,81 @@ fn sandbox_init_refuses_with_126_and_passes_arguments_unchanged() {
         want.push(0);
     }
     assert_eq!(o.stdout, want);
+}
+
+/// Phase 5B final review: `deps --install` picks the helper launcher ONCE for all archive packages of the run, so
+/// when the plan may run an installer package (which gets a read-write prefix in the installer sandbox) the app is
+/// marked BEFORE that choice: an archive package's `reg.exe` after the installer package is then sandboxed (or,
+/// without bwrap, refused) instead of running through a launcher chosen while the app was unmarked. The download
+/// cache is a file here, so nothing can ever be downloaded (the fetch fails on it first).
+#[test]
+fn deps_install_marks_the_app_before_choosing_the_helper_launcher_when_an_installer_package_may_run() {
+    let r = rig();
+    let id = install_msvcp140(&r); // plan: vcrun2022, an installer package
+    let marker = r.apps().join(&id).join("ran-sandboxed");
+    assert!(!marker.exists());
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+
+    // Without bwrap: marked, so the helper launcher refuses before anything is fetched or run.
+    let before = r.calls();
+    let o = no_bwrap(&r).args(["deps", &id, "--install"]).output().unwrap();
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("has run in the sandbox") && err.contains("must run sandboxed too") && err.contains("bwrap"),
+        "{err}"
+    );
+    assert!(marker.is_file(), "marked before the launcher was chosen");
+    assert_eq!(r.calls(), before, "nothing ran");
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
+
+    // With bwrap: the launcher chosen for the run's archive packages is the app sandbox (the marker is there).
+    fake_bwrap(&r);
+    let o = r.rt(&["deps", &id, "--install"]);
+    assert!(!s(&o.stderr).contains("must run sandboxed too"), "{}", s(&o.stderr));
+    assert!(marker.is_file());
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
+}
+
+/// An archive-only plan on a never-sandboxed app writes no marker: its `reg.exe` runs like any Wine helper, the
+/// documented residual for apps no sandboxed code has touched.
+#[test]
+fn deps_install_of_archive_packages_only_does_not_mark_the_app() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r); // plan: dxvk, an archive package
+    fs::write(r.data.join("deps-cache"), b"not a directory").unwrap();
+    let _ = r.rt(&["deps", &id, "--install"]);
+    assert!(!r.apps().join(&id).join("ran-sandboxed").exists());
+}
+
+/// The mark fails closed: when it cannot be written, nothing is fetched or installed.
+#[test]
+fn deps_install_refuses_when_the_marker_cannot_be_written() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+    let root = r.apps().join(&id);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = r.rt(&["deps", &id, "--install"]);
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = assert_fails(&o);
+    assert!(
+        err.contains("cannot record") && err.contains("nothing was installed"),
+        "{err}"
+    );
+    assert!(!root.join("ran-sandboxed").exists());
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        b"not a directory",
+        "a download was attempted"
+    );
 }
