@@ -692,6 +692,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-api"
+version = "0.0.1"
+dependencies = [
+ "runtime-core",
+ "runtime-deps",
+ "runtime-installer",
+ "runtime-sandbox",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "runtime-backend-wine"
 version = "0.0.1"
 dependencies = [
@@ -707,6 +722,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "libc",
+ "runtime-api",
  "runtime-backend-wine",
  "runtime-core",
  "runtime-deps",

@@ -249,6 +249,26 @@ pub struct GrantCtx {
 }
 
 impl GrantCtx {
+    /// The context of this process: `$HOME` (absolute, or an error: nothing can be called private without it),
+    /// the account's own home, the runtime data directory and `$XDG_RUNTIME_DIR`. The CLI and the API share it.
+    pub fn from_env() -> Result<GrantCtx, String> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute())
+            .ok_or("HOME is not set to an absolute path: cannot tell which directories are private")?;
+        // `$HOME` is the caller's word: the account's real home (password database) is protected too.
+        let extra_homes = account_home().into_iter().filter(|h| *h != home).collect();
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute());
+        Ok(GrantCtx {
+            home,
+            extra_homes,
+            data_root: rt_core::data_root().map_err(|e| e.to_string())?,
+            runtime_dir,
+        })
+    }
+
     fn homes(&self) -> impl Iterator<Item = &PathBuf> {
         std::iter::once(&self.home).chain(&self.extra_homes)
     }

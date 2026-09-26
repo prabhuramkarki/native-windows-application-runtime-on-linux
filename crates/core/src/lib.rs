@@ -44,6 +44,6 @@ pub use run::{
     find_target, resolve_program, run, start,
 };
 pub use store::{AppEnv, ListEntry, Store, StoreError, StoreWarn, unique_id};
-pub use text::is_format;
+pub use text::{clean as clean_text, is_format};
 pub use unzip::{NameError, ZipError};
 pub use winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};

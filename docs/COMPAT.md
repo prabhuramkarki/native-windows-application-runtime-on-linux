@@ -1,6 +1,6 @@
 # Compatibility matrix
 
-<!-- Generated from crates/cli/compat.toml; do not edit by hand. Regenerate with:
+<!-- Generated from crates/api/compat.toml; do not edit by hand. Regenerate with:
      cargo run -q -p runtime-cli -- compat > docs/COMPAT.md -->
 
 Each row is something that was really run: `ci:<job>` is a CI job run that passed, `manual:<date>` was run by

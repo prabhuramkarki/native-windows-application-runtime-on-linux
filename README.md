@@ -148,7 +148,7 @@ create a Vulkan instance. x86_64 only, like the bundled DXVK (32-bit Direct3D st
 
 `runtime compat [--json]` prints the compatibility matrix: only what was really run (a CI job or a dated manual
 check), on which Wine, with what result; it needs no Wine, store or network. The same table is
-[docs/COMPAT.md](docs/COMPAT.md), generated from `crates/cli/compat.toml` (a test fails when they differ;
+[docs/COMPAT.md](docs/COMPAT.md), generated from `crates/api/compat.toml` (a test fails when they differ;
 regenerate with `cargo run -q -p runtime-cli -- compat > docs/COMPAT.md`).
 
 ## Requirements
