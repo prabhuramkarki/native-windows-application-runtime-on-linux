@@ -6,8 +6,8 @@
 //! Anything but a clean, in-budget run is `None`, which the verdict turns into "unknown": it never blocks.
 //!
 //! **Caching.** [`host`] probes once per process: right for one CLI invocation. A long-lived process (the daemon)
-//! uses [`Cached`] instead, which probes again once its result is older than a bound, so a GPU or driver change is
-//! seen without a restart.
+//! uses [`rt_core::Cached`] with [`probe`] instead, which probes again once its result is older than a bound, so a
+//! GPU or driver change is seen without a restart.
 use rt_core::doctor::{FsProbe, HostFs, VULKAN_DIRS};
 use rt_core::{HostVulkan, VulkanVerdict, host_verdict, probe_host};
 use std::ffi::OsStr;
@@ -133,7 +133,7 @@ fn run_tool(program: &OsStr, timeout: Duration) -> Option<String> {
 }
 
 /// The host's Vulkan, probed on first use and then shared for the life of the process, so one CLI invocation runs
-/// `vulkaninfo` at most once. A long-lived process uses [`Cached`].
+/// `vulkaninfo` at most once. A long-lived process uses [`rt_core::Cached`].
 pub fn host() -> &'static HostVulkan {
     static HOST: OnceLock<HostVulkan> = OnceLock::new();
     HOST.get_or_init(probe)
@@ -161,35 +161,6 @@ pub fn probe() -> HostVulkan {
             .any(|d| HostFs.exists(&Path::new(d).join("libvulkan.so.1")))
     });
     probe_host(&run_vulkaninfo, loader)
-}
-
-/// A probe result reused for at most `ttl`, then probed again. The lock is held while probing, so concurrent callers
-/// share one probe instead of starting one each.
-pub struct Cached<T> {
-    ttl: Duration,
-    slot: Mutex<Option<(Instant, Arc<T>)>>,
-}
-
-impl<T> Cached<T> {
-    pub const fn new(ttl: Duration) -> Cached<T> {
-        Cached {
-            ttl,
-            slot: Mutex::new(None),
-        }
-    }
-
-    /// The value probed at most `ttl` before `now`, or a fresh `probe()`.
-    pub fn get_at(&self, now: Instant, probe: impl FnOnce() -> T) -> Arc<T> {
-        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((at, v)) = &*slot
-            && now.saturating_duration_since(*at) < self.ttl
-        {
-            return v.clone();
-        }
-        let v = Arc::new(probe());
-        *slot = Some((now, v.clone()));
-        v
-    }
 }
 
 #[cfg(test)]
@@ -225,28 +196,6 @@ mod tests {
             assert_eq!(o(v), None, "{v:?}");
         }
         assert_eq!(loader_override(None), None);
-    }
-
-    #[test]
-    fn a_cached_probe_is_reused_within_its_ttl_and_redone_after() {
-        let c = Cached::new(Duration::from_secs(30));
-        let t0 = Instant::now();
-        let runs = std::cell::Cell::new(0);
-        let probe = || {
-            runs.set(runs.get() + 1);
-            runs.get()
-        };
-        assert_eq!(*c.get_at(t0, probe), 1);
-        assert_eq!(*c.get_at(t0 + Duration::from_secs(29), probe), 1, "within the ttl");
-        assert_eq!(
-            *c.get_at(t0 + Duration::from_secs(30), probe),
-            2,
-            "expired: probed again"
-        );
-        assert_eq!(*c.get_at(t0 + Duration::from_secs(31), probe), 2);
-        // a clock that went backwards is not "expired"
-        assert_eq!(*c.get_at(t0, probe), 2);
-        assert_eq!(runs.get(), 2);
     }
 
     #[test]

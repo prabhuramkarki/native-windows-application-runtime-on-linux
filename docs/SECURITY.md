@@ -786,7 +786,7 @@ without a scope, prints `note: resource limits unavailable: <why>`, and `doctor`
 (including `tasks = 4096`, the default's own value) is a request and fails closed: if the scope cannot be created
 with every controller it needs, the run is refused with the reason and the way out (`runtime permissions <app>
 --set memory=off --set cpu=off --set tasks=default`, or start the app from a desktop/user session); `doctor` says
-"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command (a throwaway scope,
+"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command, its answer kept 30 s (a throwaway scope,
 5 s at most, the same options and only `PATH` and `XDG_RUNTIME_DIR` in its environment, like the real command); the
 probe reads which controllers the user manager offers its scopes.
 
