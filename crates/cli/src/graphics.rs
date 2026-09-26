@@ -5,11 +5,7 @@ use crate::safe::safe;
 use rt_core::{HostVulkan, VulkanVerdict, host_verdict};
 
 pub fn info() -> Result<u8, CmdError> {
-    let needs: Vec<(&str, (u32, u32))> = rt_deps::Manifest::bundled()
-        .packages
-        .iter()
-        .filter_map(|p| Some((p.id.as_str(), p.min_vulkan?)))
-        .collect();
+    let needs = rt_api::host::graphics::bundled_needs();
     crate::emit(&format_info(rt_api::host::graphics::host(), &needs))?;
     Ok(0)
 }

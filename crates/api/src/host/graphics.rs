@@ -153,6 +153,15 @@ fn loader_override(v: Option<&OsStr>) -> Option<bool> {
     }
 }
 
+/// Each bundled package's minimum Vulkan version (what `runtime graphics info` reports against).
+pub fn bundled_needs() -> Vec<(&'static str, (u32, u32))> {
+    rt_deps::Manifest::bundled()
+        .packages
+        .iter()
+        .filter_map(|p| Some((p.id.as_str(), p.min_vulkan?)))
+        .collect()
+}
+
 /// Probes the host now: the loader (or the override) and a bounded `vulkaninfo` run.
 pub fn probe() -> HostVulkan {
     let loader = loader_override(std::env::var_os("RUNTIME_VULKAN_LOADER").as_deref()).unwrap_or_else(|| {

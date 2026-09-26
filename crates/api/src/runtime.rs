@@ -1,4 +1,5 @@
-//! [`Runtime`]: the read-only methods. Nothing here writes, locks or spawns; everything read is untrusted.
+//! [`Runtime`]: the read-only methods. Nothing here writes or locks; everything read is untrusted. The methods
+//! that gather host facts (and start the bounded host probes) are in [`crate::methods`].
 use crate::error::{ApiError, ErrorKind};
 use crate::types::*;
 use crate::{API_VERSION, PROTOCOL};
@@ -6,10 +7,14 @@ use rt_core::{AppEnv, AppId, Store, StoreError};
 use rt_sandbox::{GrantCtx, load_opt};
 
 pub struct Runtime {
-    store: Store,
+    pub(crate) store: Store,
+    /// The host's Vulkan, probed at most once per `methods::PROBE_TTL`.
+    pub(crate) vulkan: rt_core::Cached<rt_core::HostVulkan>,
+    /// How the host's Vulkan is probed (tests inject one).
+    pub(crate) vulkan_probe: fn() -> rt_core::HostVulkan,
 }
 
-fn unavailable(e: impl std::fmt::Display) -> ApiError {
+pub(crate) fn unavailable(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorKind::Unavailable, e.to_string())
 }
 
@@ -21,7 +26,11 @@ impl Runtime {
     }
 
     pub fn with_store(store: Store) -> Runtime {
-        Runtime { store }
+        Runtime {
+            store,
+            vulkan: rt_core::Cached::new(crate::methods::PROBE_TTL),
+            vulkan_probe: crate::host::graphics::probe,
+        }
     }
 
     pub fn version(&self) -> VersionInfo {
@@ -47,7 +56,7 @@ impl Runtime {
 
     /// `id` must be a valid `AppId` (`invalid_argument`) naming an installed app (`not_found`) whose metadata
     /// reads (`unavailable`).
-    fn env(&self, id: &str) -> Result<AppEnv, ApiError> {
+    pub(crate) fn env(&self, id: &str) -> Result<AppEnv, ApiError> {
         let id = AppId::parse(id)
             .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("not a valid app id: {e}")))?;
         self.store.get(&id).map_err(|e| match e {
@@ -538,7 +547,18 @@ mod tests {
 
     #[test]
     fn no_string_anywhere_holds_an_invisible_character() {
-        let (d, rt) = rt();
+        let (d, mut rt) = rt();
+        // A hostile GPU: names from `vulkaninfo` are host text we do not control.
+        rt.vulkan_probe = || rt_core::HostVulkan {
+            tool_found: true,
+            loader_found: true,
+            devices: vec![rt_core::VulkanDevice {
+                name: HOSTILE.into(),
+                device_type: HOSTILE.into(),
+                api: (1, 3),
+                driver: HOSTILE.into(),
+            }],
+        };
         let hostile_installer = InstallerMeta {
             family: HOSTILE.into(),
             product_name: Some(HOSTILE.into()),
@@ -607,6 +627,15 @@ mod tests {
             );
         }
         walk(&serde_json::to_value(rt.compat()).unwrap(), "compat");
+        walk(&serde_json::to_value(rt.graphics_info()).unwrap(), "graphics");
+        // h1's executable path is hostile and missing: the plan's warning quotes it.
+        let plan = rt.deps_plan("h1").unwrap();
+        assert!(plan.warnings.iter().any(|w| w.contains("cannot read")), "{plan:?}");
+        for id in ["h1", "plain", "g"] {
+            walk(&serde_json::to_value(rt.deps_plan(id).unwrap()).unwrap(), id);
+        }
+        // doctor and sandbox_info probe the host (Wine, bwrap, systemd-run): their guard runs in the CLI's rig
+        // (`crates/cli/tests/apps.rs`, `api_*`), in a child process with the rig's environment.
         for e in [
             rt.app(HOSTILE).unwrap_err(),
             rt.app("nope").unwrap_err(),

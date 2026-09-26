@@ -216,7 +216,7 @@ impl Facts {
                     Pe::Unreadable(why) => Err(why.as_str()),
                     Pe::Skipped | Pe::Archive => Err("not a PE file"),
                 };
-                let mut plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled(), &vulkan);
+                let mut plan = rt_deps::plan_for_pe(&p.metadata, exe, rt_deps::Manifest::bundled(), vulkan);
                 rt_deps::drop_present_installers(&p.env, rt_deps::Manifest::bundled(), &mut plan);
                 let d3d_routes = match &pe {
                     Pe::Analysed(info) => Some(d3d_routes(id.as_str(), info, &plan, vulkan)),

@@ -4375,3 +4375,405 @@ fn host_fact_reports_match_the_golden_transcript() {
         );
     }
 }
+
+// ================================================================ the API over the same rig: rt_api::Runtime
+
+/// Not a test of its own: the API side of the `api_*` tests. It does nothing unless `RT_API_CALL` is set; the
+/// tests below run this test binary again, with the rig's environment and only this test, so `Runtime::open()`
+/// sees exactly what the `runtime` process sees. Prints the result (`{"Ok": ...}` or `{"Err": ...}`) as JSON
+/// between markers.
+#[test]
+fn api_child() {
+    let Some(call) = std::env::var_os("RT_API_CALL") else {
+        return;
+    };
+    let rt = rt_api::Runtime::open().unwrap();
+    let arg = std::env::var("RT_API_ARG").ok();
+    let v = match call.to_str().unwrap() {
+        "doctor" => serde_json::to_value(rt.doctor(match arg {
+            None => rt_api::DoctorTarget::System,
+            Some(a) => rt_api::DoctorTarget::App(a),
+        })),
+        "graphics" => serde_json::to_value(Ok::<_, ()>(rt.graphics_info())),
+        "sandbox" => serde_json::to_value(rt.sandbox_info(&arg.unwrap())),
+        "deps" => serde_json::to_value(rt.deps_plan(&arg.unwrap())),
+        other => panic!("unknown RT_API_CALL {other}"),
+    };
+    println!("@@API@@{}@@API@@", v.unwrap());
+}
+
+/// Runs `api_child` with the environment `rig_cmd` would give `runtime`: the API's answer to `call` (`arg`).
+fn api(rig_cmd: &Command, call: &str, arg: Option<&str>) -> Result<serde_json::Value, serde_json::Value> {
+    let mut c = Command::new(std::env::current_exe().unwrap());
+    c.env_clear()
+        .args(["--exact", "api_child", "--nocapture", "--test-threads=1"]);
+    for (k, v) in rig_cmd.get_envs() {
+        if let Some(v) = v {
+            c.env(k, v);
+        }
+    }
+    c.env("RT_API_CALL", call);
+    if let Some(a) = arg {
+        c.env("RT_API_ARG", a);
+    }
+    let o = c.stdin(Stdio::null()).output().unwrap();
+    let out = s(&o.stdout);
+    let json = out
+        .split("@@API@@")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no API answer: {out}\n{}", s(&o.stderr)));
+    let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+    if let Some(ok) = v.get_mut("Ok") {
+        return Ok(ok.take());
+    }
+    Err(v
+        .get_mut("Err")
+        .unwrap_or_else(|| panic!("neither Ok nor Err: {json}"))
+        .take())
+}
+
+/// No control or format character in any string (keys too): the API's sanitise-everything rule.
+fn assert_clean_json(v: &serde_json::Value, at: &str) {
+    let clean = |s: &str| !s.chars().any(|c| c.is_control() || rt_core::is_format(c));
+    match v {
+        serde_json::Value::String(t) => assert!(clean(t), "{at}: {t:?}"),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| assert_clean_json(x, at)),
+        serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+            assert!(clean(k), "{at}: key {k:?}");
+            assert_clean_json(x, &format!("{at}.{k}"));
+        }),
+        _ => {}
+    }
+}
+
+/// The `(area, status, text)` triples of a doctor JSON (the CLI's or the API's), texts cleaned like the API's.
+fn triples(v: &serde_json::Value) -> Vec<(String, String, String)> {
+    v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["area"].as_str().unwrap().to_owned(),
+                c["status"].as_str().unwrap().to_owned(),
+                rt_core::clean_text(c["text"].as_str().unwrap(), rt_api::LONG_MAX),
+            )
+        })
+        .collect()
+}
+
+/// `doctor [<id>] --json` through the CLI and `Runtime::doctor` through the API agree: verdict, subject id and
+/// every triple; the hint's count too. Nothing is written by the API call.
+fn doctor_agrees(r: &Rig, cmd: impl Fn() -> Command, id: Option<&str>) -> serde_json::Value {
+    let mut c = cmd();
+    c.arg("doctor").args(id).arg("--json");
+    let o = c.output().unwrap();
+    let cli = json(&o);
+    let before = snapshot(r);
+    let api = api(&cmd(), "doctor", id).unwrap_or_else(|e| panic!("{id:?}: {e}"));
+    assert_eq!(snapshot(r), before, "the API's doctor wrote something");
+    assert_clean_json(&api, "doctor");
+    assert_eq!(api["verdict"], cli["verdict"], "{id:?}");
+    assert_eq!(api["subject"]["kind"], cli["subject"]["kind"]);
+    assert_eq!(api["subject"]["id"], cli["subject"]["id"]);
+    assert_eq!(triples(&api), triples(&cli), "{id:?}");
+    let hint = s(&o.stderr)
+        .lines()
+        .find_map(|l| l.strip_prefix("hint: ")?.split(' ').next()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert_eq!(api["missingDependencies"], hint, "{id:?}: {}", s(&o.stderr));
+    api
+}
+
+#[test]
+fn api_doctor_equals_the_cli_json_on_every_rig_state() {
+    let r = rig();
+    // Sandbox unavailable first (no bwrap anywhere on PATH): the check is a warning in both.
+    r.wine_dlls(&["kernel32.dll", "msvcrt.dll", "d3d11.dll", "winepulse.drv"]);
+    let no_bwrap = || {
+        let mut c = r.desktop();
+        c.env("PATH", &r.bin);
+        c
+    };
+    let v = doctor_agrees(&r, no_bwrap, None);
+    assert!(
+        triples(&v)
+            .iter()
+            .any(|t| t.1 == "warn" && t.2.contains("bwrap is not on PATH")),
+        "{v}"
+    );
+    let ids = golden_rig(&r);
+    doctor_agrees(&r, no_bwrap, Some(&ids[0]));
+    fake_bwrap(&r);
+    let desktop = || r.desktop();
+    doctor_agrees(&r, desktop, None);
+    // native, d3d11, managed without and with Mono, 32-bit, missing exe, symlinked drive_c, hostile name
+    let mut verdicts = vec![];
+    for id in &ids {
+        let v = doctor_agrees(&r, desktop, Some(id));
+        verdicts.push(v["verdict"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(verdicts[5..], ["fail", "fail", "fail"], "{verdicts:?}");
+    let mono = doctor_agrees(&r, desktop, Some(&ids[3]));
+    assert!(
+        triples(&mono)
+            .iter()
+            .any(|t| t.2.contains("Wine Mono 9.4.0 is recorded")),
+        "{mono}"
+    );
+    let without = doctor_agrees(&r, desktop, Some(&ids[2]));
+    assert!(
+        triples(&without).iter().any(|t| t.1 == "warn" && t.2.contains(".NET")),
+        "{without}"
+    );
+    // The d3d11 app's plan has DXVK to install: the CLI's hint, the API's count (compared in `doctor_agrees`).
+    assert_eq!(doctor_agrees(&r, desktop, Some(&ids[1]))["missingDependencies"], 1);
+    // The hostile name is cleaned, not escaped.
+    let evil = doctor_agrees(&r, desktop, Some("evil"));
+    assert_eq!(evil["subject"]["name"], "Evil]0;pwned[2J name");
+    // Wine missing: a failing check with the install hint, in both.
+    let no_wine = || {
+        let mut c = r.desktop();
+        c.env("RUNTIME_WINE", r.root.join("no-such-wine"));
+        c
+    };
+    let v = doctor_agrees(&r, no_wine, Some(&ids[0]));
+    assert!(
+        triples(&v)
+            .iter()
+            .any(|t| t.1 == "fail" && t.2.contains("RUNTIME_WINE")),
+        "{v}"
+    );
+    let empty = r.root.join("emptybin");
+    fs::create_dir_all(&empty).unwrap();
+    let no_wine_at_all = || {
+        let mut c = r.desktop();
+        c.env_remove("RUNTIME_WINE")
+            .env_remove("RUNTIME_WINESERVER")
+            .env("PATH", &empty);
+        c
+    };
+    let v = doctor_agrees(&r, no_wine_at_all, None);
+    assert!(
+        triples(&v)
+            .iter()
+            .any(|t| t.1 == "fail" && t.2.contains("sudo apt install wine")),
+        "{v}"
+    );
+    // Vulkan absent through the loader override: the D3D route fails in both.
+    let no_vulkan = || {
+        let mut c = r.desktop();
+        c.env("RUNTIME_VULKAN_LOADER", "absent");
+        c
+    };
+    doctor_agrees(&r, no_vulkan, Some(&ids[1]));
+    // An unknown or invalid id: the kinds, where the CLI fails.
+    let e = api(&r.desktop(), "doctor", Some("nothing")).unwrap_err();
+    assert_eq!(e["kind"], "not_found");
+    let e = api(&r.desktop(), "doctor", Some("../x")).unwrap_err();
+    assert_eq!(e["kind"], "invalid_argument");
+}
+
+#[test]
+fn api_doctor_never_passes_a_hostile_import_name_on() {
+    let r = rig();
+    r.wine_dlls(&["kernel32.dll"]); // the hostile import is then "not found" and named in the check
+    let (id, _) = install_patched(&r, b"msvcrt.dll\0", b"\x1b[2Jq\x07.dll\0");
+    let v = doctor_agrees(&r, || r.desktop(), Some(&id));
+    let line = triples(&v)
+        .into_iter()
+        .find(|t| t.0 == "imports" && t.1 == "warn")
+        .unwrap_or_else(|| panic!("no missing-import check: {v}"));
+    assert!(line.2.contains("[2Jq") && line.2.contains(".dll"), "{line:?}");
+}
+
+#[test]
+fn api_deps_plan_equals_the_cli_plan() {
+    let r = rig();
+    let ids = golden_rig(&r);
+    for (id, loader) in ids
+        .iter()
+        .map(|i| (i.as_str(), "present"))
+        .chain([(ids[1].as_str(), "absent")])
+    {
+        let mut c = r.cmd();
+        c.env("RUNTIME_VULKAN_LOADER", loader);
+        let cli = s(&r
+            .cmd()
+            .env("RUNTIME_VULKAN_LOADER", loader)
+            .args(["deps", id])
+            .output()
+            .unwrap()
+            .stdout);
+        let before = snapshot(&r);
+        let v = api(&c, "deps", Some(id)).unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert_eq!(snapshot(&r), before, "deps_plan wrote something");
+        assert_clean_json(&v, "deps");
+        let entries: Vec<&str> = cli
+            .lines()
+            .filter(|l| l.starts_with("  ") && l.contains("): "))
+            .collect();
+        let api_entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), api_entries.len(), "{id}: {cli}\n{v}");
+        for (line, e) in entries.iter().zip(api_entries) {
+            let what = match (e["action"].as_str().unwrap(), e["consent"].as_str().unwrap()) {
+                ("install", "needed") => "to install, needs your consent".to_owned(),
+                ("install", _) => "to install".to_owned(),
+                ("alreadyInstalled", _) => rt_deps::ALREADY_INSTALLED.to_owned(),
+                ("blocked", _) => format!("blocked: {}", e["blockedReason"].as_str().unwrap()),
+                other => panic!("{other:?}"),
+            };
+            let head = format!(
+                "  {} {} (",
+                e["package"].as_str().unwrap(),
+                e["version"].as_str().unwrap()
+            );
+            assert!(
+                line.starts_with(&head) && line.ends_with(&format!("): {what}")),
+                "{line} vs {e}"
+            );
+        }
+        let warnings: Vec<&str> = cli.lines().filter_map(|l| l.strip_prefix("warning: ")).collect();
+        assert_eq!(serde_json::json!(warnings), v["warnings"], "{id}");
+    }
+    let blocked = api(r.cmd().env("RUNTIME_VULKAN_LOADER", "absent"), "deps", Some(&ids[1])).unwrap();
+    assert_eq!(blocked["entries"][0]["action"], "blocked");
+}
+
+#[test]
+fn api_sandbox_info_equals_runtime_sandbox_and_fails_closed() {
+    let r = rig();
+    let id = r.install();
+    let home = r.grants.path().canonicalize().unwrap();
+    // No bwrap on PATH (the rig's bin/ only): unavailable, with the reason `runtime sandbox` prints.
+    let mut c = r.cmd();
+    c.env("PATH", &r.bin);
+    let cli = s(&no_bwrap(&r).args(["sandbox", &id]).output().unwrap().stdout);
+    let v = api(&c, "sandbox", Some(&id)).unwrap();
+    assert_eq!(
+        v["bwrap"],
+        serde_json::json!({"state": "unavailable", "reason": "bwrap is not on PATH"})
+    );
+    assert!(
+        cli.starts_with("bubblewrap: UNAVAILABLE: bwrap is not on PATH"),
+        "{cli}"
+    );
+    // With a (fake) bwrap: the view is the CLI's report, line for line.
+    fake_bwrap(&r);
+    let before = snapshot(&r);
+    let v = api(&r.cmd(), "sandbox", Some(&id)).unwrap();
+    assert_eq!(snapshot(&r), before, "sandbox_info wrote something");
+    assert_clean_json(&v, "sandbox");
+    let cli = s(&r.rt(&["sandbox", &id]).stdout);
+    assert_eq!(v["bwrap"]["state"], "available");
+    assert_eq!(v["wine"]["state"], "available");
+    assert_eq!(v["limits"]["state"], "available");
+    assert_eq!(
+        v["cgroupControllers"],
+        serde_json::json!(["cpu", "io", "memory", "pids"])
+    );
+    assert_eq!(v["profile"]["source"], "default");
+    let lines = |p: &str| -> Vec<String> {
+        cli.lines()
+            .filter_map(|l| l.strip_prefix(p))
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(serde_json::json!(lines("skipped: ")), v["skipped"]);
+    let notes = lines("note: ");
+    assert_eq!(serde_json::json!(notes), v["caveats"], "{cli}");
+    assert_eq!(lines("seccomp: ").len() + lines("landlock: ").len(), 2);
+    // The shim is the calling process's own executable: here the test binary, for `runtime` the runtime.
+    let me = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let quoted: Vec<String> = v["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            let a = a
+                .as_str()
+                .unwrap()
+                .replace(me.to_str().unwrap(), runtime_exe().to_str().unwrap());
+            format!("'{}'", a.replace('\'', r"'\''"))
+        })
+        .collect();
+    assert_eq!(lines("command: "), [quoted.join(" ")]);
+    // Wine missing: part of the answer, with the install hint; the command keeps its shape.
+    let mut c = r.cmd();
+    c.env("RUNTIME_WINE", r.root.join("no-such-wine"));
+    let v = api(&c, "sandbox", Some(&id)).unwrap();
+    assert_eq!(v["wine"]["state"], "unavailable");
+    assert!(v["wine"]["reason"].as_str().unwrap().contains("RUNTIME_WINE"), "{v}");
+    // An invalid profile: an error, never the default.
+    fs::write(r.apps().join(&id).join("permissions.toml"), "version = 1\nbogus = 1\n").unwrap();
+    let mut c = r.cmd();
+    c.env("HOME", &home);
+    let e = api(&c, "sandbox", Some(&id)).unwrap_err();
+    assert_eq!(e["kind"], "unavailable");
+    assert!(
+        e["message"].as_str().unwrap().contains("permissions.toml is refused"),
+        "{e}"
+    );
+    assert_fails(&r.cmd().env("HOME", &home).args(["sandbox", &id]).output().unwrap());
+}
+
+#[test]
+fn api_sandbox_info_cleans_a_hostile_data_dir_path_in_the_command() {
+    let r = rig();
+    fake_bwrap(&r);
+    let data = r.root.join("da\nta\u{1b}[2J\u{202e}x");
+    let p = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    assert_ok(
+        &r.cmd()
+            .env("RUNTIME_DATA_DIR", &data)
+            .arg("install")
+            .arg(&p)
+            .output()
+            .unwrap(),
+    );
+    let mut c = r.cmd();
+    c.env("RUNTIME_DATA_DIR", &data);
+    let v = api(&c, "sandbox", Some("runtime-fixture")).unwrap();
+    assert_clean_json(&v, "sandbox");
+    let cmd = v["command"].as_array().unwrap();
+    assert!(cmd.iter().any(|a| a.as_str().unwrap().contains("data[2Jx")), "{v}");
+}
+
+#[test]
+fn api_graphics_info_follows_the_loader_override_like_graphics_info() {
+    let r = rig();
+    let v = api(&r.cmd(), "graphics", None).unwrap();
+    let cli = s(&r.rt(&["graphics", "info"]).stdout);
+    assert_eq!(
+        (v["verdict"].as_str(), v["loader"].as_bool()),
+        (Some("usable"), Some(true))
+    );
+    assert!(cli.starts_with("Vulkan: usable\n"), "{cli}");
+    assert_eq!(v["devices"][0]["api"], "1.3");
+    for p in v["perPackage"].as_array().unwrap() {
+        let line = format!(
+            "  {} {}+: met",
+            p["id"].as_str().unwrap(),
+            p["minVulkan"].as_str().unwrap()
+        );
+        assert!(p["ok"] == true && cli.contains(&line), "{line} in {cli}");
+    }
+    let mut c = r.cmd();
+    c.env("RUNTIME_VULKAN_LOADER", "absent");
+    let v = api(&c, "graphics", None).unwrap();
+    let cli = s(&r
+        .cmd()
+        .env("RUNTIME_VULKAN_LOADER", "absent")
+        .args(["graphics", "info"])
+        .output()
+        .unwrap()
+        .stdout);
+    assert_eq!(
+        (v["verdict"].as_str(), v["loader"].as_bool(), v["toolFound"].as_bool()),
+        (Some("unusable"), Some(false), Some(false))
+    );
+    assert!(
+        cli.starts_with("Vulkan: unusable") && cli.contains(v["reason"].as_str().unwrap()),
+        "{cli}\n{v}"
+    );
+}

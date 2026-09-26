@@ -4,7 +4,9 @@
 //!
 //! Cleaning is LOSSY: removed characters can make two different values display identically (an escaped form
 //! may follow). Adding a string field to any type here requires covering it in the `no_string_anywhere_holds_an_
-//! invisible_character` test in `runtime.rs`, which walks every serialised string, keys included.
+//! invisible_character` test in `runtime.rs`, which walks every serialised string, keys included (the views of
+//! `doctor` and `sandbox_info`, which probe the host, are walked by the `api_*` tests of `crates/cli/tests/apps.rs`
+//! over the CLI's fake-Wine rig).
 use rt_core::{AppEnv, DependencyRecord, InstallerMeta, Metadata, clean_text};
 use rt_sandbox::{Access, Network, Permissions, Tasks};
 use serde::{Deserialize, Serialize};
@@ -301,4 +303,333 @@ impl CompatRecord {
 #[serde(rename_all = "camelCase")]
 pub struct CompatView {
     pub records: Vec<CompatRecord>,
+}
+
+// ------------------------------------------------------------------------------------------------ doctor
+
+/// What `doctor` checks: the system only, or an installed app too. (A file that is not installed is the CLI's
+/// `doctor <file>` only: it reads an arbitrary user-supplied path.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DoctorTarget {
+    System,
+    App(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum SubjectView {
+    System,
+    App {
+        id: String,
+        name: Option<String>,
+        version: Option<String>,
+    },
+}
+
+/// One check: `area` (`architecture`, `pe`, `imports`, `graphics`, `audio`, `runtime`, `prefix`, `program`) and
+/// `status` (`ok`, `warn`, `fail`) are stable, the same strings `doctor --json` prints; `text` is prose for people,
+/// not a stable API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckView {
+    pub area: String,
+    pub status: String,
+    pub text: String,
+}
+
+/// `doctor`'s report: `verdict` is `good`, `may_fail` or `fail` (stable, as `doctor --json`). `missing_dependencies`
+/// counts what `runtime deps <app> --install` would install (the CLI's hint); `notes` name installer packages
+/// already in the prefix that the runtime did not install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorView {
+    pub subject: SubjectView,
+    pub verdict: String,
+    pub checks: Vec<CheckView>,
+    pub missing_dependencies: usize,
+    pub notes: Vec<String>,
+}
+
+impl DoctorView {
+    pub(crate) fn from_report(r: &rt_core::doctor::Report, plan: Option<&rt_deps::AppPlan>) -> DoctorView {
+        use crate::host::doctor::{area_id, status_id, verdict_id};
+        use rt_core::doctor::Subject;
+        DoctorView {
+            subject: match &r.subject {
+                Subject::App { id, name, version } => SubjectView::App {
+                    id: text(id),
+                    name: name.as_deref().map(text),
+                    version: version.as_deref().map(text),
+                },
+                // A file subject is never built through the API.
+                Subject::System | Subject::File { .. } => SubjectView::System,
+            },
+            verdict: verdict_id(r.verdict).to_owned(),
+            checks: r
+                .checks
+                .iter()
+                .map(|c| CheckView {
+                    area: area_id(c.area).to_owned(),
+                    status: status_id(c.status).to_owned(),
+                    text: long(&c.text),
+                })
+                .collect(),
+            missing_dependencies: plan.map_or(0, |p| {
+                p.plan
+                    .entries
+                    .iter()
+                    .filter(|e| e.action == rt_deps::Action::Install)
+                    .count()
+            }),
+            notes: plan.map_or_else(Vec::new, |p| {
+                p.warnings
+                    .iter()
+                    .filter(|w| w.ends_with(rt_deps::MARKER_PRESENT))
+                    .map(|w| long(w))
+                    .collect()
+            }),
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ graphics
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuView {
+    pub name: String,
+    /// `vulkaninfo`'s `deviceType` without its prefix: `DISCRETE_GPU`, `INTEGRATED_GPU`, `CPU` (software), ...
+    pub device_type: String,
+    /// `major.minor` of the device's Vulkan API version.
+    pub api: String,
+    pub driver: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum VulkanState {
+    Usable,
+    Unusable,
+    /// The device list could not be read: that never blocks anything.
+    Unknown,
+}
+
+/// A bundled package's minimum Vulkan and whether this host meets it (`None`: unknown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageVulkanView {
+    pub id: String,
+    pub min_vulkan: String,
+    pub ok: Option<bool>,
+}
+
+/// `runtime graphics info`: the Vulkan devices and the verdict against the smallest bundled minimum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphicsView {
+    pub devices: Vec<GpuView>,
+    pub verdict: VulkanState,
+    /// Why it is unusable or unknown.
+    pub reason: Option<String>,
+    pub per_package: Vec<PackageVulkanView>,
+    /// The Vulkan loader (`libvulkan.so.1`) was found.
+    pub loader: bool,
+    /// `vulkaninfo` ran and answered in time.
+    pub tool_found: bool,
+}
+
+impl GraphicsView {
+    pub(crate) fn from_host(h: &rt_core::HostVulkan, needs: &[(&str, (u32, u32))]) -> GraphicsView {
+        use rt_core::{VulkanVerdict, host_verdict};
+        let (verdict, reason) = match host_verdict(h, needs.iter().map(|n| n.1).min()) {
+            VulkanVerdict::Usable => (VulkanState::Usable, None),
+            VulkanVerdict::Unusable(why) => (VulkanState::Unusable, Some(long(&why))),
+            VulkanVerdict::Unknown if !h.tool_found => (
+                VulkanState::Unknown,
+                Some("vulkaninfo is missing, failed or timed out".to_owned()),
+            ),
+            VulkanVerdict::Unknown => (VulkanState::Unknown, Some("vulkaninfo listed no devices".to_owned())),
+        };
+        GraphicsView {
+            devices: h
+                .devices
+                .iter()
+                .map(|d| GpuView {
+                    name: text(&d.name),
+                    device_type: text(
+                        d.device_type
+                            .strip_prefix("PHYSICAL_DEVICE_TYPE_")
+                            .unwrap_or(&d.device_type),
+                    ),
+                    api: format!("{}.{}", d.api.0, d.api.1),
+                    driver: text(&d.driver),
+                })
+                .collect(),
+            verdict,
+            reason,
+            per_package: needs
+                .iter()
+                .map(|(id, (major, minor))| PackageVulkanView {
+                    id: text(id),
+                    min_vulkan: format!("{major}.{minor}"),
+                    ok: match host_verdict(h, Some((*major, *minor))) {
+                        VulkanVerdict::Usable => Some(true),
+                        VulkanVerdict::Unusable(_) => Some(false),
+                        VulkanVerdict::Unknown => None,
+                    },
+                })
+                .collect(),
+            loader: h.loader_found,
+            tool_found: h.tool_found,
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ sandbox
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum Availability {
+    Available,
+    Unavailable { reason: String },
+}
+
+impl Availability {
+    fn of<T>(r: &Result<T, String>) -> Availability {
+        match r {
+            Ok(_) => Availability::Available,
+            Err(why) => Availability::Unavailable { reason: long(why) },
+        }
+    }
+}
+
+/// `runtime sandbox <app>`: what the app's sandbox would be on this host, without running anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxView {
+    /// bubblewrap on `PATH` that can really create a sandbox (`runtime run` refuses without it).
+    pub bwrap: Availability,
+    /// Wine (only used to describe the command; without it the command shows `wine` and no Wine directories).
+    pub wine: Availability,
+    pub profile: PermissionsView,
+    pub seccomp: String,
+    pub landlock: String,
+    /// seccomp and Landlock are both fully there.
+    pub hardening_complete: bool,
+    /// `systemd-run --user` scopes (the resource limits) work here.
+    pub limits: Availability,
+    pub cgroup_controllers: Vec<String>,
+    /// Why the sandbox would refuse this app's command, if it would.
+    pub refused: Option<String>,
+    /// What the host lacks for this profile (left out of the sandbox).
+    pub skipped: Vec<String>,
+    /// What the host or the profile cannot enforce (the hardening caveat first).
+    pub caveats: Vec<String>,
+    /// The command line `runtime run` would start, one argument each.
+    pub command: Vec<String>,
+}
+
+impl SandboxView {
+    pub(crate) fn from_status(st: &crate::host::sandbox::Status, source: PermSource) -> SandboxView {
+        let h = &st.hardening;
+        SandboxView {
+            bwrap: Availability::of(&st.bwrap),
+            wine: Availability::of(&st.wine),
+            profile: PermissionsView::from_profile(&st.profile, source),
+            seccomp: long(&h.seccomp),
+            landlock: long(&h.landlock),
+            hardening_complete: h.complete && h.caveat.is_none(),
+            limits: Availability::of(&st.scopes),
+            cgroup_controllers: st
+                .scopes
+                .as_ref()
+                .map_or_else(|_| vec![], |s| s.controllers.iter().map(|c| text(c)).collect()),
+            refused: st.refused.as_deref().map(long),
+            skipped: st.skipped.iter().map(|s| long(s)).collect(),
+            caveats: h.caveat.iter().chain(&st.caveats).map(|c| long(c)).collect(),
+            command: st
+                .argv
+                .iter()
+                .map(|a| clean_text(&a.to_string_lossy(), PATH_MAX))
+                .collect(),
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ dependency plan
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum PlanAction {
+    Install,
+    AlreadyInstalled,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ConsentView {
+    NotNeeded,
+    Needed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanEntryView {
+    pub package: String,
+    /// The bundled manifest's version of the package (`None`: not in the manifest).
+    pub version: Option<String>,
+    pub action: PlanAction,
+    pub consent: ConsentView,
+    pub blocked_reason: Option<String>,
+}
+
+/// `runtime deps <app>` without `--install`: dependencies first; `unsatisfied` are needed capabilities no bundled
+/// package provides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepsPlanView {
+    pub entries: Vec<PlanEntryView>,
+    pub unsatisfied: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl DepsPlanView {
+    pub(crate) fn from_plan(p: &rt_deps::AppPlan, manifest: &rt_deps::Manifest) -> DepsPlanView {
+        use rt_deps::{Action, ConsentState};
+        DepsPlanView {
+            entries: p
+                .plan
+                .entries
+                .iter()
+                .map(|e| PlanEntryView {
+                    package: text(&e.package),
+                    version: manifest.get(&e.package).map(|m| text(&m.version)),
+                    action: match e.action {
+                        Action::Install => PlanAction::Install,
+                        Action::AlreadyInstalled => PlanAction::AlreadyInstalled,
+                        Action::Blocked { .. } => PlanAction::Blocked,
+                    },
+                    consent: match e.consent {
+                        ConsentState::NotNeeded => ConsentView::NotNeeded,
+                        ConsentState::Needed => ConsentView::Needed,
+                        ConsentState::Denied => ConsentView::Denied,
+                    },
+                    blocked_reason: match &e.action {
+                        Action::Blocked { reason } => Some(long(reason)),
+                        _ => None,
+                    },
+                })
+                .collect(),
+            unsatisfied: p.plan.unsatisfied.iter().map(|u| text(u)).collect(),
+            warnings: p.warnings.iter().map(|w| long(w)).collect(),
+        }
+    }
 }

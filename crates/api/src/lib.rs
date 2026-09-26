@@ -1,5 +1,7 @@
 //! The runtime as a typed, read-only API: what a front end (the `runtimed` daemon, a GUI) may ask, and the
-//! sanitised, serialisable answers. No method changes anything on disk and none starts a process.
+//! sanitised, serialisable answers. No method changes anything on disk; the only processes any method starts are
+//! the bounded host probes of [`methods`] (`vulkaninfo`, bwrap's probe, the `systemd-run` scope probe,
+//! `wine --version`). [`host`] is the gathering code those methods share with the CLI (not a stable API).
 //!
 //! Everything read from an app's directory is untrusted, so every free-text field in [`types`] is cleaned at the
 //! boundary (control and format characters removed, length bounded) and ids are validated `AppId`s. Failures are
@@ -7,6 +9,7 @@
 pub mod compat;
 pub mod error;
 pub mod host;
+pub mod methods;
 pub mod runtime;
 pub mod types;
 
