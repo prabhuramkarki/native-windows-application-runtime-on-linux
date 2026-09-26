@@ -104,7 +104,7 @@ impl Reply {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("request line longer than {MAX_FRAME} bytes")]
+    #[error("line longer than the cap")]
     TooLarge,
     #[error("read failed: {0}")]
     Io(#[from] std::io::Error),
@@ -113,6 +113,11 @@ pub enum FrameError {
 /// The next line without its `\n`; `None` at a clean end of stream. Holds at most `MAX_FRAME` bytes of the line
 /// (plus `r`'s own buffer): one byte more and it is [`FrameError::TooLarge`].
 pub fn read_frame<R: std::io::BufRead>(r: &mut R) -> Result<Option<Vec<u8>>, FrameError> {
+    read_frame_max(r, MAX_FRAME)
+}
+
+/// [`read_frame`] with the cap `max` instead of [`MAX_FRAME`] (the client reads replies, which may be longer).
+pub fn read_frame_max<R: std::io::BufRead>(r: &mut R, max: usize) -> Result<Option<Vec<u8>>, FrameError> {
     let mut line = Vec::new();
     loop {
         let buf = r.fill_buf()?;
@@ -123,7 +128,7 @@ pub fn read_frame<R: std::io::BufRead>(r: &mut R) -> Result<Option<Vec<u8>>, Fra
             Some(i) => (i, true),
             None => (buf.len(), false),
         };
-        if line.len() + take > MAX_FRAME {
+        if line.len() + take > max {
             return Err(FrameError::TooLarge);
         }
         line.extend_from_slice(&buf[..take]);
