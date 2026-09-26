@@ -3418,6 +3418,41 @@ fn a_sandboxed_run_starts_bwrap_in_a_scope_with_the_apps_limits() {
 }
 
 #[test]
+fn a_143_under_a_memory_limit_points_at_the_journal() {
+    let r = rig();
+    let id = r.install();
+    fake_bwrap(&r);
+    r.hook("exit 143");
+    let note = "note: the program was terminated (exit 143); if it exceeded its memory limit see `journalctl --user -u \
+                'run-p*.scope'`\n";
+    let o = r.rt(&["run", &id]);
+    assert_eq!(o.status.code(), Some(143));
+    assert_eq!(s(&o.stderr), "", "no memory limit: no note");
+    let home = r.grants.path().canonicalize().unwrap();
+    let run = || r.cmd().env("HOME", &home).args(["run", &id]).output().unwrap();
+    let set = |e: &str| {
+        let o = r
+            .cmd()
+            .env("HOME", &home)
+            .args(["permissions", &id, "--set", e])
+            .output()
+            .unwrap();
+        assert_ok(&o);
+    };
+    set("memory=128");
+    let o = run();
+    assert_eq!(o.status.code(), Some(143));
+    assert_eq!(s(&o.stderr), note);
+    r.hook("exit 3");
+    let o = run();
+    assert_eq!(
+        (o.status.code(), s(&o.stderr)),
+        (Some(3), String::new()),
+        "another status: no note"
+    );
+}
+
+#[test]
 fn explicit_limits_refuse_the_run_without_a_user_manager_and_the_default_degrades_with_a_note() {
     let r = rig();
     let id = r.install();
@@ -3574,6 +3609,29 @@ fn doctor_reports_whether_limits_can_be_applied() {
     let line = lines_with(&out, "limits: ")[0];
     assert!(
         line.contains("[warn]") && line.contains(&format!("runs of {id} will be refused")),
+        "{out}"
+    );
+    // scopes work, but not the controller this app's limit needs: not "available"
+    script(
+        &r.bin.join("systemd-run"),
+        &FAKE_SYSTEMD_RUN
+            .replace("cpu io memory pids", "cpu io pids")
+            .replace("@LOG@", r.log.to_str().unwrap()),
+    );
+    let out = s(&r
+        .cmd()
+        .env("HOME", &home)
+        .args(["doctor", &id])
+        .output()
+        .unwrap()
+        .stdout);
+    let line = lines_with(&out, "limits: ")[0];
+    assert!(
+        line.contains("[warn]")
+            && line.contains(&format!(
+                "limits: systemd-run --user available, but runs of {id} will be refused: the memory cgroup \
+                 controller is not available to your user session"
+            )),
         "{out}"
     );
 }

@@ -70,7 +70,8 @@ runtime permissions game --reset                          # back to the default;
 Limits run the app's sandbox in a `systemd-run --user --scope` (cgroup v2). The default task limit (4096) is
 applied when a user manager is available and skipped with a note otherwise; a limit you set is mandatory: without a
 working `systemd-run --user` the app does not start (`runtime doctor` and `runtime sandbox <app>` say why). Bounds:
-memory 64..1048576 MiB, cpu 1..100 x CPUs, tasks 16..65536.
+memory 64..1048576 MiB, cpu 1..100 x the CPUs you have (a stored profile loads anywhere up to 409600), tasks
+16..65536. Resource limits need systemd 254 or newer (older: the default is skipped with a note, set limits refuse).
 
 The default is no network, no host directories, and display, audio and gpu on. The profile is stored in the app's
 own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute

@@ -70,7 +70,8 @@
 //! are explicit ([`RenderError::Limits`]); with only the default task limit the run goes ahead without a scope and a
 //! caveat says `resource limits unavailable: <why>`. `tasks = "unlimited"` with no other limit means no scope at all.
 //!
-//! **Environment.** Exactly the finalized command's variables that `rt_core::allowed_env` or the Wine backend
+//! **Environment.** (Inside a scope `systemd-run` adds its own `INVOCATION_ID`, a random id, to what follows.) Exactly
+//! the finalized command's variables that `rt_core::allowed_env` or the Wine backend
 //! ([`BACKEND_ENV`]) may set (the launcher already filtered; re-applied here as defence in depth), minus those of a
 //! switch that is off (display: `DISPLAY WAYLAND_DISPLAY XAUTHORITY`; audio: `PULSE_SERVER`) and minus
 //! `DBUS_SESSION_BUS_ADDRESS` (no D-Bus socket is ever bound; with a shared network namespace an abstract bus
@@ -207,11 +208,14 @@ pub enum RenderError {
     #[error("the sandbox launcher would refuse its arguments: {0}")]
     Shim(init::InitError),
     #[error(
-        "the app's permissions.toml sets resource limits, but they cannot be applied: {why}. Start the app from a \
-         desktop or user session with systemd, or remove the limits (`runtime permissions {app} --set memory=off \
-         --set cpu=off --set tasks=default`)"
+        "the app's permissions.toml sets resource limits, but they cannot be applied: {why}. {hint}, or remove the \
+         limits (`runtime permissions {app} --set memory=off --set cpu=off --set tasks=default`)"
     )]
-    Limits { app: String, why: String },
+    Limits {
+        app: String,
+        why: String,
+        hint: &'static str,
+    },
 }
 
 /// See the module docs. `ro_binds` are the backend's dll directories (bound read-only).
@@ -669,22 +673,20 @@ impl AppSandbox {
     fn scope(&self, dirs: &AppDirs, caveats: &mut Vec<String>) -> Result<Option<Vec<OsString>>, RenderError> {
         let l = &self.perms.limits;
         let mut props: Vec<String> = Vec::new();
-        let mut need = Vec::new();
         if let Some(n) = l.tasks_max() {
             props.push(format!("TasksMax={n}"));
-            need.push("pids");
         }
         if let Some(m) = l.memory_mb {
             props.extend([format!("MemoryMax={m}M"), "MemorySwapMax=0".to_owned()]);
-            need.push("memory");
         }
         if let Some(c) = l.cpu_percent {
             props.push(format!("CPUQuota={c}%"));
-            need.push("cpu");
         }
         if props.is_empty() {
             return Ok(None);
         }
+        let need = l.controllers();
+        let mut hint = "Start the app from a desktop or user session with systemd";
         let why = match self.host.scopes() {
             Ok(s) => match need.iter().find(|c| !s.controllers.iter().any(|h| h == *c)) {
                 None => {
@@ -696,15 +698,25 @@ impl AppSandbox {
                     argv.push("--".into());
                     return Ok(Some(argv));
                 }
-                Some(c) => format!("the cgroup `{c}` controller is not delegated to the systemd user manager"),
+                Some(c) => {
+                    hint = "systemd hands a controller to your user session through `Delegate=` of user@.service \
+                            (`systemctl edit user@.service`)";
+                    format!("the cgroup `{c}` controller is not delegated to the systemd user manager")
+                }
             },
-            Err(why) => why,
+            Err(why) => {
+                if why == crate::OLD_SYSTEMD {
+                    hint = "resource limits need systemd 254 or newer";
+                }
+                why
+            }
         };
         if l.explicit() {
             let app = dirs.prefix_dst.parent().and_then(Path::file_name).unwrap_or_default();
             return Err(RenderError::Limits {
                 app: lossy(Path::new(app)),
                 why,
+                hint,
             });
         }
         caveats.push(format!(

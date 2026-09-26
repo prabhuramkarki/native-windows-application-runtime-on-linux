@@ -486,7 +486,9 @@ fn support_pids_with(needle: &str) -> Vec<u32> {
 /// Phase 5B: `tasks = 64` stops a Windows fork bomb (CreateProcess in a loop) inside the app's scope: the pids
 /// controller refuses the fork (EAGAIN), CreateProcess fails, and the host never notices. The same bounded bomb
 /// runs to the end under the default limit and unsandboxed (40 copies, well above what 64 tasks allow), so it is
-/// the limit that stopped it. Never an unbounded bomb: the probe stops at its cap and ends every copy.
+/// the limit that stopped it. Never an unbounded bomb: the probe stops at its cap (100 here, 5000 in the fixture) and
+/// ends every copy, so if the limit silently failed the bomb would run 100 copies, print `FORKBOMB-OK` and exit 0,
+/// which fails `fails_boxed` below.
 #[test]
 #[ignore = "needs Wine, bwrap, systemd-run --user and fixtures; run with --ignored --test-threads=1"]
 fn e2e_real_wine_sandbox_11_a_fork_bomb_hits_the_task_limit_and_the_host_is_unharmed() {
@@ -498,7 +500,12 @@ fn e2e_real_wine_sandbox_11_a_fork_bomb_hits_the_task_limit_and_the_host_is_unha
         return;
     }
     s.set(&["tasks=64"]).expect_ok();
-    let ran = s.fails_boxed(&s.id, &["forkbomb", "200"]);
+    let ran = s.fails_boxed(&s.id, &["forkbomb", "100"]);
+    assert!(
+        !ran.err().contains("refused") && !ran.err().contains("Failed to"),
+        "the run itself failed, the limit was not tested: {}",
+        ran.report()
+    );
     let out = ran.out();
     let n: u32 = out
         .split("CreateProcess after ")
@@ -541,9 +548,22 @@ fn e2e_real_wine_sandbox_12_a_memory_hog_is_killed_at_the_memory_limit_and_the_h
         "MEASURED: memory=128 ended the 512 MiB hog with {:?} after {:?}",
         ran.code, ran.elapsed
     );
+    // 143: systemd stopped the scope after the kernel's OOM kill inside it. Not "any failure": a refused run (126)
+    // or a systemd-run failure (1) would not test the limit at all.
     assert!(
-        ran.code != Some(0) && !ran.out().contains("MEMHOG-OK"),
-        "the hog finished under memory=128: {}",
+        ran.code == Some(143) && !ran.out().contains("MEMHOG-OK"),
+        "the hog was not OOM-killed under memory=128: {}",
+        ran.report()
+    );
+    assert!(
+        !ran.err().contains("refused") && !ran.err().contains("Failed to"),
+        "{}",
+        ran.report()
+    );
+    assert!(
+        ran.err()
+            .contains("note: the program was terminated (exit 143); if it exceeded its memory limit"),
+        "{}",
         ran.report()
     );
     host_is_responsive();
