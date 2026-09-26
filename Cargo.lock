@@ -759,6 +759,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-daemon"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "runtime-api",
+ "runtime-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "runtime-deps"
 version = "0.0.1"
 dependencies = [
