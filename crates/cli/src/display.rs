@@ -9,57 +9,18 @@
 //! (`rt_deps::wineservers_for`, the guard `deps` uses), which fails closed when `/proc` cannot be read.
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
-use rt_core::doctor::{HostFs, MAX_DLL_DIRS, MAX_LISTING, wayland_socket};
+use rt_core::doctor::{HostFs, wayland_socket};
 use rt_core::{CompatBackend, GraphicsDriver, Launcher};
 use rt_deps::wine_config::{read_graphics_driver_from_prefix, set_graphics_driver};
 use std::ffi::OsString;
-use std::fs;
 
 fn env_var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|v| !v.is_empty())
 }
 
-/// Driver names kept at most.
-const MAX_DRIVERS: usize = 200;
-
-/// The `wine*.drv` names (lowercase) among `entries`; `None` when an entry could not be read or there are more
-/// than [`MAX_LISTING`] of them (a refusal must never rest on a partly read directory).
-fn drivers_in(entries: impl Iterator<Item = std::io::Result<String>>) -> Option<Vec<String>> {
-    let mut found = Vec::new();
-    for (i, e) in entries.enumerate() {
-        let n = e.ok()?.to_ascii_lowercase();
-        if i >= MAX_LISTING {
-            return None;
-        }
-        if n.starts_with("wine") && n.ends_with(".drv") && found.len() < MAX_DRIVERS && !found.contains(&n) {
-            found.push(n);
-        }
-    }
-    Some(found)
-}
-
-/// File names (lowercase) of the Wine driver modules (`wine*.drv`) in the backend's DLL directories: at most
-/// [`MAX_DRIVERS`], from at most [`MAX_DLL_DIRS`] directories. `None` when none of the directories could be listed
-/// or one was read only in part. `doctor` and `display` both use it.
-pub fn wine_drivers(backend: &dyn CompatBackend) -> Option<Vec<String>> {
-    let mut found: Vec<String> = Vec::new();
-    let mut verified = false;
-    for dir in backend.dll_dirs().iter().take(MAX_DLL_DIRS) {
-        let Ok(rd) = fs::read_dir(dir) else { continue };
-        let names = rd.map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()));
-        for n in drivers_in(names)? {
-            if found.len() < MAX_DRIVERS && !found.contains(&n) {
-                found.push(n);
-            }
-        }
-        verified = true;
-    }
-    verified.then_some(found)
-}
-
 /// `Some(found)` when the backend's DLL directories could be listed, `None` when nothing could be checked.
 fn has_winewayland(backend: &dyn CompatBackend) -> Option<bool> {
-    wine_drivers(backend).map(|l| l.iter().any(|n| n == "winewayland.drv"))
+    rt_api::host::doctor::wine_drivers(backend).map(|l| l.iter().any(|n| n == "winewayland.drv"))
 }
 
 fn session() -> String {
@@ -154,27 +115,4 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     let helpers = crate::sandbox::helper_launcher(&env, &launcher, &backend)?;
     set_graphics_driver(&env, &backend, &helpers, &want).map_err(|e| e.to_string())?;
     crate::emit(&format!("graphics driver of {} set to {}\n", env.id(), want.as_str()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::drivers_in;
-    use std::io;
-
-    fn ok(n: &str) -> io::Result<String> {
-        Ok(n.to_owned())
-    }
-
-    #[test]
-    fn keeps_wine_drivers_only() {
-        let l = drivers_in([ok("WinePulse.drv"), ok("kernel32.dll"), ok("winealsa.drv")].into_iter());
-        assert_eq!(l.unwrap(), ["winepulse.drv", "winealsa.drv"]);
-        assert_eq!(drivers_in(std::iter::empty()), Some(vec![]));
-    }
-
-    #[test]
-    fn an_unreadable_entry_means_not_verified() {
-        let bad = Err(io::Error::other("boom"));
-        assert_eq!(drivers_in([ok("winepulse.drv"), bad].into_iter()), None);
-    }
 }

@@ -12,6 +12,8 @@ path = "src/lib.rs"
 [dependencies]
 runtime-core = { path = "../core" }
 runtime-backend-wine = { path = "../backend-wine" }
+runtime-deps = { path = "../deps" }
+runtime-pe = { path = "../pe" }
 runtime-sandbox = { path = "../sandbox" }
 libc.workspace = true
 serde.workspace = true

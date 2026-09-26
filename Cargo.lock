@@ -698,6 +698,8 @@ dependencies = [
  "libc",
  "runtime-backend-wine",
  "runtime-core",
+ "runtime-deps",
+ "runtime-pe",
  "runtime-sandbox",
  "serde",
  "serde_json",
