@@ -207,6 +207,12 @@ fn rpc_and_daemon_status_against_the_real_daemon() {
         assert!(text(&o.stderr).contains(want), "{args:?}: {}", text(&o.stderr));
     }
 
+    // Junk (over 1 MiB, no newline, raw control bytes) does not hurt it: the next client is served.
+    let mut junk = UnixStream::connect(&sock).unwrap();
+    let _ = junk.write_all(&vec![0x1b; (1 << 20) + 4096]);
+    drop(junk);
+    assert_eq!(json_out(&s.rpc(&sock, &["rpc.version"]))["api"], rt_api::API_VERSION);
+
     assert!(d.stop().success());
     assert!(!sock.exists());
     let o = s.status(&sock);
