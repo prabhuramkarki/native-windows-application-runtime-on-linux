@@ -727,16 +727,16 @@ impl AppSandbox {
     }
 }
 
-/// What runs instead of an app that cannot be sandboxed: a shell that prints the reason and exits 126, with an
-/// empty environment. Nothing of the app's command is in it.
-fn refusal(e: &RenderError) -> Command {
+/// What runs instead of a program that cannot be sandboxed: a shell that prints the reason and exits 126, with an
+/// empty environment. Nothing of the program's command is in it. Also `rt_installer`'s installer sandbox refusal.
+pub fn refusal(why: &dyn std::fmt::Display) -> Command {
     let mut c = Command::new("/bin/sh");
     c.args([
         "-c",
         "printf 'runtime: the sandbox refused to start the program: %s\\n' \"$1\" >&2; exit 126",
     ])
     .arg("sh")
-    .arg(e.to_string())
+    .arg(why.to_string())
     .env_clear();
     c
 }

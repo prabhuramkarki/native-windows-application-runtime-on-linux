@@ -189,6 +189,13 @@ pub(crate) fn backend(launcher: &Launcher) -> Result<backend_wine::WineBackend, 
     Ok(backend_wine::WineBackend::discover_with(launcher.clone())?)
 }
 
+/// This executable, for the installer sandbox's `sandbox-init` shim (`rt_installer::InstallerSandbox::new`). The
+/// library checks it (absolute, not `(deleted)`, a resolvable file, outside the data directory) and refuses to run
+/// the installer otherwise; an unknown path is passed as the empty path, which it refuses.
+pub(crate) fn runtime_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_default()
+}
+
 /// Best-effort: deletes `id`'s `.desktop` entry and hicolor icons (`rt_desktop::entry::remove`), warning (never
 /// failing) on error. Shared by `remove` and `uninstall` so the two removal commands cannot drift apart on this
 /// again — both must clean up desktop integration, exactly like both already stop the backend and remove the

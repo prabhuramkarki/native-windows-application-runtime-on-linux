@@ -151,6 +151,7 @@ impl WineRig {
             consent: answers,
             now,
             vulkan: &|_| VulkanVerdict::Unknown,
+            runtime_exe: &crate::test_runtime_exe(),
         };
         let t = Instant::now();
         let rep = install_plan(&o, &self.plan(imports)).unwrap();

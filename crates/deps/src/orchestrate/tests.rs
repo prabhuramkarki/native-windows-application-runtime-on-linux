@@ -258,6 +258,7 @@ fn run_with(r: &Rig, app: &AppPlan, f: &FakeFetcher, a: &Answers, b: &FakeBacken
         consent: a,
         now,
         vulkan: &|_| VulkanVerdict::Unknown,
+        runtime_exe: &crate::test_runtime_path(),
     };
     install_plan(&o, app)
 }
@@ -328,6 +329,7 @@ fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable
         consent: &a,
         now,
         vulkan: &unusable,
+        runtime_exe: &crate::test_runtime_path(),
     };
     let rep = install_plan(&o, &app).unwrap();
     assert_eq!(f.calls(), ["other"], "something Vulkan-blocked was downloaded");
@@ -792,11 +794,15 @@ fn a_malformed_sha256_never_reaches_the_fetcher() {
     assert!(reason(&rep.failed, "a").contains("sha256"), "{rep:?}");
 }
 
-/// Real `bwrap`, or a loud skip (`RUNTIME_REQUIRE_BWRAP=1` makes it a failure).
+/// Real `bwrap` (and the built `runtime` for the installer sandbox's shim, [`crate::test_runtime_exe`]), or a loud
+/// skip (`RUNTIME_REQUIRE_BWRAP=1` makes it a failure).
 fn have_bwrap() -> bool {
     let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
     match rt_installer::find_bwrap_on_path() {
-        Some(_) => true,
+        Some(_) => {
+            crate::test_runtime_exe();
+            true
+        }
         None if require => panic!("bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set"),
         None => {
             eprintln!("SKIP: bwrap not found on $PATH");
@@ -1507,6 +1513,7 @@ fn execute_never_fetches_a_gated_install_without_consent() {
         consent: &a,
         now,
         vulkan: &|_| VulkanVerdict::Unknown,
+        runtime_exe: &crate::test_runtime_path(),
     };
     let plan = Plan {
         entries: vec![PlanEntry {

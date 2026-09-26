@@ -32,6 +32,9 @@ jobs:
       # Plain `cargo test` skips the `#[ignore]`d real-Wine tests; the `wine-e2e` job runs them.
       # RUNTIME_REQUIRE_BWRAP=1 turns a missing `bwrap` into a hard test failure instead of the default
       # loud-skip-and-pass, so the real-sandbox tests above are guaranteed to actually execute here.
+      # `runtime-deps`' real-bwrap tests run the installer sandbox with the built `runtime` binary as its
+      # `sandbox-init` shim (target/debug/runtime); `cargo test --workspace` builds it (runtime-cli has integration
+      # tests), and those tests fail loudly when it is missing.
       - run: cargo test --workspace
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
@@ -96,6 +99,9 @@ jobs:
       # denied/tampered downloads against the local HTTPS test server, second run, killed-install discard, app
       # removal, installer-registered service kept in the sandbox). These tests check the Wine version first and
       # FAIL up front with a clear message on Wine < 10 (they were verified on Wine 10.0 only).
+      # The installer sandbox runs the built `runtime` binary as its `sandbox-init` shim (Phase 5B Task 6); these
+      # tests look for it in target/debug and fail loudly without it (`cargo test -p runtime-deps` does not build it).
+      - run: cargo build -p runtime-cli
       - run: cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1 --nocapture
         env:
           RUNTIME_REQUIRE_BWRAP: "1"

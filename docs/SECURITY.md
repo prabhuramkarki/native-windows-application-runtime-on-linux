@@ -20,9 +20,9 @@ code in it can make any Linux system call Wine's process could. For a sandboxed 
 dangerous system calls), **Landlock** (the file layout enforced a second time, where the kernel has it) and **cgroup
 limits** (a task limit against fork bombs, memory and CPU on request). What still reaches the host from inside is
 listed in "What the hardening layers add and do not"; the biggest items are the X11 server (shared input), the GPU
-driver and every allowed system call's kernel code. Outside the app sandbox (`--unsandboxed`, the unsandboxed Wine
-helpers, and the installer sandbox, which has bubblewrap but none of the Phase 5B layers) the older statement
-holds: the runtime protects its *own* handling of untrusted input (archives, PE files, `metadata.json`, file names,
+driver and every allowed system call's kernel code. Installers, uninstallers and `runtime deps` installer packages
+run in the installer sandbox: bubblewrap, seccomp and Landlock, but no cgroup limits ("Installer sandbox" below).
+Outside both sandboxes (`--unsandboxed` and the unsandboxed Wine helpers) the older statement holds: the runtime protects its *own* handling of untrusted input (archives, PE files, `metadata.json`, file names,
 program output), so that merely installing, listing, inspecting or removing something cannot hurt you, and nothing
 a running program can reach on its own. Treat the separation between apps (separate prefixes) outside the sandbox as
 accident prevention, not a guarantee (below). Do not run software you would not trust with your X11 session.
@@ -148,7 +148,7 @@ layers add and do not".
   and HTML-embedding programs fail until a .NET package exists (not planned in Phase 4). `doctor` warns about .NET.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
 
-## Installer sandbox (Phase 3 Task 5)
+## Installer sandbox (Phase 3 Task 5; seccomp and Landlock since Phase 5B Task 6)
 
 `rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
 through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
@@ -198,6 +198,24 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   `SI:localuser` grant (`xhost +si:localuser:$USER`, which some desktop sessions set by default and which
   admits any process of the same user with no cookie at all). Where that grant exists, a `--network` installer
   can reach the host display.
+- **The `sandbox-init` shim (Phase 5B Task 6).** bubblewrap does not start the installer itself: it starts
+  `runtime sandbox-init --v1 <rules> -- <program> <args>`, the same launcher and code as the app sandbox ("seccomp
+  and Landlock (Phase 5B)" below): `RLIMIT_CORE = 0`, the Landlock ruleset (best effort: a kernel without Landlock
+  runs without it, as for apps), the same seccomp deny-list (mandatory; `ptrace` for Wine's requests only inside an
+  enforced Landlock domain), then `execve` of the unchanged program. The runtime executable is an explicit input of
+  `InstallerSandbox::new(bwrap, runtime_exe)`, the only constructor (the CLI passes its own `current_exe()`), and is
+  bound read-only at its resolved path after the system binds and before the prefix. One that is relative, ends in
+  ` (deleted)` (replaced since it started), does not resolve to a file or lies inside the data directory makes the
+  sandbox run a refusal instead (exit 126, `runtime: the sandbox refused to start the program: <why>` on stderr):
+  there is no switch, variable or feature that runs an installer without the shim. The Landlock rules mirror the
+  mounts, each for its path inside the sandbox: read-write for `/proc`, bwrap's `/dev/null`, `/dev/zero`,
+  `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty` and its `/dev/pts` and `/dev/shm` directories (`/dev/ptmx`
+  is a link to `pts/ptmx`, covered by the `pts` rule), `/tmp`, the prefix and the empty `$HOME`; read-execute for
+  `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/alternatives`, the backend's dll directories and the runtime executable.
+  No display, audio, GPU or `/sys` rule, as there is no such mount. Tests: the frozen argv and rules
+  (`the_exact_argv_for_a_typical_command`), the refusals, `Seccomp: 2`/`NoNewPrivs: 1` inside, a nested user
+  namespace refused (`unshare -U`: EPERM through the shim, success with bwrap alone on this host), a test-only bind
+  without a rule unreadable through Landlock, and `syscall_escape_4` (below).
 - **Wine's registry flush happens inside the sandbox.** `--unshare-pid` makes `bwrap` tear down the PID namespace
   the instant its direct child exits, killing `wineserver` before it writes `system.reg`/`user.reg`. Every
   installer/uninstaller command is therefore wrapped by `CompatBackend::settle` (Wine:
@@ -218,20 +236,17 @@ other apps' data or any other host path, and (by default) has no network at all,
   outside the fresh IPC namespace, and — only with `--network` — the host's abstract-namespace sockets) is still
   reachable exactly as any other process of that user would reach it. The display/audio/D-Bus variables that
   would point at those sockets are stripped (see above), which is not the same as the sockets being unreachable.
-- **None of the Phase 5B layers (still true after Phase 5B).** `InstallerSandbox` does NOT run the
-  `sandbox-init` shim that app runs go through: installers, uninstallers and the runtime's `reg.exe` steps in it
-  have no seccomp filter (every system call a normal process has, including `ptrace`, `unshare`, `keyctl`, `bpf`,
-  `io_uring` and terminal `TIOCSTI` into a terminal they own), no Landlock ruleset (the mounts are the only file
-  boundary), no task, memory or CPU limit (no systemd scope: a fork bomb in an installer reaches the desktop) and no
-  `RLIMIT_CORE = 0`. What they do have from bubblewrap itself (measured with bubblewrap 0.11.1, not setuid): no
-  capabilities at all (effective, permitted and bounding sets empty) and `no_new_privs`. **Because the installer
-  sandbox does NOT use the shim, a hostile installer can create nested user namespaces** (and in them, namespaces
-  of every other kind), the kernel attack surface the app sandbox's filter closes. Measured on this Ubuntu host:
-  `unshare -U` inside bwrap succeeds, but AppArmor's user-namespace restriction confines the new namespace
-  (profile `bwrap//&unpriv_bwrap`: writing `uid_map` fails, `CapEff` 0). On distributions without that
-  restriction, a user namespace with full capabilities inside it is what any user process gets. Closing this is
-  planned as Task 6 of Phase 5B: the installer sandbox goes through the same shim. A kernel exploit or a
-  namespace escape is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
+- **No resource limits.** Unlike app runs, installers get no systemd scope: no task, memory or CPU limit, so a fork
+  bomb or a memory hog in an installer reaches the desktop. What bounds them is time only: the dependency engine's
+  20-minute installer deadline and the `reg.exe` timeout (killing bwrap ends the whole tree: the PID namespace and
+  `--die-with-parent`), `--die-with-parent` and Ctrl-C of the `runtime` command. `runtime install` and
+  `runtime uninstall` have no deadline (an installer GUI may take as long as the user needs).
+- **The seccomp and Landlock layers carry the app sandbox's own limits** ("What the hardening layers add and do
+  not" below): the kernel code behind every allowed call, Landlock only where the kernel has it (without it, the
+  mounts are the only file boundary and `ptrace` is denied outright), and bubblewrap's own unfiltered pid 1. Nested
+  user namespaces, `bpf`, `userfaultfd`, `keyctl`, `io_uring`, `TIOCSTI` and the rest of the deny-list are refused
+  (before Phase 5B Task 6 they were not: `unshare -U` inside the installer sandbox succeeded). A kernel exploit
+  through an allowed call is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
   whatever privilege unprivileged user namespaces (or its setuid bit) give it on this machine.
 - **What is bound read-only is still a real, current copy of `/usr` et al.** and could itself contain something
   exploitable already on the host; this profile does not vet, pin or checksum it.
@@ -890,13 +905,13 @@ or take rights away from descriptors the program inherited (its terminal and pip
   `connect`, and the GPU needs its device ioctls.
 - **`network = "allow"` is the host's network namespace**, including abstract unix sockets (X11's among them) and
   every loopback service.
-- **The installer sandbox has none of the Phase 5B layers** ("Installer sandbox" above), and `--unsandboxed` runs
-  have no layer at all.
+- **The installer sandbox has seccomp and Landlock but no resource limits** ("Installer sandbox" above), and
+  `--unsandboxed` runs have no layer at all.
 
 ### Syscall-level escape tests
 
 A Windows program cannot make raw Linux system calls, so `crates/cli/tests/e2e_sandbox.rs` (`syscall_escape_1`,
-`syscall_escape_2`; no Wine needed, so they run in the ordinary `cargo test` on glibc hosts) uses a Linux helper: the
+`syscall_escape_2`, `syscall_escape_4`; no Wine needed, so they run in the ordinary `cargo test` on glibc hosts) uses a Linux helper: the
 test binary itself, re-executed inside the sandbox and bound read-only through the renderer's ordinary read-only
 binds. The command is the one `runtime run` renders for the default profile (the systemd-run scope, bwrap, and the
 real `runtime` binary as `sandbox-init`); nothing test-only is added to the production code. Each call runs in its
@@ -985,15 +1000,20 @@ child and attaches it (`PTRACE_ATTACH`) and opens its `/proc/<pid>/mem`. From th
 the same child is outside it and both are refused (EPERM, EACCES). The tracer is the child's parent both times, so
 Yama at 1 allows it, as the first run shows. With the nested domain removed, the test fails.
 
+`syscall_escape_4` runs every row of the table through the INSTALLER sandbox (`rt_installer::InstallerSandbox::new`
+and `wrap`, the production path, with the helper bound like a dll directory and the real `runtime` as the shim) with
+the same expectations and the same bwrap-only oracle; measured the same answers as the table's two columns. The
+bwrap-only column is what the installer sandbox was before Phase 5B Task 6.
+
 Not covered by any of these tests: `ptrace` of bwrap's own pid 1 on a host without Landlock (the residual above;
 Yama at 1 here hides it), and a kernel bug behind an allowed call.
 
 ## Roadmap
 
-Phase 5B's layers are in place for the app sandbox (seccomp, Landlock, resource limits and their escape tests).
-Next in Phase 5B: Task 6 runs the installer sandbox through the same shim (today it has none of the 5B layers).
-Later: the dependency engine's path-based prefix operations move to held directory descriptors; the shim as the
-filtered pid 1 (removing the unfiltered bubblewrap reaper, and with it the no-Landlock `/proc/1/mem` residual).
+Phase 5B's layers are in place for the app sandbox (seccomp, Landlock, resource limits and their escape tests) and,
+without resource limits, for the installer sandbox (Task 6). Later: resource limits for installers; the dependency
+engine's path-based prefix operations move to held directory descriptors; the shim as the filtered pid 1 (removing
+the unfiltered bubblewrap reaper, and with it the no-Landlock `/proc/1/mem` residual).
 
 ## Reporting
 
