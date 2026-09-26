@@ -3,19 +3,29 @@
 **Since Phase 5A, `runtime run` starts the program in a bubblewrap sandbox by default** (see "App sandbox (Phase
 5A)" below): a private filesystem view with only the app's own prefix and home writable, no network unless the
 app's `permissions.toml` allows it, and the display, audio and GPU it is given. Without a working `bwrap` it
-refuses to run. `runtime run --unsandboxed` is the per-run escape hatch, and it says so on stderr: such a run (and
+refuses to run. Since Phase 5B the program also runs under a seccomp deny-list, a Landlock filesystem ruleset where
+the kernel has Landlock, and a task limit (with optional memory and CPU limits) in a systemd user scope where one
+can be created (see "seccomp and Landlock (Phase 5B)", "Resource limits (Phase 5B)" and "What the hardening layers
+add and do not"). `runtime run --unsandboxed` is the per-run escape hatch, and it says so on stderr: such a run (and
 every run before Phase 5A) is what the Phase 2 sections below describe, the program with your full access; Phase 2's
 measures make accidents less likely and remove Wine's most obvious host exposure, and do not stop a program that
 wants out.
 
 ## Threat model
 
-Assume the installer or application is **malicious**. It will run Windows code inside Wine as your uid. What this
-project tries to protect is the *runtime's own* handling of untrusted input (archives, PE files, `metadata.json`,
-file names, program output) so that merely installing, listing, inspecting or removing something cannot hurt you.
-It does not protect anything a running program can reach on its own. Do not run software you would not run
-directly on your account. Treat the separation between apps (separate prefixes) as accident prevention, not a
-guarantee: a hostile program can go around it (below).
+Assume the installer or application is **malicious**. It runs Windows code inside Wine as your uid. **Wine is not a
+security boundary**: a Windows program can reach every host file Wine's process can (`\\?\unix\` paths), and native
+code in it can make any Linux system call Wine's process could. For a sandboxed run the boundary is the kernel's:
+**bubblewrap** (a mount, PID, IPC, UTS and, unless network is allowed, network namespace), **seccomp** (a deny-list of
+dangerous system calls), **Landlock** (the file layout enforced a second time, where the kernel has it) and **cgroup
+limits** (a task limit against fork bombs, memory and CPU on request). What still reaches the host from inside is
+listed in "What the hardening layers add and do not"; the biggest items are the X11 server (shared input), the GPU
+driver and every allowed system call's kernel code. Installers, uninstallers and `runtime deps` installer packages
+run in the installer sandbox: bubblewrap, seccomp and Landlock, but no cgroup limits ("Installer sandbox" below).
+Outside both sandboxes (`--unsandboxed` and the unsandboxed Wine helpers) the older statement holds: the runtime protects its *own* handling of untrusted input (archives, PE files, `metadata.json`, file names,
+program output), so that merely installing, listing, inspecting or removing something cannot hurt you, and nothing
+a running program can reach on its own. Treat the separation between apps (separate prefixes) outside the sandbox as
+accident prevention, not a guarantee (below). Do not run software you would not trust with your X11 session.
 
 ## What Phase 2 does
 
@@ -64,15 +74,16 @@ Covered by unit or hostile-input tests; items marked (e2e) are also checked agai
 - **Cleanup**: `remove` stops the app's `wineserver` first; the e2e tests start a persistent `wineserver` for an
   app and require that `runtime remove` alone ends it.
 
-## What is still NOT covered (Phase 2–5A)
+## What is still NOT covered without the app sandbox
 
 This list describes a program that runs WITHOUT the app sandbox: a `runtime run --unsandboxed` run (and every run
 before Phase 5A). The app sandbox removes the first two items for a sandboxed run (its host view has no host files
 to reach through `\\?\unix\`, and its devices and sockets are only those the profile grants); the rest still
-apply. What the app sandbox itself does not protect is listed in "App sandbox (Phase 5A)".
+apply. What the app sandbox itself does not protect is listed in "App sandbox (Phase 5A)" and "What the hardening
+layers add and do not".
 
-- **No sandbox boundary.** No seccomp, namespaces, Landlock or bubblewrap. The program shares the host's
-  network (it can connect anywhere), GPU, audio and display sockets.
+- **No sandbox boundary** in such a run: no bubblewrap namespaces, no seccomp filter, no Landlock, no resource
+  limits. The program shares the host's network (it can connect anywhere), GPU, audio and display sockets.
 - **Wine's `\\?\unix\` escape.** Wine maps the host filesystem into the NT namespace regardless of drive letters.
   From a Windows program, `\\?\unix\etc\hostname` (in a C string `"\\\\?\\unix\\etc\\hostname"`) names the
   host's `/etc/hostname`; `\\?\unix\etc\passwd` and `\\?\unix\home` are found the same way, with the `Z:` drive
@@ -137,10 +148,11 @@ apply. What the app sandbox itself does not protect is listed in "App sandbox (P
   and HTML-embedding programs fail until a .NET package exists (not planned in Phase 4). `doctor` warns about .NET.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
 
-## Installer sandbox (Phase 3 Task 5)
+## Installer sandbox (Phase 3 Task 5; seccomp and Landlock since Phase 5B Task 6)
 
-`rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes Task 6 will run
-through it (unpacking an installer payload, running a silent `.exe`/`.msi`). **It is scoped to those helpers,
+`rt_installer::InstallerSandbox` is a `bwrap` profile for the installer helper processes: `runtime install`'s
+`.exe`/`.msi` installers (msiexec for MSI), `runtime uninstall`'s recorded uninstaller, and `runtime deps --install`'s
+installer packages with the `reg.exe` steps that follow them. **It is scoped to those helpers,
 not to Wine app runs in general**: app runs have their own, per-app profile since Phase 5A ("App sandbox
 (Phase 5A)" below). It is wired through the same `Launcher::wrap` seam named in the roadmap below (now a
 `Sandbox` trait a `Launcher` can optionally carry, rather than a hard-coded identity function), so a sandboxed
@@ -187,6 +199,31 @@ run still goes through `Launcher::spawn`/`run_helper`, never a second `Command::
   `SI:localuser` grant (`xhost +si:localuser:$USER`, which some desktop sessions set by default and which
   admits any process of the same user with no cookie at all). Where that grant exists, a `--network` installer
   can reach the host display.
+- **The `sandbox-init` shim (Phase 5B Task 6).** bubblewrap does not start the installer itself: it starts
+  `runtime sandbox-init --v1 <rules> -- <program> <args>`, the same launcher and code as the app sandbox ("seccomp
+  and Landlock (Phase 5B)" below): `RLIMIT_CORE = 0`, the Landlock ruleset (best effort: a kernel without Landlock
+  runs without it, as for apps), the same seccomp deny-list (mandatory; `ptrace` for Wine's requests only inside an
+  enforced Landlock domain), then `execve` of the unchanged program. The runtime executable is an explicit input of
+  `InstallerSandbox::new(bwrap, runtime_exe)`, the only constructor (the CLI passes its own `current_exe()`), and is
+  bound read-only at its resolved path after the system binds and before the prefix. One that is relative, ends in
+  ` (deleted)` (replaced since it started), does not resolve to a file or lies inside the data directory is refused
+  before anything runs: every caller runs the sandbox's pre-flight check first (`InstallerSandbox::check`), so
+  `runtime install` and `runtime deps --install` fail with `the installer sandbox refused to start: <why> (nothing
+  was run; nothing was installed)`, a `reg.exe` step fails with that text, and `runtime uninstall` warns with it and
+  removes the environment as it does for any uninstaller failure. `wrap` itself still fails closed (a refusal command:
+  exit 126, the reason on stderr) should it ever be reached with such an executable. There is no switch, variable or
+  feature that runs an installer without the shim. The Landlock rules mirror the
+  mounts, each for its path inside the sandbox: read-write for `/proc`, bwrap's `/dev/null`, `/dev/zero`,
+  `/dev/full`, `/dev/random`, `/dev/urandom`, `/dev/tty` and its `/dev/pts` and `/dev/shm` directories (`/dev/ptmx`
+  is a link to `pts/ptmx`, covered by the `pts` rule), `/tmp`, the prefix and the empty `$HOME`; read-execute for
+  `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/alternatives`, the backend's dll directories and the runtime executable.
+  A dll directory that is a host symlink under an already-bound tree (e.g. a `*-windows` link inside `/usr`) stays a
+  symlink inside, where bwrap cannot mount over it and a Landlock rule on it fails (ELOOP), so both sandboxes bind
+  and rule its resolved directory instead (`rt_sandbox::render::ro_bind_target`); the link inside resolves into it.
+  No display, audio, GPU or `/sys` rule, as there is no such mount. Tests: the frozen argv and rules
+  (`the_exact_argv_for_a_typical_command`), the refusals, `Seccomp: 2`/`NoNewPrivs: 1` inside, a nested user
+  namespace refused (`unshare -U`: EPERM through the shim, success with bwrap alone on this host), a test-only bind
+  without a rule unreadable through Landlock, and `syscall_escape_4` (below).
 - **Wine's registry flush happens inside the sandbox.** `--unshare-pid` makes `bwrap` tear down the PID namespace
   the instant its direct child exits, killing `wineserver` before it writes `system.reg`/`user.reg`. Every
   installer/uninstaller command is therefore wrapped by `CompatBackend::settle` (Wine:
@@ -207,9 +244,17 @@ other apps' data or any other host path, and (by default) has no network at all,
   outside the fresh IPC namespace, and — only with `--network` — the host's abstract-namespace sockets) is still
   reachable exactly as any other process of that user would reach it. The display/audio/D-Bus variables that
   would point at those sockets are stripped (see above), which is not the same as the sockets being unreachable.
-- **No seccomp filter, no Landlock, no capability drop, no resource limits (cgroups, rlimits).** A sandboxed
-  process still has every syscall a normal process has inside its namespaces; a kernel exploit or a namespace
-  escape is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
+- **No resource limits.** Unlike app runs, installers get no systemd scope: no task, memory or CPU limit, so a fork
+  bomb or a memory hog in an installer reaches the desktop. What bounds them is time only: the dependency engine's
+  20-minute installer deadline and the `reg.exe` timeout (killing bwrap ends the whole tree: the PID namespace and
+  `--die-with-parent`), `--die-with-parent` and Ctrl-C of the `runtime` command. `runtime install` and
+  `runtime uninstall` have no deadline (an installer GUI may take as long as the user needs).
+- **The seccomp and Landlock layers carry the app sandbox's own limits** ("What the hardening layers add and do
+  not" below): the kernel code behind every allowed call, Landlock only where the kernel has it (without it, the
+  mounts are the only file boundary and `ptrace` is denied outright), and bubblewrap's own unfiltered pid 1. Nested
+  user namespaces, `bpf`, `userfaultfd`, `keyctl`, `io_uring`, `TIOCSTI` and the rest of the deny-list are refused
+  (before Phase 5B Task 6 they were not: `unshare -U` inside the installer sandbox succeeded). A kernel exploit
+  through an allowed call is not this profile's problem to solve. `bwrap` itself is trusted, unaudited code running with
   whatever privilege unprivileged user namespaces (or its setuid bit) give it on this machine.
 - **What is bound read-only is still a real, current copy of `/usr` et al.** and could itself contain something
   exploitable already on the host; this profile does not vet, pin or checksum it.
@@ -509,8 +554,11 @@ run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
   CANNOT be enforced (only the X server's cookie check remains). Both are printed as notes.
 - **Display, audio and GPU are attack surface.** The Wayland compositor, PulseAudio/PipeWire and the GPU kernel
   driver are reachable when switched on (the default), and `/sys/devices` is readable with gpu on.
-- **Same uid, no seccomp, Landlock, capability drop or cgroups** until Phase 5B: a kernel bug reachable from an
-  unprivileged user namespace is an escape, and nothing limits CPU, memory or disk use.
+- **Same uid.** The program holds no capabilities (bubblewrap leaves the effective, permitted and bounding sets
+  empty) and runs with `no_new_privs`, but it is your uid: whatever that uid can reach through what is bound is
+  reachable. Phase 5B adds seccomp and Landlock (next section), which narrow the kernel surface; a kernel bug in a
+  syscall that stays allowed is still an escape. Resource limits (a task limit by default, memory and CPU on request)
+  are in "Resource limits (Phase 5B)"; disk use and IO are never limited.
 - **Host directory grants** are what they say: an `rw` grant can be destroyed. `$HOME`, `/`, the data root, secret
   directories (`~/.ssh`, `~/.gnupg`, ...) and system trees (`rw`) are refused, and **all of `/tmp` is refused as a
   grant** (at or below it, by its written and its resolved path): other programs' sockets (tmux, ssh-agent, editor
@@ -534,12 +582,19 @@ test's temporary directory, given to `runtime` itself, so the grant checks use i
 |---|---|---|
 | 1 | read `$HOME/.ssh/id_test` | a secret in the home is not visible |
 | 2 | write `$HOME/escape.txt` | the home cannot be written; the file is not there afterwards |
-| 3 | read another app's `drive_c/canary.txt`; list the apps directory | other prefixes are not visible (inside, the list shows only the app's own id) |
+| 3 | read another app's `drive_c/canary.txt`; list the apps directory | other prefixes are not visible (inside, the list shows only the app's own id; with Landlock it cannot be listed at all) |
 | 4 | read and write `<app root>/permissions.toml` | the profile can be neither read nor rewritten; it is byte-identical afterwards |
 | 5 | TCP connect to a listener on the host's `127.0.0.1` | no network by default; the same connect works after `--set network=allow` |
-| 6 | read/write in a granted directory; read a file next to it | `ro` reads but cannot write, `rw` writes to the host, and the parent directory's other entries stay hidden |
+| 6 | read/write in a granted directory; read a file next to it | `ro` reads but cannot write, `rw` writes to the host, and the parent directory's other entries stay hidden (with Landlock the parent cannot be listed at all) |
 | 7 | `runtime permissions --set fs+=$HOME/.ssh:ro` | refused with the reason, nothing written (a harmless grant as the control is accepted) |
 | 8 | `--unsandboxed` | it really is unsandboxed and prints its warning |
+| 9 | the Wine process's own `/proc/self/status` | it runs with `Seccomp: 2` and `NoNewPrivs: 1` (unsandboxed: `Seccomp: 0`) |
+| 10 | `ReadProcessMemory`/`WriteProcessMemory` of a second process; Set/GetThreadContext (registers, Dr0/Dr7) | what wineserver does with `ptrace` still works under the filter (with Landlock; without it the memory modes must fail) |
+| 11 | a CreateProcess loop (100 copies) under `tasks = 64` | stopped after ~23 copies inside the app's scope; the same bounded loop finishes 40 copies under the default limit and unsandboxed; the user manager and a new process still start afterwards |
+| 12 | touching 512 MiB under `memory = 128` | OOM-killed inside the scope (exit 143 and the journal note), a 32 MiB hog under the same limit finishes, 64 MiB unsandboxed finishes; the desktop is unaffected |
+| 13 | two concurrent runs | each is bwrap in its own `run-p<pid>-*.scope`, the program in the same scope, exit statuses pass through |
+| `syscall_escape_1` | 36 denied system calls (every class of spec criterion 1) and 6 allowed ones from a Linux helper | EPERM (`clone3`: ENOSYS) through the real shim; with the shim cut out, a different answer for the 28 rows that have an oracle on the test host; see "Syscall-level escape tests" |
+| `syscall_escape_2` | `ptrace`/`/proc/<pid>/mem` of a process outside the Landlock domain | refused; the same process in the same domain is reachable (what wineserver needs) |
 
 Test 4 found a real gap while it was being written. bwrap's root is a writable tmpfs holding the directories it
 creates for its mount points, so the write to `<app root>/permissions.toml` "succeeded" in that memory. The host
@@ -547,8 +602,10 @@ file never changed. The profile now ends with `--remount-ro /`. Forcing every sa
 `--unsandboxed` makes tests 1-6 and 8 fail with `SANDBOX HOLE` (test 7 is a CLI refusal and runs no program).
 
 **What the suite does NOT prove.**
-- **Same uid.** It tests the mount, network and PID views only. There is no seccomp, Landlock or capability
-  filter until Phase 5B, so a kernel bug reachable from an unprivileged user namespace is not covered.
+- **Same uid.** It tests the mount, network and PID views, (9, 10) that the seccomp filter is on and what it
+  lets through for Wine, and (the `syscall_escape_*` tests) a sample of the denied calls through the real shim. The
+  whole filter is tested entry by entry in `rt_sandbox` (a BPF interpreter and real filtered processes), not from a
+  Windows program; a kernel bug in an allowed syscall is not covered.
 - **Granted sockets are shared.** The display, audio and GPU pieces are the host's, and the suite does not attack
   them: the X11 server (shared input), the Wayland compositor, PulseAudio/PipeWire and the GPU driver.
 - **`network = "allow"` is the host network.** Test 5 only shows that the switch changes something. With it on,
@@ -576,15 +633,23 @@ your full access (`\\?\unix\` paths reach every file). Which commands start a Wi
 | `runtime uninstall <app>` | the recorded uninstaller | yes, the installer sandbox |
 | `runtime remove`/`uninstall` (stop) | `wineserver -k`: not a session, runs no Windows code | no (not needed) |
 | `runtime doctor` | `wine --version`: no prefix | no (not needed) |
-| `runtime install` | `wineboot -u` in a brand-new prefix; installers in the installer sandbox | not app-written yet |
+| `runtime install` | `wineboot -u` in a brand-new prefix; the installer in the installer sandbox | installer: yes (installer sandbox); wineboot: not app-written yet |
 
-"Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program), written by the
-first sandboxed run; from then on those helpers run through the same `AppSandbox` (the app's own profile, so they
-get nothing the app does not have) and refuse, changing nothing, when bubblewrap is unavailable. Residual risk: an
-app that never ran sandboxed but whose prefix was written by an earlier unsandboxed run or by a vendor installer
-still has its `display`/archive-package `reg.exe` sessions run unsandboxed (as before Phase 5A), and
-`runtime run --unsandboxed` runs whatever the app wrote with your full access; `runtime sandbox <app>` warns about
-the latter.
+"Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program: no sandbox binds
+the app root). It is written whenever the runtime runs Windows code from outside your trust in the prefix inside a
+sandbox: the first `runtime run`, AND `runtime install` of an installer (before the installer's own code starts),
+`runtime deps <app> --install` whenever its plan may run an installer package (UP FRONT, before any package is
+fetched and before the run's helper launcher is chosen, so an archive package's `reg.exe` that follows an installer
+package in the same run is sandboxed too; and again before the installer and each of its own `reg.exe` steps), and
+`runtime uninstall` (before the recorded uninstaller). It is written BEFORE that code runs and its failure fails the
+operation (fail closed: nothing is fetched, installed or run if the marker cannot be written), so a prefix a
+sandboxed installer or uninstaller touched is never later reached by an unsandboxed helper. From then on `display` and archive-package
+`reg.exe` run through the same `AppSandbox` (the app's own profile, so they get nothing the app does not have) and
+refuse, changing nothing, when bubblewrap is unavailable (a marker-path error other than "not found" also refuses).
+Residual risk: an app that has NEVER run through any of those sandboxed paths is unmarked, so a prefix written by
+`runtime run --unsandboxed`, or created before Phase 5A/Task 6 and never touched sandboxed since, still has its
+`display`/archive-package `reg.exe` sessions run unsandboxed; and `runtime run --unsandboxed` runs whatever the app
+wrote with your full access. `runtime sandbox <app>` warns about the latter.
 
 **A running sandboxed app is invisible to `wineserver -k`.** Its `wineserver` keeps its socket in the sandbox's
 private `/tmp`, so the stop of `runtime remove`/`uninstall` cannot reach it. Both therefore check the host's `/proc`
@@ -593,10 +658,379 @@ and REFUSE while a `wineserver` still serves the prefix, or when `/proc` cannot 
 (wineserver pid N); quit it (Ctrl-C its runtime run) first; nothing was removed`. Nothing is deleted and no
 uninstaller runs (real-Wine test: `e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program`).
 
+## seccomp and Landlock (Phase 5B)
+
+bubblewrap no longer starts the program directly. It starts `runtime sandbox-init` (a hidden subcommand; the
+runtime's own executable, bound read-only at its own path), which hardens itself and then `execve`s the program, so
+everything the program starts (the Wine loader, `wineserver`, every Windows process) inherits the same layers. Its
+only input is its argument block, written by the renderer and strictly checked (`--v1`, at most 256 `ro:`/`rw:`
+rules with absolute paths, `--`, an absolute program; no NUL bytes); it reads no configuration file and no
+environment variable for it. It is safe for anyone to run: it only takes rights away from itself and then runs a
+program its caller could have run directly. Every refusal exits **126** with one `runtime: sandbox-init: ...` line on
+the program's stderr, which a normal run writes to the app's log (`runtime logs <app>`; `--debug` shows it). In
+order (`crates/sandbox/src/init.rs`):
+
+1. `RLIMIT_CORE = 0`: no core dumps of Windows program memory.
+2. **Landlock** (best effort): the filesystem ruleset below. Landlock missing from the kernel or disabled at boot:
+   the run goes on without it, and `runtime sandbox` and `doctor` say so (a host-side probe; the shim prints
+   nothing). Any other Landlock failure (a probe error, a rule that cannot be added) refuses the run.
+3. **seccomp** (mandatory, fail closed): the deny-list in `crates/sandbox/src/seccomp.rs` (a table with a reason per
+   syscall; `runtime sandbox` shows the count). Denied calls return `EPERM` (`clone3`: `ENOSYS`, so glibc falls
+   back to `clone`, whose namespace flags are checked). The architecture is checked first: on x86-64 the x32 ABI is
+   refused outright and the i386 ABI (`int 0x80`) except `set_thread_area`, the one call Wine makes through it: 32-bit
+   Windows programs run in 64-bit processes (new WoW64), but Wine 10.0 allocates their 32-bit `%fs` selector with
+   i386 `set_thread_area` (found when `hello32.exe` crashed under the first filter: "failed to allocate %fs
+   selector"). It only sets a TLS descriptor of the calling thread. A filter that cannot be built for the host refuses the run at
+   render time; one that cannot be installed refuses it in the shim.
+
+**What they add.** seccomp closes kernel interfaces a Windows program has no business using and that have a long
+record of escapes or host effects: `ptrace` (see below), `process_vm_readv`/`writev`, `kcmp`, the keyring calls,
+`bpf`, `perf_event_open`, `userfaultfd`, every mount and namespace call (`unshare`, `setns`, `clone` with a
+`CLONE_NEW*` flag, `clone3`), `open_by_handle_at`, module and kexec loading, `io_uring_setup` (io_uring requests
+bypass seccomp), terminal injection (`ioctl` `TIOCSTI`/`TIOCLINUX`, next to `--new-session`), `personality` other
+than the plain Linux/32-bit personas, and the `AF_VSOCK`/`AF_ALG`/`AF_KEY` socket families. Landlock enforces the
+file layout a second time, in the kernel's LSM layer, so a mistake in the mount list is not a hole: the rules mirror
+the bwrap binds exactly (`crates/sandbox/src/render.rs`, "Landlock"), and a real-bwrap test binds an extra file on
+purpose, without a rule, and sees Landlock refuse to read it.
+
+**The Landlock rules** (paths as they are INSIDE the sandbox, where bwrap's mount points are real directories even
+when the host's `/lib` is a symlink): read+execute for the read-only binds (`/usr`, `/bin`, `/lib`, `/lib64`,
+`/etc/alternatives`, the `/etc` files, Wine's DLL directories, with gpu the `/sys` parts and `/run/opengl-driver`,
+each `ro` grant, the runtime executable); read-write (every right the kernel's ABI handles, including device ioctls
+from ABI 5) for `/proc`, the device nodes of bwrap's `/dev` one by one (`null`, `zero`, `full`, `random`,
+`urandom`, `tty`) and its `/dev/pts` and `/dev/shm` directories, `/tmp`, the runtime directory, with gpu `/dev/dri`
+and each `/dev/nvidia*` node, each `rw` grant, the prefix and the app's home. `/dev` itself has no rule: a rule on it
+would also allow creating entries there, and its links (`fd`, `stdin`, `ptmx`) resolve into paths that have rules.
+Found by running, on kernel 7.0 (Landlock ABI 8): Landlock does not govern `connect()` on a unix socket file, so the
+Wayland, PulseAudio and X11 sockets need no rule (what is bound is what is reachable); and bwrap's skeleton
+directories (the parents of a bound path: the apps directory, a grant's parent, the directories above the runtime
+executable) have no rule, so they cannot be listed from inside, which is stricter than bubblewrap alone (it shows
+them with only the bound entry).
+
+**`ptrace`, decided.** wineserver implements `ReadProcessMemory` and `WriteProcessMemory` on another process with
+`ptrace`. Measured on Wine 10.0: with `ptrace` denied both fail with `ERROR_ACCESS_DENIED` (escape-suite probes
+`readmem`/`writemem`, test 10), and strace shows wineserver's `PTRACE_ATTACH` refused. That breaks debuggers,
+psapi's `GetModuleFileNameEx`/`EnumProcessModules` on another process, .NET's process list, crash reporters,
+launchers and mod loaders that inject into a child. Same-process Set/GetThreadContext (registers, debug registers
+of a suspended thread) does not need it. So `ptrace` is allowed for exactly the requests Wine's `server/ptrace.c`
+makes: `ATTACH` was observed; `PEEKDATA`, `POKEDATA`, `CONT` and `DETACH` come from reading that file (the
+cross-process memory tests pass with them); `PEEKUSER`/`POKEUSER` (debug registers of ANOTHER process's thread
+through Get/SetThreadContext) come from the same file and are exercised by no test. `TRACEME`, `SEIZE`, `GETREGS`
+and the rest stay denied. It is allowed **only when the Landlock domain is enforced**: Landlock refuses both
+`ptrace` and `/proc/<pid>/mem` of any process outside the tracer's domain, which confines them to the program's own
+process tree (verified by experiment). Without Landlock `ptrace` stays denied and cross-process memory access fails.
+
+**Without Landlock the seccomp layer can be shed on hosts where Yama `ptrace_scope` is 0, via `/proc/1/mem`.**
+bubblewrap's own PID 1 inside the sandbox (its reaper) is dumpable, has the same uid and carries no filter; opening
+its `/proc/1/mem` (the sandbox's `/proc` is a fresh read-write procfs) is checked by `ptrace_may_access`, i.e. by
+Yama and the LSMs, never by seccomp, so a program can write code into it and run unfiltered, still inside the
+bubblewrap namespaces. Keeping `ptrace` denied there is still right (one fewer path), but it does not close this
+one. `runtime sandbox` and `doctor` show, and `runtime run` (and any command that runs Windows code in the installer
+sandbox) prints as one `note:` line at the start, `seccomp can be bypassed through /proc/1/mem on this host (no
+Landlock, no Yama)` exactly when Landlock is unavailable and Yama's `ptrace_scope` is 0 or Yama is absent (Debian
+and Fedora default to 0). With Landlock, or with Yama at 1 or more, the path is closed. `/proc` stays read-write
+because bwrap mounts it that way; no test proves read-only would be enough.
+
+**What they do NOT add.**
+- **Same uid, same kernel.** A bug in a syscall the filter allows (the GPU driver's ioctls, the filesystem, the
+  network stack, futexes) is still an escape; the deny-list narrows the surface, it does not close it.
+- **Display, audio and GPU stay shared.** The X11, Wayland and PulseAudio sockets and the GPU nodes are reachable as
+  before (Landlock does not restrict unix-socket `connect`, and the GPU needs its device ioctls).
+- **Landlock is best effort.** Linux 5.13+ with Landlock in the boot-time LSM list; on older or differently
+  configured kernels the mounts are the only file boundary and `ptrace` stays denied. Landlock's network rules are
+  not used (`--unshare-net` already covers deny, and `allow` means all).
+- **The runtime executable's path** is visible inside (read-only), and so are the names of the directories above it
+  (empty; not listable with Landlock).
+- **Inherited descriptors.** Landlock checks at `open`: the terminal and pipes the program inherits keep full rights.
+- **Follow-up:** run the shim as the filtered PID 1 (`--as-pid-1`) once its signal handling is designed, which
+  removes the unfiltered process from the sandbox. Not done now: an init without handlers ignores SIGINT/SIGTERM
+  from inside the namespace, which would break the Ctrl-C forwarding of Phase 5A.
+
+## Resource limits (Phase 5B)
+
+**What runs.** When a limit applies, `runtime run` starts bwrap inside a transient systemd user scope:
+`systemd-run --user --scope --collect --quiet --expand-environment=no -p TasksMax=<n> [-p MemoryMax=<m>M -p
+MemorySwapMax=0] [-p CPUQuota=<p>%] -- bwrap ...` (cgroup v2). `runtime sandbox <app>` prints the limits, whether
+scopes work, and that command line. The point is the desktop: a buggy or hostile app cannot take the session down
+with a fork bomb (or, when asked for, by eating the memory or the CPU).
+
+| `permissions.toml` `[limits]` | `--set` | Scope property | Default |
+|---|---|---|---|
+| `tasks = <n>` (16..65536) or `"unlimited"` | `tasks=<n>\|unlimited\|default` | `TasksMax=<n>` | 4096, best effort |
+| `memory_mb = <MiB>` (64..1048576) | `memory=<MiB>\|off` | `MemoryMax=<MiB>M`, `MemorySwapMax=0` | none |
+| `cpu_percent = <p>` (1..409600; `--set`: 1..100 x CPUs) | `cpu=<percent>\|off` | `CPUQuota=<p>%` | none |
+
+**Needs systemd 254 or newer** (for `--expand-environment`): on older systemd the default task limit is skipped
+with a note and a `doctor` warning, and explicit limits refuse the run. The CPU bound of a stored profile is fixed
+(409600, i.e. 4096 CPUs), so a profile loads on any host and under any CPU affinity or quota `runtime` is started
+with; `--set cpu=` also checks the CPUs this process may use, and a quota above the host's total just never
+throttles. A 143 exit under a memory limit prints a note pointing at `journalctl --user -u 'run-p*.scope'`.
+
+**Default vs requested.** Without a `tasks` key every run gets `TasksMax=4096`, best effort: when `systemd-run --user`
+does not work (no user manager: a container, an SSH session without lingering; no cgroup v2; systemd older than 254,
+which lacks `--expand-environment`) or the user manager does not delegate the `pids` controller, the run goes ahead
+without a scope, prints `note: resource limits unavailable: <why>`, and `doctor` warns. ANY key written in the file
+(including `tasks = 4096`, the default's own value) is a request and fails closed: if the scope cannot be created
+with every controller it needs, the run is refused with the reason and the way out (`runtime permissions <app>
+--set memory=off --set cpu=off --set tasks=default`, or start the app from a desktop/user session); `doctor` says
+"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command (a throwaway scope,
+5 s at most, the same options and only `PATH` and `XDG_RUNTIME_DIR` in its environment, like the real command); the
+probe reads which controllers the user manager offers its scopes.
+
+**Signals and exit codes** (measured with systemd 259). With `--scope`, `systemd-run` registers the scope and then
+EXECS the command in place: the process `runtime` started keeps its pid, and it is bwrap (the scope is named
+`run-p<that pid>-i<n>.scope`; asserted by the escape suite), so the Phase 5A forwarding of Ctrl-C/SIGTERM reaches
+bwrap exactly as before (the real-Wine Ctrl-C test still ends the program within ~2 ms with 130/143). The exit
+status is the command's own (the program's code, 130/143 for a forwarded signal). Scope names are unique per pid, so
+concurrent runs of one app get separate scopes; `--collect` removes a finished scope even when it failed.
+`--expand-environment=no` matters: by default `systemd-run` expands `$VAR`/`${VAR}` in the command line (`$$`
+becomes `$`), which would change the program's arguments. `systemd-run` adds `INVOCATION_ID` to the environment the
+program sees (a random id, harmless). A `systemd-run` failure after the probe (the user manager went away) ends the
+run with its message and exit 1, before bwrap starts.
+
+**What the limits give, and what they do not.**
+- **They are per scope, i.e. per run.** Every process of one run (Wine, `wineserver`, whatever the program starts)
+  shares one budget. Two concurrent runs of one app get two budgets. The task limit protects the desktop, not the
+  app from itself: a fork bomb inside a run still starves that run's own processes.
+- **`TasksMax` counts threads as well as processes.** A Wine process has several threads, so `tasks = 64` allows
+  about twenty Windows processes (measured: a CreateProcess loop stopped after 21-23 copies); the default 4096 is
+  well above what real programs use.
+- **`MemoryMax` is a limit, not a reservation.** Nothing is set aside for the app; at the limit the kernel reclaims
+  and then OOM-kills inside the scope (with no swap: `MemorySwapMax=0`), and systemd then stops the whole scope
+  (its default `OOMPolicy=stop`): the program ends, `runtime` reports 143 (the scope's SIGTERM to bwrap), and
+  `journalctl --user` shows `Failed with result 'oom-kill'`. Measured: a 512 MiB hog under `memory = 128` ended after
+  ~1 s; the test process and the session were unaffected.
+- **`CPUQuota` is a throttle.** `cpu_percent = 150` is one and a half CPUs' worth of time per period; the program
+  runs slower, it is never killed for it.
+- **Not limited:** disk space, IO bandwidth, GPU time and GPU memory, network bandwidth, open files beyond the
+  kernel's per-process defaults. Processes the program reaches OUTSIDE the scope (the X server, the compositor,
+  PulseAudio/PipeWire, the GPU driver's kernel work) are charged to themselves, not to the app.
+- **Only the app sandbox.** `runtime run` and the Wine helpers that run in an app's sandbox (once it ran sandboxed)
+  get the scope; the installer sandbox and `--unsandboxed` runs do not.
+
+## What the hardening layers add and do not
+
+The app sandbox is four layers, each a kernel mechanism that holds if the one before it has a mistake. None of them
+is Wine: Wine only translates the program's calls, and a hostile program can bypass it completely.
+
+| Layer | Mandatory? | What it adds | What it does not |
+|---|---|---|---|
+| bubblewrap (5A) | yes: no bwrap, no run | its own mount, PID, IPC, UTS (and without `network = "allow"`, network) namespaces; only the profile's paths, devices and sockets; no capabilities, `no_new_privs`; a new session | the same uid and the same kernel; the bound sockets and devices are the host's |
+| seccomp (5B) | yes: a filter that cannot be built or installed refuses the run | EPERM for the calls below | no protection from a bug in an allowed call (file systems, the network stack, futexes, the GPU driver's ioctls); not a sandbox by itself |
+| Landlock (5B) | best effort, reported | the file layout a second time, in the LSM layer; `ptrace` and `/proc/<pid>/mem` confined to the program's own processes | nothing on kernels without it (older than 5.13, or Landlock not in the boot-time LSM list); no network or unix-socket rules |
+| cgroup limits (5B) | the default task limit is best effort; any limit in `permissions.toml` is mandatory | a task limit (4096) against fork bombs; memory and CPU on request | disk, IO, GPU time and memory, network bandwidth; work done for the app by processes outside its scope (X server, compositor, audio server, GPU driver) |
+
+**The seccomp deny-list.** Denied calls return `EPERM` (the program sees an ordinary error and can degrade; nothing
+is killed). This table is `rt_sandbox::seccomp::DENIED` itself (a test fails when they differ):
+
+<!-- deny-list: rt_sandbox::seccomp::DENIED, checked by the_security_document_lists_the_deny_list -->
+| syscall | refused when | why |
+| `ptrace` | always | inspects and rewrites the memory and registers of other processes of the same user |
+| `process_vm_readv` | always | reads another process's memory directly |
+| `process_vm_writev` | always | writes another process's memory directly |
+| `kcmp` | always | compares kernel objects (files, memory maps) of other processes, leaking how they are shared |
+| `keyctl` | always | manages kernel keyrings, which hold credentials and are shared with the session outside the sandbox |
+| `add_key` | always | adds keys to the kernel keyrings (see keyctl) |
+| `request_key` | always | looks up keyring keys and can make the kernel run the host's request-key helper |
+| `bpf` | always | loads eBPF programs and maps, a large kernel attack surface |
+| `perf_event_open` | always | performance counters: a large kernel attack surface and a side channel |
+| `userfaultfd` | always | lets a program stall page faults (even the kernel's) at will, a standard kernel-exploit primitive |
+| `mount` | always | mounts filesystems; the sandbox's mount layout is fixed by bubblewrap |
+| `umount2` | always | unmounts filesystems, which could uncover what the sandbox's mounts hide |
+| `pivot_root` | always | changes the root mount |
+| `chroot` | always | changes the root directory |
+| `unshare` | always | creates namespaces; a new user namespace grants capabilities inside it |
+| `setns` | always | joins other namespaces |
+| `open_by_handle_at` | always | opens files by handle, bypassing path-based confinement (the 'shocker' container escape) |
+| `name_to_handle_at` | always | produces the file handles open_by_handle_at consumes |
+| `kexec_load` | always | loads a new kernel to boot into |
+| `kexec_file_load` | always | loads a new kernel to boot into |
+| `init_module` | always | loads a kernel module |
+| `finit_module` | always | loads a kernel module |
+| `delete_module` | always | unloads a kernel module |
+| `syslog` | always | reads or clears the kernel log, which leaks kernel addresses and host activity |
+| `acct` | always | switches process accounting on or off |
+| `quotactl` | always | manages filesystem quotas |
+| `quotactl_fd` | always | manages filesystem quotas (by file descriptor) |
+| `swapon` | always | enables a swap area |
+| `swapoff` | always | disables a swap area |
+| `reboot` | always | reboots or halts the machine |
+| `settimeofday` | always | sets the system clock |
+| `clock_settime` | always | sets a system clock |
+| `clock_adjtime` | always | adjusts a system clock |
+| `adjtimex` | always | adjusts the system clock |
+| `sethostname` | always | renames the host |
+| `setdomainname` | always | renames the host's NIS domain |
+| `vhangup` | always | hangs up the current terminal |
+| `iopl` | always | grants direct access to hardware I/O ports (x86-64) |
+| `ioperm` | always | grants direct access to hardware I/O ports (x86-64) |
+| `lookup_dcookie` | always | obsolete profiling interface that turns kernel directory cookies into paths |
+| `nfsservctl` | always | obsolete NFS server control (removed from Linux in 3.1) |
+| `move_pages` | always | moves the memory pages of other processes between NUMA nodes |
+| `mbind` | always | NUMA memory policy: unused by desktop programs, historically buggy kernel code |
+| `set_mempolicy` | always | NUMA memory policy: unused by desktop programs, historically buggy kernel code |
+| `get_mempolicy` | always | NUMA memory policy: unused by desktop programs, historically buggy kernel code |
+| `migrate_pages` | always | moves the memory pages of other processes between NUMA nodes |
+| `fanotify_init` | always | watches file access across whole mounts or filesystems |
+| `mount_setattr` | always | new mount API: changes mount attributes |
+| `move_mount` | always | new mount API: attaches or moves mounts |
+| `open_tree` | always | new mount API: clones mount trees |
+| `fsopen` | always | new mount API: creates a filesystem context |
+| `fsconfig` | always | new mount API: configures a filesystem context |
+| `fsmount` | always | new mount API: creates a mount from a filesystem context |
+| `fspick` | always | new mount API: reconfigures a mounted filesystem |
+| `pidfd_getfd` | always | copies a file descriptor out of another process |
+| `process_madvise` | always | gives memory advice for another process's address space |
+| `uselib` | always | obsolete a.out library loader (x86-64) |
+| `io_uring_setup` | always | io_uring runs operations without seccomp seeing them (it could open the sockets denied below) |
+| `clone3` | always (`ENOSYS`) | its flags live behind a pointer seccomp cannot read; ENOSYS makes glibc fall back to clone |
+| `clone` | arg0 has any bit of 0x7e020080 | creates namespaces (CLONE_NEW* flags); threads and plain forks are allowed |
+| `ioctl` | arg1 is one of 0x5412, 0x541c | TIOCSTI and TIOCLINUX push input into a terminal, e.g. keystrokes into the user's shell |
+| `personality` | arg0 is none of 0x0, 0x8, 0xffffffff | only PER_LINUX, PER_LINUX32 and the query are allowed; other flags weaken exploit mitigations |
+| `socket` | arg0 is one of 0x28, 0x26, 0xf | AF_VSOCK (hypervisor), AF_ALG (kernel crypto, a recurring exploit vector), AF_KEY (IPsec keys): no Windows API uses them |
+<!-- /deny-list -->
+
+Three things are not in the table:
+- **The architecture check comes first.** On x86-64 the x32 ABI (any number with bit 30 set) is refused, and so is
+  every i386 call (`int 0x80`) except `set_thread_area` (243), which Wine 10.0's new WoW64 makes to set up a 32-bit
+  program's `%fs` selector (without it every 32-bit program crashes) and which only sets a TLS descriptor of the
+  calling thread.
+- **`ptrace` when Landlock is enforced.** The shim then installs a second variant of the filter that lets exactly
+  Wine's requests through (`ATTACH`, `DETACH`, `PEEKDATA`, `POKEDATA`, `PEEKUSER`, `POKEUSER`, `CONT`;
+  `rt_sandbox::seccomp::WINE_PTRACE`), because Landlock confines them to the program's own processes; `TRACEME`,
+  `SEIZE`, `GETREGS` and the rest stay refused ("`ptrace`, decided" above).
+- **The residual without Landlock.** bubblewrap's pid 1 inside the sandbox carries no filter. Without Landlock,
+  where Yama's `ptrace_scope` is 0, the program can write into it through `/proc/1/mem` and run code without the
+  filter (still inside the namespaces). `runtime sandbox` and `doctor` say so on such a host.
+
+**Landlock, what exactly.** File-system rights only, negotiated with the kernel's ABI (1 to 8 are known; the rights a
+newer kernel adds are not used): read+execute for the read-only binds, every handled right (from ABI 5 including
+device ioctls) for the writable ones and the device nodes; the rule list is in "The Landlock rules" above. What it
+breaks: the parent directories bubblewrap creates for a bound path (the apps directory, a grant's parent, the
+directories above the runtime executable) cannot be listed, so a Windows file dialog cannot browse above a granted
+folder. What it does not do: restrict `connect()` on a unix socket file (measured on ABI 8), restrict the network,
+or take rights away from descriptors the program inherited (its terminal and pipes).
+
+**What still reaches the host from inside, with every layer on.**
+- **Your uid.** Anything bound is reachable as you: the prefix, the app's home, each grant (`rw` grants can be
+  destroyed).
+- **Kernel code behind every allowed call.** The deny-list removes the interfaces with the worst record; a bug in
+  what stays allowed (and Wine needs a lot) is an escape.
+- **Display, audio and GPU** (on by default). The X11 server is shared: the program can read and inject the input of
+  every other X11 window, which is code execution as you (`display = off` removes it). The Wayland compositor,
+  PulseAudio/PipeWire and the GPU driver's kernel code are reachable; Landlock does not restrict unix-socket
+  `connect`, and the GPU needs its device ioctls.
+- **`network = "allow"` is the host's network namespace**, including abstract unix sockets (X11's among them) and
+  every loopback service.
+- **The installer sandbox has seccomp and Landlock but no resource limits** ("Installer sandbox" above), and
+  `--unsandboxed` runs have no layer at all.
+
+### Syscall-level escape tests
+
+A Windows program cannot make raw Linux system calls, so `crates/cli/tests/e2e_sandbox.rs` (`syscall_escape_1`,
+`syscall_escape_2`, `syscall_escape_4`; no Wine needed, so they run in the ordinary `cargo test` on glibc hosts) uses a Linux helper: the
+test binary itself, re-executed inside the sandbox and bound read-only through the renderer's ordinary read-only
+binds. The command is the one `runtime run` renders for the default profile (the systemd-run scope, bwrap, and the
+real `runtime` binary as `sandbox-init`); nothing test-only is added to the production code. Each call runs in its
+own forked child with arguments that do nothing even if the filter let the call through (NULL or bad pointers, fd
+-1, invalid flags or magic numbers). **The oracle** is the same command with the shim's words cut out: bwrap alone,
+the same binds and namespaces, no Landlock and no seccomp. The tests skip visibly without bwrap, seccomp, Landlock
+(the Landlock half of `syscall_escape_2`) or IA32 emulation (the `int 0x80` rows); **`RUNTIME_REQUIRE_BWRAP=1` (set
+by CI's `test` job) turns each of those skips into a failure**, so it requires seccomp, Landlock and IA32 emulation
+too. Yama `ptrace_scope` 2 or 3 stays a visible skip of `syscall_escape_2` even then: no unprivileged attach can
+succeed there, so there is nothing to observe.
+
+**Which layer of tests covers what.**
+- **The BPF interpreter** (`crates/sandbox/src/seccomp/tests.rs`): every `DENIED` entry, with all-ones arguments,
+  and every argument rule's refused and allowed values; the only layer that proves, for every entry, that the
+  FILTER refuses it.
+- **Real kernel, outside bubblewrap** (`crates/sandbox/src/seccomp/tests/kernel.rs`):
+  `every_denied_entry_is_refused_by_a_real_filtered_call` calls every `DENIED` entry (63 on x86-64) for real in a
+  filtered child and requires EPERM (`clone3`: ENOSYS). Only the filtered answers are checked. With the filter
+  removed (measured, then reverted) 46 of the 63 answer something else. The other 17 are EPERM for an unprivileged
+  caller anyway, because the kernel checks a capability first: `kexec_load`, `kexec_file_load`, `init_module`,
+  `finit_module`, `delete_module`, `syslog`, `acct`, `swapoff`, `reboot`, `sethostname`, `setdomainname`,
+  `vhangup`, `fanotify_init`, `move_mount`, `fsopen`, `fsmount`, `fspick`. For those, only the interpreter
+  distinguishes the filter from the kernel. A second test there runs 35 probes (on x86-64) WITH and WITHOUT the filter and
+  requires a different answer where the kernel's own is deterministic.
+- **The real pipeline** (`syscall_escape_1`, the table below): 42 rows, 36 of them denied calls covering every class
+  of spec criterion 1, EPERM through the shim except `clone3` (ENOSYS). A **strict** row requires a specific
+  non-EPERM answer from bwrap alone, where the kernel's argument checks answer before any permission check. A
+  **host** row accepts whatever bwrap alone answers, because host policy decides it (Yama, AppArmor's user-namespace
+  restriction, sysctls, loaded modules, the kernel version). When that answer is also EPERM, the test prints "NO
+  ORACLE here" instead of failing, and the row rests on the tests above. The row names and classes below are checked
+  against the test's own list by `syscall_escape_3_the_security_table_is_the_test_list`. Measured on 2026-09-26
+  (kernel 7.0, bubblewrap 0.11.1, systemd 259, Landlock ABI 8, Yama 1, AppArmor's user-namespace restriction on,
+  `dev.tty.legacy_tiocsti` 0): **28 of the 36 denied rows had an oracle.** With the shim also cut out of the
+  "through the shim" run, exactly those 28 fail; the 8 without an oracle pass either way.
+
+<!-- pipeline-rows: the ROWS of crates/cli/tests/e2e_sandbox.rs, checked by syscall_escape_3 -->
+| Row (the helper's call) | Class | Through the shim | bwrap only (here) | Oracle here |
+|---|---|---|---|---|
+| `getpid` | allowed | 0 | 0 | same answer both ways |
+| `thread (clone3 -> clone fallback)` | allowed | 0 | 0 | same answer both ways |
+| `mmap(PROT_EXEC)` | allowed | 0 | 0 | same answer both ways |
+| `socket(AF_UNIX)` | allowed | 0 | 0 | same answer both ways |
+| `ioctl(TCGETS) on a pty` | allowed | 0 | 0 | same answer both ways |
+| `int 0x80 set_thread_area(NULL)` | allowed | EFAULT | EFAULT | the kernel answered, not the filter |
+| `ptrace(TRACEME)` | host | EPERM | 0 | yes |
+| `ptrace(SEIZE, 0)` | strict | EPERM | ESRCH | yes |
+| `unshare(NEWUSER)` | host | EPERM | 0 | yes |
+| `unshare(NEWUSER\|PARENT)` | strict | EPERM | EINVAL | yes |
+| `clone(NEWUSER\|SIGCHLD)` | host | EPERM | 0 | yes |
+| `clone(thread flags\|PIDFD\|NEWUSER)` | strict | EPERM | EINVAL | yes |
+| `clone3(NULL, 0)` | host | ENOSYS | EINVAL | yes |
+| `mount(bad type)` | strict | EPERM | EFAULT | yes |
+| `keyctl(9999)` | strict | EPERM | EOPNOTSUPP | yes |
+| `bpf(9999)` | host | EPERM | EINVAL | yes |
+| `perf_event_open(NULL)` | strict | EPERM | EACCES | yes |
+| `userfaultfd(USER_MODE_ONLY)` | host | EPERM | 0 | yes |
+| `open_by_handle_at(NULL)` | host | EPERM | EFAULT | yes |
+| `io_uring_setup(1, NULL)` | host | EPERM | EFAULT | yes |
+| `ioctl(TIOCSTI) into its own terminal` | strict | EPERM | EIO | yes |
+| `pivot_root(NULL, NULL)` | host | EPERM | EFAULT | yes |
+| `chroot(NULL)` | strict | EPERM | EFAULT | yes |
+| `setns(-1, 0)` | strict | EPERM | EBADF | yes |
+| `umount2(NULL, bad flags)` | strict | EPERM | EINVAL | yes |
+| `kexec_load(1000 segments, bad flag)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `syslog(SIZE_BUFFER)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `acct(bad pointer)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `quotactl(bad type)` | strict | EPERM | EINVAL | yes |
+| `swapon(NULL, bad flags)` | strict | EPERM | EINVAL | yes |
+| `swapoff(bad pointer)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `reboot(bad magic)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `init_module(NULL)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `finit_module(-1)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `delete_module(NULL)` | host | EPERM | EPERM | **no**: EPERM without the filter too |
+| `add_key(NULL)` | strict | EPERM | EFAULT | yes |
+| `request_key(NULL)` | strict | EPERM | EFAULT | yes |
+| `ioctl(TIOCLINUX) on a pty` | strict | EPERM | ENOTTY | yes |
+| `socket(AF_VSOCK)` | host | EPERM | 0 | yes |
+| `socket(AF_ALG)` | host | EPERM | 0 | yes |
+| `int 0x80 getpid` | strict | EPERM | 0 | yes |
+| `x32 getpid` | strict | EPERM | ENOSYS | yes |
+<!-- /pipeline-rows -->
+
+`syscall_escape_2` covers the Landlock half of the `ptrace` decision without Yama in the way: the helper forks a
+child and attaches it (`PTRACE_ATTACH`) and opens its `/proc/<pid>/mem`. From the same Landlock domain both work
+(0, 0: what wineserver does). After the helper enters a new, nested domain through a second `runtime sandbox-init`,
+the same child is outside it and both are refused (EPERM, EACCES). The tracer is the child's parent both times, so
+Yama at 1 allows it, as the first run shows. With the nested domain removed, the test fails.
+
+`syscall_escape_4` runs every row of the table through the INSTALLER sandbox (`rt_installer::InstallerSandbox::new`
+and `wrap`, the production path, with the helper bound like a dll directory and the real `runtime` as the shim) with
+the same expectations and the same bwrap-only oracle; measured the same answers as the table's two columns. The
+bwrap-only column is what the installer sandbox was before Phase 5B Task 6.
+
+Not covered by any of these tests: `ptrace` of bwrap's own pid 1 on a host without Landlock (the residual above;
+Yama at 1 here hides it), and a kernel bug behind an allowed call.
+
 ## Roadmap
 
-Phase 5B adds the layers the namespace sandbox lacks: a seccomp filter, Landlock rules as a second layer, and
-resource limits, and moves the dependency engine's path-based prefix operations to held directory descriptors.
+Phase 5B's layers are in place for the app sandbox (seccomp, Landlock, resource limits and their escape tests) and,
+without resource limits, for the installer sandbox (Task 6). Later: resource limits for installers; the dependency
+engine's path-based prefix operations move to held directory descriptors; the shim as the filtered pid 1 (removing
+the unfiltered bubblewrap reaper, and with it the no-Landlock `/proc/1/mem` residual).
 
 ## Reporting
 

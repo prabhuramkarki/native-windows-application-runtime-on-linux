@@ -117,6 +117,9 @@ pub struct Orchestrator<'a> {
     /// The host's Vulkan verdict; the install re-resolves the plan, so it applies [`block_for_vulkan`] again and
     /// installs exactly what `plan_for_app` showed as installable.
     pub vulkan: VulkanFor<'a>,
+    /// This runtime's own executable (the CLI's `std::env::current_exe()`): installer packages run in the installer
+    /// sandbox with it as the `sandbox-init` shim ([`rt_installer::InstallerSandbox::new`]).
+    pub runtime_exe: &'a Path,
 }
 
 /// Unix seconds (0 if the clock is before 1970).
@@ -672,18 +675,20 @@ fn install_one(
         Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
             .map(|_| Vec::new())
             .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?,
-        Kind::Installer => match install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher) {
-            Ok(done) => {
-                let mut w = done.warnings;
-                if !done.staged_removed {
-                    w.push("the staged installer copy could not be removed from windows\\temp".into());
+        Kind::Installer => {
+            match install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher, o.runtime_exe) {
+                Ok(done) => {
+                    let mut w = done.warnings;
+                    if !done.staged_removed {
+                        w.push("the staged installer copy could not be removed from windows\\temp".into());
+                    }
+                    w
                 }
-                w
+                // Present by now although it was not a moment ago: still nothing of ours to record.
+                Err(InstallerPkgError::MarkerAlreadyPresent) => return Ok(None),
+                Err(e) => return Err(installer_reason(e)),
             }
-            // Present by now although it was not a moment ago: still nothing of ours to record.
-            Err(InstallerPkgError::MarkerAlreadyPresent) => return Ok(None),
-            Err(e) => return Err(installer_reason(e)),
-        },
+        }
     };
     record(o, pkg, consent).map_err(|e| {
         format!(
@@ -745,6 +750,7 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::BadPackage(_)
         | E::Stage(_)
         | E::BwrapNotFound
+        | E::SandboxRefused(_)
         | E::BadSilentArg(_)
         | E::MsiExecMissing
         | E::ExplorerMissing => e.to_string(),

@@ -781,6 +781,7 @@ dependencies = [
  "runtime-core",
  "runtime-desktop",
  "runtime-pe",
+ "runtime-sandbox",
  "tempfile",
  "thiserror",
 ]

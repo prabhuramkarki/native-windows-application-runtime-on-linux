@@ -125,6 +125,8 @@ impl Rig {
             consent,
             now: || 1_900_000_000,
             vulkan: &|_| rt_core::VulkanVerdict::Unknown,
+            // No installer package runs in these tests.
+            runtime_exe: std::path::Path::new("/nonexistent/runtime"),
         };
         install_report(&o, app).unwrap()
     }

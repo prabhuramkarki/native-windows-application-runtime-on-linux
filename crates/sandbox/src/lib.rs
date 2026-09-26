@@ -1,14 +1,21 @@
 //! The per-app sandbox: the validated permission profile (`permissions.toml`) that decides what a program may
 //! reach, and [`AppSandbox`], which renders it into a bubblewrap command around the program. This crate never
-//! trusts the file it reads: see [`permissions`]. The rendered profile is described in [`render`].
+//! trusts the file it reads: see [`permissions`]. The rendered profile is described in [`render`]; the seccomp
+//! deny-list the program runs under in [`seccomp`]; its Landlock filesystem ruleset in [`landlock`]; its resource
+//! limits (a systemd user scope, [`probe_limits`]) in [`render`], "Limits".
+#[cfg(test)]
+mod bpf_interp;
 pub mod host;
+pub mod init;
+pub mod landlock;
 pub mod permissions;
 pub mod render;
+pub mod seccomp;
 
 pub use host::{Host, RealHost};
 pub use permissions::{
-    Access, FsGrant, GrantCtx, Network, PermError, Permissions, Refusal, account_home, load, load_opt, load_opt_raw,
-    reset, store, validate_grant, validate_grant_for,
+    Access, DEFAULT_TASKS, FsGrant, GrantCtx, Limits, Network, PermError, Permissions, Refusal, Tasks, account_home,
+    load, load_opt, load_opt_raw, reset, store, validate_grant, validate_grant_for,
 };
 pub use render::{AppSandbox, RenderError};
 
@@ -20,23 +27,252 @@ use std::time::Duration;
 /// Looks for `bwrap` on `$PATH` the way a shell would (absolute directories only, first match wins), with an
 /// injected environment and file probe; the same rules as `rt_installer::sandbox::find_bwrap`.
 pub fn find_bwrap(env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    find_exe("bwrap", env, is_file)
+}
+
+/// [`find_bwrap`] for `systemd-run`.
+pub fn find_systemd_run(env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    find_exe("systemd-run", env, is_file)
+}
+
+fn find_exe(name: &str, env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let path = env("PATH")?;
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("bwrap"))
+        .map(|dir| dir.join(name))
         .find(|candidate| is_file(candidate))
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// [`find_bwrap`] over the real environment and filesystem (a regular, executable file).
 pub fn find_bwrap_on_path() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    find_bwrap(&|k| std::env::var_os(k), &|p: &Path| {
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    find_bwrap(&|k| std::env::var_os(k), &is_executable)
+}
+
+/// [`find_systemd_run`] over the real environment and filesystem (a regular, executable file).
+pub fn find_systemd_run_on_path() -> Option<PathBuf> {
+    find_systemd_run(&|k| std::env::var_os(k), &is_executable)
+}
+
+/// What `systemd-run --user --scope` offers on this host ([`probe_limits`]): the binary, and the cgroup v2
+/// controllers a scope of the user manager can use (`cpu`, `memory`, `pids`, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSupport {
+    pub systemd_run: PathBuf,
+    pub controllers: Vec<String>,
+}
+
+/// [`probe_limits`]'s reason when `systemd-run` does not know `--expand-environment` (added in systemd 254).
+pub const OLD_SYSTEMD: &str = "systemd-run does not support --expand-environment=no (systemd older than 254)";
+
+/// The options every scope is started with (`render`, "Limits"); the probe uses the same ones.
+pub const SCOPE_ARGS: [&str; 5] = ["--user", "--scope", "--collect", "--quiet", "--expand-environment=no"];
+
+/// What the probe's scope runs: the cgroup v2 controllers its PARENT offers (the scope's own list shows only what
+/// systemd has enabled so far; a controller the parent offers is enabled for a scope that asks for it).
+const PROBE_SCRIPT: &str =
+    r#"c=$(sed -n 's/^0:://p' /proc/self/cgroup) && [ -n "$c" ] && cat "/sys/fs/cgroup${c%/*}/cgroup.controllers""#;
+
+/// Really starts a throwaway scope once (`systemd-run <SCOPE_ARGS> -p TasksMax=100 -- /bin/sh -c <PROBE_SCRIPT>`, at
+/// most 5 s, output capped by the launcher) with only `PATH` and `runtime_dir` (`$XDG_RUNTIME_DIR`,
+/// which is how `systemd-run --user` finds the user manager: the sandboxed command never carries
+/// `DBUS_SESSION_BUS_ADDRESS`, so the probe does not either). `Err` is a one-line reason.
+pub fn probe_limits(systemd_run: &Path, runtime_dir: Option<&std::ffi::OsStr>) -> Result<ScopeSupport, String> {
+    let mut env = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+    env.extend(runtime_dir.map(|d| (OsString::from("XDG_RUNTIME_DIR"), d.to_owned())));
+    let mut cmd = Command::new(systemd_run);
+    cmd.args(SCOPE_ARGS)
+        .args(["-p", "TasksMax=100", "--", "/bin/sh", "-c", PROBE_SCRIPT]);
+    let out = rt_core::Launcher::with_host_env(env)
+        .run_helper(cmd, PROBE_TIMEOUT)
+        .map_err(|e| format!("systemd-run could not be run: {e}"))?;
+    let text = String::from_utf8_lossy(&out.output);
+    let line = |l: Option<&str>| -> String {
+        l.unwrap_or("no output")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect()
+    };
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    if !out.status.success() {
+        if text.contains("--expand-environment") {
+            return Err(OLD_SYSTEMD.to_owned());
+        }
+        return Err(format!("systemd-run --user --scope failed ({})", line(lines.next())));
+    }
+    let last = lines.next_back();
+    let controllers: Vec<String> = last.unwrap_or("").split_whitespace().map(str::to_owned).collect();
+    if controllers.is_empty()
+        || !controllers
+            .iter()
+            .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    {
+        return Err(format!("the scope reported no cgroup v2 controllers ({})", line(last)));
+    }
+    Ok(ScopeSupport {
+        systemd_run: systemd_run.to_path_buf(),
+        controllers,
     })
+}
+
+/// The in-kernel layers the `sandbox-init` shim adds, probed on the host (the shim itself reports nothing): one
+/// `seccomp: ...` and one `landlock: ...` line for `runtime sandbox` and `doctor`, whether both are fully there,
+/// and [`BYPASS_CAVEAT`] when the filter can be shed on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardening {
+    pub seccomp: String,
+    pub landlock: String,
+    pub complete: bool,
+    pub caveat: Option<String>,
+}
+
+/// Without Landlock, bwrap's own pid 1 inside the sandbox (dumpable, same uid, no filter) is reachable through
+/// `/proc/1/mem`, which seccomp cannot see and only Yama guards (`rt_sandbox::seccomp`, "ptrace and Landlock").
+pub const BYPASS_CAVEAT: &str = "seccomp can be bypassed through /proc/1/mem on this host (no Landlock, no Yama)";
+
+pub fn hardening() -> Hardening {
+    let seccomp = seccomp::host_arch().and_then(|a| seccomp::build_filter(a).map(|_| a));
+    hardening_from(seccomp.map_err(|e| e.to_string()), landlock::host_state(), yama_scope())
+}
+
+/// Yama's `ptrace_scope` (0-3), read bounded; `None` when the file is missing or unreadable (Yama not there).
+fn yama_scope() -> Option<u32> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let n = std::fs::File::open("/proc/sys/kernel/yama/ptrace_scope")
+        .and_then(|mut f| f.read(&mut buf))
+        .ok()?;
+    std::str::from_utf8(&buf[..n]).ok()?.trim().parse().ok()
+}
+
+/// [`hardening`] from its probes: the filter (its arch, or why it cannot be built), Landlock, and Yama's scope
+/// (`None`: no Yama, the same as scope 0).
+fn hardening_from(
+    seccomp: Result<seccomp::Arch, String>,
+    landlock: landlock::HostState,
+    yama: Option<u32>,
+) -> Hardening {
+    let (seccomp, seccomp_ok) = match seccomp {
+        Ok(a) => (
+            format!("seccomp: enforced ({}, {} rules)", a.name(), seccomp::DENIED.len()),
+            true,
+        ),
+        Err(e) => (
+            format!("seccomp: UNAVAILABLE ({e}); `runtime run` refuses to start programs"),
+            false,
+        ),
+    };
+    let mut caveat = None;
+    let (landlock, landlock_ok) = match landlock {
+        landlock::HostState::Abi(abi) => (
+            format!("landlock: ABI {abi} (fs); ptrace and /proc/<pid>/mem reach only the app's own processes"),
+            true,
+        ),
+        landlock::HostState::Unavailable(why) => {
+            if yama.unwrap_or(0) == 0 {
+                caveat = Some(BYPASS_CAVEAT.to_owned());
+            }
+            (
+                format!(
+                    "landlock: unavailable: {why}; only the mounts confine files, ptrace stays denied (Windows \
+                     programs cannot read or write other processes' memory), and /proc/1/mem is guarded by Yama only"
+                ),
+                false,
+            )
+        }
+        landlock::HostState::Error(e) => (
+            format!("landlock: {e}; `runtime run` refuses to start programs while this fails"),
+            false,
+        ),
+    };
+    Hardening {
+        seccomp,
+        landlock,
+        complete: seccomp_ok && landlock_ok,
+        caveat,
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn the_bypass_caveat_appears_exactly_without_landlock_and_without_yama() {
+        let arch = || seccomp::host_arch().map_err(|e| e.to_string());
+        let unavailable = || landlock::HostState::Unavailable("gone".into());
+        for yama in [None, Some(0)] {
+            let h = hardening_from(arch(), unavailable(), yama);
+            assert_eq!(h.caveat.as_deref(), Some(BYPASS_CAVEAT), "{yama:?}");
+            assert!(!h.complete);
+            assert!(h.landlock.starts_with("landlock: unavailable: gone;"), "{}", h.landlock);
+            assert!(
+                h.landlock.contains("/proc/1/mem is guarded by Yama only"),
+                "{}",
+                h.landlock
+            );
+        }
+        for yama in [1, 2, 3] {
+            let h = hardening_from(arch(), unavailable(), Some(yama));
+            assert_eq!(h.caveat, None, "{yama}");
+            assert!(!h.complete);
+        }
+        for yama in [None, Some(0), Some(1)] {
+            let h = hardening_from(arch(), landlock::HostState::Abi(8), yama);
+            assert_eq!(h.caveat, None);
+            assert!(h.complete);
+            assert!(h.landlock.starts_with("landlock: ABI 8 (fs)"), "{}", h.landlock);
+        }
+        let h = hardening_from(Err("no table".into()), landlock::HostState::Abi(8), Some(1));
+        assert!(
+            !h.complete && h.seccomp.starts_with("seccomp: UNAVAILABLE (no table)"),
+            "{}",
+            h.seccomp
+        );
+        let e = landlock::HostState::Error(landlock::LandlockError::BadPath("x".into()));
+        let h = hardening_from(arch(), e, None);
+        assert_eq!(
+            h.caveat, None,
+            "a probe error refuses every run: nothing runs to bypass"
+        );
+        assert!(h.landlock.contains("refuses to start programs"), "{}", h.landlock);
+    }
+
+    #[test]
+    fn yama_scope_is_read_from_this_host() {
+        let want = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        assert_eq!(yama_scope(), want);
+    }
 }
 
 /// How long [`probe`] waits for `bwrap`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// In an app root: Windows code from outside the user's trust (the app itself, a vendor installer or uninstaller)
+/// has run in this app's prefix inside a sandbox, so that prefix may hold anything that code wrote there (registry
+/// `Run` keys, services, `DllOverrides` naming a planted native DLL). From then on every Wine helper that starts a
+/// session in the prefix runs sandboxed too (the CLI's `helper_launcher`). No sandbox ever binds the app root.
+pub const MARKER: &str = "ran-sandboxed";
+
+/// Writes [`MARKER`] in `app_root` (created `0600` if missing, never through a symlink). Callers write it BEFORE
+/// starting the code (a crash then leaves it set) and fail closed: an error means nothing may run.
+pub fn mark(app_root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(app_root.join(MARKER))
+        .map(drop)
+}
 
 /// Really creates a throwaway sandbox once (`bwrap --unshare-all --die-with-parent --ro-bind / / true`, at most
 /// [`PROBE_TIMEOUT`], output capped by the launcher) so a caller can say why sandboxing is impossible on this host
@@ -107,6 +343,63 @@ mod tests {
         let only_rel = |k: &str| (k == "PATH").then(|| OsString::from("rel"));
         assert_eq!(find_bwrap(&only_rel, &|_: &Path| true), None);
         assert_eq!(find_bwrap(&|_: &str| None, &|_: &Path| true), None);
+    }
+
+    #[test]
+    fn find_systemd_run_searches_path_like_find_bwrap() {
+        let env = |k: &str| (k == "PATH").then(|| OsString::from("rel:/opt/bin:/usr/bin"));
+        let is_file = |p: &Path| p == Path::new("/usr/bin/systemd-run") || p == Path::new("/opt/bin/bwrap");
+        assert_eq!(
+            find_systemd_run(&env, &is_file),
+            Some(PathBuf::from("/usr/bin/systemd-run"))
+        );
+        assert_eq!(find_systemd_run(&|_: &str| None, &|_: &Path| true), None);
+    }
+
+    #[test]
+    fn probe_limits_reports_a_systemd_run_that_cannot_run_or_fails() {
+        let e = probe_limits(Path::new("/nonexistent/systemd-run"), None).unwrap_err();
+        assert!(e.contains("could not be run"), "{e}");
+        // systemd older than 254 does not know `--expand-environment`: named as such
+        let td = tempfile::tempdir().unwrap();
+        let old = td.path().join("systemd-run");
+        std::fs::write(
+            &old,
+            "#!/bin/sh\necho \"systemd-run: unrecognized option '--expand-environment=no'\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&old, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(probe_limits(&old, None).unwrap_err(), OLD_SYSTEMD);
+        let e = probe_limits(Path::new("/bin/false"), None).unwrap_err();
+        assert_eq!(e, "systemd-run --user --scope failed (no output)");
+        // `true` succeeds without printing the controllers
+        let e = probe_limits(Path::new("/bin/true"), None).unwrap_err();
+        assert_eq!(e, "the scope reported no cgroup v2 controllers (no output)");
+    }
+
+    /// The real thing on this host, when it has a user manager (skips visibly otherwise; required under
+    /// `RUNTIME_REQUIRE_BWRAP`, like the other real-host tests).
+    #[test]
+    fn probe_limits_on_this_host() {
+        let required = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
+        let got = find_systemd_run_on_path()
+            .ok_or_else(|| "systemd-run is not on PATH".to_owned())
+            .and_then(|s| probe_limits(&s, std::env::var_os("XDG_RUNTIME_DIR").as_deref()));
+        match got {
+            Ok(s) => {
+                assert!(s.controllers.iter().any(|c| c == "pids"), "{s:?}");
+                // the probe leaves no scope behind (`--collect`, and it exited)
+            }
+            Err(e) => {
+                assert!(!required, "RUNTIME_REQUIRE_BWRAP=1 but {e}");
+                eprintln!("SKIPPED probe_limits_on_this_host: {e}");
+            }
+        }
+        // without a runtime directory systemd-run cannot find the user manager: a reason, not a hang
+        if let Some(s) = find_systemd_run_on_path() {
+            let e = probe_limits(&s, None).unwrap_err();
+            assert!(e.starts_with("systemd-run --user --scope failed ("), "{e}");
+        }
     }
 
     #[test]

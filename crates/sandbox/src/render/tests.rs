@@ -14,6 +14,14 @@ struct FakeHost {
     files: BTreeSet<PathBuf>,
     links: HashMap<PathBuf, PathBuf>,
     uid: u32,
+    /// `runtime_exe` is `None` (default: [`EXE`]).
+    no_exe: bool,
+    /// `runtime_exe` is this instead of [`EXE`].
+    exe_at: Option<PathBuf>,
+    /// `scopes` fails with this (default: [`SYSTEMD_RUN`] works).
+    no_scopes: Option<String>,
+    /// `scopes` offers only these controllers (default: cpu, memory, pids).
+    controllers: Option<Vec<&'static str>>,
 }
 
 impl Host for FakeHost {
@@ -37,6 +45,24 @@ impl Host for FakeHost {
     }
     fn uid(&self) -> u32 {
         self.uid
+    }
+    fn runtime_exe(&self) -> Option<PathBuf> {
+        (!self.no_exe).then(|| self.exe_at.clone().unwrap_or_else(|| EXE.into()))
+    }
+    fn scopes(&self) -> Result<crate::ScopeSupport, String> {
+        if let Some(why) = &self.no_scopes {
+            return Err(why.clone());
+        }
+        Ok(crate::ScopeSupport {
+            systemd_run: SYSTEMD_RUN.into(),
+            controllers: self
+                .controllers
+                .clone()
+                .unwrap_or_else(|| vec!["cpu", "memory", "pids"])
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        })
     }
 }
 
@@ -78,6 +104,11 @@ const PREFIX: &str = "/data/apps/a/prefix";
 const APP_HOME: &str = "/data/apps/a/runtime/home";
 const APP_ROOT: &str = "/data/apps/a";
 const RT: &str = "/run/user/1000";
+/// The fake host's runtime executable (the shim).
+const EXE: &str = "/opt/runtime/bin/runtime";
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+/// What every scope-wrapped command starts with, before its `-p` properties.
+const SCOPE: [&str; 5] = ["--user", "--scope", "--collect", "--quiet", "--expand-environment=no"];
 
 /// This dev machine's shape: Wayland + Xwayland, a Pulse-compatible socket, AMD + NVIDIA nodes.
 fn host() -> FakeHost {
@@ -129,7 +160,16 @@ fn sb(p: Permissions, h: FakeHost) -> AppSandbox {
     AppSandbox::new("/usr/bin/bwrap".into(), p, vec!["/opt/wine/lib".into()], Arc::new(h))
 }
 
+/// bwrap's own arguments: a `systemd-run` scope in front (see `limits_*`) is cut off.
 fn argv(c: &Command) -> Vec<String> {
+    let a = all_args(c);
+    match a.iter().position(|x| x == "/usr/bin/bwrap") {
+        Some(i) if c.get_program() == SYSTEMD_RUN => a[i + 1..].to_vec(),
+        _ => a,
+    }
+}
+
+fn all_args(c: &Command) -> Vec<String> {
     c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
 }
 
@@ -145,6 +185,73 @@ fn pos(a: &[String], seq: &[&str]) -> Option<usize> {
         .position(|w| w.iter().zip(seq).all(|(x, y)| x == y))
 }
 
+/// The Landlock rules of the default profile on [`host`], mirroring its binds (gpu on or off).
+fn default_rules(gpu: bool) -> Vec<&'static str> {
+    let mut r = vec![
+        "rw:/proc",
+        "rw:/dev/null",
+        "rw:/dev/zero",
+        "rw:/dev/full",
+        "rw:/dev/random",
+        "rw:/dev/urandom",
+        "rw:/dev/tty",
+        "rw:/dev/pts",
+        "rw:/dev/shm",
+        "rw:/tmp",
+        "ro:/usr",
+        "ro:/bin",
+        "ro:/lib",
+        "ro:/lib64",
+        "ro:/etc/alternatives",
+        "ro:/etc/passwd",
+        "ro:/etc/group",
+        "ro:/etc/nsswitch.conf",
+        "ro:/etc/ld.so.cache",
+        "ro:/etc/localtime",
+        "ro:/etc/fonts",
+        "ro:/etc/ssl",
+        "ro:/etc/pki",
+        "ro:/etc/ca-certificates",
+        "ro:/etc/vulkan",
+        "ro:/etc/glvnd",
+        "ro:/opt/wine/lib",
+        "rw:/run/user/1000",
+    ];
+    if gpu {
+        r.extend([
+            "rw:/dev/dri",
+            "rw:/dev/nvidiactl",
+            "rw:/dev/nvidia0",
+            "ro:/sys/dev/char",
+            "ro:/sys/devices",
+            "ro:/sys/class/drm",
+            "ro:/run/opengl-driver",
+        ]);
+    }
+    r.extend([
+        "ro:/opt/runtime/bin/runtime",
+        "rw:/data/apps/a/prefix",
+        "rw:/data/apps/a/runtime/home",
+    ]);
+    r
+}
+
+/// The shim invocation after bwrap's `--`: (the shim's rules, the program and its arguments).
+fn shim_part(a: &[String]) -> (Vec<String>, Vec<String>) {
+    let dd = a.iter().position(|x| x == "--").unwrap();
+    assert_eq!(a[dd + 1..dd + 4], [EXE, "sandbox-init", "--v1"], "{a:?}");
+    let block = &a[dd + 3..];
+    let end = block.iter().position(|x| x == "--").unwrap();
+    let rules = block[1..end]
+        .chunks(2)
+        .map(|c| {
+            assert_eq!(c[0], "--rule");
+            c[1].clone()
+        })
+        .collect();
+    (rules, block[end + 1..].to_vec())
+}
+
 fn rendered(p: Permissions, h: FakeHost) -> Command {
     sb(p, h).render(&app_cmd()).unwrap()
 }
@@ -158,7 +265,11 @@ fn perms(f: impl FnOnce(&mut Permissions)) -> Permissions {
 #[test]
 fn the_default_profile_is_exactly_this() {
     let c = rendered(Permissions::default(), host());
-    assert_eq!(c.get_program(), "/usr/bin/bwrap");
+    // the default task limit, in a scope of the user manager, around bwrap
+    assert_eq!(c.get_program(), SYSTEMD_RUN);
+    let mut scope: Vec<&str> = SCOPE.to_vec();
+    scope.extend(["-p", "TasksMax=4096", "--", "/usr/bin/bwrap"]);
+    assert_eq!(all_args(&c)[..scope.len()], scope[..]);
     let mut want: Vec<&str> = vec![
         "--die-with-parent",
         "--new-session",
@@ -210,8 +321,13 @@ fn the_default_profile_is_exactly_this() {
     for d in ["/sys/dev/char", "/sys/devices", "/sys/class/drm", "/run/opengl-driver"] {
         want.extend(["--ro-bind-try", d, d]);
     }
+    want.extend(["--ro-bind", EXE, EXE]);
     want.extend(["--bind", PREFIX, PREFIX, "--bind", APP_HOME, APP_HOME]);
     want.extend(["--remount-ro", "/"]);
+    want.extend(["--", EXE, "sandbox-init", "--v1"]);
+    for r in default_rules(true) {
+        want.extend(["--rule", r]);
+    }
     want.extend(["--", "/usr/bin/wine", "C:\\x.exe", "--flag"]);
     assert_eq!(argv(&c), want);
     let e = envs(&c);
@@ -242,10 +358,169 @@ fn the_default_profile_is_exactly_this() {
     assert_eq!(s.caveats(&app_cmd()), [X11_CAVEAT]);
     // the preview is the wrapped command line, program first
     let preview = s.argv_preview(&app_cmd());
-    assert_eq!(preview[0], "/usr/bin/bwrap");
+    assert_eq!(preview[0], SYSTEMD_RUN);
     assert_eq!(preview[1..], c.get_args().map(OsString::from).collect::<Vec<_>>()[..]);
     // and `Sandbox::wrap` is `render`
-    assert_eq!(argv(&s.wrap(app_cmd())), argv(&c));
+    assert_eq!(all_args(&s.wrap(app_cmd())), all_args(&c));
+}
+
+/// The scope part of a rendered command: everything before bwrap (program first).
+fn scope_of(c: &Command) -> Vec<String> {
+    let a = all_args(c);
+    let end = a.iter().position(|x| x == "/usr/bin/bwrap").unwrap_or(0);
+    std::iter::once(c.get_program().to_string_lossy().into_owned())
+        .chain(a[..end].iter().cloned())
+        .collect()
+}
+
+fn limited(sets: &[&str]) -> Permissions {
+    let mut p = Permissions::default();
+    let ctx = GrantCtx {
+        home: "/home/me".into(),
+        extra_homes: vec![],
+        data_root: "/data".into(),
+        runtime_dir: None,
+    };
+    for s in sets {
+        p.apply_set(s, &ctx).unwrap();
+    }
+    p
+}
+
+fn want_scope(props: &[&str]) -> Vec<String> {
+    let mut w = vec![SYSTEMD_RUN.to_owned()];
+    w.extend(SCOPE.iter().map(|s| s.to_string()));
+    for p in props {
+        w.extend(["-p".to_owned(), p.to_string()]);
+    }
+    w.push("--".into());
+    w
+}
+
+#[test]
+fn limits_become_the_scope_properties_exactly() {
+    let c = rendered(limited(&["memory=2048", "cpu=150", "tasks=512"]), host());
+    assert_eq!(
+        scope_of(&c),
+        want_scope(&["TasksMax=512", "MemoryMax=2048M", "MemorySwapMax=0", "CPUQuota=150%"])
+    );
+    // bwrap follows unchanged, env and cwd too
+    let plain = rendered(Permissions::default(), host());
+    assert_eq!(argv(&c), argv(&plain));
+    assert_eq!(envs(&c), envs(&plain));
+    assert_eq!(c.get_current_dir(), plain.get_current_dir());
+    // memory alone keeps the default task limit
+    let m = rendered(limited(&["memory=100"]), host());
+    assert_eq!(
+        scope_of(&m),
+        want_scope(&["TasksMax=4096", "MemoryMax=100M", "MemorySwapMax=0"])
+    );
+    // an explicit 4096 renders like the default (it only changes what a failure does)
+    assert_eq!(
+        scope_of(&rendered(limited(&["tasks=4096"]), host())),
+        want_scope(&["TasksMax=4096"])
+    );
+    // no task limit and nothing else: no scope at all, and no probe needed
+    let h = FakeHost {
+        no_scopes: Some("never asked".into()),
+        ..host()
+    };
+    let s = sb(limited(&["tasks=unlimited"]), h.clone());
+    let u = s.render(&app_cmd()).unwrap();
+    assert_eq!(u.get_program(), "/usr/bin/bwrap");
+    assert_eq!(all_args(&u), argv(&plain));
+    assert_eq!(s.caveats(&app_cmd()), [X11_CAVEAT]);
+    // ...but unlimited tasks with a CPU limit is a scope without TasksMax
+    let cpu = rendered(limited(&["tasks=unlimited", "cpu=50"]), host());
+    assert_eq!(scope_of(&cpu), want_scope(&["CPUQuota=50%"]));
+}
+
+#[test]
+fn explicit_limits_fail_closed_and_the_default_degrades_with_a_caveat() {
+    let down = FakeHost {
+        no_scopes: Some("systemd-run --user --scope failed (Failed to connect to bus)".into()),
+        ..host()
+    };
+    // default only: bwrap without a scope, and a caveat that says why
+    let s = sb(Permissions::default(), down.clone());
+    let c = s.render(&app_cmd()).unwrap();
+    assert_eq!(c.get_program(), "/usr/bin/bwrap");
+    assert_eq!(
+        s.caveats(&app_cmd()),
+        [
+            "resource limits unavailable: systemd-run --user --scope failed (Failed to connect to bus); the \
+             default task limit (4096) is not applied"
+                .to_owned(),
+            X11_CAVEAT.to_owned(),
+        ]
+    );
+    // anything explicit: refused, naming the reason and the way out
+    for sets in [
+        &["tasks=4096"][..],
+        &["memory=128"],
+        &["cpu=50"],
+        &["tasks=unlimited", "memory=64"],
+    ] {
+        let s = sb(limited(sets), down.clone());
+        let e = s.render(&app_cmd()).unwrap_err();
+        assert!(matches!(e, RenderError::Limits { .. }), "{sets:?}: {e:?}");
+        let text = e.to_string();
+        assert!(text.contains("Failed to connect to bus"), "{text}");
+        assert!(
+            text.contains("runtime permissions a --set memory=off --set cpu=off --set tasks=default"),
+            "{text}"
+        );
+        assert_eq!(s.wrap(app_cmd()).get_program(), "/bin/sh", "{sets:?}: fail closed");
+        assert!(s.caveats(&app_cmd()).is_empty());
+    }
+    // the hint follows the cause
+    for (why, hint) in [
+        (
+            crate::OLD_SYSTEMD.to_owned(),
+            "resource limits need systemd 254 or newer",
+        ),
+        (
+            "systemd-run is not on PATH".to_owned(),
+            "Start the app from a desktop or user session with systemd",
+        ),
+    ] {
+        let h = FakeHost {
+            no_scopes: Some(why.clone()),
+            ..host()
+        };
+        let text = sb(limited(&["cpu=50"]), h).render(&app_cmd()).unwrap_err().to_string();
+        assert!(text.contains(&why) && text.contains(hint), "{text}");
+        assert!(
+            text.contains("runtime permissions a --set memory=off --set cpu=off --set tasks=default"),
+            "{text}"
+        );
+    }
+    // a controller the user manager does not delegate counts as unavailable, for what needs it
+    let no_mem = FakeHost {
+        controllers: Some(vec!["cpu", "pids"]),
+        ..host()
+    };
+    let e = sb(limited(&["memory=128"]), no_mem.clone())
+        .render(&app_cmd())
+        .unwrap_err();
+    assert!(e.to_string().contains("`memory` controller"), "{e}");
+    assert!(e.to_string().contains("Delegate="), "{e}");
+    assert!(!e.to_string().contains("desktop or user session"), "{e}");
+    assert_eq!(
+        scope_of(&sb(limited(&["cpu=50"]), no_mem).render(&app_cmd()).unwrap()),
+        want_scope(&["TasksMax=4096", "CPUQuota=50%"])
+    );
+    let no_pids = FakeHost {
+        controllers: Some(vec![]),
+        ..host()
+    };
+    let s = sb(Permissions::default(), no_pids);
+    assert_eq!(s.render(&app_cmd()).unwrap().get_program(), "/usr/bin/bwrap");
+    assert!(
+        s.caveats(&app_cmd())[0].contains("`pids` controller"),
+        "{:?}",
+        s.caveats(&app_cmd())
+    );
 }
 
 #[test]
@@ -345,6 +620,121 @@ fn pulse_server_is_kept_only_when_it_names_the_bound_socket() {
         .render(&cmd)
         .unwrap();
     assert!(!envs(&c).contains_key("PULSE_SERVER"));
+}
+
+#[test]
+fn the_shim_runs_the_original_program_under_rules_that_mirror_the_binds() {
+    for gpu in [true, false] {
+        let a = argv(&rendered(perms(|p| p.gpu = gpu), host()));
+        let (rules, program) = shim_part(&a);
+        assert_eq!(rules, default_rules(gpu), "gpu {gpu}");
+        assert_eq!(program, ["/usr/bin/wine", "C:\\x.exe", "--flag"]);
+        // the shim itself is bound read-only at its own path, after every other mount but the app's own dirs
+        let exe = pos(&a, &["--ro-bind", EXE, EXE]).expect("the runtime executable is bound");
+        assert_eq!(pos(&a, &["--bind", PREFIX, PREFIX]), Some(exe + 3));
+        // the parsed block is exactly these rules and this program
+        let dd = a.iter().position(|x| x == "--").unwrap();
+        let block: Vec<OsString> = a[dd + 3..].iter().map(OsString::from).collect();
+        let parsed = crate::init::parse(&block).unwrap();
+        assert_eq!(parsed.program, Path::new("/usr/bin/wine"));
+        assert_eq!(parsed.landlock.len(), default_rules(gpu).len());
+    }
+    // network=allow: its /etc files are rules too
+    let a = argv(&rendered(perms(|p| p.network = Network::Allow), host()));
+    let (rules, _) = shim_part(&a);
+    let glvnd = rules.iter().position(|r| r == "ro:/etc/glvnd").unwrap();
+    assert_eq!(rules[glvnd + 1..glvnd + 3], ["ro:/etc/hosts", "ro:/etc/resolv.conf"]);
+}
+
+#[test]
+fn awkward_program_arguments_reach_the_shim_unchanged() {
+    let mut cmd = app_cmd();
+    let odd = [
+        OsString::from("--"),
+        OsString::from("--rule"),
+        OsString::from("rw:/"),
+        OsString::from(""),
+        OsString::from("a\nb"),
+        OsString::from(std::ffi::OsStr::from_bytes(b"\xff")),
+    ];
+    cmd.args(&odd);
+    let c = sb(Permissions::default(), host()).render(&cmd).unwrap();
+    let a: Vec<OsString> = c.get_args().map(OsString::from).collect();
+    // bwrap's `--` (the scope's own comes first)
+    let dd = a.iter().rposition(|x| x == EXE).unwrap() - 1;
+    assert_eq!(a[dd], "--");
+    let parsed = crate::init::parse(&a[dd + 3..]).unwrap();
+    let mut want: Vec<OsString> = ["C:\\x.exe", "--flag"].iter().map(OsString::from).collect();
+    want.extend(odd);
+    assert_eq!(parsed.argv, want);
+    assert_eq!(parsed.landlock.len(), default_rules(true).len());
+}
+
+#[test]
+fn grants_become_landlock_rules_with_their_access() {
+    let td = crate::grant_tempdir();
+    let root = td.path().canonicalize().unwrap();
+    let (ro, rw) = (root.join("ro"), root.join("rw"));
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::create_dir_all(&rw).unwrap();
+    let p = perms(|p| {
+        p.filesystem = vec![
+            FsGrant {
+                path: ro.clone(),
+                access: Access::Ro,
+            },
+            FsGrant {
+                path: rw.clone(),
+                access: Access::Rw,
+            },
+        ]
+    });
+    let (rules, _) = shim_part(&argv(&rendered(p, host())));
+    let exe = rules.iter().position(|r| r == &format!("ro:{EXE}")).unwrap();
+    assert_eq!(
+        rules[exe - 2..exe],
+        [format!("ro:{}", ro.display()), format!("rw:{}", rw.display())]
+    );
+}
+
+#[test]
+fn a_runtime_executable_that_cannot_be_resolved_refuses_the_run() {
+    let h = FakeHost { no_exe: true, ..host() };
+    let s = sb(Permissions::default(), h);
+    assert_eq!(s.render(&app_cmd()).unwrap_err(), RenderError::RuntimeExe);
+    let w = s.wrap(app_cmd());
+    assert_eq!(w.get_program(), "/bin/sh", "the fail-closed stub");
+    assert!(
+        argv(&w).iter().any(|a| a.contains("runtime executable")),
+        "{:?}",
+        argv(&w)
+    );
+    // a runtime inside the data directory is refused (by the written and the resolved data root)
+    let h = FakeHost {
+        exe_at: Some("/data/bin/runtime".into()),
+        ..host()
+    };
+    let e = sb(Permissions::default(), h).render(&app_cmd()).unwrap_err();
+    assert_eq!(e, RenderError::RuntimeExeInData("/data/bin/runtime".into()));
+    // a block the shim would refuse (here: a Wine dll directory with `..`) is refused at render
+    let s = AppSandbox::new(
+        "/usr/bin/bwrap".into(),
+        Permissions::default(),
+        vec!["/opt/wine/../lib".into()],
+        Arc::new(host()),
+    );
+    let e = s.render(&app_cmd()).unwrap_err();
+    assert!(
+        matches!(e, RenderError::Shim(crate::init::InitError::NotAbsolute(_))),
+        "{e:?}"
+    );
+    // a program that is not an absolute path is refused before the shim would refuse it
+    let mut rel = Command::new("wine");
+    for (k, v) in app_cmd().get_envs() {
+        rel.env(k, v.unwrap());
+    }
+    let e = sb(Permissions::default(), host()).render(&rel).unwrap_err();
+    assert_eq!(e, RenderError::Program("wine".into()));
 }
 
 #[test]
@@ -936,6 +1326,16 @@ fn real_bwrap(test: &str) -> Option<PathBuf> {
 /// run by `/bin/sh -c` inside the sandbox with `$1` = the real `$HOME`, `$2` = the app root, `$3` = the temp root.
 /// Returns (stdout, stderr, temp root).
 fn run_real(bwrap: PathBuf, p: Permissions, script: &str) -> (String, String, tempfile::TempDir) {
+    run_real_with(bwrap, p, script, vec![])
+}
+
+/// [`run_real`] with test-only extra read-only binds that get NO Landlock rule (`AppSandbox::hole`).
+fn run_real_with(
+    bwrap: PathBuf,
+    p: Permissions,
+    script: &str,
+    hole: Vec<PathBuf>,
+) -> (String, String, tempfile::TempDir) {
     let td = tempfile::tempdir().unwrap();
     let root = td.path().canonicalize().unwrap();
     let app = root.join("apps/a");
@@ -963,7 +1363,8 @@ fn run_real(bwrap: PathBuf, p: Permissions, script: &str) -> (String, String, te
             cmd.env(k, v);
         }
     }
-    let s = AppSandbox::new(bwrap, p, vec![], Arc::new(crate::RealHost));
+    let mut s = AppSandbox::new(bwrap, p, vec![], Arc::new(crate::RealHost));
+    s.hole = hole;
     let out = s.wrap(cmd).output().unwrap();
     let (so, se) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -989,7 +1390,9 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
         for f in "$2/secret" "$3/secret"; do [ -r "$f" ] && echo "SECRET-READ $f"; done
         touch /usr/rt-sandbox-probe 2>/dev/null && echo "USR-WRITABLE"
         touch /rt-sandbox-probe 2>/dev/null && echo "ROOT-WRITABLE"
-        mkdir -p "$1" 2>/dev/null && echo "HOME-PATH-WRITABLE"
+        # (the path itself may exist: bwrap makes empty parent directories for the runtime executable's bind)
+        mkdir -p "$1" 2>/dev/null && touch "$1/.rt-sandbox-probe" 2>/dev/null && echo "HOME-PATH-WRITABLE"
+        mkdir "$1/.rt-sandbox-probe-dir" 2>/dev/null && echo "HOME-PATH-WRITABLE"
         touch "$WINEPREFIX/w" && echo prefix-rw
         touch "$HOME/w" && echo home-rw
         touch /dev/shm/w && echo shm-rw
@@ -1007,7 +1410,20 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
     let app = root.join("apps/a");
     let lines: Vec<&str> = so.lines().collect();
     assert_eq!(lines[0], "ok", "{so}\n{se}");
-    assert_eq!(lines[1], "--home-end", "the real home is listed inside: {so}");
+    // Nothing of the real home is listed, except (without Landlock, which refuses the listing) the empty directory
+    // bwrap makes for the runtime executable's bind when the runtime lives below the home.
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let skeleton = exe
+        .strip_prefix(home.canonicalize().unwrap_or(home))
+        .ok()
+        .and_then(|rest| rest.iter().next())
+        .map(|c| c.to_string_lossy().into_owned());
+    let end = lines.iter().position(|l| *l == "--home-end").unwrap();
+    assert!(
+        lines[1..end].iter().all(|l| Some(*l) == skeleton.as_deref()),
+        "the real home is listed inside: {so}"
+    );
     for want in ["prefix-rw", "home-rw", "shm-rw", "tmp-private", "net:lo,", "xauth-ok"] {
         assert!(lines.contains(&want), "{want}: {so}\n{se}");
     }
@@ -1062,4 +1478,122 @@ fn real_bwrap_with_network_allow_reads_the_resolver_config() {
     let (so, se, _td) = run_real(bwrap, perms(|p| p.network = Network::Allow), script);
     assert!(so.contains("dns-ok") && so.contains("hosts-ok"), "{so}\n{se}");
     assert!(!so.contains("RESOLVE-DIR-VISIBLE"), "{so}");
+}
+
+fn required() -> bool {
+    std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty())
+}
+
+/// Prints `<what> <ptrace result> <errno>` for: PTRACE_ATTACH of its own child, of pid 1 (bwrap's own init,
+/// outside the Landlock domain) and PTRACE_TRACEME.
+const PTRACE_PY: &str = r#"
+import ctypes, os, signal
+c = ctypes.CDLL(None, use_errno=True)
+c.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+def pt(what, req, pid):
+    ctypes.set_errno(0)
+    r = c.ptrace(req, pid, None, None)
+    print(what, r, ctypes.get_errno())
+    return r
+child = os.fork()
+if child == 0:
+    import time
+    time.sleep(10)
+    os._exit(0)
+if pt("attach-child", 16, child) == 0:
+    os.waitpid(child, 0)
+    c.ptrace(17, child, None, None)
+os.kill(child, signal.SIGKILL)
+pt("attach-pid1", 16, 1)
+pt("traceme", 0, 0)
+"#;
+
+/// Through the real shim (this test binary, see `init::TEST_SHIM`) inside real bwrap: the program has the seccomp
+/// filter and no new privileges, and Landlock refuses a file the MOUNT layer exposes but no rule covers (a
+/// test-only bind punches that hole on purpose).
+#[test]
+fn real_bwrap_runs_the_program_through_the_shim_and_landlock_backs_the_mounts() {
+    let Some(bwrap) = real_bwrap("real_bwrap_runs_the_program_through_the_shim_and_landlock_backs_the_mounts") else {
+        return;
+    };
+    let hole_dir = crate::grant_tempdir();
+    let hole = hole_dir.path().canonicalize().unwrap().join("hole.txt");
+    std::fs::write(&hole, "exposed").unwrap();
+    let script = format!(
+        r#"
+        grep -E '^(Seccomp|NoNewPrivs):' /proc/self/status | tr -d '\t '
+        [ -e '{h}' ] && echo hole-exists
+        cat '{h}' 2>/dev/null && echo || echo hole-denied
+        cat /etc/passwd >/dev/null && echo etc-ok
+        touch "$WINEPREFIX/w2" && echo prefix-rw
+        echo x >/dev/null && echo devnull-ok
+        [ -x /usr/bin/python3 ] && /usr/bin/python3 -c '{py}'
+        true
+    "#,
+        h = hole.display(),
+        py = PTRACE_PY
+    );
+    let (so, se, _td) = run_real_with(bwrap, Permissions::default(), &script, vec![hole.clone()]);
+    let lines: Vec<&str> = so.lines().collect();
+    assert_eq!(lines[..2], ["NoNewPrivs:1", "Seccomp:2"], "{so}\n{se}");
+    for want in ["hole-exists", "etc-ok", "prefix-rw", "devnull-ok"] {
+        assert!(lines.contains(&want), "{want}: {so}\n{se}");
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        assert!(
+            !required(),
+            "RUNTIME_REQUIRE_BWRAP=1 but /usr/bin/python3 (the ptrace probe) is missing"
+        );
+        eprintln!("SKIPPED the ptrace half: no /usr/bin/python3");
+    } else if crate::landlock::abi_version().is_ok() {
+        // Landlock enforced: Wine's ptrace requests reach the program's own children and nothing outside its
+        // domain (bwrap's pid 1); other requests stay refused.
+        for want in ["attach-child 0 0", "attach-pid1 -1 1", "traceme -1 1"] {
+            assert!(lines.contains(&want), "{want}: {so}\n{se}");
+        }
+    } else {
+        assert!(
+            lines.contains(&"attach-child -1 1"),
+            "ptrace is refused without Landlock: {so}"
+        );
+    }
+    match crate::landlock::abi_version() {
+        Ok(_) => assert!(
+            lines.contains(&"hole-denied") && !so.contains("exposed"),
+            "LANDLOCK HOLE: {so}\n{se}"
+        ),
+        Err(e) => {
+            assert!(so.contains("exposed"), "without Landlock the mount decides: {so}");
+            eprintln!("SKIPPED the Landlock half: {e}");
+        }
+    }
+}
+
+/// A dll directory whose last component is a host symlink under an already-bound tree (`/usr`) is a symlink inside
+/// the sandbox too, and a Landlock rule on it would fail (ELOOP: every run refused). Its resolved directory is bound
+/// and ruled instead (the link inside resolves into it). Outside every bound tree bwrap makes the destination a real
+/// directory, so the path the backend named stays.
+#[test]
+fn a_symlinked_dll_dir_under_a_bound_tree_is_bound_and_ruled_at_its_resolved_path() {
+    let link = "/usr/lib/wine/x86_64-windows";
+    let real = "/usr/lib/x86_64-linux-gnu/wine/x86_64-windows";
+    let far = "/opt/wine/x86_64-windows";
+    let mut h = host();
+    h.links.insert(link.into(), real.into());
+    h.links.insert(far.into(), "/srv/wine/x86_64-windows".into());
+    let s = AppSandbox::new(
+        "/usr/bin/bwrap".into(),
+        Permissions::default(),
+        vec![link.into(), far.into()],
+        Arc::new(h),
+    );
+    let a = argv(&s.render(&app_cmd()).unwrap());
+    assert!(pos(&a, &["--ro-bind-try", real, real]).is_some(), "{a:?}");
+    assert!(pos(&a, &["--ro-bind-try", far, far]).is_some(), "{a:?}");
+    assert!(!a.iter().any(|x| x == link), "{a:?}");
+    let (rules, _) = shim_part(&a);
+    assert!(
+        rules.contains(&format!("ro:{real}")) && rules.contains(&format!("ro:{far}")),
+        "{rules:?}"
+    );
 }

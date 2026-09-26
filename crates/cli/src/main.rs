@@ -12,6 +12,7 @@ mod remove;
 mod run;
 mod safe;
 mod sandbox;
+mod sandbox_init;
 mod uninstall;
 
 use clap::{Parser, Subcommand};
@@ -123,25 +124,30 @@ enum Cmd {
         choice: Option<String>,
     },
     /// Show or change what an app's sandbox may reach (`permissions.toml`): network (default deny), display, audio
-    /// and gpu (default on) and host directories (default none). `--set network=allow`, `--set gpu=off`,
-    /// `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir` (repeatable; all are checked before anything is written);
+    /// and gpu (default on), host directories (default none) and resource limits. `--set network=allow`,
+    /// `--set gpu=off`, `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir`, `--set memory=<MiB>|off`,
+    /// `--set cpu=<percent>|off`, `--set tasks=<n>|unlimited|default` (repeatable; all are checked before anything is
+    /// written);
     /// `--reset` returns to the default. Changing needs the app to be stopped. `$HOME`, `/`, the runtime's data
     /// directory and secret directories (`~/.ssh`, `~/.gnupg`, ...) can never be granted.
     Permissions {
         /// An app id from `runtime list`
         app: String,
-        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir
+        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir,
+        /// memory=<MiB>|off, cpu=<percent>|off, tasks=<n>|unlimited|default
         #[arg(long = "set", value_name = "EXPR")]
         set: Vec<String>,
         /// Delete the app's permissions.toml (back to the default)
         #[arg(long)]
         reset: bool,
-        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}]}
+        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}], limits: {memory_mb,
+        /// cpu_percent, tasks, tasks_default}}
         #[arg(long)]
         json: bool,
     },
-    /// Show what an app's sandbox would be (needs no Wine; starts nothing): whether bubblewrap works, the
-    /// profile, what the host lacks, what the profile cannot enforce, and the full bubblewrap command line
+    /// Show what an app's sandbox would be (needs no Wine; starts nothing but throwaway probes): whether bubblewrap
+    /// and systemd user scopes work, the profile and its resource limits, what the host lacks, what the profile
+    /// cannot enforce, and the full command line (systemd-run and bubblewrap)
     Sandbox {
         /// An app id from `runtime list`
         app: String,
@@ -156,6 +162,13 @@ enum Cmd {
         /// (absent optional fields are null)
         #[arg(long)]
         json: bool,
+    },
+    /// The sandbox's own launcher (runs inside bubblewrap; see `rt_sandbox::init`). Not for people.
+    #[command(hide = true, disable_help_flag = true)]
+    SandboxInit {
+        /// The argument block the sandbox renderer built, passed on unparsed
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true, num_args = 0..)]
+        args: Vec<OsString>,
     },
     /// Show the newest log of an app (its last run's stderr)
     Logs {
@@ -174,6 +187,13 @@ pub(crate) fn store() -> Result<Store, CmdError> {
 /// The system Wine, with `launcher` for its helper processes (`run` spawns with the same launcher).
 pub(crate) fn backend(launcher: &Launcher) -> Result<backend_wine::WineBackend, CmdError> {
     Ok(backend_wine::WineBackend::discover_with(launcher.clone())?)
+}
+
+/// This executable, for the installer sandbox's `sandbox-init` shim (`rt_installer::InstallerSandbox::new`). The
+/// library checks it (absolute, not `(deleted)`, a resolvable file, outside the data directory) and refuses to run
+/// the installer otherwise; an unknown path is passed as the empty path, which it refuses.
+pub(crate) fn runtime_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_default()
 }
 
 /// Best-effort: deletes `id`'s `.desktop` entry and hicolor icons (`rt_desktop::entry::remove`), warning (never
@@ -260,6 +280,7 @@ fn main() -> ExitCode {
         Cmd::Sandbox { app } => sandbox::run(&app).map(|()| 0),
         Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
+        Cmd::SandboxInit { args } => sandbox_init::run(&args),
     };
     match result {
         Ok(code) => ExitCode::from(code),

@@ -95,7 +95,9 @@ use crate::fetch;
 use crate::install_archive::{self, open_archive};
 use crate::manifest::{self, Install, Kind, MAX_LIST_LEN, MAX_PACKAGE_SIZE, MAX_TEXT_LEN, Marker, Package, clip};
 use rt_core::{AppEnv, CompatBackend, Launcher, ResolveError, WinPath, join_new, resolve_under};
-use rt_installer::{MSIEXEC_RELATIVE, RegValue, SandboxOpts, WineReg, find_bwrap_on_path, run_sandboxed, stage_file};
+use rt_installer::{
+    InstallerSandbox, MSIEXEC_RELATIVE, RegValue, SandboxOpts, WineReg, find_bwrap_on_path, run_sandboxed, stage_file,
+};
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
@@ -136,6 +138,9 @@ pub enum InstallerPkgError {
     BwrapNotFound,
     #[error("cannot run the installer in the sandbox: {0}")]
     Sandbox(String),
+    /// The installer sandbox's pre-flight check failed (`rt_installer::InstallerSandbox::check`): the reason.
+    #[error("the installer sandbox refused to start: {0} (nothing was run; nothing was installed)")]
+    SandboxRefused(String),
     #[error("the package's marker is already present in this prefix; the installer was not run")]
     MarkerAlreadyPresent,
     #[error(
@@ -186,12 +191,15 @@ pub struct InstallerPkgInstalled {
 }
 
 /// Installs `pkg` (an installer package) from `file`, the verified download, into `env`. See the module docs.
+/// `runtime_exe` is this runtime's own executable, the installer sandbox's `sandbox-init` shim
+/// ([`InstallerSandbox::new`]).
 pub fn install_installer_pkg(
     pkg: &Package,
     file: &Path,
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
+    runtime_exe: &Path,
 ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     install_with(
         pkg,
@@ -199,23 +207,30 @@ pub fn install_installer_pkg(
         env,
         backend,
         launcher,
-        find_bwrap_on_path(),
+        find_bwrap_on_path().map(|bwrap| InstallerSandbox::new(bwrap, runtime_exe)),
         INSTALLER_DEADLINE,
     )
 }
 
-/// [`install_installer_pkg`] with the `bwrap` lookup and the deadline injected (tests).
+/// [`install_installer_pkg`] with the sandbox (`None`: no `bwrap`) and the deadline injected (tests).
 fn install_with(
     pkg: &Package,
     file: &Path,
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
-    bwrap: Option<PathBuf>,
+    sandbox: Option<InstallerSandbox>,
     deadline: Duration,
 ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     let (silent_args, marker, overrides) = check_package(pkg)?;
-    let bwrap = bwrap.ok_or(InstallerPkgError::BwrapNotFound)?;
+    let sandbox = sandbox.ok_or(InstallerPkgError::BwrapNotFound)?;
+    let opts = SandboxOpts {
+        allow_network: false,
+        extra_ro_binds: backend.dll_dirs(),
+    };
+    sandbox
+        .check(env, &opts)
+        .map_err(|why| InstallerPkgError::SandboxRefused(bounded(&why)))?;
 
     let stage_err = |e: &dyn Display| InstallerPkgError::Stage(bounded(e));
     let mut src = open_archive(file, pkg.size).map_err(|e| stage_err(&e))?;
@@ -260,12 +275,11 @@ fn install_with(
         args.extend(silent_args.iter().map(OsString::from));
         (explorer, args)
     };
-    let opts = SandboxOpts {
-        allow_network: false,
-        extra_ro_binds: backend.dll_dirs(),
-    };
-    let status = run_sandboxed(backend, launcher, env, &bwrap, &exe, &args, opts, Some(deadline))
-        .map_err(|e| InstallerPkgError::Sandbox(bounded(&e)))?;
+    let status =
+        run_sandboxed(backend, launcher, env, &sandbox, &exe, &args, opts, Some(deadline)).map_err(|e| match e {
+            rt_installer::InstallerError::SandboxRefused(why) => InstallerPkgError::SandboxRefused(bounded(&why)),
+            e => InstallerPkgError::Sandbox(bounded(&e)),
+        })?;
     let Some(status) = status else {
         // The sandbox tree is already dead; this only makes sure nothing of the prefix is left running outside it.
         let _ = backend.stop(env);
@@ -288,7 +302,7 @@ fn install_with(
             if let Err(why) = &removed {
                 warnings.push(format!("the staged installer copy was not removed: {why}"));
             }
-            set_overrides(overrides, env, backend, launcher, &bwrap)?;
+            set_overrides(overrides, env, backend, launcher, &sandbox)?;
             Ok(InstallerPkgInstalled {
                 marker_confirmed: true,
                 warnings,
@@ -369,9 +383,9 @@ fn set_overrides(
     env: &AppEnv,
     backend: &dyn CompatBackend,
     launcher: &Launcher,
-    bwrap: &Path,
+    sandbox: &InstallerSandbox,
 ) -> Result<(), InstallerPkgError> {
-    let sandbox = Some(bwrap);
+    let sandbox = Some(sandbox);
     for (i, name) in names.iter().enumerate() {
         if let Err(e) = install_archive::set_override(name, env, backend, launcher, sandbox) {
             // Delete the failed one too: a `reg add` that fails may still have written it.

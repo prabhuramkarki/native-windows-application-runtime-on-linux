@@ -9,10 +9,36 @@
 //! audio = true
 //! gpu = true
 //!
+//! [limits]                                 # optional, every key too
+//! memory_mb = 2048                         # MemoryMax (and no swap), 64..=1048576
+//! cpu_percent = 150                        # CPUQuota, 1..=409600 (--set: 1..=100 x this host's CPUs)
+//! tasks = 512                              # TasksMax, 16..=65536, or "unlimited"
+//!
 //! [[filesystem]]
 //! path = "/home/me/Documents/game-saves"   # absolute, must exist, symlinks resolved when it is added
 //! access = "rw"                            # or "ro"
 //! ```
+//!
+//! **Limits.** A key the file does not have is the default: no memory or CPU limit, and [`DEFAULT_TASKS`] tasks,
+//! best effort (applied when `systemd-run --user` works, skipped with a caveat otherwise). A key the file HAS is a
+//! request, mandatory at run time (see `crate::render`, "Limits"), even `tasks = 4096`: [`Limits`] keeps that
+//! difference ([`Tasks::Default`] vs [`Tasks::Max`]). Bounds are checked on every parse and every `--set`; out of
+//! range is [`PermError::Limit`], never clamped. The CPU bound differs: a parse checks only the fixed
+//! [`CPU_PERCENT_MAX`] (a profile must load on any host, under any affinity, so `--set cpu=off` can always repair
+//! it), `--set cpu=` also checks this host's CPU count. The `--set` forms ([`Permissions::apply_set`]):
+//!
+//! | `--set` | Effect on `[limits]` |
+//! |---|---|
+//! | `memory=<MiB>` | `memory_mb = <MiB>` (64..=1048576) |
+//! | `memory=off`, `memory=default` | removes `memory_mb` (no memory limit) |
+//! | `cpu=<percent>` | `cpu_percent = <percent>` (1..=100 x the CPUs `runtime` may use, at most 409600) |
+//! | `cpu=off`, `cpu=default` | removes `cpu_percent` (no CPU limit) |
+//! | `tasks=<n>` | `tasks = <n>` (16..=65536), mandatory |
+//! | `tasks=unlimited` | `tasks = "unlimited"`: no task limit at all |
+//! | `tasks=default` | removes `tasks` (back to 4096, best effort) |
+//!
+//! Numbers are plain decimal digits (no sign, unit or space); `tasks=off` is refused as ambiguous (`unlimited` or
+//! `default`). The `[limits]` table is written only when it has a key.
 //!
 //! A host directory grant is judged by [`validate_grant`] on every parse (so a stored profile that no longer
 //! passes, e.g. a symlink re-pointed at `$HOME`, is refused at run time): absolute, no `.`/`..`, no control or
@@ -113,6 +139,80 @@ pub struct FsGrant {
     pub access: Access,
 }
 
+/// The default `TasksMax` of every sandboxed run (module docs, "Limits").
+pub const DEFAULT_TASKS: u32 = 4096;
+/// `memory_mb` bounds: 64 MiB to 1 TiB.
+pub const MEMORY_MB: std::ops::RangeInclusive<u64> = 64..=1024 * 1024;
+/// `tasks` bounds.
+pub const TASKS: std::ops::RangeInclusive<u32> = 16..=65536;
+
+/// The largest `cpu_percent` a profile may hold (100 x 4096 CPUs): the only bound a LOAD checks, so a profile never
+/// stops loading because of the host it is read on. A quota above the host's CPUs is harmless (it never throttles).
+pub const CPU_PERCENT_MAX: u32 = 409_600;
+
+/// What `--set cpu=` accepts on a host with `cpus` CPUs: 1 to 100 per CPU, at most [`CPU_PERCENT_MAX`].
+fn cpu_range(cpus: usize) -> std::ops::RangeInclusive<u32> {
+    let per_host = u32::try_from(cpus.max(1)).unwrap_or(u32::MAX).saturating_mul(100);
+    1..=per_host.min(CPU_PERCENT_MAX)
+}
+
+/// The largest `cpu_percent` `--set cpu=` accepts here: 100 per CPU this process may use
+/// (`available_parallelism`, which follows its affinity and cgroup quota).
+pub fn max_cpu_percent() -> u32 {
+    *cpu_range(std::thread::available_parallelism().map_or(1, |n| n.get())).end()
+}
+
+/// The task limit (module docs, "Limits").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tasks {
+    /// No `tasks` key: [`DEFAULT_TASKS`], best effort.
+    #[default]
+    Default,
+    /// `tasks = <n>`: mandatory.
+    Max(u32),
+    /// `tasks = "unlimited"`: no task limit at all.
+    Unlimited,
+}
+
+/// The `[limits]` table (module docs, "Limits"). `None` and [`Tasks::Default`] are keys the file does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Limits {
+    pub memory_mb: Option<u64>,
+    pub cpu_percent: Option<u32>,
+    pub tasks: Tasks,
+}
+
+impl Limits {
+    /// The file asks for a limit: the run must get it or not start.
+    pub fn explicit(&self) -> bool {
+        self.memory_mb.is_some() || self.cpu_percent.is_some() || matches!(self.tasks, Tasks::Max(_))
+    }
+
+    /// The cgroup controllers these limits need (`pids` for the task limit, `memory`, `cpu`).
+    pub fn controllers(&self) -> Vec<&'static str> {
+        let mut c = Vec::new();
+        if self.tasks_max().is_some() {
+            c.push("pids");
+        }
+        if self.memory_mb.is_some() {
+            c.push("memory");
+        }
+        if self.cpu_percent.is_some() {
+            c.push("cpu");
+        }
+        c
+    }
+
+    /// The `TasksMax` to apply, default or explicit; `None` with `tasks = "unlimited"`.
+    pub fn tasks_max(&self) -> Option<u32> {
+        match self.tasks {
+            Tasks::Default => Some(DEFAULT_TASKS),
+            Tasks::Max(n) => Some(n),
+            Tasks::Unlimited => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub network: Network,
@@ -120,6 +220,7 @@ pub struct Permissions {
     pub audio: bool,
     pub gpu: bool,
     pub filesystem: Vec<FsGrant>,
+    pub limits: Limits,
 }
 
 impl Default for Permissions {
@@ -130,6 +231,7 @@ impl Default for Permissions {
             audio: true,
             gpu: true,
             filesystem: Vec::new(),
+            limits: Limits::default(),
         }
     }
 }
@@ -247,11 +349,14 @@ pub enum PermError {
     #[error("cannot grant {path:?}: {why}")]
     Grant { path: String, why: Refusal },
     #[error(
-        "bad permission {0:?}: use network=allow|deny, display|audio|gpu=on|off, fs+=/abs/path:ro|rw or fs-=/abs/path"
+        "bad permission {0:?}: use network=allow|deny, display|audio|gpu=on|off, fs+=/abs/path:ro|rw, fs-=/abs/path, \
+         memory=<MiB>|off, cpu=<percent>|off or tasks=<n>|unlimited|default"
     )]
     Expr(String),
     #[error("{0:?} is not granted")]
     NotGranted(String),
+    #[error("{0}")]
+    Limit(String),
 }
 
 fn io_err(e: io::Error) -> PermError {
@@ -403,6 +508,67 @@ struct Raw {
     gpu: bool,
     #[serde(default)]
     filesystem: Vec<RawGrant>,
+    #[serde(default)]
+    limits: RawLimits,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawLimits {
+    memory_mb: Option<i64>,
+    cpu_percent: Option<i64>,
+    tasks: Option<RawTasks>,
+}
+
+/// `tasks = <n>` or `tasks = "unlimited"`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawTasks {
+    Max(i64),
+    Word(String),
+}
+
+/// `value` when it is within `range`, else [`PermError::Limit`] naming the key and the bounds.
+fn bounded<T: TryFrom<i64> + PartialOrd + std::fmt::Display + Copy>(
+    key: &str,
+    value: i64,
+    range: std::ops::RangeInclusive<T>,
+    unit: &str,
+) -> Result<T, PermError> {
+    T::try_from(value).ok().filter(|v| range.contains(v)).ok_or_else(|| {
+        PermError::Limit(format!(
+            "{key} {value} is out of range: {}..={}{unit}",
+            range.start(),
+            range.end()
+        ))
+    })
+}
+
+impl RawLimits {
+    fn checked(self) -> Result<Limits, PermError> {
+        let tasks = match self.tasks {
+            None => Tasks::Default,
+            Some(RawTasks::Word(w)) if w == "unlimited" => Tasks::Unlimited,
+            Some(RawTasks::Word(w)) => {
+                return Err(PermError::Toml(format!(
+                    "limits.tasks {:?}: use a number or \"unlimited\"",
+                    clip(&w)
+                )));
+            }
+            Some(RawTasks::Max(n)) => Tasks::Max(bounded("tasks", n, TASKS, "")?),
+        };
+        Ok(Limits {
+            memory_mb: self
+                .memory_mb
+                .map(|n| bounded("memory_mb", n, MEMORY_MB, " MiB"))
+                .transpose()?,
+            cpu_percent: self
+                .cpu_percent
+                .map(|n| bounded("cpu_percent", n, 1..=CPU_PERCENT_MAX, " percent"))
+                .transpose()?,
+            tasks,
+        })
+    }
 }
 
 fn deny() -> Network {
@@ -429,6 +595,7 @@ impl Permissions {
         if raw.filesystem.len() > MAX_GRANTS {
             return Err(PermError::TooManyGrants);
         }
+        let limits = raw.limits.checked()?;
         Ok(Permissions {
             network: raw.network,
             display: raw.display,
@@ -442,6 +609,7 @@ impl Permissions {
                     access: g.access,
                 })
                 .collect(),
+            limits,
         })
     }
 
@@ -475,6 +643,21 @@ impl Permissions {
             self.audio,
             self.gpu
         );
+        let l = &self.limits;
+        if l.memory_mb.is_some() || l.cpu_percent.is_some() || l.tasks != Tasks::Default {
+            s.push_str("\n[limits]\n");
+            if let Some(m) = l.memory_mb {
+                s.push_str(&format!("memory_mb = {m}\n"));
+            }
+            if let Some(c) = l.cpu_percent {
+                s.push_str(&format!("cpu_percent = {c}\n"));
+            }
+            match l.tasks {
+                Tasks::Default => {}
+                Tasks::Max(n) => s.push_str(&format!("tasks = {n}\n")),
+                Tasks::Unlimited => s.push_str("tasks = \"unlimited\"\n"),
+            }
+        }
         for g in &self.filesystem {
             s.push_str("\n[[filesystem]]\npath = \"");
             for c in g.path.to_string_lossy().chars() {
@@ -499,7 +682,8 @@ impl Permissions {
     }
 
     /// One `--set` expression: `network=allow|deny`, `display|audio|gpu=on|off`, `fs+=<abs>:ro|rw` (an existing
-    /// path re-added replaces its access) and `fs-=<abs>`. On error `self` is unchanged.
+    /// path re-added replaces its access), `fs-=<abs>`, and the limits (module docs, "Limits"). On error `self` is
+    /// unchanged.
     pub fn apply_set(&mut self, expr: &str, ctx: &GrantCtx) -> Result<(), PermError> {
         let bad = || PermError::Expr(clip(expr));
         if let Some(rest) = expr.strip_prefix("fs+=") {
@@ -535,6 +719,48 @@ impl Permissions {
             return Ok(());
         }
         let (key, value) = expr.split_once('=').ok_or_else(bad)?;
+        // A limit value is plain digits (no sign, unit or space); `u64::from_str` alone would take `+5`.
+        let number = || {
+            (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())).then(|| {
+                value
+                    .parse::<u64>()
+                    .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+                    .unwrap_or(i64::MAX)
+            })
+        };
+        let l = &mut self.limits;
+        match (key, value) {
+            ("memory" | "cpu", "off" | "default") => {
+                if key == "memory" {
+                    l.memory_mb = None;
+                } else {
+                    l.cpu_percent = None;
+                }
+                return Ok(());
+            }
+            ("tasks", "default") => {
+                l.tasks = Tasks::Default;
+                return Ok(());
+            }
+            ("tasks", "unlimited") => {
+                l.tasks = Tasks::Unlimited;
+                return Ok(());
+            }
+            ("memory", _) => {
+                l.memory_mb = Some(bounded("memory", number().ok_or_else(bad)?, MEMORY_MB, " MiB")?);
+                return Ok(());
+            }
+            ("cpu", _) => {
+                let n = number().ok_or_else(bad)?;
+                l.cpu_percent = Some(bounded("cpu", n, 1..=max_cpu_percent(), " percent")?);
+                return Ok(());
+            }
+            ("tasks", _) => {
+                l.tasks = Tasks::Max(bounded("tasks", number().ok_or_else(bad)?, TASKS, "")?);
+                return Ok(());
+            }
+            _ => {}
+        }
         let flag = match value {
             "on" => Some(true),
             "off" => Some(false),
@@ -744,6 +970,231 @@ mod tests {
         assert_eq!(Permissions::parse(&p.to_toml(), &x.ctx).unwrap(), p);
     }
 
+    fn limits_of(text: &str) -> Result<Limits, PermError> {
+        Permissions::parse_raw(&format!("version = 1\n{text}")).map(|p| p.limits)
+    }
+
+    #[test]
+    fn limits_are_default_unless_the_file_has_the_key() {
+        let d = Limits::default();
+        assert_eq!(d.tasks, Tasks::Default);
+        assert_eq!(
+            (d.memory_mb, d.cpu_percent, d.tasks_max(), d.explicit()),
+            (None, None, Some(4096), false)
+        );
+        assert_eq!(limits_of(""), Ok(d));
+        assert_eq!(limits_of("[limits]\n"), Ok(d));
+        // the default value written out is a REQUEST: mandatory
+        let four = limits_of("[limits]\ntasks = 4096\n").unwrap();
+        assert_eq!(
+            (four.tasks, four.tasks_max(), four.explicit()),
+            (Tasks::Max(4096), Some(4096), true)
+        );
+        let u = limits_of("[limits]\ntasks = \"unlimited\"\n").unwrap();
+        assert_eq!((u.tasks, u.tasks_max(), u.explicit()), (Tasks::Unlimited, None, false));
+        let m = limits_of("[limits]\nmemory_mb = 2048\ncpu_percent = 150\n").unwrap();
+        assert_eq!(
+            (m.memory_mb, m.cpu_percent, m.tasks, m.explicit()),
+            (Some(2048), Some(150), Tasks::Default, true)
+        );
+        // explicit vs default survives store/load
+        let x = t();
+        let app = x.dir("app");
+        for limits in [
+            d,
+            four,
+            u,
+            m,
+            Limits {
+                memory_mb: Some(64),
+                cpu_percent: Some(1),
+                tasks: Tasks::Max(16),
+            },
+        ] {
+            let p = Permissions {
+                limits,
+                ..Permissions::default()
+            };
+            store(&app, &p).unwrap();
+            assert_eq!(load(&app, &x.ctx).unwrap(), p, "{limits:?}");
+        }
+    }
+
+    #[test]
+    fn the_limits_table_text_is_stable() {
+        let x = t();
+        let p = perms_with(&["memory=2048", "cpu=150", "tasks=512"], &x);
+        let text = p.to_toml();
+        assert_eq!(
+            text,
+            "version = 1\nnetwork = \"deny\"\ndisplay = true\naudio = true\ngpu = true\n\n[limits]\nmemory_mb = 2048\ncpu_percent = 150\ntasks = 512\n"
+        );
+        assert_eq!(Permissions::parse(&text, &x.ctx).unwrap(), p);
+        let u = perms_with(&["tasks=unlimited"], &x);
+        assert!(
+            u.to_toml().ends_with("\n[limits]\ntasks = \"unlimited\"\n"),
+            "{}",
+            u.to_toml()
+        );
+        assert_eq!(Permissions::parse(&u.to_toml(), &x.ctx).unwrap(), u);
+        // no explicit key: no table at all (the pre-5B text)
+        assert!(!Permissions::default().to_toml().contains("limits"));
+        // the table sits before the grants and both survive
+        let d = x.dir("share/g");
+        let mut g = perms_with(&["memory=100"], &x);
+        g.apply_set(&format!("fs+={}:ro", d.display()), &x.ctx).unwrap();
+        assert_eq!(Permissions::parse(&g.to_toml(), &x.ctx).unwrap(), g);
+    }
+
+    fn perms_with(sets: &[&str], x: &T) -> Permissions {
+        let mut p = Permissions::default();
+        for s in sets {
+            p.apply_set(s, &x.ctx).unwrap_or_else(|e| panic!("{s}: {e}"));
+        }
+        p
+    }
+
+    #[test]
+    fn the_limits_table_is_strict() {
+        for bad in [
+            "[limits]\nmemory = 100\n",
+            "[limits]\ntasks = 100\nextra = 1\n",
+            "[limits]\ntasks = \"lots\"\n",
+            "[limits]\ntasks = \"default\"\n",
+            "[limits]\nmemory_mb = \"100\"\n",
+            "[limits]\ncpu_percent = 1.5\n",
+            "limits = 1\n",
+        ] {
+            assert!(limits_of(bad).is_err(), "{bad:?}");
+        }
+        for bad in [
+            "memory_mb = 63".to_owned(),
+            "memory_mb = 1048577".into(),
+            "memory_mb = -1".into(),
+            "cpu_percent = 0".into(),
+            "cpu_percent = 409601".into(),
+            "tasks = 15".into(),
+            "tasks = 65537".into(),
+            "tasks = -4096".into(),
+        ] {
+            assert!(
+                matches!(limits_of(&format!("[limits]\n{bad}\n")), Err(PermError::Limit(_))),
+                "{bad}"
+            );
+        }
+        for ok in [
+            "memory_mb = 64".to_owned(),
+            "memory_mb = 1048576".into(),
+            "cpu_percent = 1".into(),
+            // a load never depends on this host's CPUs (or the affinity/quota `runtime` was started under)
+            "cpu_percent = 1500".into(),
+            "cpu_percent = 409600".into(),
+            "tasks = 16".into(),
+            "tasks = 65536".into(),
+        ] {
+            assert!(limits_of(&format!("[limits]\n{ok}\n")).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn the_cpu_bound_of_set_follows_the_cpu_count_and_the_fixed_ceiling() {
+        assert_eq!(cpu_range(1), 1..=100);
+        assert_eq!(cpu_range(12), 1..=1200);
+        assert_eq!(cpu_range(4096), 1..=409600);
+        assert_eq!(cpu_range(100_000), 1..=409600, "never above what a load accepts");
+        assert_eq!(cpu_range(0), 1..=100, "at least one CPU");
+        // `--set cpu=1500` on a 12-CPU host is refused, a 16-CPU host takes it
+        let bad = bounded("cpu", 1500, cpu_range(12), " percent").unwrap_err();
+        assert!(bad.to_string().contains("1..=1200"), "{bad}");
+        assert_eq!(bounded("cpu", 1500, cpu_range(16), " percent"), Ok(1500));
+    }
+
+    #[test]
+    fn cpu_off_repairs_a_profile_whose_cpu_exceeds_this_host() {
+        let x = t();
+        let app = x.dir("app");
+        let over = CPU_PERCENT_MAX;
+        assert!(over > max_cpu_percent());
+        fs::write(
+            app.join(FILE_NAME),
+            format!("version = 1\n[limits]\ncpu_percent = {over}\n"),
+        )
+        .unwrap();
+        let mut p = load(&app, &x.ctx).unwrap();
+        assert_eq!(p.limits.cpu_percent, Some(over));
+        p.apply_set("cpu=off", &x.ctx).unwrap();
+        store(&app, &p).unwrap();
+        assert_eq!(load(&app, &x.ctx).unwrap(), Permissions::default());
+        // but it cannot be set again here
+        assert!(matches!(
+            p.apply_set(&format!("cpu={over}"), &x.ctx),
+            Err(PermError::Limit(_))
+        ));
+    }
+
+    #[test]
+    fn apply_set_handles_every_limit_form_and_its_bounds() {
+        let x = t();
+        let cpu_max = max_cpu_percent();
+        let mut p = Permissions::default();
+        let set = |p: &mut Permissions, e: &str| p.apply_set(e, &x.ctx).unwrap_or_else(|e2| panic!("{e}: {e2}"));
+        set(&mut p, "memory=64");
+        set(&mut p, "memory=1048576");
+        assert_eq!(p.limits.memory_mb, Some(1048576));
+        set(&mut p, "cpu=1");
+        set(&mut p, &format!("cpu={cpu_max}"));
+        assert_eq!(p.limits.cpu_percent, Some(cpu_max));
+        set(&mut p, "tasks=16");
+        set(&mut p, "tasks=65536");
+        assert_eq!(p.limits.tasks, Tasks::Max(65536));
+        set(&mut p, "tasks=unlimited");
+        assert_eq!(p.limits.tasks, Tasks::Unlimited);
+        set(&mut p, "tasks=default");
+        assert_eq!(p.limits.tasks, Tasks::Default);
+        set(&mut p, "memory=off");
+        set(&mut p, "cpu=off");
+        assert_eq!(p.limits, Limits::default());
+        set(&mut p, "memory=100");
+        set(&mut p, "cpu=50");
+        set(&mut p, "memory=default");
+        set(&mut p, "cpu=default");
+        assert_eq!(p.limits, Limits::default());
+        // out of range: an error that names the bounds, nothing changed
+        set(&mut p, "memory=128");
+        let before = p.clone();
+        for bad in [
+            "memory=63".to_owned(),
+            "memory=1048577".into(),
+            "cpu=0".into(),
+            format!("cpu={}", cpu_max + 1),
+            "tasks=15".into(),
+            "tasks=65537".into(),
+            "memory=99999999999999999999999".into(),
+        ] {
+            let e = p.apply_set(&bad, &x.ctx);
+            assert!(matches!(e, Err(PermError::Limit(_))), "{bad}: {e:?}");
+        }
+        assert!(p.apply_set("memory=63", &x.ctx).unwrap_err().to_string().contains("64"));
+        // not a number or not a form at all
+        for bad in [
+            "memory=",
+            "memory=+100",
+            "memory=-1",
+            "memory=1e3",
+            "memory=100M",
+            "memory= 100",
+            "cpu=50%",
+            "tasks=off",
+            "tasks=",
+            "tasks=Unlimited",
+            "memory_mb=100",
+            "mem=100",
+        ] {
+            assert_eq!(p.apply_set(bad, &x.ctx), Err(PermError::Expr(bad.to_owned())), "{bad}");
+        }
+        assert_eq!(p, before);
+    }
+
     #[test]
     fn a_full_profile_round_trips_and_the_text_is_stable() {
         let x = t();
@@ -762,6 +1213,7 @@ mod tests {
                     access: Access::Ro,
                 },
             ],
+            limits: Limits::default(),
         };
         let text = p.to_toml();
         assert_eq!(Permissions::parse(&text, &x.ctx).unwrap(), p);

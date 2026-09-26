@@ -87,6 +87,17 @@ fn require_real_bwrap() -> Option<PathBuf> {
 /// instead — so this lock only has to cover this file's own calls to be sufficient.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The options of a plain, non-silent install; the runtime executable is this test binary, which runs the real
+/// `sandbox-init` shim (`crate::sandbox`'s `TEST_SHIM`).
+fn opts() -> InstallerOpts {
+    InstallerOpts {
+        silent: false,
+        allow_network: false,
+        exe_override: None,
+        runtime_exe: std::env::current_exe().unwrap(),
+    }
+}
+
 /// [`install_via_installer`], with `XDG_DATA_HOME` pointed at a fresh scratch directory for the call's duration.
 ///
 /// Task 7 wired `rt_desktop::entry::write`/`mime::register` into `run_after_create` on every path that returns
@@ -133,8 +144,7 @@ fn real_hello_msi_is_detected_and_the_install_fails_cleanly_without_a_real_msiex
     let f = fx();
     let path = f.input("hello.msi", &fixture("hello.msi"));
     let backend = FakeBackend::new();
-    let err =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
     assert!(matches!(err, InstallerError::MsiExecMissing), "{err}");
     f.assert_no_app_left();
     // Named after the real MsiInfo::read'd ProductName ("Runtime Fixture MSI"), slugged the same way as Phase 2.
@@ -173,8 +183,7 @@ exit 5
 "#;
     let backend = fake_backend(script);
 
-    let outcome =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap();
     let InstallOutcome::Installed {
         id,
         executable,
@@ -225,8 +234,7 @@ exit 5
 
     // Installing the very same file again must not collide: the id (and metadata) diverge, mirroring Phase 2's
     // "installing the same program twice gives distinct ids".
-    let second =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let second = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap();
     let InstallOutcome::Installed { id: id2, .. } = second else {
         panic!("expected Installed");
     };
@@ -268,7 +276,7 @@ exit 0
         precreate_windows_temp: true,
         ..Wrap::new(fake_backend(script))
     };
-    let outcome = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, opts()).unwrap();
     let InstallOutcome::Installed { id, executable, .. } = outcome else {
         panic!("expected Installed, got {outcome:?}");
     };
@@ -300,10 +308,7 @@ fn silent_on_an_unrecognised_installer_family_creates_nothing() {
     // `--silent` on `Unknown` is refused (never a guessed flag) before anything is created.
     let path = f.input("gui.exe", &fixture("gui64.exe"));
     let backend = FakeBackend::new();
-    let opts = InstallerOpts {
-        silent: true,
-        ..Default::default()
-    };
+    let opts = InstallerOpts { silent: true, ..opts() };
     let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
     assert!(
         matches!(
@@ -326,8 +331,7 @@ fn unrecognised_file_formats_are_refused_before_anything_is_created() {
         ("empty.bin", Vec::new()),
     ] {
         let path = f.input(name, &bytes);
-        let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default())
-            .unwrap_err();
+        let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
         assert!(matches!(err, InstallerError::NotAnInstaller), "{name}: {err}");
     }
     assert!(!f.apps().exists());
@@ -353,8 +357,7 @@ fn ambiguous_discovery_returns_candidates_and_installs_nothing() {
     let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
     let backend = fake_backend(AMBIGUOUS_SCRIPT);
 
-    let outcome =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap();
     let InstallOutcome::NeedsChoice(candidates) = outcome else {
         panic!("expected NeedsChoice, got {outcome:?}");
     };
@@ -373,7 +376,7 @@ fn exe_override_skips_discovery_and_installs_the_named_file() {
     let backend = fake_backend(AMBIGUOUS_SCRIPT);
     let opts = InstallerOpts {
         exe_override: Some("App/two.exe".to_owned()),
-        ..Default::default()
+        ..opts()
     };
 
     let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap();
@@ -471,7 +474,7 @@ exit 0
         version_fails: true,
         ..Wrap::new(fake_backend(script))
     };
-    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, opts()).unwrap_err();
     assert!(
         matches!(err, InstallerError::Backend(BackendError::Unavailable(_))),
         "{err}"
@@ -490,7 +493,7 @@ fn a_backend_command_failure_cleans_up_the_environment() {
         command_fails: true,
         ..Wrap::new(FakeBackend::new())
     };
-    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, InstallerOpts::default()).unwrap_err();
+    let err = install_via_installer_isolated(&f.store, &wrap, launcher(), &path, opts()).unwrap_err();
     assert!(
         matches!(err, InstallerError::Backend(BackendError::Unavailable(_))),
         "{err}"
@@ -679,8 +682,7 @@ REG
 exit 0
 "#;
     let backend = fake_backend(script);
-    let outcome =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap();
     let InstallOutcome::NeedsChoice(candidates) = outcome else {
         panic!("expected NeedsChoice, got {outcome:?}");
     };
@@ -725,8 +727,7 @@ REG
 exit 0
 "#;
     let backend = fake_backend(script);
-    let outcome =
-        install_via_installer_isolated(&f.store, &backend, launcher(), &path, InstallerOpts::default()).unwrap();
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap();
     let InstallOutcome::Installed { id, warnings, .. } = outcome else {
         panic!("expected Installed, got {outcome:?}");
     };
@@ -739,4 +740,38 @@ exit 0
     let installer = md.installer.expect("installer field");
     assert_eq!(installer.product_name, None);
     assert_eq!(installer.uninstall_command, None);
+}
+
+/// Phase 5B Task 6 fix round 1: a runtime executable the installer sandbox cannot use is a typed error that names the
+/// reason, before anything runs (never an installer "exit 126" warning followed by an empty discovery).
+#[test]
+fn an_unusable_runtime_executable_is_a_sandbox_refusal_and_nothing_runs() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let deleted = format!("{} (deleted)", std::env::current_exe().unwrap().display());
+    for (exe, why) in [
+        (PathBuf::from("runtime"), "not an absolute path"),
+        (PathBuf::from(&deleted), "replaced or deleted"),
+        (PathBuf::from("/nonexistent/runtime"), "cannot be resolved"),
+    ] {
+        let f = fx();
+        let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+        let backend = fake_backend("exit 0");
+        let opts = InstallerOpts {
+            runtime_exe: exe.clone(),
+            ..opts()
+        };
+        let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
+        let cause = match err {
+            InstallerError::WithCleanup { cause, .. } => *cause,
+            e => e,
+        };
+        assert!(matches!(cause, InstallerError::SandboxRefused(_)), "{exe:?}: {cause:?}");
+        let text = cause.to_string();
+        assert!(text.contains(why) && text.contains("nothing was run"), "{text}");
+        assert!(
+            !backend.calls().iter().any(|c| matches!(c, Call::Command { .. })),
+            "{exe:?}: {:?}",
+            backend.calls()
+        );
+    }
 }
