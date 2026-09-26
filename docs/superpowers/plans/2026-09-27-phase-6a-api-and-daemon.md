@@ -120,10 +120,27 @@
 **Interfaces:**
 - Produces: `Client::connect(path) -> Result<Client, ApiError>`, `Client::call<T: DeserializeOwned>(&mut self, method: &str, params: impl Serialize) -> Result<T, ApiError>` (assigns integer ids, validates the reply id and `jsonrpc`, maps JSON-RPC errors to `ApiError` via `data.kind`, caps reply size at 16 MiB, read/write timeouts), typed helpers `apps()`, `app(id)`, `doctor_system()`, ...; `runtime rpc` prints the raw `result` JSON (pretty) or the error (exit 1, kind + message sanitised); `--local` calls `rt_api::Runtime` in process (no daemon) so the CLI and the daemon can be compared in tests.
 
-- [ ] **Step 1: Failing tests:** client against the in-process server: every helper; id mismatch / wrong version / oversized reply / connection closed mid-reply => typed errors, no panic, no hang (timeouts); `runtime rpc apps.list` equals `runtime rpc --local apps.list` for the same data root; `runtime daemon-status` on no daemon => exit 1 with a helpful message ("no daemon at <path>: start `runtimed` or use `--local`").
-- [ ] **Step 2: e2e** (real binaries, temp `XDG_RUNTIME_DIR`, temp data root with the rig's fake-Wine app or a plain metadata-only app): start `runtimed`, wait for the socket (bounded), `runtime rpc rpc.version`, `apps.list`, `doctor.system`, `permissions.get`, `compat.list`; send SIGTERM => the daemon exits 0 and removes the socket; a second `runtimed` on the same socket refuses; garbage on the socket does not crash it (send 1 MiB of junk, then a valid request on a new connection succeeds).
-- [ ] **Step 3: Docs:** `docs/API.md` (method table with params/results/errors, versioning policy, framing, limits, examples with `runtime rpc`), SECURITY.md daemon section (what it exposes: read-only in 6A; any process of the same user can call it; socket mode/uid checks; no network; mutating methods in 6B come with per-method rules), README, roadmap row.
-- [ ] **Step 4:** full gate; commit `feat(api,cli): a client, runtime rpc and daemon-status; API and daemon docs`.
+- [x] **Step 1: Failing tests:** client against the in-process server: every helper; id mismatch / wrong version / oversized reply / connection closed mid-reply => typed errors, no panic, no hang (timeouts); `runtime rpc apps.list` equals `runtime rpc --local apps.list` for the same data root; `runtime daemon-status` on no daemon => exit 1 with a helpful message ("no daemon at <path>: start `runtimed` or use `--local`").
+- [x] **Step 2: e2e** (real binaries, temp `XDG_RUNTIME_DIR`, temp data root with the rig's fake-Wine app or a plain metadata-only app): start `runtimed`, wait for the socket (bounded), `runtime rpc rpc.version`, `apps.list`, `doctor.system`, `permissions.get`, `compat.list`; send SIGTERM => the daemon exits 0 and removes the socket; a second `runtimed` on the same socket refuses; garbage on the socket does not crash it (send 1 MiB of junk, then a valid request on a new connection succeeds).
+- [x] **Step 3: Docs:** `docs/API.md` (method table with params/results/errors, versioning policy, framing, limits, examples with `runtime rpc`), SECURITY.md daemon section (what it exposes: read-only in 6A; any process of the same user can call it; socket mode/uid checks; no network; mutating methods in 6B come with per-method rules), README, roadmap row.
+- [x] **Step 4:** full gate; commit `feat(api,cli): a client, runtime rpc and daemon-status; API and daemon docs`.
+
+**As built (Task 4; deviations from the text above, decided on the controller's Task 4 brief):**
+- The client is `rt_daemon::client` (`crates/daemon/src/client.rs`), not `rt_api::client`: it shares the daemon's
+  framing (`read_frame_max`), non-blocking connect and `peer_allowed`, and `rt_api` stays free of socket code. The CLI
+  depends on `runtime-daemon` for this client only (documented in `crates/cli/Cargo.toml`, README and API.md).
+- Errors are `ClientError` (`Rpc { code, message, kind }` keeps the JSON-RPC code and `data.kind`;
+  `api_error()` maps -32000 to `ApiError`), not `ApiError`: busy/timeout/protocol failures have no `ApiError` kind.
+  `call` is raw (`Value` in, `Value` out); the typed helpers cover every method.
+- Before sending, the client checks the socket directory (not a symlink, ours, `& 0o077 == 0`), the socket (a socket,
+  ours, `& 0o077 == 0`) and after connecting the peer uid; the connect is non-blocking with a deadline.
+- Request lines are capped at the daemon's 1 MiB before sending; replies at 16 MiB (a legitimate `apps.list` can
+  exceed 1 MiB). Whole-reply deadline 40 s (`daemon-status`: 5 s).
+- No `--local`: the e2e equality oracle is the standalone CLI (`runtime list --json`, `compat --json`,
+  `doctor --json`), which is what users compare against.
+- The e2e lives in `crates/daemon/tests/e2e.rs` and takes `runtime` from next to `runtimed` (fails loudly when absent).
+- `docs/API.md`'s method table and sections are checked against `dispatch::METHODS` by a test.
+- Found by the equality test and fixed: `compat.list` cut `notes` at 256 bytes; the matrix allows 300.
 
 ---
 
@@ -131,4 +148,7 @@
 
 - Spec criteria: 1 -> Tasks 1-2; 2 -> Task 3; 3 -> Task 4; 4 -> Tasks 3-4; 5 -> Tasks 1-2.
 - Placeholders: none; Task 2's "decide which sandbox code moves" has a rule (no dependency on the CLI) and the CLI test suite as oracle.
+- Recorded deviations (Tasks 3-4): busy is -32001 and timeout -32002 (not -32000); `serve` takes `&'static AtomicBool`;
+  no `--max-connections`; the unit ships without `PrivateNetwork=` or any hardening option (see its comments); the
+  client lives in `rt_daemon` and returns `ClientError`; no `runtime rpc --local`.
 - Types: `Runtime`, `ApiError/ErrorKind`, `AppSummary/AppDetail/PermissionsView/CompatView/DoctorView/GraphicsView/SandboxView/DepsPlanView`, `Request/Reply/Id`, `ServerConfig`, `Client` are named identically across tasks.

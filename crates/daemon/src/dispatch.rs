@@ -284,6 +284,22 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_methods_are_the_dispatch_table() {
+        let doc = include_str!("../../../docs/API.md");
+        // The method table's rows (`| \`name\` | ...`) and the `### \`name\`` sections, both in METHODS' order.
+        let rows: Vec<&str> = doc
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `")?.split('`').next())
+            .collect();
+        let sections: Vec<&str> = doc
+            .lines()
+            .filter_map(|l| l.strip_prefix("### `")?.strip_suffix('`'))
+            .collect();
+        assert_eq!(rows, METHODS, "docs/API.md's method table");
+        assert_eq!(sections, METHODS, "docs/API.md's method sections");
+    }
+
+    #[test]
     fn every_listed_method_is_dispatched() {
         let (_d, rt) = rt();
         for m in METHODS {
