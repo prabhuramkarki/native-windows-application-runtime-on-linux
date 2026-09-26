@@ -10,8 +10,8 @@
 //! rendered around another's prefix. [`RunSandbox`] renders BEFORE the spawn (`Sandbox::try_wrap`: a refusal is
 //! an error, never the fail-closed stub), prints what the profile cannot enforce (`note: ...`, one line each) and
 //! records [`MARKER`]. The profile's resource limits wrap the run in a `systemd-run --user` scope (`rt_sandbox`'s
-//! renderer, "Limits"); whether scopes work is probed once per command (`RealHost::scopes`) and shown by `runtime
-//! sandbox` (a `limits:` section) and `doctor` (one check, a warning at worst).
+//! renderer, "Limits"); whether scopes work is probed once per command (`RealHost::scopes`, kept for 30 s) and shown
+//! by `runtime sandbox` (a `limits:` section) and `doctor` (one check, a warning at worst).
 //!
 //! **Helpers in a prefix the app has written.** A sandboxed program can write its own prefix: registry `Run` keys
 //! and services, `DllOverrides` naming a native DLL it dropped. The next Wine session in that prefix runs them, and

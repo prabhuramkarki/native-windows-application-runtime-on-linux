@@ -4,7 +4,7 @@
 use crate::ScopeSupport;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub trait Host: Send + Sync {
     /// A variable of the runtime's own (unfiltered) environment.
@@ -65,16 +65,16 @@ impl Host for RealHost {
         self.is_file(&real).then_some(real)
     }
     fn scopes(&self) -> Result<ScopeSupport, String> {
-        // Probed once per process: a launch renders two or three times, and `runtime sandbox` more.
-        static PROBED: OnceLock<Result<ScopeSupport, String>> = OnceLock::new();
-        PROBED
-            .get_or_init(|| {
-                let sr = crate::find_systemd_run_on_path().ok_or("systemd-run is not on PATH")?;
-                // The program gets `$XDG_RUNTIME_DIR` only when it is absolute (`rt_core::allowed_env`).
-                let rt = self.env("XDG_RUNTIME_DIR").filter(|d| Path::new(d).is_absolute());
-                crate::probe_limits(&sr, rt.as_deref())
-            })
-            .clone()
+        // Probed once per 30 s: a launch renders two or three times, and `runtime sandbox` more; a long-lived
+        // process (the daemon) still sees a user manager that started or stopped since.
+        static PROBED: rt_core::Cached<Result<ScopeSupport, String>> = rt_core::Cached::new(Duration::from_secs(30));
+        let probed = PROBED.get_at(Instant::now(), || {
+            let sr = crate::find_systemd_run_on_path().ok_or("systemd-run is not on PATH")?;
+            // The program gets `$XDG_RUNTIME_DIR` only when it is absolute (`rt_core::allowed_env`).
+            let rt = self.env("XDG_RUNTIME_DIR").filter(|d| Path::new(d).is_absolute());
+            crate::probe_limits(&sr, rt.as_deref())
+        });
+        probed.as_ref().clone()
     }
 }
 
