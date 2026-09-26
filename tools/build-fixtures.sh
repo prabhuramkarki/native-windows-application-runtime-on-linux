@@ -19,6 +19,8 @@ for arch in x86_64 i686; do
     "$cc" $flags -o "$out/d3d11_64.exe" tools/fixtures/d3d11.c -ld3d11 -ldxgi -ldxguid
     # The sandbox escape probe (e2e_sandbox.rs).
     "$cc" $flags -o "$out/probe64.exe" tools/fixtures/probe.c -lws2_32 -lntdll
+    # A hostile reg.exe stand-in for the installer-sandbox escape test (e2e_installers.rs).
+    "$cc" $flags -o "$out/escape-reg64.exe" tools/fixtures/escape-reg.c
   fi
   rm -f "$out/hello$tag.res.o"
 done

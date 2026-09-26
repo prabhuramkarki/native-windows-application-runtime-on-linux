@@ -224,8 +224,12 @@ fn install_with(
 ) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     let (silent_args, marker, overrides) = check_package(pkg)?;
     let sandbox = sandbox.ok_or(InstallerPkgError::BwrapNotFound)?;
+    let opts = SandboxOpts {
+        allow_network: false,
+        extra_ro_binds: backend.dll_dirs(),
+    };
     sandbox
-        .check(env)
+        .check(env, &opts)
         .map_err(|why| InstallerPkgError::SandboxRefused(bounded(&why)))?;
 
     let stage_err = |e: &dyn Display| InstallerPkgError::Stage(bounded(e));
@@ -270,10 +274,6 @@ fn install_with(
         ];
         args.extend(silent_args.iter().map(OsString::from));
         (explorer, args)
-    };
-    let opts = SandboxOpts {
-        allow_network: false,
-        extra_ro_binds: backend.dll_dirs(),
     };
     let status =
         run_sandboxed(backend, launcher, env, &sandbox, &exe, &args, opts, Some(deadline)).map_err(|e| match e {

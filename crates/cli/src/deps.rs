@@ -115,6 +115,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
         return Ok(0);
     }
     check_yes(&plan.plan, yes)?;
+    crate::sandbox::print_hardening_caveat();
     let launcher = Launcher::new();
     let backend = crate::backend(&launcher)?;
     // `reg.exe` of archive packages; installer packages replace it with the installer sandbox.

@@ -1572,3 +1572,54 @@ fn an_unusable_runtime_executable_is_refused_before_anything_is_staged() {
     assert!(!f.ran());
     assert!(!f.staging_left());
 }
+
+/// Phase 5B final review IMPORTANT 1: the installer sandbox has read-write access to the prefix, so a vendor
+/// installer package marks the app "ran sandboxed" (`rt_sandbox::MARKER` in the app root, which no sandbox binds)
+/// BEFORE its Windows code starts and before every `reg.exe` override step, so the app's later Wine helpers run
+/// sandboxed too. Here: the marker is present after a successful install with overrides, and it was written before
+/// the reg steps (the installer command comes first in the log, and the marker is written before each sandboxed
+/// command).
+#[test]
+fn a_successful_installer_package_marks_the_app_ran_sandboxed_before_its_reg_steps() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let marker = f.env.root().join("ran-sandboxed"); // rt_sandbox::MARKER
+    assert!(!marker.exists(), "not marked before the install");
+    let b = reg_backend(&f, "exit 0", MAKE_MARKER);
+    let p = pkg_with_overrides(&["/S"], &["vcruntime140"], &["vcruntime140"]);
+    let got = run_with(&f, &p, &b, &bwrap).unwrap();
+    assert!(got.marker_confirmed);
+    assert!(
+        marker.exists(),
+        "the app root must be marked (rt_sandbox::MARKER) after a sandboxed installer package install"
+    );
+    // The installer command ran first, then the reg override: the marker (written before every sandboxed command)
+    // was therefore set before the reg step.
+    let calls = b.calls();
+    let cmds: Vec<&Call> = calls.iter().filter(|c| matches!(c, Call::Command { .. })).collect();
+    assert!(
+        matches!(cmds[0], Call::Command { exe, .. } if exe.ends_with(EXPLORER_RELATIVE)),
+        "{cmds:?}"
+    );
+    assert!(
+        reg_calls(&b).contains(&"add vcruntime140".to_owned()),
+        "{:?}",
+        reg_calls(&b)
+    );
+}
+
+/// The mark fails closed: if the app root is read-only when the installer would run, nothing runs.
+#[test]
+fn a_marker_that_cannot_be_written_stops_the_install() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let f = fx(BODY);
+    let p = pkg_for(BODY, &["/S"], file_marker());
+    fs::set_permissions(f.env.root(), fs::Permissions::from_mode(0o500)).unwrap();
+    let err = run_with(&f, &p, &backend(MAKE_MARKER), &bwrap).unwrap_err();
+    fs::set_permissions(f.env.root(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&err, InstallerPkgError::Sandbox(m) if m.contains("runs sandboxed")),
+        "{err:?}"
+    );
+    assert!(!f.ran(), "nothing ran when the marker could not be written");
+}

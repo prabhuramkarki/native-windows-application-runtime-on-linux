@@ -255,6 +255,25 @@ mod hardening_tests {
 /// How long [`probe`] waits for `bwrap`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// In an app root: Windows code from outside the user's trust (the app itself, a vendor installer or uninstaller)
+/// has run in this app's prefix inside a sandbox, so that prefix may hold anything that code wrote there (registry
+/// `Run` keys, services, `DllOverrides` naming a planted native DLL). From then on every Wine helper that starts a
+/// session in the prefix runs sandboxed too (the CLI's `helper_launcher`). No sandbox ever binds the app root.
+pub const MARKER: &str = "ran-sandboxed";
+
+/// Writes [`MARKER`] in `app_root` (created `0600` if missing, never through a symlink). Callers write it BEFORE
+/// starting the code (a crash then leaves it set) and fail closed: an error means nothing may run.
+pub fn mark(app_root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(app_root.join(MARKER))
+        .map(drop)
+}
+
 /// Really creates a throwaway sandbox once (`bwrap --unshare-all --die-with-parent --ro-bind / / true`, at most
 /// [`PROBE_TIMEOUT`], output capped by the launcher) so a caller can say why sandboxing is impossible on this host
 /// before a run fails on it. `Err` is a one-line reason.

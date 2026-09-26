@@ -633,15 +633,21 @@ your full access (`\\?\unix\` paths reach every file). Which commands start a Wi
 | `runtime uninstall <app>` | the recorded uninstaller | yes, the installer sandbox |
 | `runtime remove`/`uninstall` (stop) | `wineserver -k`: not a session, runs no Windows code | no (not needed) |
 | `runtime doctor` | `wine --version`: no prefix | no (not needed) |
-| `runtime install` | `wineboot -u` in a brand-new prefix; installers in the installer sandbox | not app-written yet |
+| `runtime install` | `wineboot -u` in a brand-new prefix; the installer in the installer sandbox | installer: yes (installer sandbox); wineboot: not app-written yet |
 
-"Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program), written by the
-first sandboxed run; from then on those helpers run through the same `AppSandbox` (the app's own profile, so they
-get nothing the app does not have) and refuse, changing nothing, when bubblewrap is unavailable. Residual risk: an
-app that never ran sandboxed but whose prefix was written by an earlier unsandboxed run or by a vendor installer
-still has its `display`/archive-package `reg.exe` sessions run unsandboxed (as before Phase 5A), and
-`runtime run --unsandboxed` runs whatever the app wrote with your full access; `runtime sandbox <app>` warns about
-the latter.
+"Ran sandboxed" is a marker file `ran-sandboxed` in the app root (never visible to the program: no sandbox binds
+the app root). It is written whenever the runtime runs Windows code from outside your trust in the prefix inside a
+sandbox: the first `runtime run`, AND `runtime install` of an installer (before the installer's own code starts),
+`runtime deps <app> --install` of an installer package (before the installer and before each of its `reg.exe`
+steps), and `runtime uninstall` (before the recorded uninstaller). It is written BEFORE that code runs and its
+failure fails the operation (fail closed: nothing runs if the marker cannot be written), so a prefix a sandboxed
+installer touched can never later be reached by an unsandboxed helper. From then on `display` and archive-package
+`reg.exe` run through the same `AppSandbox` (the app's own profile, so they get nothing the app does not have) and
+refuse, changing nothing, when bubblewrap is unavailable (a marker-path error other than "not found" also refuses).
+Residual risk: an app that has NEVER run through any of those sandboxed paths is unmarked, so a prefix written by
+`runtime run --unsandboxed`, or created before Phase 5A/Task 6 and never touched sandboxed since, still has its
+`display`/archive-package `reg.exe` sessions run unsandboxed; and `runtime run --unsandboxed` runs whatever the app
+wrote with your full access. `runtime sandbox <app>` warns about the latter.
 
 **A running sandboxed app is invisible to `wineserver -k`.** Its `wineserver` keeps its socket in the sandbox's
 private `/tmp`, so the stop of `runtime remove`/`uninstall` cannot reach it. Both therefore check the host's `/proc`
@@ -717,7 +723,8 @@ bubblewrap's own PID 1 inside the sandbox (its reaper) is dumpable, has the same
 its `/proc/1/mem` (the sandbox's `/proc` is a fresh read-write procfs) is checked by `ptrace_may_access`, i.e. by
 Yama and the LSMs, never by seccomp, so a program can write code into it and run unfiltered, still inside the
 bubblewrap namespaces. Keeping `ptrace` denied there is still right (one fewer path), but it does not close this
-one. `runtime sandbox` prints and `doctor` warns `seccomp can be bypassed through /proc/1/mem on this host (no
+one. `runtime sandbox` and `doctor` show, and `runtime run` (and any command that runs Windows code in the installer
+sandbox) prints as one `note:` line at the start, `seccomp can be bypassed through /proc/1/mem on this host (no
 Landlock, no Yama)` exactly when Landlock is unavailable and Yama's `ptrace_scope` is 0 or Yama is absent (Debian
 and Fedora default to 0). With Landlock, or with Yama at 1 or more, the path is closed. `/proc` stays read-write
 because bwrap mounts it that way; no test proves read-only would be enough.

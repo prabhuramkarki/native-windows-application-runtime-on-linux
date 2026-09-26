@@ -72,9 +72,17 @@ fn run_uninstall_command(
         return false;
     };
     let sandbox = InstallerSandbox::new(bwrap, runtime_exe);
-    if let Err(why) = sandbox.check(env) {
+    if let Err(why) = sandbox.check(env, &opts) {
         warnings.push(format!(
             "the installer sandbox refused to start the uninstaller: {why} (nothing was run)"
+        ));
+        return false;
+    }
+    // The vendor uninstaller runs sandboxed Windows code in the prefix: mark before it starts (fail closed), so any
+    // later Wine helper of this app runs sandboxed too. A crash after the mark leaves it set.
+    if let Err(e) = rt_sandbox::mark(env.root()) {
+        warnings.push(format!(
+            "could not record that the app runs sandboxed ({e}); the uninstaller was not run"
         ));
         return false;
     }
