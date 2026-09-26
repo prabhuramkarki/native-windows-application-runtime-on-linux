@@ -108,7 +108,10 @@ impl Fx {
             &self.launcher,
             target,
             args,
-            &RunOptions { debug },
+            &RunOptions {
+                debug,
+                ..RunOptions::default()
+            },
             &env,
         )
     }
@@ -347,7 +350,10 @@ fn a_failing_terminal_is_reported_and_does_not_fail_the_program() {
         &f.launcher,
         "app",
         &[],
-        &RunOptions { debug: true },
+        &RunOptions {
+            debug: true,
+            ..RunOptions::default()
+        },
         &env,
     )
     .unwrap()
@@ -881,4 +887,149 @@ fn a_failure_for_an_app_that_was_already_installed_is_not_wrapped() {
     };
     assert!(matches!(e, RunAppError::Backend(_)), "{e:?}");
     assert!(!text(&e).contains("installed as"), "{e}");
+}
+
+// ------------------------------------------------------------------------------ sandbox
+
+/// A wrapped command's program, `WINEPREFIX` and `SETTLED`.
+type Seen = (OsString, Option<OsString>, Option<OsString>);
+
+/// Records the commands it is given (program and `WINEPREFIX`/`SETTLED`), and refuses them all when `refuse`.
+#[derive(Default)]
+struct RecordingSandbox {
+    seen: Mutex<Vec<Seen>>,
+    refuse: bool,
+}
+
+impl Sandbox for RecordingSandbox {
+    fn wrap(&self, cmd: std::process::Command) -> std::process::Command {
+        let var = |name: &str| {
+            cmd.get_envs()
+                .find(|(k, _)| *k == name)
+                .and_then(|(_, v)| v.map(OsString::from))
+        };
+        let seen = (cmd.get_program().to_owned(), var("WINEPREFIX"), var("SETTLED"));
+        self.seen.lock().unwrap().push(seen);
+        cmd
+    }
+    fn try_wrap(&self, cmd: std::process::Command) -> Result<std::process::Command, String> {
+        let cmd = self.wrap(cmd);
+        if self.refuse {
+            Err("refused for the test".into())
+        } else {
+            Ok(cmd)
+        }
+    }
+}
+
+/// [`FakeBackend`] whose `settle` marks the command with `SETTLED=1`.
+struct SettlingBackend(FakeBackend);
+
+impl CompatBackend for SettlingBackend {
+    fn id(&self) -> &'static str {
+        self.0.id()
+    }
+    fn version(&self) -> Result<String, BackendError> {
+        self.0.version()
+    }
+    fn prepare(&self, env: &AppEnv) -> Result<(), BackendError> {
+        self.0.prepare(env)
+    }
+    fn command(
+        &self,
+        env: &AppEnv,
+        exe: &Path,
+        cwd: &Path,
+        args: &[OsString],
+        opts: &RunOpts,
+    ) -> Result<std::process::Command, BackendError> {
+        self.0.command(env, exe, cwd, args, opts)
+    }
+    fn stop(&self, env: &AppEnv) -> Result<(), BackendError> {
+        self.0.stop(env)
+    }
+    fn dll_dirs(&self) -> Vec<PathBuf> {
+        vec![]
+    }
+    fn settle(&self, mut cmd: std::process::Command) -> std::process::Command {
+        cmd.env("SETTLED", "1");
+        cmd
+    }
+}
+
+fn start_with(
+    f: &Fx,
+    backend: &dyn CompatBackend,
+    target: &str,
+    sandbox: Option<Arc<dyn Sandbox>>,
+) -> Result<Started, RunAppError> {
+    let base = f.tmp.path().join("in");
+    let terminal = || -> Box<dyn Write + Send> { Box::new(io::sink()) };
+    let env = Env {
+        base: &base,
+        terminal: &terminal,
+    };
+    let opts = RunOptions { debug: false, sandbox };
+    start_in(&f.store, backend, &f.launcher, target, &[], &opts, &env)
+}
+
+#[test]
+fn the_sandbox_wraps_the_settled_program_only_and_never_the_install() {
+    let f = fx("exit 5");
+    let backend = SettlingBackend(FakeBackend::with_script("exit 5"));
+    f.input("hello64.exe", &fixture("hello64.exe"));
+    let sb = Arc::new(RecordingSandbox::default());
+    let out = start_with(&f, &backend, "hello64.exe", Some(sb.clone()))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(out.exit_code, 5);
+    // The install prepared the prefix (its helpers run through the backend, never through the sandbox) ...
+    assert!(backend.0.calls().iter().any(|c| matches!(c, Call::Prepare { .. })));
+    // ... and the sandbox saw exactly one command: the program, settled, in the new app's prefix.
+    let env = f.store.get(&out.id).unwrap();
+    let seen = sb.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [(
+            OsString::from("/bin/sh"),
+            Some(env.prefix().into_os_string()),
+            Some(OsString::from("1"))
+        )]
+    );
+}
+
+#[test]
+fn without_a_sandbox_the_program_is_not_settled() {
+    let f = fx("exit 0");
+    f.app("app");
+    let backend = SettlingBackend(FakeBackend::with_script("[ -z \"$SETTLED\" ] || exit 9"));
+    let out = start_with(&f, &backend, "app", None).unwrap().wait().unwrap();
+    assert_eq!(out.exit_code, 0, "settle is only for a sandboxed run");
+}
+
+#[test]
+fn a_sandbox_that_refuses_starts_nothing() {
+    let f = fx("exit 0");
+    let env = f.app("app");
+    let canary = f.tmp.path().join("outside/ran");
+    let backend = FakeBackend::with_script(&format!("touch {}", canary.display()));
+    let sb = Arc::new(RecordingSandbox {
+        refuse: true,
+        ..RecordingSandbox::default()
+    });
+    let Err(e) = start_with(&f, &backend, "app", Some(sb)) else {
+        panic!("a refused command must not start")
+    };
+    assert!(
+        matches!(&e, RunAppError::Launch(LaunchError::Sandbox(m)) if m == "refused for the test"),
+        "{e:?}"
+    );
+    assert_eq!(
+        text(&e),
+        "the sandbox refused to start the program: refused for the test"
+    );
+    assert!(!canary.exists(), "the program ran");
+    let logs: Vec<_> = fs::read_dir(env.logs_dir()).unwrap().collect();
+    assert!(logs.is_empty(), "no log file for a run that never started: {logs:?}");
 }

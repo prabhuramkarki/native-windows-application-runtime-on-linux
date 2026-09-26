@@ -31,12 +31,20 @@
 //! child sees it; the front end must survive to report the child's status) and can call [`Started::kill`]
 //! for a timeout. [`run`] is `start` + `wait`.
 //!
+//! **Sandbox.** [`RunOptions::sandbox`] is attached to the ONE spawn of the program (`launcher.with_sandbox`);
+//! everything else keeps the plain launcher: the install of a file target, and the backend's `prepare`/`stop`
+//! helpers, which run through the backend's own launcher anyway. The sandboxed command is first wrapped in
+//! `CompatBackend::settle`: a `--unshare-pid` sandbox kills every process of its PID namespace the moment the
+//! program exits, so Wine's `wineserver` would die before it flushes the registry; `settle` waits for it INSIDE the
+//! sandbox (the exit status stays the program's). A sandbox that refuses the command starts nothing
+//! ([`LaunchError::Sandbox`]).
+//!
 //! No locking: `run` can race a concurrent `remove` of the same app (last writer wins, as everywhere in the store).
 use crate::text::quote;
 use crate::winpath::{ResolveError, WinPath, WinPathError, resolve_under};
 use crate::{
     AppEnv, AppId, BackendError, CompatBackend, InstallError, InstallOpts, InstallOutcome, LaunchError, Launcher,
-    LogSink, Metadata, RunOpts, Running, Store, StoreError, install,
+    LogSink, Metadata, RunOpts, Running, Sandbox, Store, StoreError, install,
 };
 use std::ffi::OsString;
 use std::fs;
@@ -44,12 +52,15 @@ use std::io::{self, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
 
 /// What the run service takes besides the target and the arguments.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct RunOptions {
     /// Verbose backend logging and the child's stderr also on the terminal (see the module docs).
     pub debug: bool,
+    /// The sandbox of the program's own process (see the module docs); `None`: none.
+    pub sandbox: Option<Arc<dyn Sandbox>>,
 }
 
 /// How a target string is read (Ruling 1 of the plan): a string containing `/` or ending in `.exe`/`.zip` (any
@@ -185,6 +196,11 @@ impl Started {
         self.running.log_path()
     }
 
+    /// The pid of the started process (with a sandbox: of the sandbox's own process, e.g. `bwrap`).
+    pub fn pid(&self) -> u32 {
+        self.running.id()
+    }
+
     /// SIGKILLs the program (see `Running::kill`); still call [`wait`](Self::wait) afterwards.
     pub fn kill(&mut self) -> io::Result<()> {
         self.running.kill()
@@ -250,7 +266,14 @@ fn launch(
         LogSink::LogOnly
     };
     let cmd = backend.command(&p.env, &p.exe, &p.cwd, args, &run_opts)?;
-    Ok(launcher.spawn(cmd, &p.env, sink)?)
+    // The program only (module docs, "Sandbox"): the backend's helpers never see this launcher.
+    Ok(match &opts.sandbox {
+        Some(sandbox) => launcher
+            .clone()
+            .with_sandbox(sandbox.clone())
+            .spawn(backend.settle(cmd), &p.env, sink)?,
+        None => launcher.spawn(cmd, &p.env, sink)?,
+    })
 }
 
 /// An installed app's program, checked and mapped into the host file system.

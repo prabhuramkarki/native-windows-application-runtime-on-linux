@@ -151,7 +151,8 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     // never meets a symlinked prefix or `user.reg`. A missing user.reg is fine.
     read_graphics_driver_from_prefix(&env)
         .map_err(|e| format!("not set: cannot use {}'s registry: {e}; nothing was changed", env.id()))?;
-    set_graphics_driver(&env, &backend, &launcher, &want).map_err(|e| e.to_string())?;
+    let helpers = crate::sandbox::helper_launcher(&env, &launcher, &backend)?;
+    set_graphics_driver(&env, &backend, &helpers, &want).map_err(|e| e.to_string())?;
     crate::emit(&format!("graphics driver of {} set to {}\n", env.id(), want.as_str()))
 }
 

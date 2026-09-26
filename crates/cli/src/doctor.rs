@@ -52,6 +52,11 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         Some((store, Target::Installed(id))) => Facts::app(store, id),
         Some((_, Target::File(path))) => Facts::file(path),
     };
+    let sandbox_env = match &found {
+        Some((store, Target::Installed(id))) => store.get(id).ok(),
+        _ => None,
+    };
+    let sandbox = crate::sandbox::doctor_state(sandbox_env.as_ref());
     let report = doctor(DoctorInput {
         subject: facts.subject,
         host_arch: std::env::consts::ARCH,
@@ -86,6 +91,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
             Err(e) => Err(e.as_str()),
         }),
         d3d_routes: facts.d3d_routes.as_deref(),
+        sandbox: sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
     });
     crate::emit(&if as_json {
         render_json(&report)?

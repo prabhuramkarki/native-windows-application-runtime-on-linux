@@ -91,12 +91,21 @@ pub struct Rig {
     calls: Cell<u32>,
     /// `server-<dev>-<ino>` directory names of every prefix seen (Wine names a server's directory that way).
     server_dirs: RefCell<HashSet<String>>,
+    /// Extra environment of the `runtime remove` calls [`Rig::cleanup`] makes (the fake `HOME` of a suite).
+    cleanup_env: RefCell<Vec<(String, String)>>,
 }
 
 impl Rig {
     pub fn new() -> Rig {
+        Rig::new_in(&std::env::temp_dir())
+    }
+
+    /// A rig whose tempdir (and so data dir) is below `parent`: the escape suite keeps its data dir out of `/tmp`
+    /// (inside the sandbox `/tmp` is a writable tmpfs, which would make a write next to the app root succeed
+    /// there, in memory, and prove nothing about the host).
+    pub fn new_in(parent: &Path) -> Rig {
         let backend = WineBackend::discover().expect("Wine must be installed for the e2e tests (apt install wine)");
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
         let data = root.path().join("data");
         fs::create_dir(&data).unwrap();
         Rig {
@@ -105,7 +114,18 @@ impl Rig {
             wineserver: backend.wineserver_path().to_path_buf(),
             calls: Cell::new(0),
             server_dirs: RefCell::default(),
+            cleanup_env: RefCell::default(),
         }
+    }
+
+    /// `extra_env` for [`Rig::cleanup`]'s own `runtime` calls (it also runs from `Drop`, on a panic).
+    pub fn set_cleanup_env(&self, extra_env: &[(&str, &str)]) {
+        *self.cleanup_env.borrow_mut() = extra_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    }
+
+    /// The data directory (`RUNTIME_DATA_DIR` of every `runtime` this rig runs).
+    pub fn data(&self) -> &Path {
+        &self.data
     }
 
     pub fn apps(&self) -> PathBuf {
@@ -340,8 +360,10 @@ impl Rig {
     /// that is still there.
     pub fn cleanup(&self) {
         self.remember_servers();
+        let env = self.cleanup_env.borrow().clone();
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         for id in self.installed_ids() {
-            let _ = self.exec(&["remove", &id], &[], Duration::from_secs(60));
+            let _ = self.exec(&["remove", &id], &env, Duration::from_secs(60));
         }
         if !self.wait_for_no_wineserver(Duration::from_secs(5)) {
             for pid in self.wineservers() {
@@ -375,6 +397,23 @@ impl Drop for Rig {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+/// Whether bwrap can create a sandbox here; `false` after saying SKIPPED, a failure with `RUNTIME_REQUIRE_BWRAP=1`.
+pub fn bwrap_works(test: &str) -> bool {
+    let why = match rt_sandbox::find_bwrap_on_path() {
+        None => "bwrap is not on PATH".to_owned(),
+        Some(b) => match rt_sandbox::probe(&b) {
+            Ok(()) => return true,
+            Err(e) => e,
+        },
+    };
+    assert!(
+        std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_none_or(|v| v != "1"),
+        "RUNTIME_REQUIRE_BWRAP=1 but {why}"
+    );
+    eprintln!("SKIPPED {test}: {why}");
+    false
 }
 
 pub fn installed_id(ran: &Ran) -> String {

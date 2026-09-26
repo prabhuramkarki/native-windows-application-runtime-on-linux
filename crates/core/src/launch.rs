@@ -60,6 +60,9 @@ pub enum LaunchError {
     Log(#[source] io::Error),
     #[error("cannot start the process: {0}")]
     Spawn(#[source] io::Error),
+    /// The attached [`Sandbox`] refused the command ([`Sandbox::try_wrap`]); nothing was started.
+    #[error("the sandbox refused to start the program: {0}")]
+    Sandbox(String),
 }
 
 /// Where the child's stderr goes. It always goes to the log file; `Tee` also copies it to a terminal writer.
@@ -80,6 +83,12 @@ impl LogSink {
 /// program and args (e.g. `bwrap <profile> -- <program> <args>`) and carries the env/cwd over unchanged.
 pub trait Sandbox: Send + Sync {
     fn wrap(&self, cmd: Command) -> Command;
+    /// [`Sandbox::wrap`], or why this command cannot be sandboxed. [`Launcher::spawn`] uses it, so a refusal is
+    /// an error before anything starts; `run_helper` keeps `wrap` (a sandbox that fails closed there must return a
+    /// command that refuses to run). Default: `wrap` never refuses.
+    fn try_wrap(&self, cmd: Command) -> Result<Command, String> {
+        Ok(self.wrap(cmd))
+    }
 }
 
 /// See the module docs. Cheap to clone (the filtered host environment and the sandbox are shared), so a backend
@@ -144,8 +153,14 @@ impl Launcher {
         }
     }
 
-    /// Applies the environment rules (module docs) and the sandbox hook. `spawn` and `run_helper` use it.
-    pub fn finalize(&self, mut cmd: Command) -> Command {
+    /// Applies the environment rules (module docs) and the sandbox hook. `run_helper` uses it (`spawn` the same with
+    /// [`Sandbox::try_wrap`]).
+    pub fn finalize(&self, cmd: Command) -> Command {
+        self.wrap(self.env_rules(cmd))
+    }
+
+    /// The environment rules of the module docs.
+    fn env_rules(&self, mut cmd: Command) -> Command {
         // 1. Snapshot what the backend set: `env_clear` would discard it. `None` = an explicit removal.
         let explicit: Vec<(OsString, Option<OsString>)> = cmd
             .get_envs()
@@ -163,12 +178,17 @@ impl Launcher {
                 None => cmd.env_remove(k),
             };
         }
-        self.wrap(cmd)
+        cmd
     }
 
     /// Finalises `cmd`, creates the log file and starts the child. The returned [`Running`] must be waited for.
+    /// An attached sandbox that refuses the command is [`LaunchError::Sandbox`], before the log file exists.
     pub fn spawn(&self, cmd: Command, env: &AppEnv, sink: LogSink) -> Result<Running, LaunchError> {
-        let cmd = self.finalize(cmd);
+        let cmd = self.env_rules(cmd);
+        let cmd = match &self.sandbox {
+            Some(sandbox) => sandbox.try_wrap(cmd).map_err(LaunchError::Sandbox)?,
+            None => cmd,
+        };
         let (log, log_path) = create_log_with(&env.logs_dir(), log_names())?;
         let running = start_child(cmd, log, log_path, sink)?;
         // Best effort: a failed prune must not fail the launch.

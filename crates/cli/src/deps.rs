@@ -117,6 +117,8 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     check_yes(&plan.plan, yes)?;
     let launcher = Launcher::new();
     let backend = crate::backend(&launcher)?;
+    // `reg.exe` of archive packages; installer packages replace it with the installer sandbox.
+    let launcher = crate::sandbox::helper_launcher(&env, &launcher, &backend)?;
     let cache = cache_dir()?;
     let stdin = io::stdin();
     let answers: Option<Box<dyn BufRead>> =

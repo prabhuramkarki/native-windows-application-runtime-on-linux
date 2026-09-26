@@ -2,13 +2,15 @@
 
 A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
 
-**Status: Phase 4A (dependency engine), an early MVP, and app runs are NOT sandboxed.** Windows programs run as your Linux user, with
-your network, GPU, audio and files; Wine can still reach the whole host (see
-[docs/SECURITY.md](docs/SECURITY.md) for what is and is not protected). Only run software you would run
-directly on your account. `.msi`/`.exe` installers now install through a `bwrap` sandbox (Phase 3) — narrower
-than a plain app run, but not a full boundary either, see SECURITY.md's "Installer sandbox" section — and
-`.NET` programs still fail (no .NET package yet); the sandbox for ordinary app runs is Phase 5. `runtime deps` is the
-only command that downloads anything, and only when asked (see below).
+**Status: Phase 5A (per-app bubblewrap sandbox), an early MVP.** `runtime run` starts every program in a
+bubblewrap sandbox built from the app's permissions (default: no network, no host files, only its own prefix
+writable; display, audio and GPU on), and refuses to run without a working `bwrap` (`sudo apt install bubblewrap`)
+unless you pass `--unsandboxed`. It is a namespace sandbox, not a VM: same Linux user, no seccomp/Landlock/cgroups
+yet (Phase 5B), and the display, audio and GPU it is given are shared with the host (an X11 display lets a program
+read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
+protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3), and `.NET` programs
+still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
+(see below).
 
 ## Commands
 
@@ -18,12 +20,13 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 |---|---|
 | `install <file.exe\|file.zip> [--name N] [--exe PATH]` | Creates an app with its own hardened Wine prefix and copies the program in. For a zip, `--exe` names the program inside it. |
 | `install <file.msi\|installer.exe> [--silent] [--network] [--exe PATH]` | Installs a `.msi` or a recognised `.exe` installer (Inno Setup, NSIS, InstallShield, WiX Burn) through a `bwrap` sandbox with no display, network or host filesystem access by default. `--silent` runs it non-interactively with its family's standard silent flags; `--network` allows it network access while it runs; display, audio and D-Bus environment variables are never passed into the sandbox either way (with `--network`, an installer that guesses the host's X display can still reach it where the X server grants same-user access without a cookie; see `docs/SECURITY.md`). `--exe` names the installed program directly (a path inside the installed prefix, e.g. `Program Files\App\app.exe`), skipping automatic discovery. |
-| `run <app\|file> [--debug] [-- args...]` | Runs an installed app; a `.exe`/`.zip` path is installed first (a new app on every call). The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
+| `run <app\|file> [--debug] [--unsandboxed] [-- args...]` | Runs an installed app in its sandbox (see `permissions` and `sandbox`); a `.exe`/`.zip` path is installed first (a new app on every call, default profile). Refuses to start when bubblewrap is missing or cannot create a sandbox. `--unsandboxed` runs this once WITHOUT the sandbox and says so. Ctrl-C (or SIGTERM to `runtime`) ends the sandboxed program. The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
+| `sandbox <app>` | Shows the app's sandbox without running anything: whether bubblewrap works, the profile, the requested pieces the host lacks, what the profile cannot enforce, and the full `bwrap` command line. |
 | `list [--json]` | Lists installed apps. |
-| `remove <app>` | Stops the app's Wine processes and deletes the app, its prefix and its desktop menu entry/icon (if any). Takes an id, never a path. |
-| `uninstall <app>` | Runs the app's recorded installer uninstall command (if any), sandboxed, then removes the environment and its desktop menu entry/icon regardless of what that did. An app with no recorded uninstaller (a portable-exe install) behaves like `remove`. Takes an id, never a path. |
+| `remove <app>` | Stops the app's Wine processes and deletes the app, its prefix and its desktop menu entry/icon (if any); refuses, changing nothing, while the app still runs (a sandboxed app must be quit first). Takes an id, never a path. |
+| `uninstall <app>` | Runs the app's recorded installer uninstall command (if any), sandboxed, then removes the environment and its desktop menu entry/icon regardless of what that did; like `remove`, refused while the app still runs. An app with no recorded uninstaller (a portable-exe install) behaves like `remove`. Takes an id, never a path. |
 | `logs <app> [--lines N]` | Shows the end of the newest log (the app's stderr from its last run). |
-| `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
+| `doctor [app\|file]` | Read-only checks: Wine, the sandbox (and an app's profile), architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 | `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
 | `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
@@ -50,6 +53,24 @@ runtime display game wayland    # auto | x11 | wayland (the app must be stopped)
 
 `auto` removes the setting, so Wine picks its own driver (X11/XWayland). Wayland is experimental in Wine 10.0 and
 opt-in per app: `wayland` is refused without a Wayland session or without `winewayland` in the Wine build.
+
+## Permissions (`runtime permissions`)
+
+```
+runtime permissions game                                  # the app's profile (permissions.toml) and its source
+runtime permissions game --set network=allow --set gpu=off
+runtime permissions game --set fs+=/home/me/saves:rw      # grant a host directory (ro | rw); fs-=<dir> removes it
+runtime permissions game --reset                          # back to the default; --json for scripts
+```
+
+The default is no network, no host directories, and display, audio and gpu on. The profile is stored in the app's
+own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute
+directory (never a socket or file); symlinks are resolved and the target is judged. `$HOME`, `/`, the runtime's data directory, `~/.ssh`,
+`~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.password-store` (and anything containing or
+inside them, for `$HOME` and the account's real home), `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp`
+and everything below it, and `$XDG_RUNTIME_DIR` are always refused, and `rw` is refused on `/etc`, `/usr`, `/var`, `/opt` and
+the other system trees (`ro` is allowed). (`/tmp` is refused whole: other programs'
+sockets live there under arbitrary names.) `runtime run` enforces the profile; `runtime sandbox <app>` shows the resulting `bwrap` command.
 
 ## Dependencies (`runtime deps`)
 
@@ -132,8 +153,10 @@ the app's `C:`), `runtime/home/` (the program's `HOME`, so Wine does not hand it
 ```sh
 tools/build-fixtures.sh                 # test .exe/.dll files into tests/fixtures/build (mingw-w64)
 cargo test --workspace                  # unit, hostile-input and hermetic CLI tests; no Wine needed
-cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1
-                                        # real-Wine end-to-end tests (minutes; needs Wine 10 and the fixtures)
+RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --skip real_net_ --test-threads=1
+                                        # real-Wine end-to-end tests and the sandbox escape suite (minutes; Wine 10, bwrap, fixtures)
+DXVK_FILTER_DEVICE_NAME=<device> cargo test -p runtime-cli --test e2e_sandbox -- --ignored real_net_wine_d3d11 --nocapture
+                                        # the D3D11 fixture through DXVK under the default sandbox (internet, Vulkan, display)
 RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-deps --lib -- --ignored e2e_real_wine --test-threads=1
                                         # dependency engine on real Wine + bwrap (local HTTPS server, no internet)
 cargo test -p runtime-deps --lib -- --ignored real_net --nocapture
@@ -149,6 +172,11 @@ The Wine tests use temporary data directories, stop and kill their `wineserver` 
 `gui64.exe` (a modal message box; run it by hand to look at a window). Run them with `--test-threads=1`.
 On Wine older than 10 their 32-bit steps are skipped with a `SKIPPED 32-bit` message. Each test removes its apps with a
 persistent `wineserver` running and requires that `runtime remove` ends it.
+The escape suite (`crates/cli/tests/e2e_sandbox.rs`) runs a real Windows probe (`probe64.exe`) inside the sandbox
+and tries to read a fake home's `.ssh` secret, write to that home, read another app's prefix, read or rewrite its
+own `permissions.toml`, connect to a local TCP listener, and step outside a granted directory. Each action must fail
+sandboxed AND succeed with `--unsandboxed` on the same target, so the sandbox is shown to be what stops it; what the
+suite does not prove is in `docs/SECURITY.md` ("The escape suite").
 Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
 directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`, `hello.msi` (built with
 `wixl`) and `hello-nsis.exe` (built with `makensis`) for the installer-pipeline tests
