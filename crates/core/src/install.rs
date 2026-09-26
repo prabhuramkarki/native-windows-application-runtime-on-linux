@@ -245,8 +245,7 @@ fn check_pe(info: &PeInfo) -> Result<Vec<String>, InstallError> {
     }
     let mut warnings = Vec::new();
     if info.dotnet {
-        warnings
-            .push(".NET program: it will not run until .NET support arrives (Phase 4); installing anyway".to_owned());
+        warnings.push(".NET program: run `runtime deps` on it after installing, to install Wine Mono".to_owned());
     }
     for w in info.warnings.iter().take(5) {
         warnings.push(format!("analysis: {}", quote(w)));

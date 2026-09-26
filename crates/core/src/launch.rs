@@ -494,7 +494,7 @@ mod tests {
             Path::new("/app.exe"),
             &fx.env.drive_c(),
             &[],
-            &RunOpts { debug },
+            &RunOpts { debug, dotnet: false },
         )
         .unwrap()
     }

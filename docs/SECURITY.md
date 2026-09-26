@@ -144,8 +144,15 @@ layers add and do not".
   first), can leave a partial app that `remove` cleans up.
 - **Run-by-path installs every time.** `runtime run some.exe` creates a *new* app on each invocation
   (`some-2`, `some-3`, ...) with its own prefix. Use `install` once and `run <id>` afterwards.
-- **.NET, Mono and Gecko are disabled** by `WINEDLLOVERRIDES=winemenubuilder.exe=d;mscoree=d;mshtml=d`, so .NET
-  and HTML-embedding programs fail until a .NET package exists (not planned in Phase 4). `doctor` warns about .NET.
+- **Gecko is disabled, and Mono is off until an app has it.** Every Wine process gets
+  `WINEDLLOVERRIDES=winemenubuilder.exe=d;mscoree=d;mshtml=d`, except the program of an app whose metadata records
+  the `wine-mono` package: it gets `winemenubuilder.exe=d;mshtml=d`. Only the recorded state decides (never files in
+  the prefix), and only `command()` in the Wine backend can pick the second string; native apps, installers and every
+  helper keep `mscoree=d`. HTML-embedding programs still fail. `doctor` says whether a managed program has Wine Mono.
+  Mono adds a JIT to the sandboxed process set (writable and executable memory inside the Wine process, like
+  Wine's own code): seccomp and Landlock apply to it unchanged, as to any program. The package is a pinned upstream MSI
+  (Wine Mono 9.4.0, SHA-256 checked) installed through the sandboxed installer pipeline, with the installer's own
+  `mscoree=d`, like any other package.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
 
 ## Installer sandbox (Phase 3 Task 5; seccomp and Landlock since Phase 5B Task 6)
