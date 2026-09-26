@@ -139,10 +139,11 @@ pub struct Status {
 /// The sandbox of the installed app `env` (module docs). `Err` (as text) when its profile is refused, its program
 /// cannot be resolved, or Wine cannot describe the command.
 pub fn status(store: &Store, env: &AppEnv) -> Result<Status, String> {
+    // The profile first: a refused one is the answer, before any probe runs.
+    let (profile, source) = profile(env)?;
     let bwrap = working_bwrap();
     let hardening = rt_sandbox::hardening();
     let shim = RealHost.runtime_exe();
-    let (profile, source) = profile(env)?;
     let scopes = RealHost.scopes();
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(store, env.id(), backend_wine::BACKEND_ID).map_err(|e| e.to_string())?;
