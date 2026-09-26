@@ -1966,7 +1966,7 @@ fn a_managed_program_is_judged_by_the_recorded_wine_mono_and_a_native_one_has_no
     assert_eq!(c[0].status, Status::Ok);
     assert_eq!(
         c[0].text,
-        "managed (.NET) program: Wine Mono 9.4.0 is installed for this app"
+        "managed (.NET) program: Wine Mono 9.4.0 is recorded as installed for this app"
     );
     // Not recorded: a warning that names the fix.
     let c = dotnet_check(app(vec![]), DotnetState::ManagedNeedsMono);

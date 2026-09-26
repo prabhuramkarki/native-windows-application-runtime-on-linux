@@ -313,10 +313,19 @@ pub fn run(app: &str) -> Result<(), CmdError> {
     out += &limits_section(&perms.limits, &RealHost.scopes());
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(&store, env.id(), backend_wine::BACKEND_ID)?;
-    // The command `run` builds (backend command, settled, host environment rules); without Wine, its shape.
+    // The command `run` builds (backend command with the app's real `dotnet`, settled, host environment rules); without Wine, its shape.
     let (cmd, dll_dirs) = match crate::backend(&launcher) {
         Ok(b) => (
-            b.settle(b.command(&p.env, &p.exe, &p.cwd, &[], &RunOpts::default())?),
+            b.settle(b.command(
+                &p.env,
+                &p.exe,
+                &p.cwd,
+                &[],
+                &RunOpts {
+                    dotnet: p.metadata.has_dependency(rt_core::DOTNET_PACKAGE_ID),
+                    ..RunOpts::default()
+                },
+            )?),
             b.dll_dirs(),
         ),
         Err(e) => {

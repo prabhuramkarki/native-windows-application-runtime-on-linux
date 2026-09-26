@@ -1290,12 +1290,18 @@ esac
     /// `stop` and `version` build their commands through them or bypass `wine_command` entirely.
     #[test]
     fn only_command_can_pass_dotnet_to_wine_command() {
-        let src = include_str!("lib.rs");
-        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
-        let calls: Vec<&str> = prod.lines().filter(|l| l.contains("self.wine_command(")).collect();
+        let lib = include_str!("lib.rs");
+        let prod = &lib[..lib.find("#[cfg(test)]").unwrap()];
+        // Whitespace-normalised, so a rustfmt line split cannot hide a call; every source file of the crate.
+        let all = [prod, include_str!("harden.rs"), include_str!("discover.rs")].join("\n");
+        let flat = all.split_whitespace().collect::<Vec<_>>().join(" ");
+        let calls: Vec<&str> = flat.split("self.wine_command(").skip(1).collect();
         assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(calls.iter().any(|l| l.contains("\"-all\", false)")), "{calls:?}");
-        assert!(calls.iter().any(|l| l.contains("opts.dotnet)")), "{calls:?}");
+        assert!(
+            calls.iter().any(|l| l.starts_with("env, \"-all\", false)")),
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|l| l.contains("opts.dotnet);")), "{calls:?}");
     }
 
     // ---- settle ----

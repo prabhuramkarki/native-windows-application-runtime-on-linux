@@ -547,7 +547,7 @@ fn runtime_needs(info: &PeInfo, input: &DoctorInput<'_>, out: &mut Out) {
             Area::Runtime,
             Status::Ok,
             format!(
-                "managed (.NET) program: Wine Mono {} is installed for this app",
+                "managed (.NET) program: Wine Mono {} is recorded as installed for this app",
                 escape(version, NAME_WIDTH)
             ),
         ),
