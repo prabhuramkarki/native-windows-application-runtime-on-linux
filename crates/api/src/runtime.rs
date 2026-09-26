@@ -282,13 +282,33 @@ mod tests {
                 has_drive_c: true
             }
         );
-        // a symlinked prefix does not count
-        std::fs::remove_dir_all(env.prefix()).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_never_counts_as_the_prefix_or_drive_c() {
+        let (_d, rt) = rt();
+        let env = add(&rt, "a", |_| {});
+        let none = PrefixState {
+            exists: false,
+            has_drive_c: false,
+        };
+        // prefix -> a directory that DOES hold a drive_c: absent, and the target is not probed
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("drive_c")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), env.prefix()).unwrap();
+        assert_eq!(rt.app("a").unwrap().prefix, none);
+        // prefix -> a directory without drive_c
+        std::fs::remove_file(env.prefix()).unwrap();
         std::os::unix::fs::symlink("/tmp", env.prefix()).unwrap();
+        assert_eq!(rt.app("a").unwrap().prefix, none);
+        // a real prefix whose drive_c is a symlink to a real directory
+        std::fs::remove_file(env.prefix()).unwrap();
+        std::fs::create_dir(env.prefix()).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("drive_c"), env.drive_c()).unwrap();
         assert_eq!(
             rt.app("a").unwrap().prefix,
             PrefixState {
-                exists: false,
+                exists: true,
                 has_drive_c: false
             }
         );
@@ -474,6 +494,19 @@ mod tests {
     }
 
     #[test]
+    fn grant_paths_are_cleaned() {
+        let p = rt_sandbox::Permissions {
+            filesystem: vec![rt_sandbox::FsGrant {
+                path: format!("/a/b{HOSTILE}c").into(),
+                access: rt_sandbox::Access::Rw,
+            }],
+            ..Default::default()
+        };
+        let v = PermissionsView::from_profile(&p, PermSource::File);
+        assert_eq!(v.filesystem[0].path, "/a/ba[31mbcde".to_owned() + "c");
+    }
+
+    #[test]
     fn path_bound_shows_a_maximal_grant_path_whole() {
         let p = format!("/{}", "d".repeat(PATH_MAX - 1));
         let v = PermissionsView::from_profile(
@@ -532,23 +565,35 @@ mod tests {
             m.dependencies = vec![dep(HOSTILE)];
         });
         add(&rt, "plain", |_| {});
-        // a grant whose directory name carries a format character: the validator refuses it, which is an error
-        // path whose message may quote the path
+        // A grant whose directory name carries a format character is refused by the validator (it rejects
+        // control and format characters in any grant path, so a hostile-but-VALID grant cannot exist: the view's
+        // path cleaning is exercised in `grant_paths_are_cleaned` instead). The refusal message quotes the path.
         let env = add(&rt, "g", |_| {});
         let ctx = ctx(d.path());
         if let Ok(vt) = tempfile::tempdir_in("/var/tmp") {
-            let odd = vt.path().join(format!("od{}d", '\u{202e}'));
+            let odd = vt.path().join("od\u{202e}d");
             std::fs::create_dir(&odd).unwrap();
+            let toml_path = format!("{}/od\\u202ed", vt.path().to_str().unwrap());
             std::fs::write(
                 env.root().join("permissions.toml"),
-                format!(
-                    "version = 1\n[[filesystem]]\npath = {:?}\naccess = \"ro\"\n",
-                    odd.to_str().unwrap()
-                ),
+                format!("version = 1\n[[filesystem]]\npath = \"{toml_path}\"\naccess = \"ro\"\n"),
             )
             .unwrap();
             let err = rt.permissions_with(&env, &ctx).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Unavailable);
+            assert!(
+                err.message.contains("invisible characters"),
+                "the validator's reason: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("/od") && err.message.contains("d"),
+                "path reached the text: {}",
+                err.message
+            );
             walk(&serde_json::to_value(&err).unwrap(), "grant error");
+        } else {
+            eprintln!("SKIPPED: /var/tmp not writable (hostile grant check)");
         }
         std::fs::remove_file(env.root().join("permissions.toml")).ok();
         walk(&serde_json::to_value(rt.version()).unwrap(), "version");
