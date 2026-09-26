@@ -211,6 +211,7 @@ fn the_default_profile_is_exactly_this() {
         want.extend(["--ro-bind-try", d, d]);
     }
     want.extend(["--bind", PREFIX, PREFIX, "--bind", APP_HOME, APP_HOME]);
+    want.extend(["--remount-ro", "/"]);
     want.extend(["--", "/usr/bin/wine", "C:\\x.exe", "--flag"]);
     assert_eq!(argv(&c), want);
     let e = envs(&c);
@@ -601,7 +602,9 @@ fn a_grant_equal_to_the_prefix_or_the_app_home_is_refused() {
 fn the_app_root_and_its_parents_are_never_bound() {
     let a = argv(&rendered(Permissions::default(), host()));
     for x in [APP_ROOT, "/data/apps", "/data", "/data/apps/a/runtime", "/home/me", "/"] {
-        assert!(!a.iter().any(|y| y == x), "{x} appears: {a:?}");
+        // `/` only as the target of the read-only root remount
+        let bound = a.iter().enumerate().any(|(i, y)| y == x && a[i - 1] != "--remount-ro");
+        assert!(!bound, "{x} appears: {a:?}");
     }
     // the only read-write binds are the prefix and the app home
     let rw: Vec<&str> = a
@@ -718,9 +721,10 @@ fn the_prefix_is_bound_after_every_tmpfs_that_contains_it() {
             let t = pos(&a, &["--tmpfs", t]).unwrap();
             assert!(p > t && hm > t, "{prefix}: {a:?}");
         }
-        // and after every other mount: they are the last two before `--`
+        // and after every other mount: they are the last two before the read-only root remount and `--`
         let dd = a.iter().position(|x| x == "--").unwrap();
-        assert_eq!(hm + 3, dd);
+        assert_eq!(a[dd - 2..dd], ["--remount-ro", "/"]);
+        assert_eq!(hm + 3, dd - 2);
         assert_eq!(p + 3, hm);
     }
 }
@@ -984,6 +988,8 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
         echo pwned 2>/dev/null > "$2/permissions.toml"
         for f in "$2/secret" "$3/secret"; do [ -r "$f" ] && echo "SECRET-READ $f"; done
         touch /usr/rt-sandbox-probe 2>/dev/null && echo "USR-WRITABLE"
+        touch /rt-sandbox-probe 2>/dev/null && echo "ROOT-WRITABLE"
+        mkdir -p "$1" 2>/dev/null && echo "HOME-PATH-WRITABLE"
         touch "$WINEPREFIX/w" && echo prefix-rw
         touch "$HOME/w" && echo home-rw
         touch /dev/shm/w && echo shm-rw
@@ -1009,6 +1015,8 @@ fn real_bwrap_runs_the_default_profile_and_hides_the_host() {
         "APP-ROOT-VISIBLE",
         "SECRET-READ",
         "USR-WRITABLE",
+        "ROOT-WRITABLE",
+        "HOME-PATH-WRITABLE",
         "BUS-VISIBLE",
         "RESOLV-VISIBLE",
     ] {

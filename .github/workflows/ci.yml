@@ -80,7 +80,9 @@ jobs:
       # integration-test binary of that crate. RUNTIME_REQUIRE_BWRAP/RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE match
       # the `test` job's own convention (Tasks 6/7's fix rounds), so a runner missing either tool fails loudly
       # instead of the installer-pipeline/`.desktop` tests silently skip-and-passing.
-      - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --test-threads=1 --nocapture
+      # `--skip real_net_`: `e2e_sandbox.rs`'s `real_net_wine_d3d11_renders_under_the_default_sandbox` needs the
+      # internet (the DXVK download), a display and a Vulkan device; it is run by hand (docs/COMPAT.md).
+      - run: cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --skip real_net_ --test-threads=1 --nocapture
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
