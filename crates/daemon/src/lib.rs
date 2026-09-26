@@ -3,6 +3,7 @@
 //! peer check, the connection limits and shutdown.
 pub mod dispatch;
 pub mod protocol;
+pub mod server;
 
 #[cfg(test)]
 pub(crate) mod testutil {
