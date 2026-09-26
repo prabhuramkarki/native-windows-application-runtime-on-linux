@@ -1453,8 +1453,8 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
             .collect();
         if name.starts_with("mfcm140") {
             // The MFC managed-code (C++/CLI) support DLLs import mscoree.dll, the .NET loader, which runtime
-            // prefixes do not have (no .NET package; Wine Mono is disabled): they load in NO form, native or
-            // builtin. An app that uses them imports mscoree too, which the plan reports as unsatisfied `dotnet`.
+            // prefixes do not have (Wine Mono is disabled and not installed there): they load in NO form, native or
+            // builtin. An app that uses them imports mscoree too, which the plan resolves to the `wine-mono` package.
             assert!(
                 how == "not loaded"
                     && relevant

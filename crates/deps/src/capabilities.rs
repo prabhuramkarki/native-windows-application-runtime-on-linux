@@ -27,8 +27,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("mfc140u", "mfc140u"),
     ("mfcm140", "mfcm140"),
     ("mfcm140u", "mfcm140u"),
-    // The .NET Framework loader: every managed executable imports mscoree. No package provides `dotnet` yet, so
-    // this resolves to nothing until one is added.
+    // The .NET Framework loader: every managed executable imports mscoree. Provided by the bundled `wine-mono`.
     ("mscoree", "dotnet"),
     ("msvcp140", "msvcp140"),
     ("msvcp140_1", "msvcp140_1"),
@@ -79,9 +78,7 @@ mod tests {
     #[test]
     fn table_and_bundled_provides_agree() {
         let m = Manifest::bundled();
-        // Known gap (Task 8 report): no bundled .NET.
-        let unprovided = ["dotnet"];
-        for (_, cap) in TABLE.iter().filter(|(_, c)| !unprovided.contains(c)) {
+        for (_, cap) in TABLE {
             assert!(
                 m.packages.iter().any(|p| p.provides.iter().any(|x| x == cap)),
                 "{cap} has no provider"
@@ -94,12 +91,25 @@ mod tests {
                     "{}: {name} is not in the table",
                     p.id
                 );
-                assert!(
-                    !unprovided.contains(&name.as_str()),
-                    "{name} is provided now: update the test"
-                );
             }
         }
+    }
+
+    #[test]
+    fn mscoree_resolves_to_wine_mono() {
+        use crate::resolve::{Action, ConsentState, Facts, InstalledSet, resolve};
+        let facts = Facts {
+            imports: vec!["mscoree.dll".into()],
+            extra_capabilities: vec![],
+        };
+        let plan = resolve(&facts, &InstalledSet::default(), &[], Manifest::bundled());
+        let got: Vec<_> = plan
+            .entries
+            .iter()
+            .map(|e| (e.package.as_str(), &e.action, &e.consent))
+            .collect();
+        assert_eq!(got, [("wine-mono", &Action::Install, &ConsentState::NotNeeded)]);
+        assert!(plan.unsatisfied.is_empty(), "{plan:?}");
     }
 
     #[test]
