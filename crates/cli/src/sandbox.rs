@@ -26,14 +26,12 @@ use crate::safe::safe;
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
 use rt_sandbox::{Access, AppSandbox, Host, Limits, Network, Permissions, RealHost, Tasks, load, load_opt_raw};
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-/// In the app root: this app has run in the sandbox at least once (module docs).
-pub(crate) const MARKER: &str = "ran-sandboxed";
+/// In the app root: sandboxed Windows code has run in this app's prefix (module docs; `rt_sandbox::MARKER`).
+pub(crate) use rt_sandbox::MARKER;
 
 const INSTALL_HINT: &str =
     "Install bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)";
@@ -109,20 +107,15 @@ impl Sandbox for RunSandbox {
 
     fn try_wrap(&self, cmd: Command) -> Result<Command, String> {
         let out = self.0.render(&cmd).map_err(|e| e.to_string())?;
+        print_hardening_caveat();
         for c in self.0.caveats(&cmd) {
             eprintln!("note: {}", safe(&c));
         }
         // `render` accepted the shape `<root>/prefix`, so the parent is the app root.
         let root = env_of(&cmd, "WINEPREFIX").and_then(|p| Path::new(p).parent());
-        let marked = root.ok_or_else(|| "no app root".to_owned()).and_then(|r| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(r.join(MARKER))
-                .map_err(|e| e.to_string())
-        });
+        let marked = root
+            .ok_or_else(|| "no app root".to_owned())
+            .and_then(|r| rt_sandbox::mark(r).map_err(|e| e.to_string()));
         marked.map_err(|e| format!("cannot record that the app runs sandboxed ({e})"))?;
         Ok(out)
     }
@@ -179,6 +172,22 @@ pub(crate) fn doctor_hardening() -> Result<String, String> {
         Ok(text)
     } else {
         Err(text)
+    }
+}
+
+/// The one-line hardening caveat to print at the start of any command that runs Windows code (`rt_sandbox::hardening`
+/// finds it): on a host with no Landlock and Yama `ptrace_scope` 0 the seccomp filter can be shed through
+/// `/proc/1/mem` ([`rt_sandbox::BYPASS_CAVEAT`]). `None` when the host has no such gap. Pure (takes the probed
+/// `Hardening`) so it is unit-tested without the host.
+fn hardening_note(h: &rt_sandbox::Hardening) -> Option<String> {
+    h.caveat.as_deref().map(|c| format!("note: {}", safe(c)))
+}
+
+/// Prints [`hardening_note`] for this host, if any, once. Called at the start of a run and of every command that runs
+/// Windows code in the installer sandbox, so the caveat is not buried in `doctor`/`runtime sandbox` alone.
+pub(crate) fn print_hardening_caveat() {
+    if let Some(note) = hardening_note(&rt_sandbox::hardening()) {
+        eprintln!("{note}");
     }
 }
 
@@ -359,6 +368,16 @@ mod tests {
             Ok(true),
             "a directory counts as marked"
         );
+    }
+
+    #[test]
+    fn the_hardening_note_is_shown_only_when_the_host_has_the_bypass_gap() {
+        let mut h = rt_sandbox::hardening();
+        h.caveat = Some(rt_sandbox::BYPASS_CAVEAT.to_owned());
+        let note = hardening_note(&h).expect("a note when the caveat is present");
+        assert!(note.starts_with("note: ") && note.contains(rt_sandbox::BYPASS_CAVEAT));
+        h.caveat = None;
+        assert_eq!(hardening_note(&h), None);
     }
 
     #[test]

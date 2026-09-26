@@ -93,6 +93,12 @@ fn e2e_msi_silent_install_desktop_entry_run_and_uninstall() {
     // `productName` comes from the MSI Property table first (not the registry); the load-bearing
     // registry-derived (C1) check is `uninstallCommand`: msiexec's Uninstall key (Wow6432Node,
     // REG_EXPAND_SZ) reached disk and was read.
+    // Phase 5B: the installer had read-write access to the prefix, so the app is marked "ran sandboxed"; its later
+    // Wine helpers (runtime display, archive reg.exe) now run sandboxed too (see the escape test below).
+    assert!(
+        rig.apps().join(&id).join("ran-sandboxed").is_file(),
+        "install must mark the app ran-sandboxed"
+    );
     let inst = installer_metadata(&rig, &id);
     assert_eq!(inst["productName"], "Runtime Fixture MSI", "{inst}");
     let uninstall = inst["uninstallCommand"]
@@ -157,6 +163,10 @@ fn e2e_nsis_silent_install_desktop_entry_run_and_uninstall() {
     );
 
     // Registry-derived (C1): the NSIS Uninstall key (under Wow6432Node, I1) reached disk and was read.
+    assert!(
+        rig.apps().join(&id).join("ran-sandboxed").is_file(),
+        "install must mark the app ran-sandboxed"
+    );
     let inst = installer_metadata(&rig, &id);
     assert_eq!(inst["productName"], "Runtime Fixture NSIS", "{inst}");
     assert_eq!(
@@ -295,5 +305,63 @@ fn e2e_install_without_silent_never_silently_forces_silent_mode() {
     for id in rig.installed_ids() {
         let _ = rig.rt_env(&["uninstall", &id], &xdg_env);
     }
+    rig.finish();
+}
+
+/// Phase 5B final review, IMPORTANT 1 (reproduced then closed): a sandboxed installer had read-write access to the
+/// prefix, so it could plant a native `reg.exe` and a `reg.exe=native` DLL override; the NEXT Wine helper the
+/// runtime starts (`runtime display` runs reg.exe) would run that payload. Before the fix, `runtime install` never
+/// marked the app "ran sandboxed", so that helper ran UNSANDBOXED and the payload could write outside the prefix.
+/// Now `runtime install` marks the app, so the helper runs in the app sandbox and the payload cannot escape.
+///
+/// The payload here (`escape-reg64.exe`) writes a canary to the app ROOT (the parent of the prefix), which no
+/// sandbox binds writable; it stays inside the test's temp base, never the real home. Marked (the real path): the
+/// canary is NOT created. With the marker removed (the control): it IS created — so the test bites.
+#[test]
+#[ignore = "needs Wine, bwrap and nsis-built fixtures; run with --ignored --test-threads=1"]
+fn e2e_a_planted_reg_exe_cannot_escape_the_helper_sandbox_after_a_sandboxed_install() {
+    let rig = Rig::new();
+    let xdg = rig.xdg_data_home();
+    let xdg_env = [("XDG_DATA_HOME", xdg.to_str().unwrap())];
+
+    let nsis = fixture("hello-nsis.exe");
+    let ran = rig.rt_env(&["install", nsis.to_str().unwrap(), "--silent"], &xdg_env);
+    ran.expect_ok();
+    let id = installed_id(&ran);
+    let root = rig.apps().join(&id);
+    let marker = root.join("ran-sandboxed");
+    assert!(marker.is_file(), "install must mark the app ran-sandboxed");
+
+    // The malicious installer's leftovers: a native reg.exe payload and the override that makes Wine run it.
+    let system32 = rig.drive_c(&id).join("windows/system32");
+    std::fs::create_dir_all(&system32).unwrap();
+    std::fs::copy(fixture("escape-reg64.exe"), system32.join("reg.exe")).unwrap();
+    let user_reg = root.join("prefix/user.reg");
+    let mut reg = std::fs::read_to_string(&user_reg).unwrap_or_default();
+    reg.push_str("\n[Software\\\\Wine\\\\DllOverrides] 1700000000\n\"reg.exe\"=\"native\"\n");
+    std::fs::write(&user_reg, reg).unwrap();
+    let canary = root.join("escape-canary");
+    assert!(!canary.exists());
+
+    // Marked: `runtime display` runs reg.exe in the app sandbox, which does not bind the app root writable.
+    let ran = rig.rt(&["display", &id, "wayland"]);
+    eprintln!("display (marked): {}", ran.report());
+    assert!(
+        !canary.exists(),
+        "SANDBOX ESCAPE: the planted reg.exe wrote outside the prefix while sandboxed"
+    );
+
+    // Control: remove the marker so the helper runs UNSANDBOXED (an app that never ran sandboxed), and the same
+    // payload now writes the canary — proving the test bites and the marker is what closes the hole.
+    std::fs::remove_file(&marker).unwrap();
+    let ran = rig.rt(&["display", &id, "x11"]);
+    eprintln!("display (unmarked control): {}", ran.report());
+    assert!(
+        canary.exists(),
+        "the control did not write the canary: the payload never ran, so the test proves nothing"
+    );
+    std::fs::remove_file(&canary).ok();
+
+    rig.rt_env(&["uninstall", &id], &xdg_env).expect_ok();
     rig.finish();
 }

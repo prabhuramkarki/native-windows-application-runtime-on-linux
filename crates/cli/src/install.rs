@@ -44,6 +44,7 @@ pub fn run(
                  window, retry with --silent",
             );
         }
+        crate::sandbox::print_hardening_caveat();
         let opts = InstallerOpts {
             silent,
             allow_network: network,

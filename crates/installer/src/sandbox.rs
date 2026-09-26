@@ -138,11 +138,15 @@ impl InstallerSandbox {
         }
     }
 
-    /// The pre-flight check: whether [`InstallerSandbox::wrap`] can run the shim for `env`'s app, or why not (the same
-    /// decision, [`shim_exe`]). Callers check before running anything, so a refusal reaches the user as a sandbox
-    /// error instead of the installer's exit 126 in a log.
-    pub fn check(&self, env: &AppEnv) -> Result<(), String> {
-        shim_exe(&self.runtime_exe, env).map(drop)
+    /// The pre-flight check: whether [`InstallerSandbox::wrap`] can render a runnable command for `env`'s app with
+    /// `opts`, or why not. It renders a dummy command (`/bin/true`) through the SAME [`InstallerSandbox::render`], so
+    /// it catches everything a real render's `refusal` would (an unusable shim exe via [`shim_exe`], AND the shim's
+    /// own argument checks: a relative dll directory, more than [`init`]'s rule cap, a NUL byte), before anything runs
+    /// — a refusal reaches the user as a sandbox error instead of the installer's exit 126 in a log.
+    pub fn check(&self, env: &AppEnv, opts: &SandboxOpts) -> Result<(), String> {
+        let mut dummy = Command::new("/bin/true");
+        dummy.env_clear();
+        self.render(&dummy, env, opts).map(drop)
     }
 
     pub fn bwrap_path(&self) -> &Path {

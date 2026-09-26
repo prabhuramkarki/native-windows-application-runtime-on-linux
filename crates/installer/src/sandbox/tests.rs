@@ -783,3 +783,29 @@ fn real_sandbox_a_symlinked_dll_dir_under_a_bound_tree_works_through_the_shim() 
         "{args:?}"
     );
 }
+
+#[test]
+fn check_refuses_a_relative_dll_dir_before_anything_runs() {
+    let (_tmp, env) = fx();
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![PathBuf::from("relative/wine/x86_64-windows")],
+        ..Default::default()
+    };
+    // The shim's own parse (in render) rejects a non-absolute rule path: check surfaces it as a reason.
+    let why = sb("/usr/bin/bwrap").check(&env, &opts).unwrap_err();
+    assert!(
+        why.contains("refuse its arguments") && why.contains("absolute"),
+        "{why}"
+    );
+    // A good exe with only absolute binds passes.
+    assert!(sb("/usr/bin/bwrap").check(&env, &SandboxOpts::default()).is_ok());
+}
+
+#[test]
+fn check_refuses_an_unusable_runtime_executable() {
+    let (_tmp, env) = fx();
+    let why = InstallerSandbox::new("/usr/bin/bwrap", "relative/runtime")
+        .check(&env, &SandboxOpts::default())
+        .unwrap_err();
+    assert!(why.contains("not an absolute path"), "{why}");
+}

@@ -60,6 +60,11 @@ pub fn stage_file(env: &AppEnv, dir: &str, file_name: &str, src: &mut dyn Read) 
 /// Nothing runs when the sandbox's pre-flight check fails ([`InstallerSandbox::check`]):
 /// [`InstallerError::SandboxRefused`] with the reason.
 ///
+/// The app root is [`rt_sandbox::mark`]ed BEFORE anything starts: a vendor installer, uninstaller or `reg.exe` step
+/// gets read-write access to the prefix, so from now on the app's own Wine helpers (`runtime display`, archive-package
+/// `reg.exe`) must run sandboxed too (the CLI's `helper_launcher` reads this marker). A crash after the mark leaves it
+/// set; if it cannot be written nothing runs (fail closed). The app root is never inside any writable bind.
+///
 /// `deadline: None` waits as long as it takes (Phase 3: an interactive installer GUI can take any time).
 /// `Some(d)`: once `d` has passed the sandbox is killed and reaped and `Ok(None)` is returned. Killing `bwrap`
 /// kills the whole tree: `--die-with-parent` and the PID namespace take every process inside with it, a
@@ -75,7 +80,8 @@ pub fn run_sandboxed(
     opts: SandboxOpts,
     deadline: Option<Duration>,
 ) -> Result<Option<ExitStatus>, InstallerError> {
-    sandbox.check(env).map_err(InstallerError::SandboxRefused)?;
+    sandbox.check(env, &opts).map_err(InstallerError::SandboxRefused)?;
+    rt_sandbox::mark(env.root()).map_err(io_err("cannot record that the app runs sandboxed"))?;
     let sandboxed = launcher
         .clone()
         .with_sandbox(sandbox.clone().for_launcher(env.clone(), opts));
