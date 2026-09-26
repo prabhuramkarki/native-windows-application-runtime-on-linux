@@ -1,9 +1,13 @@
 //! The per-app sandbox: the validated permission profile (`permissions.toml`) that decides what a program may
 //! reach, and [`AppSandbox`], which renders it into a bubblewrap command around the program. This crate never
-//! trusts the file it reads: see [`permissions`]. The rendered profile is described in [`render`].
+//! trusts the file it reads: see [`permissions`]. The rendered profile is described in [`render`]; the seccomp
+//! deny-list the program runs under in [`seccomp`].
+#[cfg(test)]
+mod bpf_interp;
 pub mod host;
 pub mod permissions;
 pub mod render;
+pub mod seccomp;
 
 pub use host::{Host, RealHost};
 pub use permissions::{
