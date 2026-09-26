@@ -1,0 +1,25 @@
+[package]
+name = "runtime-daemon"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "rt_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "runtimed"
+path = "src/main.rs"
+
+[dependencies]
+runtime-api = { path = "../api" }
+runtime-core = { path = "../core" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

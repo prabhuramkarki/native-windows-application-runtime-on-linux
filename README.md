@@ -35,6 +35,7 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 | `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
 | `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
+| `rpc <method> [json-params] [--socket PATH]` / `daemon-status [--socket PATH]` | Calls a running `runtimed` / says whether one answers (see "API and daemon" below). |
 
 ```sh
 runtime install ~/Downloads/tool.exe --name tool
@@ -148,8 +149,23 @@ create a Vulkan instance. x86_64 only, like the bundled DXVK (32-bit Direct3D st
 
 `runtime compat [--json]` prints the compatibility matrix: only what was really run (a CI job or a dated manual
 check), on which Wine, with what result; it needs no Wine, store or network. The same table is
-[docs/COMPAT.md](docs/COMPAT.md), generated from `crates/cli/compat.toml` (a test fails when they differ;
+[docs/COMPAT.md](docs/COMPAT.md), generated from `crates/api/compat.toml` (a test fails when they differ;
 regenerate with `cargo run -q -p runtime-cli -- compat > docs/COMPAT.md`).
+
+## API and daemon (`runtimed`, `runtime rpc`)
+
+`runtimed` serves a typed, read-only API (apps, permissions, doctor, dependency plan, sandbox and graphics info,
+the compatibility matrix) as JSON-RPC 2.0 over an owner-only Unix socket (`$XDG_RUNTIME_DIR/runtime/runtimed.sock`,
+no network), for a GUI or scripts; systemd user units for socket activation are in `contrib/systemd/`.
+`runtime rpc <method> [json-params]` calls it and prints the result, `runtime daemon-status` says whether one
+answers. Every other command works without it. Methods, types, errors, versioning and setup:
+[docs/API.md](docs/API.md); what it exposes and to whom: [docs/SECURITY.md](docs/SECURITY.md).
+
+```sh
+runtimed &
+runtime daemon-status
+runtime rpc apps.get '{"id": "tool"}'
+```
 
 ## Requirements
 
@@ -224,7 +240,12 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/installer`, `crates/desktop`: installer pipeline and sandbox (Phase 3), desktop entries.
 - `crates/deps`: the dependency engine: bundled manifest, resolver, verified HTTPS fetch, archive and installer
   package installers (Phase 4A).
-- `crates/cli`: the `runtime` binary, a thin front end over the above.
+- `crates/api`: `rt_api`, the typed, sanitised, read-only API (`Runtime`: apps, permissions, doctor, dependency
+  plan, sandbox and graphics info, compatibility matrix) and the host-fact gathering the CLI shares (`rt_api::host`).
+- `crates/daemon`: `runtimed`, the read-only API as JSON-RPC 2.0 (NDJSON) over an owner-only Unix socket, with
+  systemd user units in `contrib/systemd/`, and its client (`rt_daemon::client`).
+- `crates/cli`: the `runtime` binary, a thin front end over the above (it uses `rt_daemon` only for its client, in
+  `runtime rpc` and `runtime daemon-status`).
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
 
 The roadmap and the phase plans, with notes on where the code departs from them, are in

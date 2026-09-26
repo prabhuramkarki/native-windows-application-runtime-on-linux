@@ -43,7 +43,8 @@
 | 5A Sandbox + permissions | done | per-app `permissions.toml`, bubblewrap run sandbox, `runtime permissions/sandbox`, `--unsandboxed`, escape suite |
 | 5B seccomp, Landlock, limits | done | hidden `runtime sandbox-init` shim (seccomp deny-list, best-effort Landlock), cgroup limits via `systemd-run --user`, the INSTALLER sandbox uses the same shim |
 | 5C Portal "ask" flows | deferred | a running bubblewrap sandbox cannot gain mounts; needs a different design (per-run grants) |
-| 6 Daemon, API, plugins, GUI | not started | open decisions: GUI toolkit, project name, licence |
+| 6A API crate + read-only daemon | implemented on branch `phase-6a-api-daemon`, pending merge | `rt_api` (typed, sanitised read-only API; host gathering moved out of the CLI), `runtimed` (JSON-RPC 2.0 NDJSON, owner-only Unix socket, peer uid, caps and deadlines, systemd socket activation), `rt_daemon::client`, `runtime rpc`/`daemon-status`; `docs/API.md` |
+| 6B-6D mutating methods + events, GUI, plugins | not started | GUI toolkit GTK4 + libadwaita (6C); licence MIT OR Apache-2.0 and name `runtime` defaults |
 
 **Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are only partly met: no game was recorded; .NET runs: met for Mono-compatible console programs (Phase 4F: Wine Mono 9.4.0 per app, a C# console fixture with threads and GC verified under the hardened sandbox); a real .NET Framework 4.8 GUI app is not claimed. `doctor` predicts a deliberately broken environment (met).
 

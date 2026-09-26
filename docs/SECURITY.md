@@ -512,6 +512,11 @@ its own process group, and bounds the run: 10 s, 64 KiB of output; the reader is
 own session can hold the pipe), so every wait is bounded. The output is untrusted and is used for nothing but a
 yes/no/unknown verdict on Vulkan (and the device lines shown to the user); it never blocks anything when unknown, and
 the verdict only gates the plan's `blocked` state for packages with `min_vulkan`.
+The runner lives in `rt_api::host::graphics`: the CLI probes once per command, the API (`rt_api::Runtime`, and so a
+long-lived daemon) caches the result for 30 s per `Runtime` and probes again after that, one probe at a time (callers
+wait for the probe in progress). Known bound: a `vulkaninfo` (or an ICD helper it starts) that leaves its session and
+keeps stdout open leaves one detached reader thread and one pipe descriptor behind per probe until it closes the
+pipe; a long-lived process can accumulate at most one such leak per 30 s.
 
 **Graphics driver setting (Phase 4C).** `runtime display <app> <auto|x11|wayland>` runs the prefix's own `reg.exe`
 through Wine, unsandboxed and unpinned (a program can plant a native one), like `runtime run`, so it is not a
@@ -786,7 +791,7 @@ without a scope, prints `note: resource limits unavailable: <why>`, and `doctor`
 (including `tasks = 4096`, the default's own value) is a request and fails closed: if the scope cannot be created
 with every controller it needs, the run is refused with the reason and the way out (`runtime permissions <app>
 --set memory=off --set cpu=off --set tasks=default`, or start the app from a desktop/user session); `doctor` says
-"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command (a throwaway scope,
+"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command, its answer kept 30 s (a throwaway scope,
 5 s at most, the same options and only `PATH` and `XDG_RUNTIME_DIR` in its environment, like the real command); the
 probe reads which controllers the user manager offers its scopes.
 
@@ -1037,6 +1042,100 @@ bwrap-only column is what the installer sandbox was before Phase 5B Task 6.
 
 Not covered by any of these tests: `ptrace` of bwrap's own pid 1 on a host without Landlock (the residual above;
 Yama at 1 here hides it), and a kernel bug behind an allowed call.
+
+## The `runtimed` daemon (Phase 6A)
+
+`runtimed` serves the read-only API (`rt_api::Runtime`) as JSON-RPC 2.0 over a Unix socket. `runtime rpc` and
+`runtime daemon-status` are its CLI clients. The wire contract is [API.md](API.md).
+
+### Threat model
+
+The daemon is a local service for **one user**. The attackers considered are:
+
+- **Other users on the machine.** They must not be able to call it, read its answers, or plant a socket that a
+  client of this user talks to.
+- **Any process of this user.** It may send the daemon anything: malformed, oversized, slow or endless input. It
+  must not be able to crash the daemon, hang it for others, or exhaust it beyond the stated bounds.
+- **Installed apps' data.** Names, versions, paths and installer metadata are untrusted. They must not reach a
+  client as control or format characters.
+- **Whatever answers at the socket path.** A client must survive a hostile or broken "daemon" without crashing,
+  hanging past its deadline, or passing escape sequences to the terminal.
+
+### What is enforced
+
+- **No network, ever.** The daemon only speaks on a Unix stream socket. There is no TCP code path.
+- **Owner-only placement.** The directory is 0700 and the user's: it is created that way, and refused if it is a
+  symlink, foreign-owned, or open to group or others. The socket is 0600, set and re-checked before the first
+  accept. What is at the path:
+  - a stale socket of the user's (connect gets `ECONNREFUSED`, probed non-blocking) is replaced;
+  - anything else (a file, a symlink, another user's socket, a live daemon) is refused and left alone.
+
+  An exclusive `flock` on `<socket stem>.lock` serialises two daemons starting at once.
+- **Peer uid.** `SO_PEERCRED` uid must equal the daemon's euid, or the connection is closed without a byte. The
+  refusal is tested through the accept loop.
+- **Bounded input:**
+  - 1 MiB per request line; nothing beyond the cap plus one read is buffered.
+  - A strict request shape; batches refused.
+  - 32 connections; the next one gets a busy line and is closed.
+  - A 30 s whole-line deadline, so slow-drip clients are cut like idle ones.
+  - A 30 s whole-reply write deadline, so slow readers are cut.
+  - A 30 s per-request deadline.
+  - A panic in a method becomes a generic -32603; its text never reaches the wire or the log.
+- **Read-only.** Every method in API 0.1.0 reads. Mutating names are "method not found". A notification (a request
+  without id) is not executed.
+- **Clean output.** Every free-text field of every result is cleaned at the `rt_api` boundary: control and format
+  characters removed, length bounded. Error messages are fixed text or cleaned, and a string id with a control or
+  format character is refused instead of echoed. A test walks every string of every method's reply over a hostile
+  store.
+- **Logs** carry one fixed line per event, plus at most a cleaned socket path. They never include a request's
+  content or a panic message.
+- **The client checks before it sends** (`rt_daemon::client`, used by `runtime rpc` and `daemon-status`):
+  - the directory is not a symlink, is the user's, and is closed to group and others;
+  - the socket is a socket, is the user's, and is closed to group and others;
+  - once connected, the peer uid is the user's.
+
+  A socket planted by someone else never receives a request. Other client bounds:
+  - The connect is non-blocking with a deadline.
+  - A reply must be one line of at most 16 MiB and arrive whole within the call's deadline (40 s; 5 s for
+    `daemon-status`). It must be valid JSON-RPC 2.0 for the call's id.
+  - Anything else is an error, and the connection is not reused.
+  - The CLI re-serialises the result with C1, bidi and invisible characters as `\uXXXX` escapes, and escapes error
+    text.
+
+  Tested with a fake daemon that sends escape sequences in keys, values, messages and kinds; raw control bytes;
+  more than 16 MiB of `ESC`; 200,000 levels of nesting; wrong ids; truncated lines; and silence.
+
+### What is not enforced (known bounds)
+
+- **Every process of the same uid is trusted as the user.** There is no per-method authorisation and no
+  authentication beyond the uid. Any program you run can read everything the API exposes: app list, paths, doctor
+  and sandbox reports. This is information the same uid can already read from disk. It is acceptable only because
+  every method in 6A is read-only. The mutating methods of 6B get explicit per-method rules: no method may bypass
+  the dependency consent gate or the sandbox.
+- **A timed-out request is not cancelled.** The client gets -32002 and is disconnected, but the method keeps running
+  and keeps its connection slot until it returns. So a stuck method holds at most one extra thread per slot. Every
+  method is bounded by its own probe timeouts (the longest is `vulkaninfo`, 10 s), but the bound is theirs, not the
+  daemon's.
+- **The detached `vulkaninfo` reader** of "Host graphics probe" above applies to the daemon as a long-lived process:
+  at most one leaked thread and pipe per 30 s, while such a tool keeps its pipe open.
+- **Shutdown grace is 12 s.** A request still running after SIGTERM plus 12 s is cut off by the process exit, and its
+  client sees EOF.
+- **Same-uid denial of service is possible within the bounds.** 32 slow connections, each holding a slot for up to
+  30 s, keep other clients of the same user out. That is the user hurting themselves.
+- **Only the socket directory's last component is checked.** Its ancestors are the user's own (`XDG_RUNTIME_DIR`)
+  or, for `--socket`, the caller's choice.
+- **Probes see the daemon's environment.** The daemon runs the same host probes as the CLI (`wine --version`,
+  bwrap's probe, the `systemd-run` scope probe, `vulkaninfo`), unsandboxed and as the user, exactly like `runtime
+  doctor`. Under systemd it sees the user manager's environment, not the shell's (API.md, "Running it under
+  systemd").
+- **The unit has no systemd hardening.** `NoNewPrivileges=` (and every option that implies it in a user unit) would
+  break a setuid bwrap. The namespace options would change what the probes see. The daemon's own checks are the
+  hardening that matters (`contrib/systemd/runtimed.service` lists each omission).
+- **The client's owner check against another uid is tested with an injected uid.** A second real uid is not
+  available to the tests, the same limit as the daemon's peer check. The client's peer-uid check after connect
+  cannot be reached in a test without one: a socket at a place that passes the owner checks always has our uid as
+  its peer. It is the same `peer_allowed` the daemon uses, whose comparison is tested.
+- **Raw shell clients** (`socat`, `nc -U`) do none of the client's checks.
 
 ## Roadmap
 
