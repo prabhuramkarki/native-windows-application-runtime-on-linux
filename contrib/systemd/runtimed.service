@@ -1,16 +1,24 @@
 # The runtime read-only API daemon (a user unit), started by runtimed.socket on the first connection. See
 # runtimed.socket for installing. It serves the socket until stopped (SIGTERM; exit 0).
 #
-# Hardening: only options that leave what the daemon SEES unchanged, because its answers (doctor, sandbox.info,
-# graphics.info) must equal what `runtime` reports from a terminal, and it runs the same host probes (bwrap's
-# probe, the systemd-run scope probe, vulkaninfo, wine --version).
-# Deliberately omitted:
+# No sandboxing options, on purpose. The daemon's answers (doctor, sandbox.info, graphics.info) must equal what
+# `runtime` reports from a terminal, and it runs the same host probes (bwrap's probe, the systemd-run scope probe,
+# vulkaninfo, wine --version). It is read-only, runs as the user, and the hardening that matters is its own (0600
+# socket in a 0700 directory, peer uid check, caps and timeouts). Deliberately omitted:
+# - NoNewPrivileges=, and everything that implies it in a user unit (RestrictSUIDSGID=, LockPersonality=,
+#   RestrictRealtime=, RestrictAddressFamilies=, SystemCallFilter= and the other seccomp-based options): with
+#   no_new_privs a setuid bwrap (hosts without unprivileged user namespaces) cannot work, so sandbox.info and doctor
+#   would say bwrap is unavailable while `runtime run` uses it.
 # - ProtectSystem=, ProtectHome=, PrivateTmp=, PrivateDevices=, PrivateNetwork=, PrivateUsers=, ProtectKernel*=,
 #   RestrictNamespaces=: each gives the daemon its own mount/user/network namespace (a user manager adds
 #   PrivateUsers= for any of them), so the probes would inspect a different /tmp (the X11 socket), /dev (GPUs) or
-#   namespace setup than `runtime run` meets, and bwrap's probe could fail where the real sandbox works.
-# - SystemCallArchitectures=native: a 32-bit `wine` loader would be killed during `wine --version`.
-# - MemoryDenyWriteExecute=: vulkaninfo and the Wine loader may need W+X mappings.
+#   namespace setup than `runtime run` meets.
+# - MemoryDenyWriteExecute=, SystemCallArchitectures=: vulkaninfo and a 32-bit wine loader could be killed.
+#
+# Environment: the daemon finds the apps through RUNTIME_DATA_DIR, XDG_DATA_HOME or HOME as the USER MANAGER sees
+# them, not as your shell does. If you set RUNTIME_DATA_DIR or XDG_DATA_HOME in a shell profile, give the manager the
+# same value (`systemctl --user import-environment RUNTIME_DATA_DIR`, a file in ~/.config/environment.d/, or an
+# `Environment=` line in a drop-in), or the daemon serves a different store than `runtime`.
 [Unit]
 Description=runtime read-only API daemon
 Requires=runtimed.socket
@@ -21,15 +29,6 @@ Type=simple
 # Edit to where runtimed is installed. The `runtime` binary must sit in the same directory: sandbox.info names it
 # as the sandbox's launcher.
 ExecStart=%h/.cargo/bin/runtimed
-# NoNewPrivileges: on a host whose bwrap is setuid (not the unprivileged-user-namespace kind), bwrap's probe then
-# fails and sandbox.info says bwrap is unavailable; remove this line there.
-NoNewPrivileges=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RestrictRealtime=yes
-# The daemon itself needs only its Unix socket; AF_NETLINK is for bwrap's probe (it sets up the loopback of the
-# sandbox's empty network namespace; without it the probe fails). No IP socket can be opened.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
 UMask=0077
 
 [Install]

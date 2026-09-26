@@ -155,7 +155,11 @@ fn sandbox_info_names_the_sibling_runtime_never_runtimed() {
         Ok(rt) if !r["command"].as_array().unwrap().is_empty() && r["refused"].is_null() => {
             assert!(text.contains(rt.to_str().unwrap()), "{text}")
         }
-        Ok(_) => {}
+        // Refused for another reason (no bwrap, ...): still never because the launcher is unknown.
+        Ok(_) => assert!(
+            !r["refused"].as_str().unwrap_or("").contains("cannot be resolved"),
+            "{r}"
+        ),
     }
 }
 
