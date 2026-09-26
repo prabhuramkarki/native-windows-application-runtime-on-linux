@@ -139,6 +139,7 @@ struct Sc {
     sandbox: Result<Option<String>, String>,
     hardening: Result<String, String>,
     limits: Result<String, String>,
+    dotnet: DotnetState,
 }
 
 /// A system report on a good desktop.
@@ -162,6 +163,7 @@ fn sc() -> Sc {
         sandbox: Ok(None),
         hardening: Ok("seccomp: enforced (x86_64, 61 rules); landlock: ABI 8 (fs)".into()),
         limits: Ok("limits: systemd-run --user available (cgroup controllers: cpu memory pids)".into()),
+        dotnet: DotnetState::NotManaged,
     }
 }
 
@@ -230,6 +232,7 @@ impl Sc {
             sandbox: self.sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
             hardening: self.hardening.as_deref().map_err(String::as_str),
             limits: self.limits.as_deref().map_err(String::as_str),
+            dotnet: self.dotnet.clone(),
         })
     }
 }
@@ -374,6 +377,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
         limits: Ok("limits: test"),
+        dotnet: DotnetState::NotManaged,
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -406,6 +410,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
         limits: Ok("limits: test"),
+        dotnet: DotnetState::NotManaged,
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
@@ -900,14 +905,11 @@ fn a_file_that_cannot_be_analysed_fails_with_escaped_text() {
 fn dotnet_and_installers_are_warnings_that_name_what_is_missing() {
     let mut s = app(vec![]);
     s.info().dotnet = true;
+    s.dotnet = DotnetState::ManagedNeedsMono;
     let r = s.run();
     let c = one(&r, Area::Runtime, ".NET");
     assert_eq!(c.status, Status::Warn);
-    assert!(
-        c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
-        "{}",
-        c.text
-    );
+    assert!(c.text.contains("runtime deps app --install"), "{}", c.text);
     assert_eq!(r.verdict, Verdict::MayFail);
 
     for (kind, label) in [
@@ -1346,6 +1348,9 @@ fn everything_is_bounded_under_hostile_input() {
         .collect());
     s.info().warnings = (0..1000).map(|i| format!("w{i}")).collect();
     s.info().dotnet = true;
+    s.dotnet = DotnetState::ManagedMonoInstalled {
+        version: "9\x1b\u{202e}".repeat(1000),
+    };
     s.info().installer = Some(Installer {
         kind: InstallerKind::Nsis,
         evidence: "NullsoftInst",
@@ -1924,6 +1929,7 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
         limits: Ok("limits: test"),
+        dotnet: DotnetState::NotManaged,
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);
@@ -1936,23 +1942,78 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
     assert!(r.checks.iter().all(|c| c.status != Status::Fail), "{:#?}", r.checks);
 }
 
-#[test]
-fn a_managed_program_warns_that_no_dotnet_runtime_is_bundled_and_a_native_one_does_not() {
-    let mut s = app(vec![]);
-    s.info().dotnet = true;
+fn dotnet_check(mut s: Sc, state: DotnetState) -> Vec<Check> {
+    s.info().dotnet = !matches!(state, DotnetState::NotManaged);
+    s.dotnet = state;
     let r = s.run();
-    let c = one(&r, Area::Runtime, ".NET");
-    assert_eq!(c.status, Status::Warn);
-    assert!(
-        c.text.contains(".NET") && c.text.contains("no .NET runtime is bundled") && c.text.contains("mscoree=d"),
-        "{}",
-        c.text
+    of(&r, Area::Runtime)
+        .into_iter()
+        .filter(|c| c.text.contains(".NET"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_managed_program_is_judged_by_the_recorded_wine_mono_and_a_native_one_has_no_check() {
+    // Recorded: Ok, with the recorded version.
+    let c = dotnet_check(
+        app(vec![]),
+        DotnetState::ManagedMonoInstalled {
+            version: "9.4.0".into(),
+        },
     );
-    let r = app(vec![]).run();
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].status, Status::Ok);
+    assert_eq!(
+        c[0].text,
+        "managed (.NET) program: Wine Mono 9.4.0 is installed for this app"
+    );
+    // Not recorded: a warning that names the fix.
+    let c = dotnet_check(app(vec![]), DotnetState::ManagedNeedsMono);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].status, Status::Warn);
+    assert_eq!(
+        c[0].text,
+        "managed (.NET) program: Wine Mono is not installed for this app; run `runtime deps app --install`"
+    );
+    // Native: nothing.
+    assert!(dotnet_check(app(vec![]), DotnetState::NotManaged).is_empty());
+}
+
+#[test]
+fn the_dotnet_texts_escape_the_version_and_the_id() {
+    let c = dotnet_check(
+        app(vec![]),
+        DotnetState::ManagedMonoInstalled {
+            version: "9\x1b]0;x\u{202e}".into(),
+        },
+    );
+    assert_tame(&c[0].text);
     assert!(
-        of(&r, Area::Runtime).iter().all(|c| !c.text.contains(".NET")),
-        "{:#?}",
-        r.checks
+        c[0].text.contains("\\u{1b}") || c[0].text.contains("\\u{1b"),
+        "{}",
+        c[0].text
+    );
+    let mut s = app(vec![]);
+    s.subject = Subject::App {
+        id: "a\u{202e}b\x1b".into(),
+        name: None,
+        version: None,
+    };
+    let c = dotnet_check(s, DotnetState::ManagedNeedsMono);
+    assert_tame(&c[0].text);
+}
+
+#[test]
+fn a_file_target_is_told_wine_mono_is_added_per_app_and_is_not_warned() {
+    let mut s = app(vec![]);
+    s.subject = Subject::File { path: "a.exe".into() };
+    let c = dotnet_check(s, DotnetState::ManagedNeedsMono);
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].status, Status::Ok);
+    assert_eq!(
+        c[0].text,
+        "managed (.NET) program: Wine Mono is installed per app by `runtime deps` after `runtime install`"
     );
 }
 

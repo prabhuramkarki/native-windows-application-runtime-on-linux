@@ -225,6 +225,23 @@ fn open_dir_nonblocking(dir: &Path) -> io::Result<File> {
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The package id of Wine Mono, the bundled .NET runtime: an app that records it runs with `mscoree` enabled.
+pub const DOTNET_PACKAGE_ID: &str = "wine-mono";
+
+impl Metadata {
+    /// Whether a dependency record has this package id. Bounded: `dependencies` holds at most
+    /// [`MAX_DEPENDENCIES`] records (a longer list is refused by `validate` and `parse`), and a duplicate still
+    /// answers `true`. The stored list decides; nothing in the prefix is looked at.
+    pub fn has_dependency(&self, id: &str) -> bool {
+        self.dependency(id).is_some()
+    }
+
+    /// The first dependency record with this package id (same bound as [`Metadata::has_dependency`]).
+    pub fn dependency(&self, id: &str) -> Option<&DependencyRecord> {
+        self.dependencies.iter().take(MAX_DEPENDENCIES).find(|d| d.id == id)
+    }
+}
+
 impl Metadata {
     /// Builds metadata for a freshly installed app: schema version, `environment` `"default"` and `created` (now)
     /// are filled in; `executable` is stored as the canonical text of `executable`. Not validated: call
@@ -1112,6 +1129,27 @@ mod tests {
                 licence_text_sha256: HASH_B.into(),
             }),
         }
+    }
+
+    #[test]
+    fn has_dependency_finds_a_record_by_exact_id_within_the_bound() {
+        assert_eq!(DOTNET_PACKAGE_ID, "wine-mono");
+        let mut m = sample("app");
+        assert!(!m.has_dependency(DOTNET_PACKAGE_ID));
+        m.dependencies = vec![dep("dxvk"), dep("Wine-Mono"), dep("wine-mono2")];
+        assert!(!m.has_dependency(DOTNET_PACKAGE_ID));
+        m.dependencies.push(dep("wine-mono"));
+        assert!(m.has_dependency(DOTNET_PACKAGE_ID));
+        assert_eq!(m.dependency("wine-mono").unwrap().version, "14.40.33810");
+        // Not validated here: a hand-built list of 10,000 is only searched up to the bound.
+        m.dependencies = (0..10_000).map(|_| dep("wine-mono")).collect();
+        assert!(m.has_dependency(DOTNET_PACKAGE_ID));
+        m.dependencies = (0..10_000).map(|i| dep(&format!("p{i}"))).collect();
+        m.dependencies.push(dep("wine-mono"));
+        assert!(
+            !m.has_dependency(DOTNET_PACKAGE_ID),
+            "past MAX_DEPENDENCIES is not looked at"
+        );
     }
 
     #[test]

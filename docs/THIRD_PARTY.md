@@ -66,7 +66,8 @@ the package provides (as winetricks does). Verified by the ignored test
 `real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker`, which loads each DLL by name with
 `rundll32 <name>.dll,rtDepsProbe` under `WINEDEBUG=+loaddll`: all load the redistributable's native copy, except
 mfcm140/mfcm140u, the MFC C++/CLI support DLLs, which import `mscoree.dll` (.NET) and load in no form in a runtime
-prefix (no .NET package; an app that needs them imports `mscoree` itself and is told `dotnet` is unavailable). What
+prefix (the installer session keeps `mscoree` disabled; an app that needs them imports `mscoree` itself, and its plan adds the
+bundled `wine-mono` package, which provides `dotnet`). What
 is NOT done: the overrides are not removed again (there is no removal of dependency packages yet), 32-bit (x86)
 copies are not installed, and only the x64 redistributable is pinned. Not bundled yet: `d3dcompiler_47` (no
 verifiable redistributable source).

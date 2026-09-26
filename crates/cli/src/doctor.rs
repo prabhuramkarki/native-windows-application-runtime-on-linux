@@ -25,8 +25,8 @@ use crate::safe::{json_safe, safe};
 use backend_wine::harden::{HardenError, audit_prefix};
 use pe::PeInfo;
 use rt_core::doctor::{
-    Area, D3dFamily, D3dRoute, DoctorInput, FsProbe, HostFs, ListResult, MAX_LISTING, PeState, PrefixAudit,
-    PrefixState, Report, Status, Subject, Verdict, doctor,
+    Area, D3dFamily, D3dRoute, DoctorInput, DotnetState, FsProbe, HostFs, ListResult, MAX_LISTING, PeState,
+    PrefixAudit, PrefixState, Report, Status, Subject, Verdict, doctor,
 };
 use rt_core::{AppId, CompatBackend, GraphicsDriver, Input, Launcher, Store, Target};
 use rt_deps::wine_config::read_graphics_driver_from_prefix;
@@ -96,6 +96,7 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         sandbox: sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
         hardening: hardening.as_deref().map_err(String::as_str),
         limits: limits.as_deref().map_err(String::as_str),
+        dotnet: facts.dotnet.clone(),
     });
     crate::emit(&if as_json {
         render_json(&report)?
@@ -139,6 +140,8 @@ struct Facts {
     /// Installed apps whose program was analysed: the predicted Direct3D route per imported family. A file target
     /// has none: nothing is recorded as installed for it, so there is nothing to predict from.
     d3d_routes: Option<Vec<(D3dFamily, D3dRoute)>>,
+    /// Managed or not, and for an installed app whether its metadata records Wine Mono (never the prefix's files).
+    dotnet: DotnetState,
 }
 
 impl Facts {
@@ -155,15 +158,18 @@ impl Facts {
             notes: vec![],
             graphics_driver: None,
             d3d_routes: None,
+            dotnet: DotnetState::NotManaged,
         }
     }
 
     fn file(path: &Path) -> Facts {
+        let pe = read_pe(path);
         Facts {
+            dotnet: dotnet_state(&pe, None),
             subject: Subject::File {
                 path: path.to_string_lossy().into_owned(),
             },
-            pe: read_pe(path),
+            pe,
             ..Facts::system()
         }
     }
@@ -192,6 +198,7 @@ impl Facts {
                 };
                 Facts {
                     d3d_routes,
+                    dotnet: dotnet_state(&pe, Some(&p.metadata)),
                     subject: Subject::App {
                         id: id.to_string(),
                         name: Some(p.metadata.name.clone()),
@@ -229,6 +236,19 @@ impl Facts {
                 }
             }
         }
+    }
+}
+
+/// `.NET` state from the analysed PE and the recorded dependencies (`None`: a file, which has no record).
+fn dotnet_state(pe: &Pe, md: Option<&rt_core::Metadata>) -> DotnetState {
+    match pe {
+        Pe::Analysed(info) if info.dotnet => match md.and_then(|m| m.dependency(rt_core::DOTNET_PACKAGE_ID)) {
+            Some(d) => DotnetState::ManagedMonoInstalled {
+                version: d.version.clone(),
+            },
+            None => DotnetState::ManagedNeedsMono,
+        },
+        _ => DotnetState::NotManaged,
     }
 }
 

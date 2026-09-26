@@ -102,9 +102,12 @@ impl BackendError {
 }
 
 /// Per-run options. `debug`: verbose backend logging and the child's stderr also shown on the terminal.
+/// `dotnet`: the app has Wine Mono recorded, so the backend enables `mscoree` for this program (only the
+/// program: helpers never get it).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOpts {
     pub debug: bool,
+    pub dotnet: bool,
 }
 
 pub trait CompatBackend: Send + Sync {
