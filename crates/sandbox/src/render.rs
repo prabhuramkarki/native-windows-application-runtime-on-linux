@@ -152,6 +152,19 @@ pub const DEV_RW: [&str; 8] = [
 ];
 /// What Mesa and the NVIDIA driver read besides the nodes (`/run/opengl-driver`: NixOS driver libraries).
 pub const GPU_RO: [&str; 4] = ["/sys/dev/char", "/sys/devices", "/sys/class/drm", "/run/opengl-driver"];
+/// Where a read-only dll directory `p` is bound and ruled (source = destination), given its resolved host path and
+/// the trees bound before it. A `p` under an already-bound tree whose last component is a host symlink is a symlink
+/// INSIDE the sandbox too: bwrap cannot mount over it, and a Landlock rule on it fails with ELOOP, so either refuses
+/// every run. Its resolved directory is bound and ruled instead, and the link inside resolves into it (Wine reaches
+/// its dll dirs through its own binary's tree, whichever spelling it uses). Anywhere else bwrap makes the destination
+/// a real directory, so the path the backend named stays.
+pub fn ro_bind_target(p: &Path, resolved: Option<PathBuf>, bound: &[PathBuf]) -> PathBuf {
+    match resolved {
+        Some(real) if real != p && bound.iter().any(|b| p.starts_with(b)) => real,
+        _ => p.to_path_buf(),
+    }
+}
+
 /// What the Wine backend sets on its command (`backend-wine`'s `wine_command`), besides the host allowlist.
 pub const BACKEND_ENV: [&str; 6] = [
     "WINEPREFIX",
@@ -484,8 +497,11 @@ impl AppSandbox {
                 ro_try(&mut out, &mut rules, Path::new(d));
             }
         }
+        let mut bound: Vec<PathBuf> = RO_BINDS.iter().map(PathBuf::from).collect();
         for d in &self.ro_binds {
-            ro_try(&mut out, &mut rules, d);
+            let d = ro_bind_target(d, self.host.resolve(d), &bound);
+            ro_try(&mut out, &mut rules, &d);
+            bound.push(d);
         }
         // Empty and private: only what is bound below appears in it (bwrap creates the parent directories).
         out.args(["--perms", "0700", "--tmpfs"]).arg(&rt);

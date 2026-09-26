@@ -753,3 +753,33 @@ fn real_sandbox_network_is_unshared_by_default_and_shared_when_allowed() {
     );
     accepted.join().unwrap().unwrap();
 }
+
+/// A dll directory whose last component is a host symlink under an already-bound tree stays a symlink inside the
+/// sandbox, and a Landlock rule on it fails with ELOOP (the shim then refuses every run). Here the bound tree is an
+/// earlier extra bind (a scratch tree: `/usr` cannot be written): the link's resolved directory is bound and ruled
+/// instead, and the program reads through the link.
+#[test]
+fn real_sandbox_a_symlinked_dll_dir_under_a_bound_tree_works_through_the_shim() {
+    let Some(bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = fx();
+    let tree = tempfile::tempdir_in(shim().parent().unwrap()).unwrap();
+    let t = tree.path().canonicalize().unwrap();
+    fs::create_dir(t.join("real")).unwrap();
+    fs::write(t.join("real/f.txt"), "dll").unwrap();
+    std::os::unix::fs::symlink(t.join("real"), t.join("link")).unwrap();
+    let opts = SandboxOpts {
+        extra_ro_binds: vec![t.clone(), t.join("link")],
+        ..Default::default()
+    };
+    let mut cmd = finalized("/usr/bin/cat");
+    cmd.arg(t.join("link/f.txt"));
+    let boxed = sb(&bwrap).wrap(cmd, &env, &opts);
+    let args = strs(&boxed);
+    let (ok, text) = run(boxed);
+    assert!(ok && text == "dll", "{text}");
+    let real = format!("ro:{}", t.join("real").display());
+    assert!(
+        args.contains(&real) && !args.contains(&format!("ro:{}", t.join("link").display())),
+        "{args:?}"
+    );
+}

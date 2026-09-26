@@ -1568,3 +1568,32 @@ fn real_bwrap_runs_the_program_through_the_shim_and_landlock_backs_the_mounts() 
         }
     }
 }
+
+/// A dll directory whose last component is a host symlink under an already-bound tree (`/usr`) is a symlink inside
+/// the sandbox too, and a Landlock rule on it would fail (ELOOP: every run refused). Its resolved directory is bound
+/// and ruled instead (the link inside resolves into it). Outside every bound tree bwrap makes the destination a real
+/// directory, so the path the backend named stays.
+#[test]
+fn a_symlinked_dll_dir_under_a_bound_tree_is_bound_and_ruled_at_its_resolved_path() {
+    let link = "/usr/lib/wine/x86_64-windows";
+    let real = "/usr/lib/x86_64-linux-gnu/wine/x86_64-windows";
+    let far = "/opt/wine/x86_64-windows";
+    let mut h = host();
+    h.links.insert(link.into(), real.into());
+    h.links.insert(far.into(), "/srv/wine/x86_64-windows".into());
+    let s = AppSandbox::new(
+        "/usr/bin/bwrap".into(),
+        Permissions::default(),
+        vec![link.into(), far.into()],
+        Arc::new(h),
+    );
+    let a = argv(&s.render(&app_cmd()).unwrap());
+    assert!(pos(&a, &["--ro-bind-try", real, real]).is_some(), "{a:?}");
+    assert!(pos(&a, &["--ro-bind-try", far, far]).is_some(), "{a:?}");
+    assert!(!a.iter().any(|x| x == link), "{a:?}");
+    let (rules, _) = shim_part(&a);
+    assert!(
+        rules.contains(&format!("ro:{real}")) && rules.contains(&format!("ro:{far}")),
+        "{rules:?}"
+    );
+}

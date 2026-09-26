@@ -57,6 +57,9 @@ pub fn stage_file(env: &AppEnv, dir: &str, file_name: &str, src: &mut dyn Read) 
 /// the instant its direct child exits, so the wait for it must happen inside the same process tree), then inside
 /// `sandbox` (with `opts`), and waits.
 ///
+/// Nothing runs when the sandbox's pre-flight check fails ([`InstallerSandbox::check`]):
+/// [`InstallerError::SandboxRefused`] with the reason.
+///
 /// `deadline: None` waits as long as it takes (Phase 3: an interactive installer GUI can take any time).
 /// `Some(d)`: once `d` has passed the sandbox is killed and reaped and `Ok(None)` is returned. Killing `bwrap`
 /// kills the whole tree: `--die-with-parent` and the PID namespace take every process inside with it, a
@@ -72,6 +75,7 @@ pub fn run_sandboxed(
     opts: SandboxOpts,
     deadline: Option<Duration>,
 ) -> Result<Option<ExitStatus>, InstallerError> {
+    sandbox.check(env).map_err(InstallerError::SandboxRefused)?;
     let sandboxed = launcher
         .clone()
         .with_sandbox(sandbox.clone().for_launcher(env.clone(), opts));

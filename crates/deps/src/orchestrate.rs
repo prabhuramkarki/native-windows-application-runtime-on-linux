@@ -750,6 +750,7 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::BadPackage(_)
         | E::Stage(_)
         | E::BwrapNotFound
+        | E::SandboxRefused(_)
         | E::BadSilentArg(_)
         | E::MsiExecMissing
         | E::ExplorerMissing => e.to_string(),

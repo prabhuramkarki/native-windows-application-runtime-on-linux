@@ -47,7 +47,7 @@ use rt_core::{AppEnv, Sandbox};
 use rt_sandbox::init::{self, InitArgs};
 use rt_sandbox::landlock::Access::{ReadExec as Ro, ReadWrite as Rw};
 use rt_sandbox::landlock::Rule;
-use rt_sandbox::render::{DEV_RW, refusal};
+use rt_sandbox::render::{DEV_RW, refusal, ro_bind_target};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,13 @@ impl InstallerSandbox {
         }
     }
 
+    /// The pre-flight check: whether [`InstallerSandbox::wrap`] can run the shim for `env`'s app, or why not (the same
+    /// decision, [`shim_exe`]). Callers check before running anything, so a refusal reaches the user as a sandbox
+    /// error instead of the installer's exit 126 in a log.
+    pub fn check(&self, env: &AppEnv) -> Result<(), String> {
+        shim_exe(&self.runtime_exe, env).map(drop)
+    }
+
     pub fn bwrap_path(&self) -> &Path {
         &self.bwrap
     }
@@ -184,11 +191,13 @@ impl InstallerSandbox {
             rule(Path::new(d), Rw);
         }
         rule(Path::new("/tmp"), Rw);
-        for dir in RO_BINDS
-            .iter()
-            .map(Path::new)
-            .chain(opts.extra_ro_binds.iter().map(PathBuf::as_path))
-        {
+        // A dll dir that is a symlink under a bound tree is bound and ruled at its resolved path (`ro_bind_target`).
+        let mut bound: Vec<PathBuf> = RO_BINDS.iter().map(PathBuf::from).collect();
+        for dir in &opts.extra_ro_binds {
+            let target = ro_bind_target(dir, std::fs::canonicalize(dir).ok(), &bound);
+            bound.push(target);
+        }
+        for dir in &bound {
             out.arg("--ro-bind-try").arg(dir).arg(dir);
             rule(dir, Ro);
         }

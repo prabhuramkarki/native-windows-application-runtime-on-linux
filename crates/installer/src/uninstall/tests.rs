@@ -240,3 +240,37 @@ fn missing_bwrap_is_a_warning_not_a_panic() {
     assert_eq!(outcome.uninstaller_succeeded, Some(false));
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
 }
+
+/// Phase 5B Task 6 fix round 1: an unusable runtime executable is reported as the sandbox's refusal, and the
+/// uninstaller is never started.
+#[test]
+fn an_unusable_runtime_executable_is_reported_as_the_sandboxs_refusal_and_nothing_runs() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let (_tmp, env) = env_with_msiexec();
+    let backend = fake_backend("exit 0");
+    let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
+    let outcome = uninstall(
+        &backend,
+        &launcher(),
+        &env,
+        &md,
+        opts_for(&backend),
+        Path::new("runtime"),
+    );
+    assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("refused") && w.contains("not an absolute path")),
+        "{outcome:?}"
+    );
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, rt_core::Call::Command { .. })),
+        "{:?}",
+        backend.calls()
+    );
+}

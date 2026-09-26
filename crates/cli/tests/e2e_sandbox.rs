@@ -1291,10 +1291,11 @@ mod syscall_escape {
             );
             sb.render(&cmd).expect("the default profile renders")
         };
-        eprintln!(
-            "launched by {:?} (systemd-run: the task limit's scope; the installer sandbox has none)",
-            boxed.get_program()
-        );
+        let by = match profile {
+            Profile::App => "systemd-run: the task limit's scope",
+            Profile::Installer => "bwrap: the installer sandbox has no scope",
+        };
+        eprintln!("launched by {:?} ({by})", boxed.get_program());
         let all: Vec<&std::ffi::OsStr> = boxed.get_args().collect();
         let at = all
             .iter()
