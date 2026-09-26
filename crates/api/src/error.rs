@@ -10,6 +10,9 @@
 //! |                    |                    | or unreadable `permissions.toml` (never a silent default)           |
 //! | `Unknown`          | (any other string) | deserialisation fallback for a newer daemon's kind; never produced here |
 //! | `Internal`         | `internal`         | a bug: reserved for the daemon's catch-all (panic, serialisation)   |
+//!
+//! `ApiError` and `ErrorKind` are `#[non_exhaustive]`: downstream crates build an error with [`ApiError::new`]
+//! (kind + message, message cleaned) and match `ErrorKind` with a wildcard arm; nothing else is needed.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
