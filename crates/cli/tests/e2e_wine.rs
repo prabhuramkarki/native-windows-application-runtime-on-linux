@@ -546,6 +546,17 @@ fn e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program() {
             let _ = child.kill();
             panic!("control: no process {exe:?}: {}", report());
         }
+        if sig == libc::SIGINT {
+            // `wineserver -k` cannot reach a sandboxed server: `remove` must refuse, not delete under it.
+            let ran = rig.rt(&["remove", &id]);
+            assert_eq!(ran.code, Some(1), "remove of a running app: {}", ran.report());
+            assert!(ran.err().contains("is running (wineserver pid"), "{}", ran.report());
+            assert!(rig.drive_c(&id).is_dir(), "the running app's prefix was removed");
+            assert!(
+                !pids_with(exe).is_empty(),
+                "remove must leave the running program alone"
+            );
+        }
         // SAFETY: `kill` of our own child's pid.
         assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0);
         let sent = Instant::now();

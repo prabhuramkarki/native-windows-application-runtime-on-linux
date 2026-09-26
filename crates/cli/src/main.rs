@@ -186,6 +186,30 @@ pub(crate) fn remove_desktop_entry(id: &rt_core::AppId) {
     }
 }
 
+/// Refuses while a `wineserver` still serves `env`'s prefix after the caller's `wineserver -k`, and when that cannot
+/// be checked (fail closed). A SANDBOXED app's server is out of `-k`'s reach (its socket is in the sandbox's private
+/// `/tmp`) but visible in the host's `/proc`; deleting its prefix under it would leave it running on a deleted tree.
+/// A server that is still shutting down gets two seconds.
+pub(crate) fn refuse_if_running(env: &rt_core::AppEnv) -> Result<(), CmdError> {
+    let id = env.id();
+    for attempt in 0..=20 {
+        let pids = rt_deps::wineservers_for(&env.prefix())
+            .map_err(|e| format!("cannot check whether {id} is running: {e}; nothing was removed"))?;
+        match pids.first() {
+            None => return Ok(()),
+            Some(pid) if attempt == 20 => {
+                return Err(format!(
+                    "{id} is running (wineserver pid {pid}); quit it (Ctrl-C its `runtime run`) first; nothing was \
+                     removed"
+                )
+                .into());
+            }
+            Some(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
 /// Writes to stdout; a closed pipe (`| head`) is the reader's choice, not an error.
 pub(crate) fn emit(text: &str) -> Result<(), CmdError> {
     let mut out = std::io::stdout().lock();

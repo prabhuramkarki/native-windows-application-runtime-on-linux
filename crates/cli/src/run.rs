@@ -18,7 +18,7 @@
 //! group), which does not handle or forward it and dies, and with it the sandbox: `--die-with-parent` kills the
 //! sandbox's PID 1 and the kernel kills every process of the PID namespace (the program and its `wineserver`)
 //! with SIGKILL. A SIGINT or SIGTERM sent to THIS process only (`kill <pid>`, a supervisor) is forwarded to `bwrap`
-//! by a handler for as long as the child runs, with the same result. So the program is killed, not asked (no
+//! by a `sigaction` handler (SA_RESTART, errno kept) for as long as the child runs, with the same result. So the program is killed, not asked (no
 //! Windows Ctrl-C event), and this process reports 130 (143 for SIGTERM). A signal this process was started with
 //! ignored (a shell's background job ignores SIGINT, and so does its `bwrap`) stays ignored.
 use crate::CmdError;
@@ -116,41 +116,59 @@ impl Drop for IgnoreSigint {
 static FORWARD_TO: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn forward(sig: libc::c_int) {
+    // SAFETY: `__errno_location` is this thread's errno; the handler must not change what the interrupted code sees.
+    let errno = unsafe { *libc::__errno_location() };
     let pid = FORWARD_TO.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: `kill` is async-signal-safe and touches no memory of this process.
         unsafe { libc::kill(pid, sig) };
     }
+    // SAFETY: as above.
+    unsafe { *libc::__errno_location() = errno };
 }
 
-/// Forwards SIGINT and SIGTERM to one child until dropped, then restores what was there before (module docs).
+/// Forwards SIGINT and SIGTERM to one child until dropped, then restores the previous actions (module docs). The
+/// handler is installed with `sigaction(SA_RESTART)`, so the `waitpid` this process is blocked in is restarted, not
+/// failed with EINTR.
 // ponytail: a signal that lands after the child was reaped but before the drop goes to its pid, which the kernel
 // does not reuse within microseconds; closing that gap needs our own waitid(WNOWAIT) loop.
-struct Forward([(libc::c_int, libc::sighandler_t); 2]);
+struct Forward(Vec<(libc::c_int, libc::sigaction)>);
 
 impl Forward {
     fn to(pid: u32) -> Forward {
         FORWARD_TO.store(i32::try_from(pid).unwrap_or(0), Ordering::SeqCst);
-        // SAFETY: `forward` is async-signal-safe (an atomic load and `kill`); the dispositions are put back by
-        // `Drop`. No other thread of this program changes them.
-        Forward([libc::SIGINT, libc::SIGTERM].map(|sig| {
-            let old = unsafe { libc::signal(sig, forward as extern "C" fn(libc::c_int) as libc::sighandler_t) };
-            if old == libc::SIG_IGN {
+        let mut saved = Vec::new();
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: plain `sigaction` calls on zeroed/filled structs; `forward` is async-signal-safe (an atomic
+            // load, `kill`, errno kept). The previous actions are put back by `Drop`; no other thread of this
+            // program changes them.
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
+                    continue;
+                }
                 // Started with it ignored (a shell's background job): stay deaf to it, like the child is.
-                unsafe { libc::signal(sig, libc::SIG_IGN) };
+                if old.sa_sigaction == libc::SIG_IGN {
+                    continue;
+                }
+                let mut new: libc::sigaction = std::mem::zeroed();
+                new.sa_sigaction = forward as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                new.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut new.sa_mask);
+                if libc::sigaction(sig, &new, std::ptr::null_mut()) == 0 {
+                    saved.push((sig, old));
+                }
             }
-            (sig, old)
-        }))
+        }
+        Forward(saved)
     }
 }
 
 impl Drop for Forward {
     fn drop(&mut self) {
-        for (sig, old) in self.0 {
-            if old != libc::SIG_ERR {
-                // SAFETY: `old` is the disposition `signal` returned for `sig`: a valid argument to give back.
-                unsafe { libc::signal(sig, old) };
-            }
+        for (sig, old) in &self.0 {
+            // SAFETY: `old` is the action `sigaction` reported for `sig`: a valid one to give back.
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
         }
         FORWARD_TO.store(0, Ordering::SeqCst);
     }
@@ -256,6 +274,18 @@ mod tests {
         }
         assert_eq!(sigint_disposition(), libc::SIG_DFL, "restored afterwards");
         assert_eq!(FORWARD_TO.load(Ordering::SeqCst), 0);
+        // The handler leaves errno alone even when its `kill` fails (ESRCH: a child that is gone).
+        let mut gone = std::process::Command::new("/bin/true").spawn().unwrap();
+        gone.wait().unwrap();
+        {
+            let _g = Forward::to(gone.id());
+            // SAFETY: this thread's errno; SIGINT goes to the forwarding handler.
+            unsafe {
+                *libc::__errno_location() = 42;
+                libc::raise(libc::SIGINT);
+                assert_eq!(*libc::__errno_location(), 42, "the handler changed errno");
+            }
+        }
         // An ignored SIGINT (a background job) stays ignored.
         // SAFETY: as above.
         unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
