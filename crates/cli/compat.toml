@@ -9,7 +9,9 @@
 
 # The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, a record without a `gpu` field is
 # not a graphics test) with the two test commands of the `wine-e2e` CI job. That job is configured but has not yet run on a hosted runner, so none of them
-# claims `ci:`.
+# claims `ci:`. The five records below whose notes say "also under the default sandbox" were run again on 2026-09-26
+# after Phase 5B (the same commands, every sandboxed run through the seccomp filter, Landlock ABI 8 and the default
+# task-limit scope): all passed.
 
 
 [[record]]
@@ -118,3 +120,35 @@ graphics = true
 gpu = "llvmpipe (LLVM 21.1.8, 256 bits) / llvmpipe Mesa 26.0.8-1ubuntu0.3 (Vulkan 1.4.335)"
 evidence = "manual:2026-09-26"
 notes = "runtime run in bubblewrap with the default profile, DXVK 3.1.1 (x64) on Mesa's CPU (software) Vulkan device: pixel ok, exit 0; frame ms: 0.0045 (informational)."
+
+# Phase 5B: the same fixture and test with every hardening layer on (the `sandbox-init` launcher's Landlock ruleset
+# and seccomp filter, the default TasksMax=4096 systemd user scope), run by hand on 2026-09-26 in the same Wayland
+# session (DISPLAY=:0, WAYLAND_DISPLAY=wayland-1), kernel 7.0 (Landlock ABI 8), with
+#   DXVK_FILTER_DEVICE_NAME=<device> RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-cli --test e2e_sandbox -- --ignored real_net_wine_d3d11 --nocapture
+
+[[record]]
+app = "d3d11 clear fixture under the default sandbox (seccomp + Landlock + limits)"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+graphics = true
+gpu = "NVIDIA GeForce RTX 3050 6GB Laptop GPU / NVIDIA 595.91.07 (Vulkan 1.4.329)"
+evidence = "manual:2026-09-26"
+notes = "runtime run with the default profile through systemd-run, bwrap and runtime sandbox-init (Landlock + seccomp), DXVK 3.1.1 (x64): pixel ok, exit 0; frame ms: 0.0049 (informational). DXVK created its device on this GPU."
+
+[[record]]
+app = "d3d11 clear fixture under the default sandbox (seccomp + Landlock + limits)"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+graphics = true
+gpu = "AMD Radeon 660M (RADV REMBRANDT) / radv Mesa 26.0.8-1ubuntu0.3 (Vulkan 1.4.335)"
+evidence = "manual:2026-09-26"
+notes = "runtime run with the default profile through systemd-run, bwrap and runtime sandbox-init (Landlock + seccomp), DXVK 3.1.1 (x64): pixel ok, exit 0; frame ms: 0.0038 (informational). DXVK created its device on this GPU."
+
+[[record]]
+app = "d3d11 clear fixture under the default sandbox (seccomp + Landlock + limits)"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+graphics = true
+gpu = "llvmpipe (LLVM 21.1.8, 256 bits) / llvmpipe Mesa 26.0.8-1ubuntu0.3 (Vulkan 1.4.335)"
+evidence = "manual:2026-09-26"
+notes = "runtime run with the default profile through systemd-run, bwrap and runtime sandbox-init (Landlock + seccomp), DXVK 3.1.1 (x64) on Mesa's CPU (software) Vulkan device: pixel ok, exit 0; frame ms: 0.0041 (informational)."
