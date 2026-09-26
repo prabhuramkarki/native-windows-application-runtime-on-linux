@@ -10,8 +10,8 @@
 //! through `int 0x80` (found by running `hello32.exe` under the filter: without it Wine 10.0 fails with "failed to
 //! allocate %fs selector" and crashes). It only sets a TLS descriptor of the calling thread. Then, on x86-64, any number with the x32 bit (`0x40000000`) set fails with
 //! `EPERM` (the x32 ABI shares the x86-64 audit architecture but numbers its calls differently; the same test also
-//! refuses a raw `syscall(-1)`, whose number has every bit set, which the kernel would answer with `ENOSYS`). Then each entry
-//! of [`DENIED`] is compared by number; an entry with an argument condition jumps to its own check. Everything
+//! refuses a raw `syscall(-1)`, whose number has every bit set, which the kernel would answer with `ENOSYS`). Then
+//! each entry of [`DENIED`] is compared by number; an entry with an argument condition jumps to its own check. Everything
 //! else is allowed. Arguments are compared on their low 32 bits: the kernel truncates `clone`'s flags, `ioctl`'s
 //! `cmd`, `personality`'s persona and `socket`'s domain to 32 bits, so garbage in the upper half changes nothing.
 //! Jump offsets are computed by a small label builder, never counted by hand.
@@ -24,14 +24,20 @@
 //! `io_uring_setup` is denied because io_uring requests never pass through seccomp.
 //!
 //! **`ptrace` and Landlock.** wineserver implements `ReadProcessMemory`/`WriteProcessMemory` on ANOTHER process
-//! (and so psapi's `GetModuleFileNameEx`, .NET's process list, debuggers) with `ptrace` (`PTRACE_ATTACH`,
-//! `PEEKDATA`/`POKEDATA`, `DETACH`; found by running the escape suite's `readmem`/`writemem` probes). So the shim
-//! builds one of two filters: [`build_filter`] (the table as written, `ptrace` always refused) when Landlock is
-//! unavailable, and [`build_filter_confined_ptrace`] when a Landlock domain is enforced, which lets exactly
-//! [`WINE_PTRACE`] through. Landlock refuses `ptrace` of any process outside the tracer's domain, i.e. anything but
-//! the program's own process tree (bubblewrap's own pid 1 inside the sandbox is dumpable, carries no filter, and
-//! would otherwise be a way around it on a host whose Yama `ptrace_scope` is 0). Every other request
-//! (`PTRACE_TRACEME`, `SEIZE`, `GETREGS`, ...) stays refused.
+//! (and so psapi's `GetModuleFileNameEx`, .NET's process list, debuggers) with `ptrace`: the escape suite's
+//! `readmem`/`writemem` probes fail without it, and strace shows wineserver's `PTRACE_ATTACH` refused. The other
+//! requests in [`WINE_PTRACE`] come from reading Wine's `server/ptrace.c` (`PEEKDATA`/`POKEDATA`, `CONT`,
+//! `DETACH`; `PEEKUSER`/`POKEUSER` for the debug registers of ANOTHER process's thread, which no test exercises).
+//! So the shim builds one of two filters ([`crate::init::filter_for`]): [`build_filter`] (the table as written,
+//! `ptrace` always refused) when Landlock is unavailable, and [`build_filter_confined_ptrace`] when a Landlock
+//! domain is enforced, which lets exactly [`WINE_PTRACE`] through. Landlock refuses `ptrace` AND `/proc/<pid>/mem`
+//! of any process outside the tracer's domain, i.e. anything but the program's own process tree; bubblewrap's own
+//! pid 1 inside the sandbox is dumpable, same uid and carries no filter. Without Landlock, denying `ptrace` closes
+//! one path to it but not the other: opening `/proc/1/mem` (a read-write procfs) is checked only by Yama and the
+//! LSMs, not by seccomp, so **without Landlock the seccomp layer can be shed on hosts where Yama `ptrace_scope` is
+//! 0, via `/proc/1/mem`** (`runtime sandbox` and `doctor` warn on such a host). Keeping `ptrace` denied there is
+//! still right: one fewer path. Every other request (`PTRACE_TRACEME`, `SEIZE`, `GETREGS`, ...) stays refused.
+//! The i386 `set_thread_area` exception below is the same in both filters.
 //!
 //! | syscall | refused when | why |
 //! |---|---|---|

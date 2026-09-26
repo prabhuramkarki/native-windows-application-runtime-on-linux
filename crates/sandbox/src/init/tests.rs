@@ -228,6 +228,119 @@ fn the_shim_hardens_itself_and_runs_the_program_with_its_arguments_unchanged() {
 }
 
 #[test]
+fn the_filter_follows_what_landlock_did() {
+    use crate::bpf_interp::{Data, run as bpf};
+    let arch = seccomp::host_arch().unwrap();
+    let enforced = filter_for(
+        &landlock::Applied::Enforced {
+            abi: 8,
+            skipped: vec![],
+        },
+        arch,
+    )
+    .unwrap();
+    let unavailable = filter_for(&landlock::Applied::Unavailable("no".into()), arch).unwrap();
+    assert_eq!(enforced, seccomp::build_filter_confined_ptrace(arch).unwrap());
+    assert_eq!(unavailable, seccomp::build_filter(arch).unwrap());
+    let own = bpf_arch(arch);
+    let call = |prog: &[seccomp::SockFilter], arch: u32, nr: i64, a0: u64| {
+        bpf(
+            prog,
+            &Data {
+                nr: nr as i32,
+                arch,
+                ip: 0,
+                args: [a0, 1, 0, 0, 0, 0],
+            },
+        )
+    };
+    let allow = libc::SECCOMP_RET_ALLOW;
+    let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+    for req in [
+        libc::PTRACE_PEEKDATA,
+        libc::PTRACE_POKEDATA,
+        libc::PTRACE_CONT,
+        libc::PTRACE_ATTACH,
+        libc::PTRACE_DETACH,
+    ] {
+        assert_eq!(
+            call(&enforced, own, libc::SYS_ptrace, u64::from(req)),
+            allow,
+            "enforced {req}"
+        );
+        assert_eq!(
+            call(&unavailable, own, libc::SYS_ptrace, u64::from(req)),
+            eperm,
+            "unavailable {req}"
+        );
+    }
+    for req in [
+        libc::PTRACE_SEIZE,
+        libc::PTRACE_SYSCALL,
+        libc::PTRACE_SETOPTIONS,
+        libc::PTRACE_INTERRUPT,
+        libc::PTRACE_TRACEME,
+        libc::PTRACE_KILL,
+    ] {
+        assert_eq!(
+            call(&enforced, own, libc::SYS_ptrace, u64::from(req)),
+            eperm,
+            "enforced {req}"
+        );
+        assert_eq!(
+            call(&unavailable, own, libc::SYS_ptrace, u64::from(req)),
+            eperm,
+            "unavailable {req}"
+        );
+    }
+    // i386 set_thread_area (Wine's WoW64 %fs selector) is allowed by BOTH filters; other i386 calls by neither
+    #[cfg(target_arch = "x86_64")]
+    {
+        let i386 = libc::EM_386 as u32 | 0x4000_0000;
+        let sta = i64::from(seccomp::I386_SET_THREAD_AREA);
+        for prog in [&enforced, &unavailable] {
+            assert_eq!(call(prog, i386, sta, 0), allow);
+            assert_eq!(call(prog, i386, 20, 0), eperm);
+        }
+    }
+}
+
+/// The audit architecture value of `arch` (the filter's own check).
+fn bpf_arch(arch: seccomp::Arch) -> u32 {
+    let em = match arch {
+        seccomp::Arch::X86_64 => libc::EM_X86_64,
+        seccomp::Arch::Aarch64 => libc::EM_AARCH64,
+    };
+    em as u32 | 0x8000_0000 | 0x4000_0000
+}
+
+/// A Landlock error refuses the run (126) before any filter is chosen or the program started: here a rule on a
+/// symlink (`ELOOP`), skipped when this host has no such link or no Landlock.
+#[test]
+fn a_landlock_error_is_a_126_refusal() {
+    let link = crate::grant_tempdir();
+    let l = link.path().join("link");
+    std::os::unix::fs::symlink("/usr", &l).unwrap();
+    if landlock::abi_version().is_err() {
+        eprintln!("SKIPPED a_landlock_error_is_a_126_refusal: no Landlock");
+        return;
+    }
+    let args = vec![
+        os("--v1"),
+        os("--rule"),
+        os(&format!("ro:{}", l.display())),
+        os("--"),
+        os("/usr/bin/true"),
+    ];
+    let out = shim(&args, &[]);
+    assert_eq!(out.status.code(), Some(REFUSED), "{out:?}");
+    assert!(
+        text(&out.stderr).starts_with("runtime: sandbox-init: landlock:"),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn a_denied_syscall_fails_with_eperm_in_the_program() {
     // `unshare -U` needs unshare(2), which the filter refuses.
     let mut args = block(&["--v1"]);

@@ -3236,7 +3236,7 @@ fn permissions_can_remove_a_grant_whose_directory_is_gone() {
 fn fake_bwrap(r: &Rig) {
     let body = "echo \"$*\" >> @LOG@/bwrap.txt\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
                 [ $# -gt 0 ] || exit 0\nshift\n\
-                if [ \"$2\" = sandbox-init ]; then while [ \"$1\" != -- ]; do shift; done; shift; fi\nexec \"$@\""
+                if [ \"$2\" = sandbox-init ]; then while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done; shift; fi\nexec \"$@\""
         .replace("@LOG@", r.log.to_str().unwrap());
     script(&r.bin.join("bwrap"), &body);
 }

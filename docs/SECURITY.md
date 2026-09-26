@@ -648,17 +648,27 @@ executable) have no rule, so they cannot be listed from inside, which is stricte
 them with only the bound entry).
 
 **`ptrace`, decided.** wineserver implements `ReadProcessMemory` and `WriteProcessMemory` on another process with
-`ptrace` (`PTRACE_ATTACH`, `PEEKDATA`/`POKEDATA`, `DETACH`), measured with strace on Wine 10.0: with `ptrace`
-denied both fail with `ERROR_ACCESS_DENIED`, which breaks debuggers, psapi's `GetModuleFileNameEx`/
-`EnumProcessModules` on another process, .NET's process list, crash reporters, launchers and mod loaders that
-inject into a child. Other same-process work (Set/GetThreadContext with registers or debug registers of a suspended
-thread) does not need it. So `ptrace` is allowed for exactly the requests Wine uses (`PEEKDATA`, `PEEKUSER`,
-`POKEDATA`, `POKEUSER`, `CONT`, `ATTACH`, `DETACH`; `TRACEME`, `SEIZE`, `GETREGS` and the rest stay denied) and
-**only when the Landlock domain is enforced**: Landlock refuses `ptrace` of any process outside the tracer's domain,
-which confines it to the program's own process tree. Without that, bwrap's own PID 1 inside the sandbox (dumpable,
-same uid, no filter) would be reachable on a host whose Yama `ptrace_scope` is 0, a way around the filter. Without
-Landlock `ptrace` therefore stays denied and cross-process memory access fails (`runtime sandbox` and `doctor` say
-so). `process_vm_readv`/`writev` stay denied (Wine does not use them).
+`ptrace`. Measured on Wine 10.0: with `ptrace` denied both fail with `ERROR_ACCESS_DENIED` (escape-suite probes
+`readmem`/`writemem`, test 10), and strace shows wineserver's `PTRACE_ATTACH` refused. That breaks debuggers,
+psapi's `GetModuleFileNameEx`/`EnumProcessModules` on another process, .NET's process list, crash reporters,
+launchers and mod loaders that inject into a child. Same-process Set/GetThreadContext (registers, debug registers
+of a suspended thread) does not need it. So `ptrace` is allowed for exactly the requests Wine's `server/ptrace.c`
+makes: `ATTACH` was observed; `PEEKDATA`, `POKEDATA`, `CONT` and `DETACH` come from reading that file (the
+cross-process memory tests pass with them); `PEEKUSER`/`POKEUSER` (debug registers of ANOTHER process's thread
+through Get/SetThreadContext) come from the same file and are exercised by no test. `TRACEME`, `SEIZE`, `GETREGS`
+and the rest stay denied. It is allowed **only when the Landlock domain is enforced**: Landlock refuses both
+`ptrace` and `/proc/<pid>/mem` of any process outside the tracer's domain, which confines them to the program's own
+process tree (verified by experiment). Without Landlock `ptrace` stays denied and cross-process memory access fails.
+
+**Without Landlock the seccomp layer can be shed on hosts where Yama `ptrace_scope` is 0, via `/proc/1/mem`.**
+bubblewrap's own PID 1 inside the sandbox (its reaper) is dumpable, has the same uid and carries no filter; opening
+its `/proc/1/mem` (the sandbox's `/proc` is a fresh read-write procfs) is checked by `ptrace_may_access`, i.e. by
+Yama and the LSMs, never by seccomp, so a program can write code into it and run unfiltered, still inside the
+bubblewrap namespaces. Keeping `ptrace` denied there is still right (one fewer path), but it does not close this
+one. `runtime sandbox` prints and `doctor` warns `seccomp can be bypassed through /proc/1/mem on this host (no
+Landlock, no Yama)` exactly when Landlock is unavailable and Yama's `ptrace_scope` is 0 or Yama is absent (Debian
+and Fedora default to 0). With Landlock, or with Yama at 1 or more, the path is closed. `/proc` stays read-write
+because bwrap mounts it that way; no test proves read-only would be enough.
 
 **What they do NOT add.**
 - **Same uid, same kernel.** A bug in a syscall the filter allows (the GPU driver's ioctls, the filesystem, the
@@ -671,6 +681,9 @@ so). `process_vm_readv`/`writev` stay denied (Wine does not use them).
 - **The runtime executable's path** is visible inside (read-only), and so are the names of the directories above it
   (empty; not listable with Landlock).
 - **Inherited descriptors.** Landlock checks at `open`: the terminal and pipes the program inherits keep full rights.
+- **Follow-up:** run the shim as the filtered PID 1 (`--as-pid-1`) once its signal handling is designed, which
+  removes the unfiltered process from the sandbox. Not done now: an init without handlers ignores SIGINT/SIGTERM
+  from inside the namespace, which would break the Ctrl-C forwarding of Phase 5A.
 
 ## Roadmap
 

@@ -42,16 +42,43 @@ pub fn find_bwrap_on_path() -> Option<PathBuf> {
 }
 
 /// The in-kernel layers the `sandbox-init` shim adds, probed on the host (the shim itself reports nothing): one
-/// `seccomp: ...` and one `landlock: ...` line for `runtime sandbox` and `doctor`, and whether both are fully there.
+/// `seccomp: ...` and one `landlock: ...` line for `runtime sandbox` and `doctor`, whether both are fully there,
+/// and [`BYPASS_CAVEAT`] when the filter can be shed on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hardening {
     pub seccomp: String,
     pub landlock: String,
     pub complete: bool,
+    pub caveat: Option<String>,
 }
 
+/// Without Landlock, bwrap's own pid 1 inside the sandbox (dumpable, same uid, no filter) is reachable through
+/// `/proc/1/mem`, which seccomp cannot see and only Yama guards (`rt_sandbox::seccomp`, "ptrace and Landlock").
+pub const BYPASS_CAVEAT: &str = "seccomp can be bypassed through /proc/1/mem on this host (no Landlock, no Yama)";
+
 pub fn hardening() -> Hardening {
-    let (seccomp, seccomp_ok) = match seccomp::host_arch().and_then(|a| seccomp::build_filter(a).map(|_| a)) {
+    let seccomp = seccomp::host_arch().and_then(|a| seccomp::build_filter(a).map(|_| a));
+    hardening_from(seccomp.map_err(|e| e.to_string()), landlock::host_state(), yama_scope())
+}
+
+/// Yama's `ptrace_scope` (0-3), read bounded; `None` when the file is missing or unreadable (Yama not there).
+fn yama_scope() -> Option<u32> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let n = std::fs::File::open("/proc/sys/kernel/yama/ptrace_scope")
+        .and_then(|mut f| f.read(&mut buf))
+        .ok()?;
+    std::str::from_utf8(&buf[..n]).ok()?.trim().parse().ok()
+}
+
+/// [`hardening`] from its probes: the filter (its arch, or why it cannot be built), Landlock, and Yama's scope
+/// (`None`: no Yama, the same as scope 0).
+fn hardening_from(
+    seccomp: Result<seccomp::Arch, String>,
+    landlock: landlock::HostState,
+    yama: Option<u32>,
+) -> Hardening {
+    let (seccomp, seccomp_ok) = match seccomp {
         Ok(a) => (
             format!("seccomp: enforced ({}, {} rules)", a.name(), seccomp::DENIED.len()),
             true,
@@ -61,18 +88,24 @@ pub fn hardening() -> Hardening {
             false,
         ),
     };
-    let (landlock, landlock_ok) = match landlock::host_state() {
+    let mut caveat = None;
+    let (landlock, landlock_ok) = match landlock {
         landlock::HostState::Abi(abi) => (
-            format!("landlock: ABI {abi} (fs); ptrace reaches only the app's own processes"),
+            format!("landlock: ABI {abi} (fs); ptrace and /proc/<pid>/mem reach only the app's own processes"),
             true,
         ),
-        landlock::HostState::Unavailable(why) => (
-            format!(
-                "landlock: unavailable: {why}; only the mounts confine files, and ptrace stays denied (Windows \
-                 programs cannot read or write other processes' memory)"
-            ),
-            false,
-        ),
+        landlock::HostState::Unavailable(why) => {
+            if yama.unwrap_or(0) == 0 {
+                caveat = Some(BYPASS_CAVEAT.to_owned());
+            }
+            (
+                format!(
+                    "landlock: unavailable: {why}; only the mounts confine files, ptrace stays denied (Windows \
+                     programs cannot read or write other processes' memory), and /proc/1/mem is guarded by Yama only"
+                ),
+                false,
+            )
+        }
         landlock::HostState::Error(e) => (
             format!("landlock: {e}; `runtime run` refuses to start programs while this fails"),
             false,
@@ -82,6 +115,61 @@ pub fn hardening() -> Hardening {
         seccomp,
         landlock,
         complete: seccomp_ok && landlock_ok,
+        caveat,
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn the_bypass_caveat_appears_exactly_without_landlock_and_without_yama() {
+        let arch = || seccomp::host_arch().map_err(|e| e.to_string());
+        let unavailable = || landlock::HostState::Unavailable("gone".into());
+        for yama in [None, Some(0)] {
+            let h = hardening_from(arch(), unavailable(), yama);
+            assert_eq!(h.caveat.as_deref(), Some(BYPASS_CAVEAT), "{yama:?}");
+            assert!(!h.complete);
+            assert!(h.landlock.starts_with("landlock: unavailable: gone;"), "{}", h.landlock);
+            assert!(
+                h.landlock.contains("/proc/1/mem is guarded by Yama only"),
+                "{}",
+                h.landlock
+            );
+        }
+        for yama in [1, 2, 3] {
+            let h = hardening_from(arch(), unavailable(), Some(yama));
+            assert_eq!(h.caveat, None, "{yama}");
+            assert!(!h.complete);
+        }
+        for yama in [None, Some(0), Some(1)] {
+            let h = hardening_from(arch(), landlock::HostState::Abi(8), yama);
+            assert_eq!(h.caveat, None);
+            assert!(h.complete);
+            assert!(h.landlock.starts_with("landlock: ABI 8 (fs)"), "{}", h.landlock);
+        }
+        let h = hardening_from(Err("no table".into()), landlock::HostState::Abi(8), Some(1));
+        assert!(
+            !h.complete && h.seccomp.starts_with("seccomp: UNAVAILABLE (no table)"),
+            "{}",
+            h.seccomp
+        );
+        let e = landlock::HostState::Error(landlock::LandlockError::BadPath("x".into()));
+        let h = hardening_from(arch(), e, None);
+        assert_eq!(
+            h.caveat, None,
+            "a probe error refuses every run: nothing runs to bypass"
+        );
+        assert!(h.landlock.contains("refuses to start programs"), "{}", h.landlock);
+    }
+
+    #[test]
+    fn yama_scope_is_read_from_this_host() {
+        let want = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        assert_eq!(yama_scope(), want);
     }
 }
 
