@@ -430,6 +430,11 @@ mod tests {
         assert!(!c.records.is_empty());
         assert_eq!(c.records[0].app, b.records[0].app);
         assert_eq!(c.records[0].status, b.records[0].status);
+        // Whole, as `runtime compat --json` prints them (notes may be up to 300 bytes long).
+        assert_eq!(
+            c.records.iter().map(|r| &r.notes).collect::<Vec<_>>(),
+            b.records.iter().map(|r| &r.notes).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -294,7 +294,8 @@ impl CompatRecord {
             gpu: opt(&r.gpu),
             graphics: r.graphics,
             evidence: opt(&r.evidence),
-            notes: opt(&r.notes),
+            // Up to 300 bytes by the matrix's own validation: the text bound would cut it.
+            notes: r.notes.as_deref().map(long),
         }
     }
 }
