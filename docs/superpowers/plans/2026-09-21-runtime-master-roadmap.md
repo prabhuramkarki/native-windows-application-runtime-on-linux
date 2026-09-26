@@ -28,6 +28,34 @@
 
 ---
 
+## 0. Status as of 2026-09-26 (written after Phase 5B; the per-phase specs/plans and `git log` are the detail)
+
+| Phase | State | Notes |
+|---|---|---|
+| 0-1 Foundations, PE analysis | done | own PE analysis behind own types (`pelite`), fuzz-style mutation tests |
+| 2 Environments + Wine backend | done | `CompatBackend` seam; per-app prefixes; Wine 10.0 tested |
+| 3 Installers + desktop integration | done | detection, sandboxed installer pipeline, `.desktop`, uninstall |
+| 4A Dependency engine | done | pinned bundled manifest, consent, HTTPS-only fetcher, archive + installer packages |
+| 4B Graphics | done | Vulkan probe, `runtime graphics info`, DXVK 3.1.1 (x64), VKD3D-Proton 3.0.1, `.tar.zst` reader |
+| 4C Audio + display | done | doctor audio path (PulseAudio-compatible socket), `runtime display` (Wine graphics driver) |
+| 4D/4E Doctor + compat matrix | done | doctor predicts .NET/Direct3D route; `runtime compat`, `docs/COMPAT.md` (TOML records, manual evidence); D3D11 fixture verified on RADV, NVIDIA, llvmpipe |
+| 5A Sandbox + permissions | done | per-app `permissions.toml`, bubblewrap run sandbox, `runtime permissions/sandbox`, `--unsandboxed`, escape suite |
+| 5B seccomp, Landlock, limits | done | hidden `runtime sandbox-init` shim (seccomp deny-list, best-effort Landlock), cgroup limits via `systemd-run --user`, the INSTALLER sandbox uses the same shim |
+| 5C Portal "ask" flows | deferred | a running bubblewrap sandbox cannot gain mounts; needs a different design (per-run grants) |
+| 6 Daemon, API, plugins, GUI | not started | open decisions: GUI toolkit, project name, licence |
+
+**Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are NOT met: no game was recorded, and .NET is not supported (`mscoree=d` is set on every Wine process, so managed programs fail; `doctor` says so). `doctor` predicts a deliberately broken environment (met).
+
+**Known follow-ups (from review ledgers; none blocks use):**
+- .NET: bundle Wine Mono (MSI or `.tar.xz`, ~90 MB, version tied to the Wine version) through the deps engine, drop `mscoree=d` per app when it is installed, needs a managed test fixture (none can be built on the dev host: no Mono/`mcs`).
+- 32-bit apps: DXVK/VKD3D are installed x64-only; a 32-bit app keeps Wine's builtin Direct3D (doctor says so).
+- `runtime deps --remove` (needs the `ArchiveInstalled` record persisted in `Metadata`).
+- Sandbox residuals (all documented in `docs/SECURITY.md`): X11 is shared with the host when `display=on`; `network=allow` shares the host network namespace; the seccomp layer can be shed via `/proc/1/mem` on hosts with neither Landlock nor Yama (disclosed by doctor, `runtime sandbox` and a run-time note; fix = run the shim as a filtered pid 1); helpers (`reg.exe` for `display`/archive `deps`) are sandboxed only for prefixes that ran or installed code sandboxed (marker), unsandboxed runs and pre-5A prefixes stay a residual; a hostile app can hide its wineserver from the `wineservers_for` check (the app lock closes the deps/permissions paths); installers have no cgroup limits.
+- CI: the `wine-e2e` GitHub job has NEVER run on a hosted runner (`continue-on-error`); every compat record is `manual:` evidence from local runs, none is `ci:`. Nothing has been pushed; all phases are merged to local `main` only.
+- Test-hygiene minors: `setsid()` unchecked in one forked-child test; host-class syscall rows can silently lose their oracle on other hosts; the escape-reg e2e (`e2e_installers.rs`) proves the outside canary is absent when sandboxed but not that the payload ran inside.
+
+---
+
 ## 1. Strategic decisions (read first)
 
 | # | Decision | Why |
