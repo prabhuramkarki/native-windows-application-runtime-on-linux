@@ -31,6 +31,8 @@ struct P {
 }
 
 const MAX_PROBES: usize = 63;
+/// The most results one child reports.
+const MAX_RESULTS: usize = 127;
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
@@ -474,7 +476,18 @@ enum ChildEnd {
 /// Forks a child that installs `filter` (if any), runs `probes` and reports each result.
 fn in_child(filter: Option<&[SockFilter]>, probes: &[P]) -> Result<Vec<i32>, ChildEnd> {
     assert!(probes.len() <= MAX_PROBES);
-    let mut out = [0i32; MAX_PROBES + 1];
+    run_in_child(filter, probes.len(), &|out| {
+        for (slot, p) in out.iter_mut().zip(probes) {
+            *slot = (p.probe)();
+        }
+    })
+}
+
+/// Forks a child that installs `filter` (if any), then lets `body` fill `n` results (it must stay
+/// async-signal-safe: raw syscalls on data that exists before the fork), and reports them.
+fn run_in_child(filter: Option<&[SockFilter]>, n: usize, body: &dyn Fn(&mut [i32])) -> Result<Vec<i32>, ChildEnd> {
+    assert!(n <= MAX_RESULTS);
+    let mut out = [0i32; MAX_RESULTS + 1];
     let mut fds = [-1; 2];
     // SAFETY: `fds` is a two-int array, as pipe2 requires.
     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
@@ -488,9 +501,7 @@ fn in_child(filter: Option<&[SockFilter]>, probes: &[P]) -> Result<Vec<i32>, Chi
             Some(Err(_)) => -1,
         };
         if out[0] == 0 {
-            for (slot, p) in out[1..].iter_mut().zip(probes) {
-                *slot = (p.probe)();
-            }
+            body(&mut out[1..=n]);
         }
         // SAFETY: `out` is a live array of that many bytes; `_exit` skips every atexit handler and destructor.
         unsafe {
@@ -502,7 +513,7 @@ fn in_child(filter: Option<&[SockFilter]>, probes: &[P]) -> Result<Vec<i32>, Chi
     // SAFETY: the write end is ours to close; the read end is owned by `File` from here on.
     unsafe { libc::close(fds[1]) };
     let mut pipe = unsafe { File::from_raw_fd(fds[0]) };
-    let mut bytes = [0u8; size_of::<[i32; MAX_PROBES + 1]>()];
+    let mut bytes = [0u8; size_of::<[i32; MAX_RESULTS + 1]>()];
     let read = pipe.read_exact(&mut bytes);
     let mut status = 0;
     // SAFETY: `pid` is our child; `status` is a live int.
@@ -522,7 +533,7 @@ fn in_child(filter: Option<&[SockFilter]>, probes: &[P]) -> Result<Vec<i32>, Chi
     if res[0] != 0 {
         return Err(ChildEnd::InstallFailed(res[0]));
     }
-    Ok(res[1..=probes.len()].to_vec())
+    Ok(res[1..=n].to_vec())
 }
 
 fn required() -> bool {
@@ -644,4 +655,62 @@ fn the_i386_abi_is_refused_in_a_real_filtered_process() {
         Err(e) => panic!("unfiltered child: {e:?}"),
     }
     assert_eq!(in_child(Some(&prog), INT80).expect("filtered child"), [libc::EPERM]);
+}
+
+/// Every [`DENIED`] entry, called for real in a filtered child: EPERM (ENOSYS for `clone3`). The arguments make the
+/// call harmless even if the filter did NOT refuse it (and even as root): all ones (bad pointers, fds, magic numbers,
+/// flags; `mount`, `reboot`, `kexec_load`, `init_module` and friends fail their argument checks), except the one
+/// argument an argument rule inspects, which gets a refused value (`clone` with `CLONE_NEWUSER|CLONE_FS`, a pair the
+/// kernel always refuses, `ioctl` on fd -1, `socket` with type -1, `personality` in a child that exits at once). The child first
+/// calls `setsid`, so `vhangup` has no terminal to hang up. Only the filtered answers are checked: the unfiltered
+/// kernel's answers to these calls depend on privileges and are covered where deterministic by the probes above.
+#[test]
+fn every_denied_entry_is_refused_by_a_real_filtered_call() {
+    let Some(prog) = real_filter("every_denied_entry_is_refused_by_a_real_filtered_call") else {
+        return;
+    };
+    let calls: Vec<(libc::c_long, [libc::c_long; 6], i32)> = DENIED
+        .iter()
+        .map(|d| {
+            let mut args = [-1 as libc::c_long; 6];
+            let (arg, value) = match d.when {
+                When::Always | When::NoSys => (None, 0),
+                // the only such rule is `clone`'s: NEWUSER with FS, a pair the kernel always refuses (EINVAL)
+                When::ArgHasBit { arg, mask } => {
+                    let v = (libc::CLONE_NEWUSER | libc::CLONE_FS) as u32;
+                    assert!(d.nr == libc::SYS_clone && mask & v != 0, "{}", d.name);
+                    (Some(arg), v)
+                }
+                When::ArgIn { arg, values } => (Some(arg), values[0]),
+                When::ArgNotIn { arg, values } => (Some(arg), (1u32..).find(|v| !values.contains(v)).unwrap()),
+            };
+            if let Some(a) = arg {
+                args[usize::from(a)] = libc::c_long::from(value);
+            }
+            let want = if d.when == When::NoSys {
+                libc::ENOSYS
+            } else {
+                libc::EPERM
+            };
+            (d.nr, args, want)
+        })
+        .collect();
+    let got = run_in_child(Some(&prog), calls.len(), &|out| {
+        // SAFETY: setsid takes no arguments; the child is not a group leader, so it gets a session and no terminal.
+        unsafe { libc::setsid() };
+        for (slot, (nr, a, _)) in out.iter_mut().zip(&calls) {
+            // SAFETY: one raw syscall with integer arguments only (see the test's docs for why each is harmless).
+            *slot = check(unsafe { libc::syscall(*nr, a[0], a[1], a[2], a[3], a[4], a[5]) });
+        }
+    })
+    .expect("filtered child");
+    let bad: Vec<String> = DENIED
+        .iter()
+        .zip(&calls)
+        .zip(&got)
+        .filter(|((_, (_, _, want)), g)| *g != want)
+        .map(|((d, (_, a, want)), g)| format!("{} {a:x?}: got {g}, want {want}", d.name))
+        .collect();
+    assert!(bad.is_empty(), "{bad:#?}");
+    assert_eq!(got.len(), DENIED.len());
 }
