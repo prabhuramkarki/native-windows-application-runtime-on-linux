@@ -2,7 +2,7 @@
 
 A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
 
-**Status: Phase 5B (bubblewrap sandbox plus seccomp and Landlock), an early MVP.** `runtime run` starts every
+**Status: Phase 5B (bubblewrap sandbox plus seccomp, Landlock and resource limits), an early MVP.** `runtime run` starts every
 program in a bubblewrap sandbox built from the app's permissions (default: no network, no host files, only its own
 prefix writable; display, audio and GPU on), and refuses to run without a working `bwrap` (`sudo apt install
 bubblewrap`) unless you pass `--unsandboxed`. Inside it, a small launcher (`runtime sandbox-init`, hidden) applies a
@@ -10,7 +10,8 @@ seccomp deny-list (mandatory) and a Landlock filesystem ruleset (when the kernel
 starts, and the run gets a task limit (a fork-bomb guard) and optional memory/CPU limits through a systemd user
 scope. It is not a VM: same Linux user, and the display, audio and GPU it is given are shared
 with the host (an X11 display lets a program read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
-protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3), and `.NET` programs
+protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3; it has none of the seccomp,
+Landlock or limit layers), and `.NET` programs
 still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
 (see below).
 
@@ -187,7 +188,11 @@ and tries to read a fake home's `.ssh` secret, write to that home, read another 
 own `permissions.toml`, connect to a local TCP listener, and step outside a granted directory. Each action must fail
 sandboxed AND succeed with `--unsandboxed` on the same target, so the sandbox is shown to be what stops it; what the
 suite does not prove is in `docs/SECURITY.md` ("The escape suite"). Since Phase 5B it also checks that the program
-runs under the seccomp filter and that cross-process memory and thread contexts (wineserver's `ptrace` use) still work.
+runs under the seccomp filter and that cross-process memory and thread contexts (wineserver's `ptrace` use) still work,
+that a fork bomb and a memory hog stop at the app's limits, and (the `syscall_escape_*` tests, no Wine needed) that a
+Linux helper run through the real `sandbox-init` launcher gets EPERM for 19 denied system calls (`ptrace`, `unshare`
+and `clone` into a new user namespace, `mount`, `keyctl`, `bpf`, `TIOCSTI`, `AF_VSOCK`, `int 0x80`, ...) while the same
+command with bubblewrap alone gets a different answer, and that `ptrace` reaches only the app's own Landlock domain.
 Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
 directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`, `hello.msi` (built with
 `wixl`) and `hello-nsis.exe` (built with `makensis`) for the installer-pipeline tests

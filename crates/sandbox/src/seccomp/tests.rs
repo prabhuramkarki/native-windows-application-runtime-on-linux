@@ -440,4 +440,24 @@ fn the_module_documentation_table_is_the_deny_list() {
     );
 }
 
+/// docs/SECURITY.md carries the same table between its `deny-list` markers: exactly these rows, in this order.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn the_security_document_lists_the_deny_list() {
+    let doc = include_str!("../../../../docs/SECURITY.md");
+    let start = doc.find("<!-- deny-list:").expect("the start marker");
+    let end = doc.find("<!-- /deny-list -->").expect("the end marker");
+    let got: Vec<&str> = doc[start..end].lines().filter(|l| l.starts_with("| `")).collect();
+    let want: Vec<String> = DENIED
+        .iter()
+        .map(|d| doc_row(d).trim_start_matches("//! ").to_owned())
+        .collect();
+    assert_eq!(
+        got,
+        want,
+        "update docs/SECURITY.md's deny-list table; expected:\n{}",
+        want.join("\n")
+    );
+}
+
 mod kernel;
