@@ -224,6 +224,10 @@ pub struct DoctorInput<'a> {
     /// (fs)`): `Ok` all there, `Err` something is missing or failing (Landlock unavailable, a probe error). One
     /// Runtime check.
     pub hardening: Result<&'a str, &'a str>,
+    /// Whether the sandbox's resource limits (`systemd-run --user` scopes) can be applied, as one phrase (`limits:
+    /// systemd-run --user available (...)`): `Ok` they can, `Err` why not and what that means for runs. One Runtime
+    /// check, a warning at worst (like an unreadable profile).
+    pub limits: Result<&'a str, &'a str>,
 }
 
 /// A Direct3D family an app imports.
@@ -400,6 +404,10 @@ pub fn doctor(input: DoctorInput<'_>) -> Report {
     wine(&input, &mut out);
     sandbox(&input, &mut out);
     match input.hardening {
+        Ok(text) => out.add(Area::Runtime, Status::Ok, clean(text, 300)),
+        Err(text) => out.add(Area::Runtime, Status::Warn, clean(text, 300)),
+    }
+    match input.limits {
         Ok(text) => out.add(Area::Runtime, Status::Ok, clean(text, 300)),
         Err(text) => out.add(Area::Runtime, Status::Warn, clean(text, 300)),
     }

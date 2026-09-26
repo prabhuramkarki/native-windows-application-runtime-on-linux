@@ -1,8 +1,10 @@
 //! The host facts [`crate::AppSandbox`] reads while rendering: the real process environment (for the real
 //! `$HOME` grants are judged against) and which paths exist. Injected so the renderer stays a pure argv builder
 //! that tests drive with a fake host; [`RealHost`] is the production view.
+use crate::ScopeSupport;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub trait Host: Send + Sync {
     /// A variable of the runtime's own (unfiltered) environment.
@@ -20,6 +22,8 @@ pub trait Host: Send + Sync {
     /// This runtime's own executable, every symlink resolved (the sandbox runs it as its `sandbox-init` shim);
     /// `None` when it cannot be resolved or was deleted or replaced since it started.
     fn runtime_exe(&self) -> Option<PathBuf>;
+    /// `systemd-run --user --scope` works here and what its scopes can limit ([`crate::probe_limits`]), or why not.
+    fn scopes(&self) -> Result<ScopeSupport, String>;
 }
 
 /// `/proc/self/exe` of a binary replaced or deleted since it started reads `<path> (deleted)`.
@@ -59,6 +63,18 @@ impl Host for RealHost {
         let exe = std::env::current_exe().ok().filter(|e| !replaced(e))?;
         let real = std::fs::canonicalize(exe).ok()?;
         self.is_file(&real).then_some(real)
+    }
+    fn scopes(&self) -> Result<ScopeSupport, String> {
+        // Probed once per process: a launch renders two or three times, and `runtime sandbox` more.
+        static PROBED: OnceLock<Result<ScopeSupport, String>> = OnceLock::new();
+        PROBED
+            .get_or_init(|| {
+                let sr = crate::find_systemd_run_on_path().ok_or("systemd-run is not on PATH")?;
+                // The program gets `$XDG_RUNTIME_DIR` only when it is absolute (`rt_core::allowed_env`).
+                let rt = self.env("XDG_RUNTIME_DIR").filter(|d| Path::new(d).is_absolute());
+                crate::probe_limits(&sr, rt.as_deref())
+            })
+            .clone()
     }
 }
 

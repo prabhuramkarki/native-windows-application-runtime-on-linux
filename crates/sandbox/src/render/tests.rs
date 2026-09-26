@@ -18,6 +18,10 @@ struct FakeHost {
     no_exe: bool,
     /// `runtime_exe` is this instead of [`EXE`].
     exe_at: Option<PathBuf>,
+    /// `scopes` fails with this (default: [`SYSTEMD_RUN`] works).
+    no_scopes: Option<String>,
+    /// `scopes` offers only these controllers (default: cpu, memory, pids).
+    controllers: Option<Vec<&'static str>>,
 }
 
 impl Host for FakeHost {
@@ -44,6 +48,21 @@ impl Host for FakeHost {
     }
     fn runtime_exe(&self) -> Option<PathBuf> {
         (!self.no_exe).then(|| self.exe_at.clone().unwrap_or_else(|| EXE.into()))
+    }
+    fn scopes(&self) -> Result<crate::ScopeSupport, String> {
+        if let Some(why) = &self.no_scopes {
+            return Err(why.clone());
+        }
+        Ok(crate::ScopeSupport {
+            systemd_run: SYSTEMD_RUN.into(),
+            controllers: self
+                .controllers
+                .clone()
+                .unwrap_or_else(|| vec!["cpu", "memory", "pids"])
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        })
     }
 }
 
@@ -87,6 +106,9 @@ const APP_ROOT: &str = "/data/apps/a";
 const RT: &str = "/run/user/1000";
 /// The fake host's runtime executable (the shim).
 const EXE: &str = "/opt/runtime/bin/runtime";
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+/// What every scope-wrapped command starts with, before its `-p` properties.
+const SCOPE: [&str; 5] = ["--user", "--scope", "--collect", "--quiet", "--expand-environment=no"];
 
 /// This dev machine's shape: Wayland + Xwayland, a Pulse-compatible socket, AMD + NVIDIA nodes.
 fn host() -> FakeHost {
@@ -138,7 +160,16 @@ fn sb(p: Permissions, h: FakeHost) -> AppSandbox {
     AppSandbox::new("/usr/bin/bwrap".into(), p, vec!["/opt/wine/lib".into()], Arc::new(h))
 }
 
+/// bwrap's own arguments: a `systemd-run` scope in front (see `limits_*`) is cut off.
 fn argv(c: &Command) -> Vec<String> {
+    let a = all_args(c);
+    match a.iter().position(|x| x == "/usr/bin/bwrap") {
+        Some(i) if c.get_program() == SYSTEMD_RUN => a[i + 1..].to_vec(),
+        _ => a,
+    }
+}
+
+fn all_args(c: &Command) -> Vec<String> {
     c.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
 }
 
@@ -234,7 +265,11 @@ fn perms(f: impl FnOnce(&mut Permissions)) -> Permissions {
 #[test]
 fn the_default_profile_is_exactly_this() {
     let c = rendered(Permissions::default(), host());
-    assert_eq!(c.get_program(), "/usr/bin/bwrap");
+    // the default task limit, in a scope of the user manager, around bwrap
+    assert_eq!(c.get_program(), SYSTEMD_RUN);
+    let mut scope: Vec<&str> = SCOPE.to_vec();
+    scope.extend(["-p", "TasksMax=4096", "--", "/usr/bin/bwrap"]);
+    assert_eq!(all_args(&c)[..scope.len()], scope[..]);
     let mut want: Vec<&str> = vec![
         "--die-with-parent",
         "--new-session",
@@ -323,10 +358,145 @@ fn the_default_profile_is_exactly_this() {
     assert_eq!(s.caveats(&app_cmd()), [X11_CAVEAT]);
     // the preview is the wrapped command line, program first
     let preview = s.argv_preview(&app_cmd());
-    assert_eq!(preview[0], "/usr/bin/bwrap");
+    assert_eq!(preview[0], SYSTEMD_RUN);
     assert_eq!(preview[1..], c.get_args().map(OsString::from).collect::<Vec<_>>()[..]);
     // and `Sandbox::wrap` is `render`
-    assert_eq!(argv(&s.wrap(app_cmd())), argv(&c));
+    assert_eq!(all_args(&s.wrap(app_cmd())), all_args(&c));
+}
+
+/// The scope part of a rendered command: everything before bwrap (program first).
+fn scope_of(c: &Command) -> Vec<String> {
+    let a = all_args(c);
+    let end = a.iter().position(|x| x == "/usr/bin/bwrap").unwrap_or(0);
+    std::iter::once(c.get_program().to_string_lossy().into_owned())
+        .chain(a[..end].iter().cloned())
+        .collect()
+}
+
+fn limited(sets: &[&str]) -> Permissions {
+    let mut p = Permissions::default();
+    let ctx = GrantCtx {
+        home: "/home/me".into(),
+        extra_homes: vec![],
+        data_root: "/data".into(),
+        runtime_dir: None,
+    };
+    for s in sets {
+        p.apply_set(s, &ctx).unwrap();
+    }
+    p
+}
+
+fn want_scope(props: &[&str]) -> Vec<String> {
+    let mut w = vec![SYSTEMD_RUN.to_owned()];
+    w.extend(SCOPE.iter().map(|s| s.to_string()));
+    for p in props {
+        w.extend(["-p".to_owned(), p.to_string()]);
+    }
+    w.push("--".into());
+    w
+}
+
+#[test]
+fn limits_become_the_scope_properties_exactly() {
+    let c = rendered(limited(&["memory=2048", "cpu=150", "tasks=512"]), host());
+    assert_eq!(
+        scope_of(&c),
+        want_scope(&["TasksMax=512", "MemoryMax=2048M", "MemorySwapMax=0", "CPUQuota=150%"])
+    );
+    // bwrap follows unchanged, env and cwd too
+    let plain = rendered(Permissions::default(), host());
+    assert_eq!(argv(&c), argv(&plain));
+    assert_eq!(envs(&c), envs(&plain));
+    assert_eq!(c.get_current_dir(), plain.get_current_dir());
+    // memory alone keeps the default task limit
+    let m = rendered(limited(&["memory=100"]), host());
+    assert_eq!(
+        scope_of(&m),
+        want_scope(&["TasksMax=4096", "MemoryMax=100M", "MemorySwapMax=0"])
+    );
+    // an explicit 4096 renders like the default (it only changes what a failure does)
+    assert_eq!(
+        scope_of(&rendered(limited(&["tasks=4096"]), host())),
+        want_scope(&["TasksMax=4096"])
+    );
+    // no task limit and nothing else: no scope at all, and no probe needed
+    let h = FakeHost {
+        no_scopes: Some("never asked".into()),
+        ..host()
+    };
+    let s = sb(limited(&["tasks=unlimited"]), h.clone());
+    let u = s.render(&app_cmd()).unwrap();
+    assert_eq!(u.get_program(), "/usr/bin/bwrap");
+    assert_eq!(all_args(&u), argv(&plain));
+    assert_eq!(s.caveats(&app_cmd()), [X11_CAVEAT]);
+    // ...but unlimited tasks with a CPU limit is a scope without TasksMax
+    let cpu = rendered(limited(&["tasks=unlimited", "cpu=50"]), host());
+    assert_eq!(scope_of(&cpu), want_scope(&["CPUQuota=50%"]));
+}
+
+#[test]
+fn explicit_limits_fail_closed_and_the_default_degrades_with_a_caveat() {
+    let down = FakeHost {
+        no_scopes: Some("systemd-run --user --scope failed (Failed to connect to bus)".into()),
+        ..host()
+    };
+    // default only: bwrap without a scope, and a caveat that says why
+    let s = sb(Permissions::default(), down.clone());
+    let c = s.render(&app_cmd()).unwrap();
+    assert_eq!(c.get_program(), "/usr/bin/bwrap");
+    assert_eq!(
+        s.caveats(&app_cmd()),
+        [
+            "resource limits unavailable: systemd-run --user --scope failed (Failed to connect to bus); the \
+             default task limit (4096) is not applied"
+                .to_owned(),
+            X11_CAVEAT.to_owned(),
+        ]
+    );
+    // anything explicit: refused, naming the reason and the way out
+    for sets in [
+        &["tasks=4096"][..],
+        &["memory=128"],
+        &["cpu=50"],
+        &["tasks=unlimited", "memory=64"],
+    ] {
+        let s = sb(limited(sets), down.clone());
+        let e = s.render(&app_cmd()).unwrap_err();
+        assert!(matches!(e, RenderError::Limits { .. }), "{sets:?}: {e:?}");
+        let text = e.to_string();
+        assert!(text.contains("Failed to connect to bus"), "{text}");
+        assert!(
+            text.contains("runtime permissions a --set memory=off --set cpu=off --set tasks=default"),
+            "{text}"
+        );
+        assert_eq!(s.wrap(app_cmd()).get_program(), "/bin/sh", "{sets:?}: fail closed");
+        assert!(s.caveats(&app_cmd()).is_empty());
+    }
+    // a controller the user manager does not delegate counts as unavailable, for what needs it
+    let no_mem = FakeHost {
+        controllers: Some(vec!["cpu", "pids"]),
+        ..host()
+    };
+    let e = sb(limited(&["memory=128"]), no_mem.clone())
+        .render(&app_cmd())
+        .unwrap_err();
+    assert!(e.to_string().contains("`memory` controller"), "{e}");
+    assert_eq!(
+        scope_of(&sb(limited(&["cpu=50"]), no_mem).render(&app_cmd()).unwrap()),
+        want_scope(&["TasksMax=4096", "CPUQuota=50%"])
+    );
+    let no_pids = FakeHost {
+        controllers: Some(vec![]),
+        ..host()
+    };
+    let s = sb(Permissions::default(), no_pids);
+    assert_eq!(s.render(&app_cmd()).unwrap().get_program(), "/usr/bin/bwrap");
+    assert!(
+        s.caveats(&app_cmd())[0].contains("`pids` controller"),
+        "{:?}",
+        s.caveats(&app_cmd())
+    );
 }
 
 #[test]
@@ -466,7 +636,9 @@ fn awkward_program_arguments_reach_the_shim_unchanged() {
     cmd.args(&odd);
     let c = sb(Permissions::default(), host()).render(&cmd).unwrap();
     let a: Vec<OsString> = c.get_args().map(OsString::from).collect();
-    let dd = a.iter().position(|x| x == "--").unwrap();
+    // bwrap's `--` (the scope's own comes first)
+    let dd = a.iter().rposition(|x| x == EXE).unwrap() - 1;
+    assert_eq!(a[dd], "--");
     let parsed = crate::init::parse(&a[dd + 3..]).unwrap();
     let mut want: Vec<OsString> = ["C:\\x.exe", "--flag"].iter().map(OsString::from).collect();
     want.extend(odd);

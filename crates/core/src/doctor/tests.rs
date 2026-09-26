@@ -138,6 +138,7 @@ struct Sc {
     d3d_routes: Option<Vec<(D3dFamily, D3dRoute)>>,
     sandbox: Result<Option<String>, String>,
     hardening: Result<String, String>,
+    limits: Result<String, String>,
 }
 
 /// A system report on a good desktop.
@@ -160,6 +161,7 @@ fn sc() -> Sc {
         d3d_routes: None,
         sandbox: Ok(None),
         hardening: Ok("seccomp: enforced (x86_64, 61 rules); landlock: ABI 8 (fs)".into()),
+        limits: Ok("limits: systemd-run --user available (cgroup controllers: cpu memory pids)".into()),
     }
 }
 
@@ -227,6 +229,7 @@ impl Sc {
             d3d_routes: self.d3d_routes.as_deref(),
             sandbox: self.sandbox.as_ref().map(Option::as_deref).map_err(String::as_str),
             hardening: self.hardening.as_deref().map_err(String::as_str),
+            limits: self.limits.as_deref().map_err(String::as_str),
         })
     }
 }
@@ -370,6 +373,7 @@ fn a_wine_whose_version_cannot_be_read_is_a_warning_with_escaped_text() {
         d3d_routes: None,
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
+        limits: Ok("limits: test"),
     });
     let c = one(&r, Area::Runtime, "version");
     assert_eq!(c.status, Status::Warn);
@@ -401,6 +405,7 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
         d3d_routes: None,
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
+        limits: Ok("limits: test"),
     });
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
@@ -1918,6 +1923,7 @@ fn a_zip_archive_is_a_warning_that_says_to_install_it_not_a_failure() {
         d3d_routes: None,
         sandbox: Ok(None),
         hardening: Ok("seccomp: test"),
+        limits: Ok("limits: test"),
     });
     let c = one(&r, Area::Pe, "zip archive");
     assert_eq!(c.status, Status::Warn);
@@ -2148,6 +2154,26 @@ fn the_hardening_check_is_ok_or_a_warning_with_its_text() {
     assert!(c.text.contains("landlock: unavailable: gone"), "{}", c.text);
     assert_tame(&c.text);
     assert!(c.text.chars().count() <= 300);
+}
+
+#[test]
+fn the_limits_check_is_ok_or_a_warning_with_its_text() {
+    let mut s = sc();
+    let r = s.run();
+    let c = one(&r, Area::Runtime, "limits: ");
+    assert_eq!(c.status, Status::Ok);
+    assert_eq!(
+        c.text,
+        "limits: systemd-run --user available (cgroup controllers: cpu memory pids)"
+    );
+    s.limits = Err(format!("limits: unavailable: no bus\x1b]0;x\x07{}", "z".repeat(600)));
+    let r = s.run();
+    let c = one(&r, Area::Runtime, "limits: ");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.text.starts_with("limits: unavailable: no bus"), "{}", c.text);
+    assert_tame(&c.text);
+    assert!(c.text.chars().count() <= 300);
+    assert_ne!(r.verdict, Verdict::Fail, "a warning, never a failure");
 }
 
 #[test]

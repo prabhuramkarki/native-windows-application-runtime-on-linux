@@ -1,7 +1,8 @@
 //! The per-app sandbox: the validated permission profile (`permissions.toml`) that decides what a program may
 //! reach, and [`AppSandbox`], which renders it into a bubblewrap command around the program. This crate never
 //! trusts the file it reads: see [`permissions`]. The rendered profile is described in [`render`]; the seccomp
-//! deny-list the program runs under in [`seccomp`]; its Landlock filesystem ruleset in [`landlock`].
+//! deny-list the program runs under in [`seccomp`]; its Landlock filesystem ruleset in [`landlock`]; its resource
+//! limits (a systemd user scope, [`probe_limits`]) in [`render`], "Limits".
 #[cfg(test)]
 mod bpf_interp;
 pub mod host;
@@ -13,8 +14,8 @@ pub mod seccomp;
 
 pub use host::{Host, RealHost};
 pub use permissions::{
-    Access, FsGrant, GrantCtx, Network, PermError, Permissions, Refusal, account_home, load, load_opt, load_opt_raw,
-    reset, store, validate_grant, validate_grant_for,
+    Access, DEFAULT_TASKS, FsGrant, GrantCtx, Limits, Network, PermError, Permissions, Refusal, Tasks, account_home,
+    load, load_opt, load_opt_raw, reset, store, validate_grant, validate_grant_for,
 };
 pub use render::{AppSandbox, RenderError};
 
@@ -26,18 +27,90 @@ use std::time::Duration;
 /// Looks for `bwrap` on `$PATH` the way a shell would (absolute directories only, first match wins), with an
 /// injected environment and file probe; the same rules as `rt_installer::sandbox::find_bwrap`.
 pub fn find_bwrap(env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    find_exe("bwrap", env, is_file)
+}
+
+/// [`find_bwrap`] for `systemd-run`.
+pub fn find_systemd_run(env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    find_exe("systemd-run", env, is_file)
+}
+
+fn find_exe(name: &str, env: &impl Fn(&str) -> Option<OsString>, is_file: &impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let path = env("PATH")?;
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("bwrap"))
+        .map(|dir| dir.join(name))
         .find(|candidate| is_file(candidate))
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// [`find_bwrap`] over the real environment and filesystem (a regular, executable file).
 pub fn find_bwrap_on_path() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    find_bwrap(&|k| std::env::var_os(k), &|p: &Path| {
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    find_bwrap(&|k| std::env::var_os(k), &is_executable)
+}
+
+/// [`find_systemd_run`] over the real environment and filesystem (a regular, executable file).
+pub fn find_systemd_run_on_path() -> Option<PathBuf> {
+    find_systemd_run(&|k| std::env::var_os(k), &is_executable)
+}
+
+/// What `systemd-run --user --scope` offers on this host ([`probe_limits`]): the binary, and the cgroup v2
+/// controllers a scope of the user manager can use (`cpu`, `memory`, `pids`, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeSupport {
+    pub systemd_run: PathBuf,
+    pub controllers: Vec<String>,
+}
+
+/// The options every scope is started with (`render`, "Limits"); the probe uses the same ones.
+pub const SCOPE_ARGS: [&str; 5] = ["--user", "--scope", "--collect", "--quiet", "--expand-environment=no"];
+
+/// What the probe's scope runs: the cgroup v2 controllers its PARENT offers (the scope's own list shows only what
+/// systemd has enabled so far; a controller the parent offers is enabled for a scope that asks for it).
+const PROBE_SCRIPT: &str =
+    r#"c=$(sed -n 's/^0:://p' /proc/self/cgroup) && [ -n "$c" ] && cat "/sys/fs/cgroup${c%/*}/cgroup.controllers""#;
+
+/// Really starts a throwaway scope once (`systemd-run <SCOPE_ARGS> -p TasksMax=100 -- /bin/sh -c <PROBE_SCRIPT>`, at
+/// most 5 s, output capped by the launcher) with only `PATH` and `runtime_dir` (`$XDG_RUNTIME_DIR`,
+/// which is how `systemd-run --user` finds the user manager: the sandboxed command never carries
+/// `DBUS_SESSION_BUS_ADDRESS`, so the probe does not either). `Err` is a one-line reason.
+pub fn probe_limits(systemd_run: &Path, runtime_dir: Option<&std::ffi::OsStr>) -> Result<ScopeSupport, String> {
+    let mut env = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+    env.extend(runtime_dir.map(|d| (OsString::from("XDG_RUNTIME_DIR"), d.to_owned())));
+    let mut cmd = Command::new(systemd_run);
+    cmd.args(SCOPE_ARGS)
+        .args(["-p", "TasksMax=100", "--", "/bin/sh", "-c", PROBE_SCRIPT]);
+    let out = rt_core::Launcher::with_host_env(env)
+        .run_helper(cmd, PROBE_TIMEOUT)
+        .map_err(|e| format!("systemd-run could not be run: {e}"))?;
+    let text = String::from_utf8_lossy(&out.output);
+    let line = |l: Option<&str>| -> String {
+        l.unwrap_or("no output")
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect()
+    };
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    if !out.status.success() {
+        return Err(format!("systemd-run --user --scope failed ({})", line(lines.next())));
+    }
+    let last = lines.next_back();
+    let controllers: Vec<String> = last.unwrap_or("").split_whitespace().map(str::to_owned).collect();
+    if controllers.is_empty()
+        || !controllers
+            .iter()
+            .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    {
+        return Err(format!("the scope reported no cgroup v2 controllers ({})", line(last)));
+    }
+    Ok(ScopeSupport {
+        systemd_run: systemd_run.to_path_buf(),
+        controllers,
     })
 }
 
@@ -245,6 +318,53 @@ mod tests {
         let only_rel = |k: &str| (k == "PATH").then(|| OsString::from("rel"));
         assert_eq!(find_bwrap(&only_rel, &|_: &Path| true), None);
         assert_eq!(find_bwrap(&|_: &str| None, &|_: &Path| true), None);
+    }
+
+    #[test]
+    fn find_systemd_run_searches_path_like_find_bwrap() {
+        let env = |k: &str| (k == "PATH").then(|| OsString::from("rel:/opt/bin:/usr/bin"));
+        let is_file = |p: &Path| p == Path::new("/usr/bin/systemd-run") || p == Path::new("/opt/bin/bwrap");
+        assert_eq!(
+            find_systemd_run(&env, &is_file),
+            Some(PathBuf::from("/usr/bin/systemd-run"))
+        );
+        assert_eq!(find_systemd_run(&|_: &str| None, &|_: &Path| true), None);
+    }
+
+    #[test]
+    fn probe_limits_reports_a_systemd_run_that_cannot_run_or_fails() {
+        let e = probe_limits(Path::new("/nonexistent/systemd-run"), None).unwrap_err();
+        assert!(e.contains("could not be run"), "{e}");
+        let e = probe_limits(Path::new("/bin/false"), None).unwrap_err();
+        assert_eq!(e, "systemd-run --user --scope failed (no output)");
+        // `true` succeeds without printing the controllers
+        let e = probe_limits(Path::new("/bin/true"), None).unwrap_err();
+        assert_eq!(e, "the scope reported no cgroup v2 controllers (no output)");
+    }
+
+    /// The real thing on this host, when it has a user manager (skips visibly otherwise; required under
+    /// `RUNTIME_REQUIRE_BWRAP`, like the other real-host tests).
+    #[test]
+    fn probe_limits_on_this_host() {
+        let required = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
+        let got = find_systemd_run_on_path()
+            .ok_or_else(|| "systemd-run is not on PATH".to_owned())
+            .and_then(|s| probe_limits(&s, std::env::var_os("XDG_RUNTIME_DIR").as_deref()));
+        match got {
+            Ok(s) => {
+                assert!(s.controllers.iter().any(|c| c == "pids"), "{s:?}");
+                // the probe leaves no scope behind (`--collect`, and it exited)
+            }
+            Err(e) => {
+                assert!(!required, "RUNTIME_REQUIRE_BWRAP=1 but {e}");
+                eprintln!("SKIPPED probe_limits_on_this_host: {e}");
+            }
+        }
+        // without a runtime directory systemd-run cannot find the user manager: a reason, not a hang
+        if let Some(s) = find_systemd_run_on_path() {
+            let e = probe_limits(&s, None).unwrap_err();
+            assert!(e.starts_with("systemd-run --user --scope failed ("), "{e}");
+        }
     }
 
     #[test]

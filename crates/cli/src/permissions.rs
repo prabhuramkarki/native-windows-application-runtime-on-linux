@@ -1,5 +1,6 @@
 //! `runtime permissions <app> [--set EXPR]... [--reset] [--json]`: shows or changes the app's `permissions.toml`
-//! (what its sandbox may reach: network, display/audio/gpu, host directories; see `rt_sandbox::permissions`).
+//! (what its sandbox may reach: network, display/audio/gpu, host directories; its resource limits; see
+//! `rt_sandbox::permissions`).
 //!
 //! Reading takes no lock and writes nothing. Changing follows the `display` sequence: every expression is
 //! validated against the current profile BEFORE the app lock is taken, the exclusive lock then keeps other
@@ -8,7 +9,7 @@
 use crate::CmdError;
 use crate::safe::{json_safe, safe, safe_lines};
 use rt_core::AppEnv;
-use rt_sandbox::{Access, GrantCtx, Network, Permissions, account_home, load_opt, load_opt_raw, reset, store};
+use rt_sandbox::{Access, GrantCtx, Network, Permissions, Tasks, account_home, load_opt, load_opt_raw, reset, store};
 use std::path::PathBuf;
 
 pub(crate) fn ctx() -> Result<GrantCtx, CmdError> {
@@ -61,9 +62,18 @@ fn show(p: &Permissions, source: &str, json: bool) -> Result<(), CmdError> {
             })
         })
         .collect();
+    let l = &p.limits;
+    let tasks = match l.tasks {
+        Tasks::Unlimited => serde_json::json!("unlimited"),
+        _ => serde_json::json!(l.tasks_max()),
+    };
     let doc = serde_json::json!({
         "network": if p.network == Network::Allow { "allow" } else { "deny" },
         "display": p.display, "audio": p.audio, "gpu": p.gpu, "filesystem": fs,
+        "limits": {
+            "memory_mb": l.memory_mb, "cpu_percent": l.cpu_percent, "tasks": tasks,
+            "tasks_default": l.tasks == Tasks::Default,
+        },
     });
     crate::emit(&format!("{}\n", json_safe(&serde_json::to_string_pretty(&doc)?)))
 }
