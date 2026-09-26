@@ -295,7 +295,8 @@ fn send(s: &UnixStream, r: &Reply) -> io::Result<()> {
     (&mut &*s).write_all(&r.to_line())
 }
 
-/// Runs one request on its own thread, bounded by `timeout`. `true`: the connection must close (timed out).
+/// Runs one request on its own thread and waits at most `timeout` for it: the reply (a [`TIMEOUT`] error when it
+/// took longer) and the thread, which the caller joins before it frees the connection's slot.
 fn run(
     rt: &Arc<Runtime>,
     req: crate::protocol::Request,
