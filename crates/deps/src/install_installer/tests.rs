@@ -125,6 +125,17 @@ fn require_real_bwrap() -> Option<PathBuf> {
     }
 }
 
+/// The installer sandbox for `bwrap`: its shim is the built `runtime` ([`crate::test_runtime_exe`]), except with
+/// [`NO_RUN_BWRAP`], where nothing may run.
+fn sandbox(bwrap: &Path) -> InstallerSandbox {
+    let exe = if bwrap == Path::new(NO_RUN_BWRAP) {
+        PathBuf::from("/nonexistent/runtime-must-not-run")
+    } else {
+        crate::test_runtime_exe()
+    };
+    InstallerSandbox::new(bwrap, exe)
+}
+
 fn run_with(f: &Fx, p: &Package, b: &FakeBackend, bwrap: &Path) -> Result<InstallerPkgInstalled, InstallerPkgError> {
     install_with(
         p,
@@ -132,7 +143,7 @@ fn run_with(f: &Fx, p: &Package, b: &FakeBackend, bwrap: &Path) -> Result<Instal
         &f.env,
         b,
         &launcher(),
-        Some(bwrap.to_path_buf()),
+        Some(sandbox(bwrap)),
         Duration::from_secs(60),
     )
 }
@@ -669,7 +680,7 @@ fn a_cache_file_of_the_wrong_size_or_a_symlink_is_refused() {
         &f.env,
         &backend(MAKE_MARKER),
         &launcher(),
-        Some(NO_RUN_BWRAP.into()),
+        Some(sandbox(Path::new(NO_RUN_BWRAP))),
         Duration::from_secs(5),
     )
     .unwrap_err();
@@ -804,7 +815,7 @@ fn a_hanging_installer_is_killed_at_the_deadline() {
         &f.env,
         &b,
         &launcher(),
-        Some(bwrap),
+        Some(sandbox(&bwrap)),
         Duration::from_secs(1),
     )
     .unwrap_err();
@@ -1088,7 +1099,7 @@ fn e2e_real_wine_nsis_installer_both_marker_kinds() {
             &env,
             &backend,
             &launcher,
-            Some(bwrap.clone()),
+            Some(sandbox(&bwrap)),
             INSTALLER_DEADLINE,
         )
         .unwrap();
@@ -1178,7 +1189,7 @@ impl RealWine {
             &self.env,
             &self.backend,
             &self.launcher,
-            Some(bwrap),
+            Some(sandbox(&bwrap)),
             deadline,
         )
     }
@@ -1303,7 +1314,16 @@ fn e2e_real_wine_an_installer_registered_service_never_runs_outside_the_sandbox_
         *dll_overrides = vec!["rtdepsx".into()];
     }
     let bwrap = rt_installer::find_bwrap_on_path().expect("bwrap must be installed");
-    let got = install_with(&p, &cache, &env, &backend, &launcher, Some(bwrap), INSTALLER_DEADLINE).unwrap();
+    let got = install_with(
+        &p,
+        &cache,
+        &env,
+        &backend,
+        &launcher,
+        Some(sandbox(&bwrap)),
+        INSTALLER_DEADLINE,
+    )
+    .unwrap();
     eprintln!("sc as installer: {got:?}");
     assert!(got.marker_confirmed);
     let user = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
@@ -1362,7 +1382,7 @@ fn real_net_wine_bundled_vcrun2022_installs_and_writes_its_marker() {
     backend.stop(&env).unwrap();
     assert!(!marker_present(&env, marker).unwrap(), "marker in a fresh prefix");
     let t = std::time::Instant::now();
-    let got = install_installer_pkg(vc, &file, &env, &backend, &launcher).unwrap();
+    let got = install_installer_pkg(vc, &file, &env, &backend, &launcher, &crate::test_runtime_exe()).unwrap();
     eprintln!("vcrun2022: {got:?} in {:?}", t.elapsed());
     assert!(got.marker_confirmed && got.staged_removed);
     assert!(marker_present(&env, marker).unwrap(), "marker absent after the run");

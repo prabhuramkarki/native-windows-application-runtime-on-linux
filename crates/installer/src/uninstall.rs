@@ -14,7 +14,7 @@ use crate::sandbox::{InstallerSandbox, SandboxOpts, find_bwrap_on_path};
 use rt_core::{AppEnv, CompatBackend, Launcher, LogSink, Metadata, RunOpts, WinPath, resolve_under};
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What [`uninstall`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,12 +37,13 @@ pub fn uninstall(
     env: &AppEnv,
     md: &Metadata,
     opts: SandboxOpts,
+    runtime_exe: &Path,
 ) -> UninstallOutcome {
     let Some(command) = md.installer.as_ref().and_then(|i| i.uninstall_command.as_deref()) else {
         return UninstallOutcome::default();
     };
     let mut warnings = Vec::new();
-    let succeeded = run_uninstall_command(backend, launcher, env, command, opts, &mut warnings);
+    let succeeded = run_uninstall_command(backend, launcher, env, command, opts, runtime_exe, &mut warnings);
     UninstallOutcome {
         uninstaller_succeeded: Some(succeeded),
         warnings,
@@ -55,6 +56,7 @@ fn run_uninstall_command(
     env: &AppEnv,
     command: &str,
     opts: SandboxOpts,
+    runtime_exe: &Path,
     warnings: &mut Vec<String>,
 ) -> bool {
     let Some((exe_unix, args)) = resolve_uninstaller(env, command) else {
@@ -71,7 +73,7 @@ fn run_uninstall_command(
     };
     let sandboxed = launcher
         .clone()
-        .with_sandbox(InstallerSandbox::new(bwrap).for_launcher(env.clone(), opts));
+        .with_sandbox(InstallerSandbox::new(bwrap, runtime_exe).for_launcher(env.clone(), opts));
     let cmd = match backend.command(env, &exe_unix, &env.drive_c(), &args, &RunOpts::default()) {
         Ok(cmd) => cmd,
         Err(e) => {

@@ -53,6 +53,32 @@ pub(crate) fn real_wine_backend(launcher: &rt_core::Launcher) -> backend_wine::W
     backend
 }
 
+/// The built `runtime` binary: the installer sandbox's `sandbox-init` shim in this crate's real-bwrap tests. It is
+/// looked up next to this test binary (`target/<profile>/deps/<test>` -> `target/<profile>/runtime`), so the profile
+/// and any `CARGO_TARGET_DIR` match. `cargo test -p runtime-deps` does not build it: a missing one fails loudly
+/// (never a silent skip). Call it only where a real sandbox runs.
+#[cfg(test)]
+pub(crate) fn test_runtime_exe() -> std::path::PathBuf {
+    let exe = test_runtime_path();
+    assert!(
+        exe.is_file(),
+        "{exe:?} is missing: run `cargo build -p runtime-cli` first (the installer sandbox runs it as its \
+         `sandbox-init` shim)"
+    );
+    exe
+}
+
+/// Where [`test_runtime_exe`] looks, without the check (for rigs whose tests may not run a sandbox at all).
+#[cfg(test)]
+pub(crate) fn test_runtime_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the test binary is in target/<profile>/deps")
+        .join("runtime")
+}
+
 #[cfg(test)]
 #[test]
 fn wine_major_reads_the_version_line() {

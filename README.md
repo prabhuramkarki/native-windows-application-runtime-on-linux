@@ -10,8 +10,9 @@ seccomp deny-list (mandatory) and a Landlock filesystem ruleset (when the kernel
 starts, and the run gets a task limit (a fork-bomb guard) and optional memory/CPU limits through a systemd user
 scope. It is not a VM: same Linux user, and the display, audio and GPU it is given are shared
 with the host (an X11 display lets a program read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
-protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3; it has none of the seccomp,
-Landlock or limit layers), and `.NET` programs
+protected. `.msi`/`.exe` installers, uninstallers and `runtime deps` installer packages run in their own `bwrap`
+sandbox (Phase 3) behind the same `sandbox-init` launcher (seccomp and Landlock since Phase 5B Task 6; no resource
+limits, only the dependency engine's deadline), and `.NET` programs
 still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
 (see below).
 
@@ -194,7 +195,8 @@ Linux helper run through the real `sandbox-init` launcher is refused 36 denied s
 spec names (`ptrace`, `unshare`/`clone` into a new user namespace, the mount family, `keyctl`, `bpf`, module and kexec
 loading, `reboot`, `TIOCSTI`, `AF_VSOCK`, `int 0x80`, ...), with EPERM except `clone3` (ENOSYS), while the same command
 with bubblewrap alone answers differently wherever the kernel's own answer is not EPERM too (28 of the 36 on the
-development host), and that `ptrace` reaches only the app's own Landlock domain. With `RUNTIME_REQUIRE_BWRAP=1` these
+development host), that the installer sandbox refuses the same calls through the same launcher, and that `ptrace`
+reaches only the app's own Landlock domain. With `RUNTIME_REQUIRE_BWRAP=1` these
 tests also require seccomp, Landlock and IA32 emulation instead of skipping.
 Fixtures: `hello{32,64}.exe` (print `hello from windows`, exit 7), `fs{32,64}.exe` (file, environment and
 directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`, `hello.msi` (built with

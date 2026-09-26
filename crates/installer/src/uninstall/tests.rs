@@ -49,6 +49,11 @@ fn require_real_bwrap() -> Option<std::path::PathBuf> {
     }
 }
 
+/// This test binary: it runs the real `sandbox-init` shim (`crate::sandbox`'s `TEST_SHIM`).
+fn runtime_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap()
+}
+
 fn launcher() -> Launcher {
     Launcher::with_host_env([("PATH", "/usr/bin:/bin")])
 }
@@ -144,7 +149,14 @@ fn no_uninstall_command_recorded_is_none_with_no_warnings() {
         "gui",
     );
     assert_eq!(portable.installer, None);
-    let outcome = uninstall(&backend, &launcher(), &env, &portable, SandboxOpts::default());
+    let outcome = uninstall(
+        &backend,
+        &launcher(),
+        &env,
+        &portable,
+        SandboxOpts::default(),
+        &runtime_exe(),
+    );
     assert_eq!(outcome, UninstallOutcome::default());
     assert_eq!(outcome.uninstaller_succeeded, None);
     assert!(outcome.warnings.is_empty());
@@ -158,6 +170,7 @@ fn no_uninstall_command_recorded_is_none_with_no_warnings() {
         &env,
         &with_family_no_command,
         SandboxOpts::default(),
+        &runtime_exe(),
     );
     assert_eq!(outcome, UninstallOutcome::default());
 }
@@ -170,7 +183,7 @@ fn an_unresolvable_uninstall_command_is_a_warning_not_a_panic() {
     let backend = FakeBackend::new();
     for bad in ["", "   ", "D:\\outside\\uninstall.exe", "not-even-a-windows-path"] {
         let md = md_with_uninstall(&env, Some(bad));
-        let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+        let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
         assert_eq!(outcome.uninstaller_succeeded, Some(false), "{bad:?}: {outcome:?}");
         assert_eq!(outcome.warnings.len(), 1, "{bad:?}: {outcome:?}");
     }
@@ -181,7 +194,7 @@ fn a_command_naming_a_missing_program_is_a_warning_not_a_panic() {
     let (_tmp, env) = env_with_msiexec();
     let backend = FakeBackend::new();
     let md = md_with_uninstall(&env, Some("C:\\Program Files\\t\\does-not-exist.exe"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false));
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
 }
@@ -194,7 +207,7 @@ fn a_real_msiexec_uninstall_command_runs_sandboxed_and_reports_success() {
     let (_tmp, env) = env_with_msiexec();
     let backend = fake_backend("exit 0");
     let md = md_with_uninstall(&env, Some("MsiExec.exe /X{8965C2A7-9312-4D38-A0C4-76FAE288CAA7}"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(true), "{outcome:?}");
     assert!(outcome.warnings.is_empty(), "{outcome:?}");
 }
@@ -208,7 +221,7 @@ fn a_real_exe_uninstall_command_that_fails_reports_failure_not_a_panic() {
     fs::write(uninstaller.join("uninstall.exe"), b"MZ").unwrap();
     let backend = fake_backend("exit 7");
     let md = md_with_uninstall(&env, Some("\"C:\\Program Files\\t\\uninstall.exe\" /S"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend));
+    let outcome = uninstall(&backend, &launcher(), &env, &md, opts_for(&backend), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false), "{outcome:?}");
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
     assert!(outcome.warnings[0].contains("exited with"), "{outcome:?}");
@@ -223,7 +236,7 @@ fn missing_bwrap_is_a_warning_not_a_panic() {
     let (_tmp, env) = env_with_msiexec();
     let backend = FakeBackend::new();
     let md = md_with_uninstall(&env, Some("C:\\Windows\\..\\..\\etc\\passwd"));
-    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default());
+    let outcome = uninstall(&backend, &launcher(), &env, &md, SandboxOpts::default(), &runtime_exe());
     assert_eq!(outcome.uninstaller_succeeded, Some(false));
     assert_eq!(outcome.warnings.len(), 1, "{outcome:?}");
 }

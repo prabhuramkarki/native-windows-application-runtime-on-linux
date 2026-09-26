@@ -1227,10 +1227,25 @@ mod syscall_escape {
         std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| v == "1")
     }
 
+    /// Which sandbox renders the helper's command.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Profile {
+        /// The app sandbox's default profile, as `runtime run` renders it (scope, bwrap, the real shim).
+        App,
+        /// The installer sandbox (`rt_installer::InstallerSandbox`, through its production constructor and `wrap`),
+        /// as `runtime install`/`uninstall`/`deps --install` render it: bwrap and the real shim, no scope.
+        Installer,
+    }
+
     /// Runs the helper with `args` under the default profile exactly as `runtime run` renders it (scope, bwrap, the
     /// real shim), or with `bwrap_only` the same command line with the shim's words cut out. Returns its stdout,
     /// checked to have exited 0.
     fn in_sandbox(args: &[&str], bwrap_only: bool) -> String {
+        in_profile(Profile::App, args, bwrap_only)
+    }
+
+    /// [`in_sandbox`] under `profile`.
+    fn in_profile(profile: Profile, args: &[&str], bwrap_only: bool) -> String {
         let bwrap = rt_sandbox::find_bwrap_on_path().unwrap();
         let shim = PathBuf::from(env!("CARGO_BIN_EXE_runtime")).canonicalize().unwrap();
         let helper = std::env::current_exe().unwrap().canonicalize().unwrap();
@@ -1250,15 +1265,34 @@ mod syscall_escape {
         if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
             cmd.env("XDG_RUNTIME_DIR", rt); // systemd-run --user needs it
         }
-        let sb = rt_sandbox::AppSandbox::new(
-            bwrap,
-            rt_sandbox::Permissions::default(),
-            vec![helper],
-            std::sync::Arc::new(ShimHost(shim.clone())),
-        );
-        let boxed = sb.render(&cmd).expect("the default profile renders");
+        let boxed = if profile == Profile::Installer {
+            // The app's environment as the store makes it (the installer sandbox binds its prefix); the helper is
+            // bound like the backend's dll dirs (read-only, with a read-only Landlock rule).
+            let env = rt_core::Store::new(app.parent().unwrap())
+                .unwrap()
+                .get(&rt_core::AppId::parse("a").unwrap())
+                .unwrap();
+            let opts = rt_installer::SandboxOpts {
+                allow_network: false,
+                extra_ro_binds: vec![helper],
+            };
+            let boxed = rt_installer::InstallerSandbox::new(bwrap, &shim).wrap(cmd, &env, &opts);
+            assert!(
+                boxed.get_program() != "/bin/sh",
+                "the installer sandbox refused: {boxed:?}"
+            );
+            boxed
+        } else {
+            let sb = rt_sandbox::AppSandbox::new(
+                bwrap,
+                rt_sandbox::Permissions::default(),
+                vec![helper],
+                std::sync::Arc::new(ShimHost(shim.clone())),
+            );
+            sb.render(&cmd).expect("the default profile renders")
+        };
         eprintln!(
-            "launched by {:?} (systemd-run: the task limit's scope)",
+            "launched by {:?} (systemd-run: the task limit's scope; the installer sandbox has none)",
             boxed.get_program()
         );
         let all: Vec<&std::ffi::OsStr> = boxed.get_args().collect();
@@ -1413,7 +1447,15 @@ mod syscall_escape {
         if !bwrap_works(test) || !seccomp_works(test) {
             return;
         }
-        let (f, u) = (in_sandbox(&["calls"], false), in_sandbox(&["calls"], true));
+        check_rows(Profile::App);
+    }
+
+    /// Every [`ROWS`] row through `profile` with the shim and with bwrap alone (the oracle); fails on any mismatch.
+    fn check_rows(profile: Profile) {
+        let (f, u) = (
+            in_profile(profile, &["calls"], false),
+            in_profile(profile, &["calls"], true),
+        );
         let (f, u) = (rows(&f), rows(&u));
         assert_eq!(f.len(), ROWS.len(), "{f:?}");
         assert_eq!(u.len(), ROWS.len(), "{u:?}");
@@ -1446,6 +1488,18 @@ mod syscall_escape {
             }
         }
         assert!(bad.is_empty(), "SECCOMP HOLE or broken control:\n{}", bad.join("\n"));
+    }
+
+    /// Phase 5B Task 6: the installer sandbox (vendor installers, uninstallers, `deps --install` installer packages and
+    /// their `reg.exe` steps) runs behind the same shim: every row, with the same oracle. Before Task 6 the installer
+    /// sandbox was bubblewrap alone, which is this test's control column (`unshare(NEWUSER)` succeeded there).
+    #[test]
+    fn syscall_escape_4_the_installer_sandbox_denies_the_same_calls_through_the_shim() {
+        let test = "syscall_escape_4_the_installer_sandbox_denies_the_same_calls_through_the_shim";
+        if !bwrap_works(test) || !seccomp_works(test) {
+            return;
+        }
+        check_rows(Profile::Installer);
     }
 
     /// Phase 5B: the Landlock half of the ptrace decision (`ptrace` is allowed for Wine's requests only inside an

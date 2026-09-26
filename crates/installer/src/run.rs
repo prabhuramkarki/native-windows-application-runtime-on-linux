@@ -55,7 +55,7 @@ pub fn stage_file(env: &AppEnv, dir: &str, file_name: &str, src: &mut dyn Read) 
 /// Runs `exe_unix` with `args` (each one argv element) through `backend.command` (cwd `drive_c`), wrapped by
 /// [`CompatBackend::settle`] BEFORE the sandbox sees it (a `--unshare-pid` sandbox kills a lingering `wineserver`
 /// the instant its direct child exits, so the wait for it must happen inside the same process tree), then inside
-/// [`InstallerSandbox`] (`bwrap`, with `opts`), and waits.
+/// `sandbox` (with `opts`), and waits.
 ///
 /// `deadline: None` waits as long as it takes (Phase 3: an interactive installer GUI can take any time).
 /// `Some(d)`: once `d` has passed the sandbox is killed and reaped and `Ok(None)` is returned. Killing `bwrap`
@@ -66,7 +66,7 @@ pub fn run_sandboxed(
     backend: &dyn CompatBackend,
     launcher: &Launcher,
     env: &AppEnv,
-    bwrap: &Path,
+    sandbox: &InstallerSandbox,
     exe_unix: &Path,
     args: &[OsString],
     opts: SandboxOpts,
@@ -74,7 +74,7 @@ pub fn run_sandboxed(
 ) -> Result<Option<ExitStatus>, InstallerError> {
     let sandboxed = launcher
         .clone()
-        .with_sandbox(InstallerSandbox::new(bwrap).for_launcher(env.clone(), opts));
+        .with_sandbox(sandbox.clone().for_launcher(env.clone(), opts));
     let cmd = backend.command(env, exe_unix, &env.drive_c(), args, &RunOpts::default())?;
     let cmd = backend.settle(cmd);
     let mut running = sandboxed.spawn(cmd, env, LogSink::LogOnly)?;
