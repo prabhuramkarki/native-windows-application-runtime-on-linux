@@ -17,6 +17,9 @@ pub trait Host: Send + Sync {
     fn resolve(&self, p: &Path) -> Option<PathBuf>;
     /// The real uid (the fallback runtime directory is `/run/user/<uid>`).
     fn uid(&self) -> u32;
+    /// This runtime's own executable, every symlink resolved (the sandbox runs it as its `sandbox-init` shim);
+    /// `None` when it cannot be resolved or was deleted or replaced since it started.
+    fn runtime_exe(&self) -> Option<PathBuf>;
 }
 
 /// This process's environment and the real filesystem.
@@ -43,5 +46,16 @@ impl Host for RealHost {
     fn uid(&self) -> u32 {
         // SAFETY: getuid cannot fail and touches no memory.
         unsafe { libc::getuid() }
+    }
+    fn runtime_exe(&self) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        // `/proc/self/exe` of a binary replaced since (a rebuild, a package upgrade) reads `<path> (deleted)`: the
+        // file at that path is not this program, so it is refused rather than run as the shim.
+        let exe = std::env::current_exe().ok()?;
+        if exe.as_os_str().as_bytes().ends_with(b" (deleted)") {
+            return None;
+        }
+        let real = std::fs::canonicalize(exe).ok()?;
+        self.is_file(&real).then_some(real)
     }
 }

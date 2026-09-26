@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod bpf_interp;
 pub mod host;
+pub mod init;
 pub mod landlock;
 pub mod permissions;
 pub mod render;
@@ -38,6 +39,50 @@ pub fn find_bwrap_on_path() -> Option<PathBuf> {
     find_bwrap(&|k| std::env::var_os(k), &|p: &Path| {
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     })
+}
+
+/// The in-kernel layers the `sandbox-init` shim adds, probed on the host (the shim itself reports nothing): one
+/// `seccomp: ...` and one `landlock: ...` line for `runtime sandbox` and `doctor`, and whether both are fully there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardening {
+    pub seccomp: String,
+    pub landlock: String,
+    pub complete: bool,
+}
+
+pub fn hardening() -> Hardening {
+    let (seccomp, seccomp_ok) = match seccomp::host_arch().and_then(|a| seccomp::build_filter(a).map(|_| a)) {
+        Ok(a) => (
+            format!("seccomp: enforced ({}, {} rules)", a.name(), seccomp::DENIED.len()),
+            true,
+        ),
+        Err(e) => (
+            format!("seccomp: UNAVAILABLE ({e}); `runtime run` refuses to start programs"),
+            false,
+        ),
+    };
+    let (landlock, landlock_ok) = match landlock::host_state() {
+        landlock::HostState::Abi(abi) => (
+            format!("landlock: ABI {abi} (fs); ptrace reaches only the app's own processes"),
+            true,
+        ),
+        landlock::HostState::Unavailable(why) => (
+            format!(
+                "landlock: unavailable: {why}; only the mounts confine files, and ptrace stays denied (Windows \
+                 programs cannot read or write other processes' memory)"
+            ),
+            false,
+        ),
+        landlock::HostState::Error(e) => (
+            format!("landlock: {e}; `runtime run` refuses to start programs while this fails"),
+            false,
+        ),
+    };
+    Hardening {
+        seccomp,
+        landlock,
+        complete: seccomp_ok && landlock_ok,
+    }
 }
 
 /// How long [`probe`] waits for `bwrap`.

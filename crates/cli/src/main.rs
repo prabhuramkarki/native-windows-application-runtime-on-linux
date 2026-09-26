@@ -12,6 +12,7 @@ mod remove;
 mod run;
 mod safe;
 mod sandbox;
+mod sandbox_init;
 mod uninstall;
 
 use clap::{Parser, Subcommand};
@@ -157,6 +158,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// The sandbox's own launcher (runs inside bubblewrap; see `rt_sandbox::init`). Not for people.
+    #[command(hide = true, disable_help_flag = true)]
+    SandboxInit {
+        /// The argument block the sandbox renderer built, passed on unparsed
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
     /// Show the newest log of an app (its last run's stderr)
     Logs {
         app: String,
@@ -260,6 +268,7 @@ fn main() -> ExitCode {
         Cmd::Sandbox { app } => sandbox::run(&app).map(|()| 0),
         Cmd::Compat { json } => compat::run(json).map(|()| 0),
         Cmd::Graphics(GraphicsCmd::Info) => graphics::info(),
+        Cmd::SandboxInit { args } => sandbox_init::run(&args),
     };
     match result {
         Ok(code) => ExitCode::from(code),

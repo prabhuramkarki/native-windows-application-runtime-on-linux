@@ -161,6 +161,12 @@ impl Suite {
     }
 }
 
+/// Whether the shim enforces Landlock on this host (it then also refuses to list bwrap's skeleton directories: the
+/// parents of a bound directory, which have no rule).
+fn landlock() -> bool {
+    rt_sandbox::landlock::abi_version().is_ok()
+}
+
 /// Wine's NT path for a host path: `\\?\unix\home\...`.
 fn unix(p: &Path) -> String {
     format!("\\\\?\\unix{}", p.display().to_string().replace('/', "\\"))
@@ -211,10 +217,15 @@ fn e2e_real_wine_sandbox_3_cannot_see_another_apps_prefix() {
     s.fails_boxed(&s.id, &["read", &unix(&canary)]);
     s.works_unboxed(&s.id, &["read", &unix(&canary)]);
 
-    // The apps directory lists only this app from inside (bwrap's skeleton for the bound prefix), both from outside.
+    // The apps directory is bwrap's skeleton for the bound prefix: it lists only this app from inside, or (with
+    // Landlock, which has no rule for the skeleton) cannot be listed at all; both from outside.
     let apps = unix(&s.rig.apps());
-    let inside = s.works_boxed(&s.id, &["list", &apps]).out();
-    assert!(inside.contains(&s.id) && !inside.contains(&other), "{inside}");
+    if landlock() {
+        s.fails_boxed(&s.id, &["list", &apps]);
+    } else {
+        let inside = s.works_boxed(&s.id, &["list", &apps]).out();
+        assert!(inside.contains(&s.id) && !inside.contains(&other), "{inside}");
+    }
     let outside = s.works_unboxed(&s.id, &["list", &apps]).out();
     assert!(outside.contains(&s.id) && outside.contains(&other), "{outside}");
     s.finish(&[&other]);
@@ -285,10 +296,14 @@ fn e2e_real_wine_sandbox_6_a_granted_directory_is_exactly_what_is_shared() {
     s.works_boxed(&s.id, &["read", &inside]);
     s.fails_boxed(&s.id, &["write", &unix(&new)]);
     assert!(!new.exists(), "a write through a read-only grant reached the host");
-    // The parent is not shared: its other entries stay invisible.
+    // The parent is not shared: its other entries stay invisible (with Landlock it cannot even be listed).
     s.fails_boxed(&s.id, &["read", &unix(&sibling)]);
-    let listed = s.works_boxed(&s.id, &["list", &unix(&parent)]).out();
-    assert!(listed.contains("granted") && !listed.contains("sibling"), "{listed}");
+    if landlock() {
+        s.fails_boxed(&s.id, &["list", &unix(&parent)]);
+    } else {
+        let listed = s.works_boxed(&s.id, &["list", &unix(&parent)]).out();
+        assert!(listed.contains("granted") && !listed.contains("sibling"), "{listed}");
+    }
     s.works_unboxed(&s.id, &["read", &unix(&sibling)]);
 
     s.set(&[&format!("fs+={grant}:rw")]).expect_ok();
@@ -336,6 +351,49 @@ fn e2e_real_wine_sandbox_8_unsandboxed_really_is_unsandboxed_and_says_so() {
     // The sandboxed run of the same listing does not warn and does not see it.
     let ran = s.fails_boxed(&s.id, &["list", &unix(s.base.path())]);
     assert!(!ran.err().contains(WARNING), "{}", ran.report());
+    s.finish(&[]);
+}
+
+/// Phase 5B: the Windows program (a Wine process) runs under the `sandbox-init` shim's seccomp filter with no new
+/// privileges; unsandboxed it does not.
+#[test]
+#[ignore = "needs Wine, bwrap and fixtures; run with --ignored --test-threads=1"]
+fn e2e_real_wine_sandbox_9_the_program_runs_under_the_seccomp_filter() {
+    let Some(s) = Suite::new("e2e_real_wine_sandbox_9_the_program_runs_under_the_seccomp_filter") else {
+        return;
+    };
+    let boxed = s.works_boxed(&s.id, &["status"]).out();
+    assert!(
+        boxed.contains("Seccomp:\t2") && boxed.contains("NoNewPrivs:\t1"),
+        "{boxed}"
+    );
+    let unboxed = s.works_unboxed(&s.id, &["status"]).out();
+    assert!(unboxed.contains("Seccomp:\t0"), "{unboxed}");
+    s.finish(&[]);
+}
+
+/// Phase 5B: what wineserver does with `ptrace` (another process's memory; a suspended thread's registers and
+/// hardware breakpoints) still works under the filter, because Landlock confines `ptrace` to the app's own
+/// processes (see `rt_sandbox::seccomp`). Without Landlock `ptrace` stays denied and the memory modes fail.
+#[test]
+#[ignore = "needs Wine, bwrap and fixtures; run with --ignored --test-threads=1"]
+fn e2e_real_wine_sandbox_10_cross_process_memory_and_thread_contexts_work() {
+    let Some(s) = Suite::new("e2e_real_wine_sandbox_10_cross_process_memory_and_thread_contexts_work") else {
+        return;
+    };
+    let landlock = landlock();
+    for mode in ["readmem", "writemem", "threadctx", "dbgregs"] {
+        s.works_unboxed(&s.id, &[mode]);
+        assert!(
+            s.rig.wait_for_no_wineserver(Duration::from_secs(15)),
+            "wineserver lingers"
+        );
+        if landlock || !mode.ends_with("mem") {
+            s.works_boxed(&s.id, &[mode]);
+        } else {
+            s.fails_boxed(&s.id, &[mode]);
+        }
+    }
     s.finish(&[]);
 }
 

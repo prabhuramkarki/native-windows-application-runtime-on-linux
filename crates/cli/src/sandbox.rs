@@ -22,7 +22,7 @@
 use crate::CmdError;
 use crate::safe::safe;
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
-use rt_sandbox::{Access, AppSandbox, Network, Permissions, RealHost, load, load_opt_raw};
+use rt_sandbox::{Access, AppSandbox, Host, Network, Permissions, RealHost, load, load_opt_raw};
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
@@ -163,6 +163,13 @@ fn marked(lstat: std::io::Result<std::fs::Metadata>) -> Result<bool, String> {
     }
 }
 
+/// `doctor`'s hardening input: seccomp and Landlock in one phrase, `Err` when either is not fully there.
+pub(crate) fn doctor_hardening() -> Result<String, String> {
+    let h = rt_sandbox::hardening();
+    let text = format!("{}; {}", h.seccomp, h.landlock);
+    if h.complete { Ok(text) } else { Err(text) }
+}
+
 /// `doctor`'s sandbox input: bwrap works (with `env`: and the app's profile in a few words), or why not.
 pub(crate) fn doctor_state(env: Option<&AppEnv>) -> Result<Option<String>, String> {
     working_bwrap().map_err(|why| format!("unavailable: {why}"))?;
@@ -195,6 +202,17 @@ pub fn run(app: &str) -> Result<(), CmdError> {
             rt_sandbox::find_bwrap_on_path().unwrap_or_else(|| PathBuf::from("bwrap"))
         }
     };
+    let h = rt_sandbox::hardening();
+    out += &format!("{}\n{}\n", safe(&h.seccomp), safe(&h.landlock));
+    match RealHost.runtime_exe() {
+        Some(exe) => {
+            out += &format!(
+                "shim: {} sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)\n",
+                safe(&exe.to_string_lossy())
+            )
+        }
+        None => out += "shim: UNAVAILABLE: the runtime executable cannot be resolved; `runtime run` refuses\n",
+    }
     let (perms, source) = profile(&env)?;
     out += &format!("profile ({source}): {}\n", summary(&perms));
     for g in &perms.filesystem {
