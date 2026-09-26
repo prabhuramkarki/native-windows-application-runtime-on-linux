@@ -188,6 +188,7 @@ fn enforce(
         };
         // SAFETY: an all-zero `stat` is a valid value; fstat fills it from a live descriptor (O_PATH suffices).
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `target` is a live descriptor and `st` a live, writable `stat` the kernel fills.
         if unsafe { libc::fstat(target.as_raw_fd(), &mut st) } != 0 {
             return Err(Fail::Rule(i, errno()));
         }

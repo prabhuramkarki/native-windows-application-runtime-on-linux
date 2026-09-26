@@ -200,12 +200,21 @@ fn in_child(body: impl FnOnce() -> [i32; SLOTS]) -> [i32; SLOTS] {
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-        // SAFETY: `out` is a live array of that many bytes; `_exit` skips every atexit handler and destructor.
+        // SAFETY: `out` and the message are live byte ranges of the lengths given; `_exit` skips every atexit
+        // handler and destructor. A panic reports a fixed message without allocating and exits 101 (the parent
+        // then fails with "the child reported nothing").
         unsafe {
-            if let Ok(out) = out {
-                libc::write(fds[1], out.as_ptr().cast(), size_of_val(&out));
+            match out {
+                Ok(out) => {
+                    libc::write(fds[1], out.as_ptr().cast(), size_of_val(&out));
+                    libc::_exit(0);
+                }
+                Err(_) => {
+                    const MSG: &[u8] = b"landlock test child panicked\n";
+                    libc::write(2, MSG.as_ptr().cast(), MSG.len());
+                    libc::_exit(101);
+                }
             }
-            libc::_exit(0);
         }
     }
     assert!(pid > 0, "fork failed: {}", std::io::Error::last_os_error());
@@ -354,7 +363,11 @@ fn a_read_write_rule_confines_the_process_to_its_tree() {
     assert_eq!(&got[3..7], [0; 4], "read, write, truncate and create inside the rule");
     assert_eq!(&got[7..9], [EACCES; 2], "read and create outside the rule");
     // EXDEV (ABI 1, or a rename Landlock cannot prove safe) or EACCES: the exact errno depends on the ABI
-    assert_ne!(got[9], 0, "rename out of the rule's tree");
+    assert!(
+        matches!(got[9], libc::EXDEV | EACCES),
+        "rename out of the rule's tree: {}",
+        got[9]
+    );
     assert_eq!(got[10], 0, "unlink inside the rule");
     assert!(t.path("a/mv.txt").exists() && !t.path("b/moved").exists());
     t.assert_parent_unrestricted();
@@ -684,5 +697,38 @@ fn device_ioctls_need_a_read_write_rule_from_abi_5() {
         });
         assert_eq!(&got[..2], [0, want], "{access:?} /dev");
     }
+    t.assert_parent_unrestricted();
+}
+
+#[test]
+fn ioctls_on_a_regular_file_are_not_device_ioctls() {
+    let Some(_) = host_abi("ioctls_on_a_regular_file_are_not_device_ioctls") else {
+        return;
+    };
+    let t = Tree::new();
+    let ok = t.c("a/ok.txt");
+    // FIONREAD on a regular file: 0 and the bytes left to read, or the errno.
+    let fionread = |p: &CStr| -> [i32; 2] {
+        // SAFETY: `p` is NUL-terminated and live; FIONREAD writes one int to a live local.
+        let fd = unsafe { libc::open(p.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return [1000 + errno(), 0];
+        }
+        let mut n: libc::c_int = 0;
+        let r = rc(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) });
+        // SAFETY: `fd` was opened above and nothing else uses it.
+        unsafe { libc::close(fd) };
+        [r, n]
+    };
+    assert_eq!(fionread(&ok), [0, 2]);
+    // ReadExec never grants IOCTL_DEV, yet the file's ioctl works: IOCTL_DEV covers device files only.
+    let rules = t.rules(&[("a", Access::ReadExec)]);
+    let got = in_child(|| {
+        let mut skipped = [false; 1];
+        let [kind, _] = enforce_real(&rules, &mut skipped);
+        let [r, n] = fionread(&ok);
+        [kind, r, n, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    });
+    assert_eq!(&got[..3], [0, 0, 2], "enforced, and FIONREAD on a/ok.txt still works");
     t.assert_parent_unrestricted();
 }
