@@ -512,6 +512,11 @@ its own process group, and bounds the run: 10 s, 64 KiB of output; the reader is
 own session can hold the pipe), so every wait is bounded. The output is untrusted and is used for nothing but a
 yes/no/unknown verdict on Vulkan (and the device lines shown to the user); it never blocks anything when unknown, and
 the verdict only gates the plan's `blocked` state for packages with `min_vulkan`.
+The runner lives in `rt_api::host::graphics`: the CLI probes once per command, the API (`rt_api::Runtime`, and so a
+long-lived daemon) caches the result for 30 s per `Runtime` and probes again after that, one probe at a time (callers
+wait for the probe in progress). Known bound: a `vulkaninfo` (or an ICD helper it starts) that leaves its session and
+keeps stdout open leaves one detached reader thread and one pipe descriptor behind per probe until it closes the
+pipe; a long-lived process can accumulate at most one such leak per 30 s.
 
 **Graphics driver setting (Phase 4C).** `runtime display <app> <auto|x11|wayland>` runs the prefix's own `reg.exe`
 through Wine, unsandboxed and unpinned (a program can plant a native one), like `runtime run`, so it is not a

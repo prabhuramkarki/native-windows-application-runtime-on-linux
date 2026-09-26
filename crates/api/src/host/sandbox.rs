@@ -7,7 +7,7 @@
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Store};
 use rt_sandbox::{AppSandbox, Hardening, Host, Network, Permissions, RealHost, ScopeSupport, load, load_opt_raw};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -136,14 +136,51 @@ pub struct Status {
     pub argv: Vec<OsString>,
 }
 
-/// The sandbox of the installed app `env` (module docs). `Err` (as text) when its profile is refused, its program
+/// The real host, except that the `sandbox-init` shim is the given `runtime` executable (resolved and checked like
+/// [`RealHost::runtime_exe`] checks its own): a daemon or GUI that links this crate is not `runtime` itself.
+struct ShimHost(PathBuf);
+
+impl Host for ShimHost {
+    fn env(&self, name: &str) -> Option<OsString> {
+        RealHost.env(name)
+    }
+    fn exists(&self, p: &Path) -> bool {
+        RealHost.exists(p)
+    }
+    fn is_socket(&self, p: &Path) -> bool {
+        RealHost.is_socket(p)
+    }
+    fn is_file(&self, p: &Path) -> bool {
+        RealHost.is_file(p)
+    }
+    fn resolve(&self, p: &Path) -> Option<PathBuf> {
+        RealHost.resolve(p)
+    }
+    fn uid(&self) -> u32 {
+        RealHost.uid()
+    }
+    fn runtime_exe(&self) -> Option<PathBuf> {
+        let real = std::fs::canonicalize(&self.0).ok()?;
+        RealHost.is_file(&real).then_some(real)
+    }
+    fn scopes(&self) -> Result<ScopeSupport, String> {
+        RealHost.scopes()
+    }
+}
+
+/// The sandbox of the installed app `env` (module docs). `runtime_exe` is the `runtime` binary the shim would be
+/// (`None`: this process, which is right only when it IS `runtime`). `Err` (as text) when its profile is refused, its program
 /// cannot be resolved, or Wine cannot describe the command.
-pub fn status(store: &Store, env: &AppEnv) -> Result<Status, String> {
+pub fn status(store: &Store, env: &AppEnv, runtime_exe: Option<&Path>) -> Result<Status, String> {
     // The profile first: a refused one is the answer, before any probe runs.
     let (profile, source) = profile(env)?;
     let bwrap = working_bwrap();
     let hardening = rt_sandbox::hardening();
-    let shim = RealHost.runtime_exe();
+    let host: Arc<dyn Host> = match runtime_exe {
+        Some(p) => Arc::new(ShimHost(p.to_owned())),
+        None => Arc::new(RealHost),
+    };
+    let shim = host.runtime_exe();
     let scopes = RealHost.scopes();
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(store, env.id(), backend_wine::BACKEND_ID).map_err(|e| e.to_string())?;
@@ -179,7 +216,7 @@ pub fn status(store: &Store, env: &AppEnv) -> Result<Status, String> {
         Ok(b) => b.clone(),
         Err(_) => rt_sandbox::find_bwrap_on_path().unwrap_or_else(|| PathBuf::from("bwrap")),
     };
-    let sb = AppSandbox::new(path, profile.clone(), dll_dirs, Arc::new(RealHost));
+    let sb = AppSandbox::new(path, profile.clone(), dll_dirs, host);
     Ok(Status {
         refused: sb.render(&cmd).err().map(|e| e.to_string()),
         skipped: sb.skipped(&cmd),

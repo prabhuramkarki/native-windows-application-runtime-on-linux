@@ -224,6 +224,8 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/installer`, `crates/desktop`: installer pipeline and sandbox (Phase 3), desktop entries.
 - `crates/deps`: the dependency engine: bundled manifest, resolver, verified HTTPS fetch, archive and installer
   package installers (Phase 4A).
+- `crates/api`: `rt_api`, the typed, sanitised, read-only API (`Runtime`: apps, permissions, doctor, dependency
+  plan, sandbox and graphics info, compatibility matrix) and the host-fact gathering the CLI shares (`rt_api::host`).
 - `crates/cli`: the `runtime` binary, a thin front end over the above.
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
 

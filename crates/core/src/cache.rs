@@ -53,7 +53,7 @@ mod tests {
             "expired: probed again"
         );
         assert_eq!(*c.get_at(t0 + Duration::from_secs(31), probe), 2);
-        // a clock that went backwards is not "expired"
+        // a caller whose `now` predates the stored probe (it waited on the lock) gets that probe
         assert_eq!(*c.get_at(t0, probe), 2);
         assert_eq!(runs.get(), 2);
     }

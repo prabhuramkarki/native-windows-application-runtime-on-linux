@@ -4387,7 +4387,11 @@ fn api_child() {
     let Some(call) = std::env::var_os("RT_API_CALL") else {
         return;
     };
-    let rt = rt_api::Runtime::open().unwrap();
+    let mut rt = rt_api::Runtime::open().unwrap();
+    // A caller that is not `runtime` (this test binary, like a daemon) names the `runtime` binary as the shim.
+    if let Some(exe) = std::env::var_os("RT_API_RUNTIME_EXE") {
+        rt = rt.with_runtime_exe(exe.into());
+    }
     let arg = std::env::var("RT_API_ARG").ok();
     let v = match call.to_str().unwrap() {
         "doctor" => serde_json::to_value(rt.doctor(match arg {
@@ -4661,7 +4665,9 @@ fn api_sandbox_info_equals_runtime_sandbox_and_fails_closed() {
     // With a (fake) bwrap: the view is the CLI's report, line for line.
     fake_bwrap(&r);
     let before = snapshot(&r);
-    let v = api(&r.cmd(), "sandbox", Some(&id)).unwrap();
+    let mut c = r.cmd();
+    c.env("RT_API_RUNTIME_EXE", runtime_exe());
+    let v = api(&c, "sandbox", Some(&id)).unwrap();
     assert_eq!(snapshot(&r), before, "sandbox_info wrote something");
     assert_clean_json(&v, "sandbox");
     let cli = s(&r.rt(&["sandbox", &id]).stdout);
@@ -4683,21 +4689,25 @@ fn api_sandbox_info_equals_runtime_sandbox_and_fails_closed() {
     let notes = lines("note: ");
     assert_eq!(serde_json::json!(notes), v["caveats"], "{cli}");
     assert_eq!(lines("seccomp: ").len() + lines("landlock: ").len(), 2);
-    // The shim is the calling process's own executable: here the test binary, for `runtime` the runtime.
+    // The supplied `runtime` is the shim, not this test binary: the command is exactly `runtime sandbox`'s.
     let me = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert!(!v.to_string().contains(me.to_str().unwrap()), "{v}");
+    assert!(v["refused"].is_null(), "{v}");
     let quoted: Vec<String> = v["command"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|a| {
-            let a = a
-                .as_str()
-                .unwrap()
-                .replace(me.to_str().unwrap(), runtime_exe().to_str().unwrap());
-            format!("'{}'", a.replace('\'', r"'\''"))
-        })
+        .map(|a| format!("'{}'", a.as_str().unwrap().replace('\'', r"'\''")))
         .collect();
     assert_eq!(lines("command: "), [quoted.join(" ")]);
+    // A supplied path that is not a file: the sandbox is refused for it (fail closed), never this binary used.
+    let mut c = r.cmd();
+    c.env("RT_API_RUNTIME_EXE", r.root.join("no-such-runtime"));
+    let v = api(&c, "sandbox", Some(&id)).unwrap();
+    assert!(
+        v["refused"].as_str().unwrap().contains("runtime executable") && !v.to_string().contains(me.to_str().unwrap()),
+        "{v}"
+    );
     // Wine missing: part of the answer, with the install hint; the command keeps its shape.
     let mut c = r.cmd();
     c.env("RUNTIME_WINE", r.root.join("no-such-wine"));
@@ -4775,5 +4785,67 @@ fn api_graphics_info_follows_the_loader_override_like_graphics_info() {
     assert!(
         cli.starts_with("Vulkan: unusable") && cli.contains(v["reason"].as_str().unwrap()),
         "{cli}\n{v}"
+    );
+}
+
+/// Hostile metadata (version, executable path) and a hostile grant path reach `doctor` and `sandbox_info` only
+/// cleaned: every string of their answers (errors included) is free of control and format characters.
+#[test]
+fn api_doctor_and_sandbox_info_clean_a_hostile_version_executable_and_grant() {
+    let r = rig();
+    fake_bwrap(&r);
+    let dir = r.plant("vile", "Vile");
+    let md_path = dir.join("metadata.json");
+    let mut md: serde_json::Value = serde_json::from_slice(&fs::read(&md_path).unwrap()).unwrap();
+    md["version"] = "9\n\u{202e}\u{1b}[31m\u{9b}2J".into();
+    md["executable"] = "C:\\Program Files\\x\\a\u{202e}b\u{200b}.exe".into();
+    fs::write(&md_path, serde_json::to_vec(&md).unwrap()).unwrap();
+    let doc = doctor_agrees(&r, || r.desktop(), Some("vile"));
+    assert_eq!(doc["subject"]["version"], "9[31m2J");
+    // The missing executable is named in the program check, escaped by core (printable) and walked clean above.
+    assert!(
+        triples(&doc)
+            .iter()
+            .any(|t| t.0 == "program" && t.2.contains(r"a\u{202e}b")),
+        "{doc}"
+    );
+    // sandbox_info cannot resolve that program: an error, cleaned.
+    let e = api(&r.cmd(), "sandbox", Some("vile")).unwrap_err();
+    assert_clean_json(&e, "sandbox error");
+    assert_eq!(e["kind"], "unavailable");
+    // A real app whose permissions.toml grants a directory with a bidi override in its name: refused (the grant
+    // validator never accepts such a path), and the refusal that quotes it is walked clean.
+    let id = r.install();
+    let home = r.grants.path().canonicalize().unwrap();
+    let odd = home.join("od\u{202e}d");
+    fs::create_dir(&odd).unwrap();
+    fs::write(
+        r.apps().join(&id).join("permissions.toml"),
+        format!(
+            "version = 1\n[[filesystem]]\npath = \"{}/od\\u202ed\"\naccess = \"ro\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let mut c = r.desktop();
+    c.env("HOME", &home);
+    let e = api(&c, "sandbox", Some(&id)).unwrap_err();
+    assert_clean_json(&e, "grant error");
+    assert!(e["message"].as_str().unwrap().contains("invisible characters"), "{e}");
+    // doctor: the sandbox check warns with the (cut) refusal, equal to the CLI's and walked clean.
+    let doc = doctor_agrees(
+        &r,
+        || {
+            let mut c = r.desktop();
+            c.env("HOME", &home);
+            c
+        },
+        Some(&id),
+    );
+    assert!(
+        triples(&doc)
+            .iter()
+            .any(|t| t.1 == "warn" && t.2.contains("cannot read the profile")),
+        "{doc}"
     );
 }

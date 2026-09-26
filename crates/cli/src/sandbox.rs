@@ -181,7 +181,10 @@ fn shell_quote(s: &OsStr) -> String {
 pub fn run(app: &str) -> Result<(), CmdError> {
     let store = crate::store()?;
     let env = crate::deps::app_env(&store, app)?;
-    crate::emit(&format_status(&env, &rt_api::host::sandbox::status(&store, &env)?))
+    crate::emit(&format_status(
+        &env,
+        &rt_api::host::sandbox::status(&store, &env, None)?,
+    ))
 }
 
 /// The report of `runtime sandbox`. Every untrusted piece goes through `safe`; the line breaks are this function's own.
