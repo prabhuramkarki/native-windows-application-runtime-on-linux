@@ -202,8 +202,16 @@ mod tests {
     fn run(script: &str, timeout: Duration) -> Option<String> {
         let dir = tempfile::tempdir().unwrap();
         let tool = dir.path().join("vulkaninfo");
-        fs::write(&tool, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::write(&tool, format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{script}\n")).unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may have forked while the file was open for writing; that child holds the write fd
+        // until its exec, and executing the script meanwhile fails with ETXTBSY. Wait until it can be executed.
+        for _ in 0..500 {
+            match std::process::Command::new(&tool).arg("--probe").status() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => thread::sleep(Duration::from_millis(4)),
+                _ => break,
+            }
+        }
         run_tool(tool.as_os_str(), timeout)
     }
     const T: Duration = Duration::from_secs(10);

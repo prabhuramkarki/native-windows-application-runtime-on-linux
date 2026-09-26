@@ -696,6 +696,7 @@ name = "runtime-api"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "runtime-backend-wine",
  "runtime-core",
  "runtime-sandbox",
  "serde",

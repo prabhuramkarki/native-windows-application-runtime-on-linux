@@ -21,10 +21,14 @@
 //! --install`) run through the SAME `AppSandbox` ([`helper_launcher`]); installer packages and uninstallers already
 //! run in the installer sandbox. `wineserver -k` is not a Wine session (no Windows code runs). What stays
 //! unsandboxed: `runtime run --unsandboxed` (it says so), and apps that never ran sandboxed. See docs/SECURITY.md.
+//!
+//! The probes and the status of `runtime sandbox` / `doctor` are gathered by `rt_api::host::sandbox`; this module
+//! builds the run's sandbox, the helper launcher, and formats.
 use crate::CmdError;
 use crate::safe::safe;
-use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
-use rt_sandbox::{Access, AppSandbox, Host, Limits, Network, Permissions, RealHost, Tasks, load, load_opt_raw};
+use rt_api::host::sandbox::{profile, summary, working_bwrap};
+use rt_core::{AppEnv, CompatBackend, Launcher, Sandbox, Store, Target};
+use rt_sandbox::{Access, AppSandbox, Limits, Permissions, RealHost, Tasks};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,45 +40,8 @@ pub(crate) use rt_sandbox::MARKER;
 const INSTALL_HINT: &str =
     "Install bubblewrap (`sudo apt install bubblewrap`) or rerun with --unsandboxed (NOT sandboxed)";
 
-/// bwrap on `PATH` that can really create a sandbox, or why not.
-fn working_bwrap() -> Result<PathBuf, String> {
-    let bwrap = rt_sandbox::find_bwrap_on_path().ok_or("bwrap is not on PATH")?;
-    rt_sandbox::probe(&bwrap)?;
-    Ok(bwrap)
-}
-
-/// The app's profile (the default without a `permissions.toml`), or why it is refused.
-fn profile(env: &AppEnv) -> Result<(Permissions, &'static str), String> {
-    let refused = |e: rt_sandbox::PermError| {
-        format!(
-            "the app's permissions.toml is refused: {e} (`runtime permissions {} --reset` deletes it)",
-            env.id()
-        )
-    };
-    // The grants are only checked against the host (which needs `HOME`) when there is a file.
-    if load_opt_raw(env.root()).map_err(refused)?.is_none() {
-        return Ok((Permissions::default(), "default"));
-    }
-    let ctx = crate::permissions::ctx().map_err(|e| e.to_string())?;
-    Ok((load(env.root(), &ctx).map_err(refused)?, "permissions.toml"))
-}
-
 fn app_sandbox(bwrap: PathBuf, perms: Permissions, backend: &dyn CompatBackend) -> AppSandbox {
     AppSandbox::new(bwrap, perms, backend.dll_dirs(), Arc::new(RealHost))
-}
-
-/// `network deny, display on, audio on, gpu on, 0 host directories`.
-fn summary(p: &Permissions) -> String {
-    let on = |b: bool| if b { "on" } else { "off" };
-    let n = p.filesystem.len();
-    format!(
-        "network {}, display {}, audio {}, gpu {}, {n} host director{}",
-        if p.network == Network::Allow { "allow" } else { "deny" },
-        on(p.display),
-        on(p.audio),
-        on(p.gpu),
-        if n == 1 { "y" } else { "ies" }
-    )
 }
 
 /// The sandbox of `runtime run` for `found` (module docs), or the error that stops the run, and whether it sets a
@@ -161,21 +128,6 @@ fn marked(lstat: std::io::Result<std::fs::Metadata>) -> Result<bool, String> {
     }
 }
 
-/// `doctor`'s hardening input: seccomp and Landlock in one phrase, `Err` when either is not fully there.
-pub(crate) fn doctor_hardening() -> Result<String, String> {
-    let h = rt_sandbox::hardening();
-    let text = match &h.caveat {
-        // First, so the 300-byte cut never drops it.
-        Some(c) => format!("{c}; {}; {}", h.seccomp, h.landlock),
-        None => format!("{}; {}", h.seccomp, h.landlock),
-    };
-    if h.complete && h.caveat.is_none() {
-        Ok(text)
-    } else {
-        Err(text)
-    }
-}
-
 /// The one-line hardening caveat to print at the start of any command that runs Windows code (`rt_sandbox::hardening`
 /// finds it): on a host with no Landlock and Yama `ptrace_scope` 0 the seccomp filter can be shed through
 /// `/proc/1/mem` ([`rt_sandbox::BYPASS_CAVEAT`]). `None` when the host has no such gap. Pure (takes the probed
@@ -219,53 +171,6 @@ fn limits_section(l: &Limits, scopes: &Result<rt_sandbox::ScopeSupport, String>)
     out
 }
 
-/// `doctor`'s limits input: `systemd-run --user` scopes work, or why not and what that means (with `env`: for that
-/// app, whose explicit limits then refuse every run).
-pub(crate) fn doctor_limits(env: Option<&AppEnv>) -> Result<String, String> {
-    // An unreadable profile is the sandbox check's warning; here it counts as the default.
-    let limits = env
-        .and_then(|e| profile(e).ok())
-        .map(|(p, _)| p.limits)
-        .unwrap_or_default();
-    let refused = |e: &AppEnv| format!("runs of {} will be refused", e.id());
-    let not_applied = "the default task limit (fork-bomb guard) is not applied";
-    match RealHost.scopes() {
-        Ok(s) => match limits
-            .controllers()
-            .into_iter()
-            .find(|c| !s.controllers.iter().any(|h| h == c))
-        {
-            None => Ok(format!(
-                "limits: systemd-run --user available (cgroup controllers: {})",
-                s.controllers.join(" ")
-            )),
-            Some(c) => Err(match env {
-                Some(e) if limits.explicit() => format!(
-                    "limits: systemd-run --user available, but {}: the {c} cgroup controller is not available to \
-                     your user session",
-                    refused(e)
-                ),
-                _ => format!("limits: the {c} cgroup controller is not available to your user session; {not_applied}"),
-            }),
-        },
-        Err(why) => Err(match env {
-            Some(e) if limits.explicit() => format!(
-                "limits: unavailable: {why}; {} (its permissions.toml sets limits)",
-                refused(e)
-            ),
-            _ => format!("limits: unavailable: {why}; {not_applied}"),
-        }),
-    }
-}
-
-/// `doctor`'s sandbox input: bwrap works (with `env`: and the app's profile in a few words), or why not.
-pub(crate) fn doctor_state(env: Option<&AppEnv>) -> Result<Option<String>, String> {
-    working_bwrap().map_err(|why| format!("unavailable: {why}"))?;
-    env.map(|env| profile(env).map(|(p, _)| summary(&p)))
-        .transpose()
-        .map_err(|why| format!("cannot read the profile: {why}"))
-}
-
 /// `'text'` for a POSIX shell.
 fn shell_quote(s: &OsStr) -> String {
     format!("'{}'", s.to_string_lossy().replace('\'', r"'\''"))
@@ -276,26 +181,24 @@ fn shell_quote(s: &OsStr) -> String {
 pub fn run(app: &str) -> Result<(), CmdError> {
     let store = crate::store()?;
     let env = crate::deps::app_env(&store, app)?;
-    let mut out = String::new();
-    let bwrap = match working_bwrap() {
-        Ok(b) => {
-            out += &format!("bubblewrap: {} works\n", safe(&b.to_string_lossy()));
-            b
-        }
-        Err(why) => {
-            out += &format!(
-                "bubblewrap: UNAVAILABLE: {}; `runtime run` refuses to start this app\n",
-                safe(&why)
-            );
-            rt_sandbox::find_bwrap_on_path().unwrap_or_else(|| PathBuf::from("bwrap"))
-        }
+    crate::emit(&format_status(&env, &rt_api::host::sandbox::status(&store, &env)?))
+}
+
+/// The report of `runtime sandbox`. Every untrusted piece goes through `safe`; the line breaks are this function's own.
+fn format_status(env: &AppEnv, st: &rt_api::host::sandbox::Status) -> String {
+    let mut out = match &st.bwrap {
+        Ok(b) => format!("bubblewrap: {} works\n", safe(&b.to_string_lossy())),
+        Err(why) => format!(
+            "bubblewrap: UNAVAILABLE: {}; `runtime run` refuses to start this app\n",
+            safe(why)
+        ),
     };
-    let h = rt_sandbox::hardening();
+    let h = &st.hardening;
     out += &format!("{}\n{}\n", safe(&h.seccomp), safe(&h.landlock));
     if let Some(c) = &h.caveat {
         out += &format!("note: {}\n", safe(c));
     }
-    match RealHost.runtime_exe() {
+    match &st.shim {
         Some(exe) => {
             out += &format!(
                 "shim: {} sandbox-init (bound read-only inside; applies Landlock and seccomp, then runs the program)\n",
@@ -304,53 +207,26 @@ pub fn run(app: &str) -> Result<(), CmdError> {
         }
         None => out += "shim: UNAVAILABLE: the runtime executable cannot be resolved; `runtime run` refuses\n",
     }
-    let (perms, source) = profile(&env)?;
-    out += &format!("profile ({source}): {}\n", summary(&perms));
-    for g in &perms.filesystem {
+    out += &format!("profile ({}): {}\n", st.source, summary(&st.profile));
+    for g in &st.profile.filesystem {
         let access = if g.access == Access::Rw { "rw" } else { "ro" };
         out += &format!("  host directory {} ({access})\n", safe(&g.path.to_string_lossy()));
     }
-    out += &limits_section(&perms.limits, &RealHost.scopes());
-    let launcher = Launcher::new();
-    let p = rt_core::resolve_program(&store, env.id(), backend_wine::BACKEND_ID)?;
-    // The command `run` builds (backend command with the app's real `dotnet`, settled, host environment rules); without Wine, its shape.
-    let (cmd, dll_dirs) = match crate::backend(&launcher) {
-        Ok(b) => (
-            b.settle(b.command(
-                &p.env,
-                &p.exe,
-                &p.cwd,
-                &[],
-                &RunOpts {
-                    dotnet: p.metadata.has_dependency(rt_core::DOTNET_PACKAGE_ID),
-                    ..RunOpts::default()
-                },
-            )?),
-            b.dll_dirs(),
-        ),
-        Err(e) => {
-            out += &format!(
-                "Wine: not found ({}); the command below shows `wine` and no Wine directories\n",
-                safe(&e.to_string())
-            );
-            let mut c = Command::new("wine");
-            c.arg(&p.exe)
-                .current_dir(&p.cwd)
-                .env("WINEPREFIX", env.prefix())
-                .env("HOME", backend_wine::app_home(&env));
-            (c, vec![])
-        }
-    };
-    let cmd = launcher.finalize(cmd);
-    let sb = AppSandbox::new(bwrap, perms, dll_dirs, Arc::new(RealHost));
-    if let Err(e) = sb.render(&cmd) {
-        out += &format!("REFUSED: {}\n", safe(&e.to_string()));
+    out += &limits_section(&st.profile.limits, &st.scopes);
+    if let Err(e) = &st.wine {
+        out += &format!(
+            "Wine: not found ({}); the command below shows `wine` and no Wine directories\n",
+            safe(e)
+        );
     }
-    for s in sb.skipped(&cmd) {
-        out += &format!("skipped: {}\n", safe(&s));
+    if let Some(e) = &st.refused {
+        out += &format!("REFUSED: {}\n", safe(e));
     }
-    for c in sb.caveats(&cmd) {
-        out += &format!("note: {}\n", safe(&c));
+    for s in &st.skipped {
+        out += &format!("skipped: {}\n", safe(s));
+    }
+    for c in &st.caveats {
+        out += &format!("note: {}\n", safe(c));
     }
     out += &format!(
         "warning: `runtime run --unsandboxed {}` would run whatever this app wrote into its prefix (registry Run \
@@ -358,10 +234,9 @@ pub fn run(app: &str) -> Result<(), CmdError> {
         env.id()
     );
     // Each argument escaped on its own: a newline inside one can never start a line of its own.
-    let argv: Vec<String> = sb.argv_preview(&cmd).iter().map(|a| safe(&shell_quote(a))).collect();
+    let argv: Vec<String> = st.argv.iter().map(|a| safe(&shell_quote(a))).collect();
     out += &format!("command: {}\n", argv.join(" "));
-    // Every untrusted piece above went through `safe`; the line breaks are this function's own.
-    crate::emit(&out)
+    out
 }
 
 #[cfg(test)]
@@ -394,24 +269,5 @@ mod tests {
     fn shell_quote_survives_quotes_and_spaces() {
         assert_eq!(shell_quote(OsStr::new("a b")), "'a b'");
         assert_eq!(shell_quote(OsStr::new("it's")), r"'it'\''s'");
-    }
-
-    #[test]
-    fn summary_names_every_switch_and_counts_grants() {
-        let mut p = Permissions::default();
-        assert_eq!(
-            summary(&p),
-            "network deny, display on, audio on, gpu on, 0 host directories"
-        );
-        p.network = Network::Allow;
-        p.gpu = false;
-        p.filesystem.push(rt_sandbox::FsGrant {
-            path: "/srv/x".into(),
-            access: Access::Ro,
-        });
-        assert_eq!(
-            summary(&p),
-            "network allow, display on, audio on, gpu off, 1 host directory"
-        );
     }
 }

@@ -56,9 +56,9 @@ pub fn run(target: Option<&str>, as_json: bool) -> Result<u8, CmdError> {
         Some((store, Target::Installed(id))) => store.get(id).ok(),
         _ => None,
     };
-    let sandbox = crate::sandbox::doctor_state(sandbox_env.as_ref());
-    let hardening = crate::sandbox::doctor_hardening();
-    let limits = crate::sandbox::doctor_limits(sandbox_env.as_ref());
+    let sandbox = rt_api::host::sandbox::doctor_state(sandbox_env.as_ref());
+    let hardening = rt_api::host::sandbox::doctor_hardening();
+    let limits = rt_api::host::sandbox::doctor_limits(sandbox_env.as_ref());
     let report = doctor(DoctorInput {
         subject: facts.subject,
         host_arch: std::env::consts::ARCH,
