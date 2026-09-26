@@ -4220,3 +4220,158 @@ fn deps_install_refuses_when_the_marker_cannot_be_written() {
         "a download was attempted"
     );
 }
+
+// ================================================================ golden: the host-fact reports, byte for byte
+
+/// A 32-bit `hello64.exe` whose `msvcrt.dll` import is `d3d11.dll` (DXVK would cover 64-bit only).
+fn x86_d3d11_exe() -> Vec<u8> {
+    let mut bytes = fs::read(fixture("hello64.exe")).unwrap();
+    let at = bytes
+        .windows(11)
+        .position(|w| w.eq_ignore_ascii_case(b"msvcrt.dll\0"))
+        .unwrap();
+    bytes[at..at + 11].copy_from_slice(b"d3d11.dll\0\0");
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    bytes[pe + 4..pe + 6].copy_from_slice(&0x014Cu16.to_le_bytes()); // machine: i386
+    bytes
+}
+
+/// The rig states the host-fact reports are pinned on (installed in this order, so the ids are stable): a native
+/// app, one importing d3d11, managed without and with Wine Mono recorded, 32-bit with DXVK recorded, one whose
+/// executable is gone, one whose `drive_c` is a symlink, and a hostile name. Returns the ids.
+fn golden_rig(r: &Rig) -> Vec<String> {
+    r.wine_dlls(&["kernel32.dll", "msvcrt.dll", "d3d11.dll", "winepulse.drv"]);
+    let native = r.install();
+    let (d3d, _) = install_d3d11(r);
+    let managed = install_managed(r);
+    let mono = install_managed(r);
+    record_installed(r, &mono, "wine-mono");
+    let p = r.input("x86.exe", &x86_d3d11_exe());
+    let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
+    assert_ok(&o);
+    let x86 = installed_id(&o);
+    record_installed(r, &x86, "dxvk");
+    let no_exe = r.install_as("gone.exe", &[]);
+    let exe = r
+        .apps()
+        .join(&no_exe)
+        .join("prefix/drive_c/Program Files")
+        .join(&no_exe);
+    fs::remove_file(exe.join("gone.exe")).unwrap();
+    let linked = r.install_as("linked.exe", &[]);
+    let drive_c = r.apps().join(&linked).join("prefix/drive_c");
+    fs::rename(&drive_c, r.root.join("elsewhere")).unwrap();
+    symlink(r.root.join("elsewhere"), &drive_c).unwrap();
+    r.plant("evil", "Evil\u{1b}]0;pwned\u{7}\u{202e}\u{9b}[2J name");
+    vec![native, d3d, managed, mono, x86, no_exe, linked, "evil".into()]
+}
+
+/// One transcript of every report, host-specific text replaced: the rig root, this binary, the kernel's
+/// hardening phrases (and the sandbox's `command:`/`skipped:`/`note:` lines, which name host devices and binds;
+/// their content is pinned by the sandbox tests above).
+fn golden_transcript(r: &Rig, ids: &[String]) -> String {
+    let h = rt_sandbox::hardening();
+    let exe = runtime_exe();
+    let root = r.root.display().to_string();
+    let norm = |text: &str| {
+        let mut t = text
+            .replace(&exe.display().to_string(), "<RUNTIME>")
+            .replace(&root, "<ROOT>")
+            .replace(&h.seccomp, "<SECCOMP>")
+            .replace(&h.landlock, "<LANDLOCK>");
+        if let Some(c) = &h.caveat {
+            t = t.replace(c, "<CAVEAT>");
+        }
+        t
+    };
+    let mut out = String::new();
+    let mut add = |name: &str, mut c: Command, sandbox: bool| {
+        let o = c.output().unwrap();
+        let mut so = norm(&s(&o.stdout));
+        if sandbox {
+            so = so
+                .lines()
+                .filter(|l| !["command: ", "skipped: ", "note: "].iter().any(|p| l.starts_with(p)))
+                .map(|l| format!("{l}\n"))
+                .collect();
+        }
+        out += &format!(
+            "=== {name} (exit {:?})\n{so}--- stderr\n{}",
+            o.status.code(),
+            norm(&s(&o.stderr))
+        );
+    };
+    let with = |args: &[&str]| {
+        let mut c = r.desktop();
+        c.args(args);
+        c
+    };
+    // Before the fake bwrap exists: only the rig's bin/ on PATH, so no bwrap at all.
+    let mut c = with(&["doctor", "--json"]);
+    c.env("PATH", &r.bin);
+    add("doctor --json, no bwrap", c, false);
+    let mut c = with(&["doctor", &ids[0], "--json"]);
+    c.env("PATH", &r.bin);
+    add("doctor native --json, no bwrap", c, false);
+    let mut c = with(&["sandbox", &ids[0]]);
+    c.env("PATH", &r.bin);
+    add("sandbox native, no bwrap", c, true);
+    fake_bwrap(r);
+    add("doctor", with(&["doctor"]), false);
+    add("doctor --json", with(&["doctor", "--json"]), false);
+    let mut c = with(&["doctor", "--json"]);
+    c.env("RUNTIME_WINE", r.root.join("no-such-wine"));
+    add("doctor --json, no wine", c, false);
+    let mut c = with(&["doctor", "--json"]);
+    c.env("RUNTIME_VULKAN_LOADER", "absent");
+    add("doctor --json, no vulkan loader", c, false);
+    for id in ids {
+        add(&format!("doctor {id}"), with(&["doctor", id]), false);
+        add(&format!("doctor {id} --json"), with(&["doctor", id, "--json"]), false);
+        add(&format!("deps {id}"), with(&["deps", id]), false);
+        add(&format!("sandbox {id}"), with(&["sandbox", id]), true);
+    }
+    let mut c = with(&["deps", &ids[1]]);
+    c.env("RUNTIME_VULKAN_LOADER", "absent");
+    add("deps d3d11, no vulkan loader", c, false);
+    let mut c = with(&["doctor", &ids[1], "--json"]);
+    c.env("RUNTIME_VULKAN_LOADER", "absent");
+    add("doctor d3d11 --json, no vulkan loader", c, false);
+    add("graphics info", with(&["graphics", "info"]), false);
+    out
+}
+
+/// The host-fact reports (`doctor`, `doctor <app>`, `--json`, `sandbox <app>`, `deps <app>`, `graphics info`) are
+/// byte for byte what `tests/golden/host_facts.txt` holds. Moving their gathering code must not change one byte;
+/// `RUNTIME_BLESS=1` rewrites the file (only for an intended change of the output).
+#[test]
+fn host_fact_reports_match_the_golden_transcript() {
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("SKIPPED: the golden transcript was taken on x86_64 (the architecture check differs)");
+        return;
+    }
+    let r = rig();
+    let ids = golden_rig(&r);
+    let got = golden_transcript(&r, &ids);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/host_facts.txt");
+    if std::env::var_os("RUNTIME_BLESS").is_some_and(|v| v == "1") {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &got).unwrap();
+    }
+    let want = fs::read_to_string(&path).expect("no golden: run with RUNTIME_BLESS=1 once");
+    if got != want {
+        let (g, w): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
+        let at = g
+            .iter()
+            .zip(&w)
+            .position(|(a, b)| a != b)
+            .unwrap_or(g.len().min(w.len()));
+        panic!(
+            "the transcript differs from {} at line {}:\n  got:  {:?}\n  want: {:?}",
+            path.display(),
+            at + 1,
+            g.get(at),
+            w.get(at)
+        );
+    }
+}
