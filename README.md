@@ -2,13 +2,15 @@
 
 A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
 
-**Status: Phase 4A (dependency engine), an early MVP, and app runs are NOT sandboxed.** Windows programs run as your Linux user, with
-your network, GPU, audio and files; Wine can still reach the whole host (see
-[docs/SECURITY.md](docs/SECURITY.md) for what is and is not protected). Only run software you would run
-directly on your account. `.msi`/`.exe` installers now install through a `bwrap` sandbox (Phase 3) — narrower
-than a plain app run, but not a full boundary either, see SECURITY.md's "Installer sandbox" section — and
-`.NET` programs still fail (no .NET package yet); the sandbox for ordinary app runs is Phase 5. `runtime deps` is the
-only command that downloads anything, and only when asked (see below).
+**Status: Phase 5A (per-app bubblewrap sandbox), an early MVP.** `runtime run` starts every program in a
+bubblewrap sandbox built from the app's permissions (default: no network, no host files, only its own prefix
+writable; display, audio and GPU on), and refuses to run without a working `bwrap` (`sudo apt install bubblewrap`)
+unless you pass `--unsandboxed`. It is a namespace sandbox, not a VM: same Linux user, no seccomp/Landlock/cgroups
+yet (Phase 5B), and the display, audio and GPU it is given are shared with the host (an X11 display lets a program
+read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
+protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3), and `.NET` programs
+still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
+(see below).
 
 ## Commands
 
@@ -18,12 +20,13 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 |---|---|
 | `install <file.exe\|file.zip> [--name N] [--exe PATH]` | Creates an app with its own hardened Wine prefix and copies the program in. For a zip, `--exe` names the program inside it. |
 | `install <file.msi\|installer.exe> [--silent] [--network] [--exe PATH]` | Installs a `.msi` or a recognised `.exe` installer (Inno Setup, NSIS, InstallShield, WiX Burn) through a `bwrap` sandbox with no display, network or host filesystem access by default. `--silent` runs it non-interactively with its family's standard silent flags; `--network` allows it network access while it runs; display, audio and D-Bus environment variables are never passed into the sandbox either way (with `--network`, an installer that guesses the host's X display can still reach it where the X server grants same-user access without a cookie; see `docs/SECURITY.md`). `--exe` names the installed program directly (a path inside the installed prefix, e.g. `Program Files\App\app.exe`), skipping automatic discovery. |
-| `run <app\|file> [--debug] [-- args...]` | Runs an installed app; a `.exe`/`.zip` path is installed first (a new app on every call). The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
+| `run <app\|file> [--debug] [--unsandboxed] [-- args...]` | Runs an installed app in its sandbox (see `permissions` and `sandbox`); a `.exe`/`.zip` path is installed first (a new app on every call, default profile). Refuses to start when bubblewrap is missing or cannot create a sandbox. `--unsandboxed` runs this once WITHOUT the sandbox and says so. Ctrl-C (or SIGTERM to `runtime`) ends the sandboxed program. The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
+| `sandbox <app>` | Shows the app's sandbox without running anything: whether bubblewrap works, the profile, the requested pieces the host lacks, what the profile cannot enforce, and the full `bwrap` command line. |
 | `list [--json]` | Lists installed apps. |
 | `remove <app>` | Stops the app's Wine processes and deletes the app, its prefix and its desktop menu entry/icon (if any). Takes an id, never a path. |
 | `uninstall <app>` | Runs the app's recorded installer uninstall command (if any), sandboxed, then removes the environment and its desktop menu entry/icon regardless of what that did. An app with no recorded uninstaller (a portable-exe install) behaves like `remove`. Takes an id, never a path. |
 | `logs <app> [--lines N]` | Shows the end of the newest log (the app's stderr from its last run). |
-| `doctor [app\|file]` | Read-only checks: Wine, architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
+| `doctor [app\|file]` | Read-only checks: Wine, the sandbox (and an app's profile), architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 | `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
 | `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
@@ -64,10 +67,10 @@ The default is no network, no host directories, and display, audio and gpu on. T
 own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute
 directory (never a socket or file); symlinks are resolved and the target is judged. `$HOME`, `/`, the runtime's data directory, `~/.ssh`,
 `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.password-store` (and anything containing or
-inside them, for `$HOME` and the account's real home), `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp` itself,
-`/tmp/.X11-unix` and `$XDG_RUNTIME_DIR` are always refused, and `rw` is refused on `/etc`, `/usr`, `/var`, `/opt` and
-the other system trees (`ro` is allowed). (The run sandbox that enforces the profile
-arrives with the next tasks of Phase 5A.)
+inside them, for `$HOME` and the account's real home), `/proc`, `/sys`, `/dev`, `/run`, `/var/run`, `/tmp`
+and everything below it, and `$XDG_RUNTIME_DIR` are always refused, and `rw` is refused on `/etc`, `/usr`, `/var`, `/opt` and
+the other system trees (`ro` is allowed). (`/tmp` is refused whole: other programs'
+sockets live there under arbitrary names.) `runtime run` enforces the profile; `runtime sandbox <app>` shows the resulting `bwrap` command.
 
 ## Dependencies (`runtime deps`)
 

@@ -23,8 +23,11 @@
 //! Wine older than 10 has no new WoW64 mode, so the 32-bit steps are skipped (loudly, with `SKIPPED 32-bit` on
 //! stderr) there.
 //!
-//! What the tests do NOT claim: Wine's own `\\?\unix\...` NT paths still reach host files (Phase 2 is not a
-//! sandbox, see `docs/SECURITY.md`), so there is deliberately no test asserting isolation from them.
+//! `runtime run` starts programs in the app sandbox, so every test here needs a working `bwrap` too (the ones
+//! named `e2e_real_wine_*` check for it first and skip visibly without it, or fail with `RUNTIME_REQUIRE_BWRAP=1`).
+//!
+//! What the tests do NOT claim: Wine's own `\\?\unix\...` NT paths reach whatever the sandbox shows (and every
+//! host file in an `--unsandboxed` run, see `docs/SECURITY.md`); the sandbox's escape tests are separate.
 //!
 //! The CLI's stdout/stderr go to files, not pipes: the `wineserver` a run starts inherits stdout and would keep
 //! a pipe open (and `Command::output` waiting) until it exits, seconds after the CLI has finished. Reading a
@@ -34,8 +37,10 @@ mod support;
 use backend_wine::WineBackend;
 use rt_core::CompatBackend;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use support::{Rig, fixture, installed_id};
 
 const HELLO: &str = "hello from windows";
@@ -425,5 +430,147 @@ fn e2e_hardening_is_visible_from_inside_the_app() {
     );
 
     rig.remove_app(&alpha);
+    rig.finish();
+}
+
+/// Whether bwrap can create a sandbox here; `false` after saying SKIPPED, a failure with `RUNTIME_REQUIRE_BWRAP=1`.
+fn bwrap_works(test: &str) -> bool {
+    let why = match rt_sandbox::find_bwrap_on_path() {
+        None => "bwrap is not on PATH".to_owned(),
+        Some(b) => match rt_sandbox::probe(&b) {
+            Ok(()) => return true,
+            Err(e) => e,
+        },
+    };
+    assert!(
+        std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_none_or(|v| v != "1"),
+        "RUNTIME_REQUIRE_BWRAP=1 but {why}"
+    );
+    eprintln!("SKIPPED {test}: {why}");
+    false
+}
+
+#[test]
+#[ignore = "needs Wine, bwrap and fixtures; run with --ignored --test-threads=1"]
+fn e2e_real_wine_run_under_sandbox() {
+    if !bwrap_works("e2e_real_wine_run_under_sandbox") {
+        return;
+    }
+    let rig = Rig::new();
+    let id = rig.install_fixture("hello64.exe", "boxed");
+    let ran = rig.rt(&["run", &id]);
+    eprintln!("{}", ran.report());
+    assert!(ran.out().contains(HELLO), "hello64 stdout: {}", ran.report());
+    assert_eq!(ran.code, Some(7), "hello64 exit code: {}", ran.report());
+    assert!(!ran.err().contains("WITHOUT a sandbox"), "{}", ran.report());
+    assert!(
+        rig.apps().join(&id).join("ran-sandboxed").is_file(),
+        "the app is marked"
+    );
+
+    // `runtime sandbox` describes that same profile.
+    let ran = rig.rt(&["sandbox", &id]);
+    let out = ran.expect_ok();
+    let prefix = rig.apps().join(&id).join("prefix");
+    assert!(
+        out.contains("' '--unshare-net' '") && out.contains(&format!("'--bind' '{0}' '{0}'", prefix.display())),
+        "{}",
+        ran.report()
+    );
+
+    // Now that it ran sandboxed, `display` runs reg.exe in the same sandbox, and the value is flushed to disk.
+    rig.rt(&["display", &id, "x11"]).expect_ok();
+    let ran = rig.rt(&["display", &id]);
+    assert!(ran.expect_ok().contains("graphics driver: x11"), "{}", ran.report());
+
+    rig.remove_app(&id);
+    rig.finish();
+}
+
+/// Every pid whose command line starts with `needle` (Wine shows a program as its host path and arguments).
+fn pids_with(needle: &str) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
+            let cmdline = fs::read(e.path().join("cmdline")).ok()?;
+            cmdline.starts_with(needle.as_bytes()).then_some(pid)
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs Wine, bwrap and fixtures; run with --ignored --test-threads=1"]
+fn e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program() {
+    if !bwrap_works("e2e_real_wine_ctrl_c_ends_a_sandboxed_console_program") {
+        return;
+    }
+    let rig = Rig::new();
+    let id = rig.install_fixture("fs64.exe", "spinner");
+    let exe = rig.drive_c(&id).join("Program Files").join(&id).join("fs64.exe");
+    let exe = exe.to_str().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    for (sig, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+        let (out, err) = (
+            logs.path().join(format!("out-{sig}")),
+            logs.path().join(format!("err-{sig}")),
+        );
+        // Its own process group, like a shell job: the signal reaches ONLY the runtime process.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_runtime"))
+            .args(["run", &id, "--", "spin"])
+            .env("RUNTIME_DATA_DIR", rig.data())
+            .env_remove("RUNTIME_WINE")
+            .env_remove("RUNTIME_WINESERVER")
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&out).unwrap())
+            .stderr(fs::File::create(&err).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let report = || {
+            format!(
+                "stdout: {}\nstderr: {}",
+                fs::read_to_string(&out).unwrap_or_default(),
+                fs::read_to_string(&err).unwrap_or_default()
+            )
+        };
+        let start = Instant::now();
+        while !fs::read_to_string(&out).unwrap_or_default().contains("SPINNING") {
+            assert!(child.try_wait().unwrap().is_none(), "ended by itself: {}", report());
+            assert!(start.elapsed() < Duration::from_secs(60), "never started: {}", report());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if pids_with(exe).is_empty() {
+            let _ = child.kill();
+            panic!("control: no process {exe:?}: {}", report());
+        }
+        // SAFETY: `kill` of our own child's pid.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, sig) }, 0);
+        let sent = Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if sent.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                panic!("signal {sig}: the runtime did not end within 10 s: {}", report());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        eprintln!("signal {sig}: runtime ended after {:?} with {status:?}", sent.elapsed());
+        assert_eq!(status.code(), Some(code), "signal {sig}: {}", report());
+        while !pids_with(exe).is_empty() || !rig.wineservers().is_empty() {
+            assert!(
+                sent.elapsed() < Duration::from_secs(10),
+                "signal {sig}: the program or its wineserver outlived the run: {:?} {:?}",
+                pids_with(exe),
+                rig.wineservers()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    rig.remove_app(&id);
     rig.finish();
 }
