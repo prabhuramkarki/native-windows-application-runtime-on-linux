@@ -150,7 +150,11 @@ layers add and do not".
   the prefix), and only `command()` in the Wine backend can pick the second string; native apps, installers and every
   helper keep `mscoree=d`. HTML-embedding programs still fail. `doctor` says whether a managed program has Wine Mono.
   Mono adds a JIT to the sandboxed process set (writable and executable memory inside the Wine process, like
-  Wine's own code): seccomp and Landlock are applied to it exactly as to any program (a managed program run under them is being verified end to end and is not yet claimed). The package is a pinned upstream MSI
+  Wine's own code): seccomp and Landlock are applied to it exactly as to any program, with no rule added for it.
+  Verified on 2026-09-26 (`crates/cli/tests/e2e_dotnet.rs`, Wine 10.0, Landlock ABI 8): the MSI installed in the
+  installer sandbox with its shim, and a managed console program ran under the default sandbox, including four
+  JIT-compiled threads and a 64 MiB allocation with a forced GC, with the deny-list and the Landlock rule set
+  unchanged. The package is a pinned upstream MSI
   (Wine Mono 9.4.0, SHA-256 checked) installed through the sandboxed installer pipeline, with the installer's own
   `mscoree=d`, like any other package.
 - **Installers and MSI are refused** (Phase 3); only portable `.exe` files and `.zip` archives are handled.
