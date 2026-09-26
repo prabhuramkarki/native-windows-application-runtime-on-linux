@@ -124,25 +124,30 @@ enum Cmd {
         choice: Option<String>,
     },
     /// Show or change what an app's sandbox may reach (`permissions.toml`): network (default deny), display, audio
-    /// and gpu (default on) and host directories (default none). `--set network=allow`, `--set gpu=off`,
-    /// `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir` (repeatable; all are checked before anything is written);
+    /// and gpu (default on), host directories (default none) and resource limits. `--set network=allow`,
+    /// `--set gpu=off`, `--set fs+=/abs/dir:ro|rw`, `--set fs-=/abs/dir`, `--set memory=<MiB>|off`,
+    /// `--set cpu=<percent>|off`, `--set tasks=<n>|unlimited|default` (repeatable; all are checked before anything is
+    /// written);
     /// `--reset` returns to the default. Changing needs the app to be stopped. `$HOME`, `/`, the runtime's data
     /// directory and secret directories (`~/.ssh`, `~/.gnupg`, ...) can never be granted.
     Permissions {
         /// An app id from `runtime list`
         app: String,
-        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir
+        /// Change one permission: network=allow|deny, display|audio|gpu=on|off, fs+=/abs/dir:ro|rw, fs-=/abs/dir,
+        /// memory=<MiB>|off, cpu=<percent>|off, tasks=<n>|unlimited|default
         #[arg(long = "set", value_name = "EXPR")]
         set: Vec<String>,
         /// Delete the app's permissions.toml (back to the default)
         #[arg(long)]
         reset: bool,
-        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}]}
+        /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}], limits: {memory_mb,
+        /// cpu_percent, tasks, tasks_default}}
         #[arg(long)]
         json: bool,
     },
-    /// Show what an app's sandbox would be (needs no Wine; starts nothing): whether bubblewrap works, the
-    /// profile, what the host lacks, what the profile cannot enforce, and the full bubblewrap command line
+    /// Show what an app's sandbox would be (needs no Wine; starts nothing but throwaway probes): whether bubblewrap
+    /// and systemd user scopes work, the profile and its resource limits, what the host lacks, what the profile
+    /// cannot enforce, and the full command line (systemd-run and bubblewrap)
     Sandbox {
         /// An app id from `runtime list`
         app: String,

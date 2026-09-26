@@ -510,9 +510,9 @@ run prints `warning: running WITHOUT a sandbox (--unsandboxed)`.
   CANNOT be enforced (only the X server's cookie check remains). Both are printed as notes.
 - **Display, audio and GPU are attack surface.** The Wayland compositor, PulseAudio/PipeWire and the GPU kernel
   driver are reachable when switched on (the default), and `/sys/devices` is readable with gpu on.
-- **Same uid, no capability drop or cgroups.** Phase 5B adds seccomp and Landlock (next section), which narrow the
-  kernel surface; a kernel bug in a syscall that stays allowed is still an escape, and nothing limits CPU, memory
-  or disk use yet.
+- **Same uid, no capability drop.** Phase 5B adds seccomp and Landlock (next section), which narrow the kernel
+  surface; a kernel bug in a syscall that stays allowed is still an escape. Resource limits (a task limit by default,
+  memory and CPU on request) are in "Resource limits (Phase 5B)"; disk use and IO are never limited.
 - **Host directory grants** are what they say: an `rw` grant can be destroyed. `$HOME`, `/`, the data root, secret
   directories (`~/.ssh`, `~/.gnupg`, ...) and system trees (`rw`) are refused, and **all of `/tmp` is refused as a
   grant** (at or below it, by its written and its resolved path): other programs' sockets (tmux, ssh-agent, editor
@@ -685,10 +685,66 @@ because bwrap mounts it that way; no test proves read-only would be enough.
   removes the unfiltered process from the sandbox. Not done now: an init without handlers ignores SIGINT/SIGTERM
   from inside the namespace, which would break the Ctrl-C forwarding of Phase 5A.
 
+## Resource limits (Phase 5B)
+
+**What runs.** When a limit applies, `runtime run` starts bwrap inside a transient systemd user scope:
+`systemd-run --user --scope --collect --quiet --expand-environment=no -p TasksMax=<n> [-p MemoryMax=<m>M -p
+MemorySwapMax=0] [-p CPUQuota=<p>%] -- bwrap ...` (cgroup v2). `runtime sandbox <app>` prints the limits, whether
+scopes work, and that command line. The point is the desktop: a buggy or hostile app cannot take the session down
+with a fork bomb (or, when asked for, by eating the memory or the CPU).
+
+| `permissions.toml` `[limits]` | `--set` | Scope property | Default |
+|---|---|---|---|
+| `tasks = <n>` (16..65536) or `"unlimited"` | `tasks=<n>\|unlimited\|default` | `TasksMax=<n>` | 4096, best effort |
+| `memory_mb = <MiB>` (64..1048576) | `memory=<MiB>\|off` | `MemoryMax=<MiB>M`, `MemorySwapMax=0` | none |
+| `cpu_percent = <p>` (1..100 x CPUs) | `cpu=<percent>\|off` | `CPUQuota=<p>%` | none |
+
+**Default vs requested.** Without a `tasks` key every run gets `TasksMax=4096`, best effort: when `systemd-run --user`
+does not work (no user manager: a container, an SSH session without lingering; no cgroup v2; systemd older than 254,
+which lacks `--expand-environment`) or the user manager does not delegate the `pids` controller, the run goes ahead
+without a scope, prints `note: resource limits unavailable: <why>`, and `doctor` warns. ANY key written in the file
+(including `tasks = 4096`, the default's own value) is a request and fails closed: if the scope cannot be created
+with every controller it needs, the run is refused with the reason and the way out (`runtime permissions <app>
+--set memory=off --set cpu=off --set tasks=default`, or start the app from a desktop/user session); `doctor` says
+"runs of <app> will be refused". `systemd-run` is found on `PATH` and probed once per command (a throwaway scope,
+5 s at most, the same options and only `PATH` and `XDG_RUNTIME_DIR` in its environment, like the real command); the
+probe reads which controllers the user manager offers its scopes.
+
+**Signals and exit codes** (measured with systemd 259). With `--scope`, `systemd-run` registers the scope and then
+EXECS the command in place: the process `runtime` started keeps its pid, and it is bwrap (the scope is named
+`run-p<that pid>-i<n>.scope`; asserted by the escape suite), so the Phase 5A forwarding of Ctrl-C/SIGTERM reaches
+bwrap exactly as before (the real-Wine Ctrl-C test still ends the program within ~2 ms with 130/143). The exit
+status is the command's own (the program's code, 130/143 for a forwarded signal). Scope names are unique per pid, so
+concurrent runs of one app get separate scopes; `--collect` removes a finished scope even when it failed.
+`--expand-environment=no` matters: by default `systemd-run` expands `$VAR`/`${VAR}` in the command line (`$$`
+becomes `$`), which would change the program's arguments. `systemd-run` adds `INVOCATION_ID` to the environment the
+program sees (a random id, harmless). A `systemd-run` failure after the probe (the user manager went away) ends the
+run with its message and exit 1, before bwrap starts.
+
+**What the limits give, and what they do not.**
+- **They are per scope, i.e. per run.** Every process of one run (Wine, `wineserver`, whatever the program starts)
+  shares one budget. Two concurrent runs of one app get two budgets. The task limit protects the desktop, not the
+  app from itself: a fork bomb inside a run still starves that run's own processes.
+- **`TasksMax` counts threads as well as processes.** A Wine process has several threads, so `tasks = 64` allows
+  about twenty Windows processes (measured: a CreateProcess loop stopped after 21-23 copies); the default 4096 is
+  well above what real programs use.
+- **`MemoryMax` is a limit, not a reservation.** Nothing is set aside for the app; at the limit the kernel reclaims
+  and then OOM-kills inside the scope (with no swap: `MemorySwapMax=0`), and systemd then stops the whole scope
+  (its default `OOMPolicy=stop`): the program ends, `runtime` reports 143 (the scope's SIGTERM to bwrap), and
+  `journalctl --user` shows `Failed with result 'oom-kill'`. Measured: a 512 MiB hog under `memory = 128` ended after
+  ~1 s; the test process and the session were unaffected.
+- **`CPUQuota` is a throttle.** `cpu_percent = 150` is one and a half CPUs' worth of time per period; the program
+  runs slower, it is never killed for it.
+- **Not limited:** disk space, IO bandwidth, GPU time and GPU memory, network bandwidth, open files beyond the
+  kernel's per-process defaults. Processes the program reaches OUTSIDE the scope (the X server, the compositor,
+  PulseAudio/PipeWire, the GPU driver's kernel work) are charged to themselves, not to the app.
+- **Only the app sandbox.** `runtime run` and the Wine helpers that run in an app's sandbox (once it ran sandboxed)
+  get the scope; the installer sandbox and `--unsandboxed` runs do not.
+
 ## Roadmap
 
-Phase 5B's last part adds resource limits (cgroups through `systemd-run --user --scope`), and moves the dependency
-engine's path-based prefix operations to held directory descriptors.
+Phase 5B closes with the escape-suite additions; the dependency engine's path-based prefix operations move to held
+directory descriptors later.
 
 ## Reporting
 

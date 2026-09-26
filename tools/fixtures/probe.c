@@ -11,6 +11,11 @@
  *   probe threadctx            Set/GetThreadContext of a suspended thread: an integer register (CONTEXT_INTEGER)
  *   probe dbgregs              Set/GetThreadContext of a suspended thread: a hardware breakpoint (Dr0/Dr7)
  *   probe wait                 sleep 30 s (the target of procmem)
+ *   probe forkbomb <max>       start copies of itself (`probe child`: each sleeps 20 s) until one fails or <max>
+ *                              (at most 5000) run; prints how many started, then ends every copy and exits
+ *   probe child                sleep 20 s (the copies of forkbomb)
+ *   probe memhog <MiB>         VirtualAlloc <MiB> MiB (at most 65536) and write to every page
+ *   probe cgroup <ms>          print the Wine process's /proc/self/cgroup, then sleep <ms> (at most 60000)
  * <path> is any Windows path, including Wine's NT unix paths (\\?\unix\<abs host path>, see docs/SECURITY.md).
  * Prints one result line, `<MODE>-OK ...` or `<MODE>-FAILED <why>`, and exits 0 if the action SUCCEEDED, 1 if it
  * FAILED. Usage errors exit 2. Plain Win32 only. */
@@ -196,11 +201,76 @@ int main(int argc, char **argv) {
         WaitForSingleObject(pi.hProcess, 5000);
         return rc;
     }
+    if (strcmp(mode, "child") == 0 && argc == 2) {
+        Sleep(20000);
+        return 0;
+    }
+    if (strcmp(mode, "forkbomb") == 0 && argc == 3) {
+        /* Bounded on purpose: at most `max` copies, each of which ends by itself, and all are ended here. */
+        int max = atoi(argv[2]), n = 0, rc;
+        unsigned long err = 0;
+        char self[MAX_PATH], cmd[MAX_PATH + 16], detail[64];
+        HANDLE *kids;
+        if (max < 1 || max > 5000) return failed("FORKBOMB", "max must be 1..5000", 0);
+        kids = calloc(max, sizeof *kids);
+        GetModuleFileNameA(NULL, self, sizeof self);
+        snprintf(cmd, sizeof cmd, "\"%s\" child", self);
+        while (n < max) {
+            STARTUPINFOA si;
+            PROCESS_INFORMATION pi;
+            memset(&si, 0, sizeof si);
+            si.cb = sizeof si;
+            if (!CreateProcessA(self, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                err = GetLastError();
+                break;
+            }
+            CloseHandle(pi.hThread);
+            kids[n++] = pi.hProcess;
+        }
+        if (n < max) {
+            snprintf(detail, sizeof detail, "CreateProcess after %d copies", n);
+            rc = failed("FORKBOMB", detail, err);
+        } else {
+            snprintf(detail, sizeof detail, "%d copies", n);
+            rc = ok("FORKBOMB", detail);
+        }
+        while (n > 0) {
+            TerminateProcess(kids[--n], 0);
+            CloseHandle(kids[n]);
+        }
+        return rc;
+    }
+    if (strcmp(mode, "memhog") == 0 && argc == 3) {
+        int mib = atoi(argv[2]);
+        SIZE_T size, i;
+        char *p, detail[32];
+        if (mib < 1 || mib > 65536) return failed("MEMHOG", "MiB must be 1..65536", 0);
+        size = (SIZE_T)mib << 20;
+        p = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p) return failed("MEMHOG", "VirtualAlloc", GetLastError());
+        for (i = 0; i < size; i += 4096) p[i] = (char)i | 1;
+        snprintf(detail, sizeof detail, "%d", mib);
+        return ok("MEMHOG", detail);
+    }
+    if (strcmp(mode, "cgroup") == 0 && argc == 3) {
+        char buf[4096];
+        DWORD n = 0;
+        int ms = atoi(argv[2]);
+        HANDLE f = CreateFileA("\\\\?\\unix\\proc\\self\\cgroup", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f == INVALID_HANDLE_VALUE) return failed("CGROUP", "open", GetLastError());
+        if (!ReadFile(f, buf, sizeof buf - 1, &n, NULL)) return failed("CGROUP", "read", GetLastError());
+        CloseHandle(f);
+        buf[n] = 0;
+        printf("CGROUP-OK\n%s", buf);
+        if (ms > 0 && ms <= 60000) Sleep(ms);
+        return 0;
+    }
     if (strcmp(mode, "threadctx") == 0 && argc == 2)
         return context_round_trip("THREADCTX", CONTEXT_INTEGER, set_reg, check_reg);
     if (strcmp(mode, "dbgregs") == 0 && argc == 2)
         return context_round_trip("DBGREGS", CONTEXT_DEBUG_REGISTERS, set_dr, check_dr);
     printf("usage: probe read <path> | write <path> | list <path> | connect <ip> <port> | status | readmem | writemem | "
-           "threadctx | dbgregs | wait\n");
+           "threadctx | dbgregs | wait | forkbomb <max> | child | memhog <MiB> | cgroup <ms>\n");
     return 2;
 }

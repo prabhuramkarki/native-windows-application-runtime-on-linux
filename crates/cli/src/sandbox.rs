@@ -9,7 +9,9 @@
 //! command's `WINEPREFIX` and refuses a command of another shape, so a profile loaded for one app can never be
 //! rendered around another's prefix. [`RunSandbox`] renders BEFORE the spawn (`Sandbox::try_wrap`: a refusal is
 //! an error, never the fail-closed stub), prints what the profile cannot enforce (`note: ...`, one line each) and
-//! records [`MARKER`].
+//! records [`MARKER`]. The profile's resource limits wrap the run in a `systemd-run --user` scope (`rt_sandbox`'s
+//! renderer, "Limits"); whether scopes work is probed once per command (`RealHost::scopes`) and shown by `runtime
+//! sandbox` (a `limits:` section) and `doctor` (one check, a warning at worst).
 //!
 //! **Helpers in a prefix the app has written.** A sandboxed program can write its own prefix: registry `Run` keys
 //! and services, `DllOverrides` naming a native DLL it dropped. The next Wine session in that prefix runs them, and
@@ -22,7 +24,7 @@
 use crate::CmdError;
 use crate::safe::safe;
 use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Sandbox, Store, Target};
-use rt_sandbox::{Access, AppSandbox, Host, Network, Permissions, RealHost, load, load_opt_raw};
+use rt_sandbox::{Access, AppSandbox, Host, Limits, Network, Permissions, RealHost, Tasks, load, load_opt_raw};
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
@@ -178,6 +180,56 @@ pub(crate) fn doctor_hardening() -> Result<String, String> {
     }
 }
 
+/// `runtime sandbox`'s limits section: whether scopes work here, then each limit and where it comes from.
+fn limits_section(l: &Limits, scopes: &Result<rt_sandbox::ScopeSupport, String>) -> String {
+    let mut out = match scopes {
+        Ok(s) => format!(
+            "limits: systemd-run --user works ({}; cgroup controllers: {})\n",
+            safe(&s.systemd_run.to_string_lossy()),
+            safe(&s.controllers.join(" "))
+        ),
+        Err(why) => format!("limits: UNAVAILABLE: {}\n", safe(why)),
+    };
+    let set = "permissions.toml, mandatory";
+    out += &match l.tasks {
+        Tasks::Default => format!("  tasks: {} (default, best effort)\n", rt_sandbox::DEFAULT_TASKS),
+        Tasks::Max(n) => format!("  tasks: {n} ({set})\n"),
+        Tasks::Unlimited => "  tasks: no limit (permissions.toml)\n".to_owned(),
+    };
+    out += &match l.memory_mb {
+        Some(m) => format!("  memory: {m} MiB, no swap ({set})\n"),
+        None => "  memory: no limit\n".to_owned(),
+    };
+    out += &match l.cpu_percent {
+        Some(c) => format!("  cpu: {c}% of one CPU ({set})\n"),
+        None => "  cpu: no limit\n".to_owned(),
+    };
+    out
+}
+
+/// `doctor`'s limits input: `systemd-run --user` scopes work, or why not and what that means (with `env`: for that
+/// app, whose explicit limits then refuse every run).
+pub(crate) fn doctor_limits(env: Option<&AppEnv>) -> Result<String, String> {
+    match RealHost.scopes() {
+        Ok(s) => Ok(format!(
+            "limits: systemd-run --user available (cgroup controllers: {})",
+            s.controllers.join(" ")
+        )),
+        Err(why) => {
+            let explicit = env
+                .and_then(|e| profile(e).ok())
+                .is_some_and(|(p, _)| p.limits.explicit());
+            Err(match env {
+                Some(e) if explicit => format!(
+                    "limits: unavailable: {why}; runs of {} will be refused (its permissions.toml sets limits)",
+                    e.id()
+                ),
+                _ => format!("limits: unavailable: {why}; the default task limit (fork-bomb guard) is not applied"),
+            })
+        }
+    }
+}
+
 /// `doctor`'s sandbox input: bwrap works (with `env`: and the app's profile in a few words), or why not.
 pub(crate) fn doctor_state(env: Option<&AppEnv>) -> Result<Option<String>, String> {
     working_bwrap().map_err(|why| format!("unavailable: {why}"))?;
@@ -230,6 +282,7 @@ pub fn run(app: &str) -> Result<(), CmdError> {
         let access = if g.access == Access::Rw { "rw" } else { "ro" };
         out += &format!("  host directory {} ({access})\n", safe(&g.path.to_string_lossy()));
     }
+    out += &limits_section(&perms.limits, &RealHost.scopes());
     let launcher = Launcher::new();
     let p = rt_core::resolve_program(&store, env.id(), backend_wine::BACKEND_ID)?;
     // The command `run` builds (backend command, settled, host environment rules); without Wine, its shape.

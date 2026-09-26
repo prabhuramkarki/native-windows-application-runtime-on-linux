@@ -60,6 +60,16 @@
 //! inside `/tmp` or the runtime dir, and Landlock does not govern `connect` on a socket file (measured on ABI 8).
 //! bwrap's skeleton directories (the parents of a bound path) have no rule, so they cannot be listed inside.
 //!
+//! **Limits.** When the profile's [`crate::Limits`] ask for any (the default [`crate::DEFAULT_TASKS`] task limit
+//! counts), the whole bwrap command runs inside a transient systemd user scope: `systemd-run --user --scope --collect
+//! --quiet --expand-environment=no -p TasksMax=<n> [-p MemoryMax=<m>M -p MemorySwapMax=0] [-p CPUQuota=<p>%] --
+//! bwrap ...` ([`crate::SCOPE_ARGS`]). `--scope` makes systemd-run exec bwrap in place (same pid, so whoever
+//! signals the child signals bwrap), its exit status is the command's, and `--expand-environment=no` stops it from
+//! expanding `$VAR` in the program's arguments. Whether scopes work comes from [`Host::scopes`] (a probe, and the
+//! cgroup controllers the user manager offers): an unusable scope or a missing controller REFUSES a run whose limits
+//! are explicit ([`RenderError::Limits`]); with only the default task limit the run goes ahead without a scope and a
+//! caveat says `resource limits unavailable: <why>`. `tasks = "unlimited"` with no other limit means no scope at all.
+//!
 //! **Environment.** Exactly the finalized command's variables that `rt_core::allowed_env` or the Wine backend
 //! ([`BACKEND_ENV`]) may set (the launcher already filtered; re-applied here as defence in depth), minus those of a
 //! switch that is off (display: `DISPLAY WAYLAND_DISPLAY XAUTHORITY`; audio: `PULSE_SERVER`) and minus
@@ -196,6 +206,12 @@ pub enum RenderError {
     RuntimeExeInData(String),
     #[error("the sandbox launcher would refuse its arguments: {0}")]
     Shim(init::InitError),
+    #[error(
+        "the app's permissions.toml sets resource limits, but they cannot be applied: {why}. Start the app from a \
+         desktop or user session with systemd, or remove the limits (`runtime permissions {app} --set memory=off \
+         --set cpu=off --set tasks=default`)"
+    )]
+    Limits { app: String, why: String },
 }
 
 /// See the module docs. `ro_binds` are the backend's dll directories (bound read-only).
@@ -427,7 +443,14 @@ impl AppSandbox {
             .clone()
             .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", self.host.uid())));
 
-        let mut out = Command::new(&self.bwrap);
+        let mut out = match self.scope(&dirs, &mut caveats)? {
+            Some(scope) => {
+                let mut c = Command::new(&scope[0]);
+                c.args(&scope[1..]).arg(&self.bwrap);
+                c
+            }
+            None => Command::new(&self.bwrap),
+        };
         out.args([
             "--die-with-parent",
             "--new-session",
@@ -638,6 +661,57 @@ impl AppSandbox {
             skipped,
             caveats,
         })
+    }
+
+    /// The `systemd-run` scope in front of bwrap, program first and ending in `--` (module docs, "Limits"); `None`
+    /// when no limit applies, or when only the default task limit does and scopes are unavailable (a caveat then
+    /// says why). Explicit limits that cannot be applied refuse the run.
+    fn scope(&self, dirs: &AppDirs, caveats: &mut Vec<String>) -> Result<Option<Vec<OsString>>, RenderError> {
+        let l = &self.perms.limits;
+        let mut props: Vec<String> = Vec::new();
+        let mut need = Vec::new();
+        if let Some(n) = l.tasks_max() {
+            props.push(format!("TasksMax={n}"));
+            need.push("pids");
+        }
+        if let Some(m) = l.memory_mb {
+            props.extend([format!("MemoryMax={m}M"), "MemorySwapMax=0".to_owned()]);
+            need.push("memory");
+        }
+        if let Some(c) = l.cpu_percent {
+            props.push(format!("CPUQuota={c}%"));
+            need.push("cpu");
+        }
+        if props.is_empty() {
+            return Ok(None);
+        }
+        let why = match self.host.scopes() {
+            Ok(s) => match need.iter().find(|c| !s.controllers.iter().any(|h| h == *c)) {
+                None => {
+                    let mut argv: Vec<OsString> = vec![s.systemd_run.into()];
+                    argv.extend(crate::SCOPE_ARGS.iter().map(OsString::from));
+                    for p in props {
+                        argv.extend([OsString::from("-p"), p.into()]);
+                    }
+                    argv.push("--".into());
+                    return Ok(Some(argv));
+                }
+                Some(c) => format!("the cgroup `{c}` controller is not delegated to the systemd user manager"),
+            },
+            Err(why) => why,
+        };
+        if l.explicit() {
+            let app = dirs.prefix_dst.parent().and_then(Path::file_name).unwrap_or_default();
+            return Err(RenderError::Limits {
+                app: lossy(Path::new(app)),
+                why,
+            });
+        }
+        caveats.push(format!(
+            "resource limits unavailable: {why}; the default task limit ({}) is not applied",
+            crate::DEFAULT_TASKS
+        ));
+        Ok(None)
     }
 }
 

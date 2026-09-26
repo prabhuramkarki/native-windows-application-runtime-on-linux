@@ -7,7 +7,8 @@ program in a bubblewrap sandbox built from the app's permissions (default: no ne
 prefix writable; display, audio and GPU on), and refuses to run without a working `bwrap` (`sudo apt install
 bubblewrap`) unless you pass `--unsandboxed`. Inside it, a small launcher (`runtime sandbox-init`, hidden) applies a
 seccomp deny-list (mandatory) and a Landlock filesystem ruleset (when the kernel has Landlock) before the program
-starts. It is not a VM: same Linux user, no cgroup limits yet, and the display, audio and GPU it is given are shared
+starts, and the run gets a task limit (a fork-bomb guard) and optional memory/CPU limits through a systemd user
+scope. It is not a VM: same Linux user, and the display, audio and GPU it is given are shared
 with the host (an X11 display lets a program read and inject input to other windows). See [docs/SECURITY.md](docs/SECURITY.md) for exactly what is and is not
 protected. `.msi`/`.exe` installers install through their own `bwrap` sandbox (Phase 3), and `.NET` programs
 still fail (no .NET package yet). `runtime deps` is the only command that downloads anything, and only when asked
@@ -22,7 +23,7 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 | `install <file.exe\|file.zip> [--name N] [--exe PATH]` | Creates an app with its own hardened Wine prefix and copies the program in. For a zip, `--exe` names the program inside it. |
 | `install <file.msi\|installer.exe> [--silent] [--network] [--exe PATH]` | Installs a `.msi` or a recognised `.exe` installer (Inno Setup, NSIS, InstallShield, WiX Burn) through a `bwrap` sandbox with no display, network or host filesystem access by default. `--silent` runs it non-interactively with its family's standard silent flags; `--network` allows it network access while it runs; display, audio and D-Bus environment variables are never passed into the sandbox either way (with `--network`, an installer that guesses the host's X display can still reach it where the X server grants same-user access without a cookie; see `docs/SECURITY.md`). `--exe` names the installed program directly (a path inside the installed prefix, e.g. `Program Files\App\app.exe`), skipping automatic discovery. |
 | `run <app\|file> [--debug] [--unsandboxed] [-- args...]` | Runs an installed app in its sandbox (see `permissions` and `sandbox`); a `.exe`/`.zip` path is installed first (a new app on every call, default profile). Refuses to start when bubblewrap is missing or cannot create a sandbox. `--unsandboxed` runs this once WITHOUT the sandbox and says so. Ctrl-C (or SIGTERM to `runtime`) ends the sandboxed program. The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
-| `sandbox <app>` | Shows the app's sandbox without running anything: whether bubblewrap works, the seccomp filter and the host's Landlock ABI (or why Landlock is unavailable), the `sandbox-init` launcher, the profile, the requested pieces the host lacks, what the profile cannot enforce, and the full `bwrap` command line (with the launcher's Landlock rules). |
+| `sandbox <app>` | Shows the app's sandbox without running anything: whether bubblewrap works, the seccomp filter and the host's Landlock ABI (or why Landlock is unavailable), the `sandbox-init` launcher, the profile, its resource limits and whether systemd user scopes work, the requested pieces the host lacks, what the profile cannot enforce, and the full command line (`systemd-run` scope, `bwrap`, the launcher's Landlock rules). |
 | `list [--json]` | Lists installed apps. |
 | `remove <app>` | Stops the app's Wine processes and deletes the app, its prefix and its desktop menu entry/icon (if any); refuses, changing nothing, while the app still runs (a sandboxed app must be quit first). Takes an id, never a path. |
 | `uninstall <app>` | Runs the app's recorded installer uninstall command (if any), sandboxed, then removes the environment and its desktop menu entry/icon regardless of what that did; like `remove`, refused while the app still runs. An app with no recorded uninstaller (a portable-exe install) behaves like `remove`. Takes an id, never a path. |
@@ -61,8 +62,15 @@ opt-in per app: `wayland` is refused without a Wayland session or without `winew
 runtime permissions game                                  # the app's profile (permissions.toml) and its source
 runtime permissions game --set network=allow --set gpu=off
 runtime permissions game --set fs+=/home/me/saves:rw      # grant a host directory (ro | rw); fs-=<dir> removes it
+runtime permissions game --set memory=2048 --set cpu=150  # MiB (no swap); percent of one CPU; `off` removes
+runtime permissions game --set tasks=256                  # processes+threads; `unlimited`, or `default` (4096)
 runtime permissions game --reset                          # back to the default; --json for scripts
 ```
+
+Limits run the app's sandbox in a `systemd-run --user --scope` (cgroup v2). The default task limit (4096) is
+applied when a user manager is available and skipped with a note otherwise; a limit you set is mandatory: without a
+working `systemd-run --user` the app does not start (`runtime doctor` and `runtime sandbox <app>` say why). Bounds:
+memory 64..1048576 MiB, cpu 1..100 x CPUs, tasks 16..65536.
 
 The default is no network, no host directories, and display, audio and gpu on. The profile is stored in the app's
 own directory, checked strictly, and changed only while the app is stopped. A grant must be an existing absolute
