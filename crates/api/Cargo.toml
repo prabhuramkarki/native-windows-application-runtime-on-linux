@@ -11,9 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 runtime-core = { path = "../core" }
-runtime-deps = { path = "../deps" }
 runtime-sandbox = { path = "../sandbox" }
-runtime-installer = { path = "../installer" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

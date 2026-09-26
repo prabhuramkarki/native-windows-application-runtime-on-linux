@@ -1,6 +1,10 @@
 //! The wire types. Every one is `Serialize + Deserialize` (camelCase, like `metadata.json`) and is built from
 //! untrusted data only through the `from_*` constructors, which clean every string: `text` removes control and
 //! format characters (bidi overrides, zero-width, newlines) and cuts to a bound.
+//!
+//! Cleaning is LOSSY: removed characters can make two different values display identically (an escaped form
+//! may follow). Adding a string field to any type here requires covering it in the `no_string_anywhere_holds_an_
+//! invisible_character` test in `runtime.rs`, which walks every serialised string, keys included.
 use rt_core::{AppEnv, DependencyRecord, InstallerMeta, Metadata, clean_text};
 use rt_sandbox::{Access, Network, Permissions, Tasks};
 use serde::{Deserialize, Serialize};
@@ -8,8 +12,10 @@ use std::fs;
 
 /// Longest names, versions and ids-like fields, in bytes.
 pub const TEXT_MAX: usize = 256;
-/// Longest paths and command lines, in bytes.
-pub const LONG_MAX: usize = 1024;
+/// Longest executable and uninstall command, in bytes (`rt_core::MAX_FIELD_LEN`, what metadata validation allows).
+pub const LONG_MAX: usize = rt_core::MAX_FIELD_LEN;
+/// Longest grant path, in bytes (Linux `PATH_MAX`, what the grant validator allows): never shown cut.
+pub const PATH_MAX: usize = 4096;
 
 fn text(s: &str) -> String {
     clean_text(s, TEXT_MAX)
@@ -52,7 +58,8 @@ impl AppSummary {
 }
 
 /// `apps()`: the usable apps and how many entries of the apps directory were skipped (corrupt metadata, a
-/// symlink, a stray file, an id mismatch, too many entries); the API never prints a warning.
+/// symlink, a stray file, an id mismatch, too many entries); the API never prints a warning. `skipped` is a
+/// lower bound when the store hit its entry cap: that whole tail counts as one skip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppList {
@@ -115,9 +122,11 @@ pub struct PrefixState {
 impl PrefixState {
     fn probe(env: &AppEnv) -> PrefixState {
         let real_dir = |p: std::path::PathBuf| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+        // `lstat` refuses only a symlink in the LAST component: a symlinked prefix must stop the second probe.
+        let exists = real_dir(env.prefix());
         PrefixState {
-            exists: real_dir(env.prefix()),
-            has_drive_c: real_dir(env.drive_c()),
+            exists,
+            has_drive_c: exists && real_dir(env.drive_c()),
         }
     }
 }
@@ -163,6 +172,7 @@ impl AppDetail {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum NetworkView {
     Deny,
     Allow,
@@ -170,6 +180,7 @@ pub enum NetworkView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum AccessView {
     Ro,
     Rw,
@@ -201,6 +212,7 @@ pub struct LimitsView {
 /// Where the profile came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum PermSource {
     /// No `permissions.toml`: the built-in default.
     Default,
@@ -237,7 +249,7 @@ impl PermissionsView {
                 .filesystem
                 .iter()
                 .map(|g| GrantView {
-                    path: long(&g.path.to_string_lossy()),
+                    path: clean_text(&g.path.to_string_lossy(), PATH_MAX),
                     access: if g.access == Access::Rw {
                         AccessView::Rw
                     } else {

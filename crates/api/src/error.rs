@@ -8,19 +8,25 @@
 //! | `Unavailable`      | `unavailable`      | the request is fine but the host cannot answer: no data directory,  |
 //! |                    |                    | unreadable/corrupt app metadata, an invalid, oversized, symlinked   |
 //! |                    |                    | or unreadable `permissions.toml` (never a silent default)           |
+//! | `Unknown`          | (any other string) | deserialisation fallback for a newer daemon's kind; never produced here |
 //! | `Internal`         | `internal`         | a bug: reserved for the daemon's catch-all (panic, serialisation)   |
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ErrorKind {
     NotFound,
     InvalidArgument,
     Unavailable,
     Internal,
+    /// A kind this client does not know (a newer daemon's): deserialisation never fails on it.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive]
 #[error("{kind:?}: {message}")]
 pub struct ApiError {
     pub kind: ErrorKind,
