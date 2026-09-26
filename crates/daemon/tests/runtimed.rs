@@ -163,10 +163,11 @@ fn sandbox_info_names_the_sibling_runtime_never_runtimed() {
 fn activated(s: &Scratch, fd: i32, env: &str) -> Child {
     let mut c = s.cmd("/bin/sh");
     c.arg("-c").arg(format!("{env}; exec \"$0\"")).arg(BIN);
-    // SAFETY: `dup2` is async-signal-safe; `fd` is open in the parent and so in the forked child.
+    // SAFETY: `dup2` and `fcntl` are async-signal-safe; `fd` is open in the parent and so in the forked child.
+    // When `fd` already is 3, `dup2` does nothing and leaves its FD_CLOEXEC set: cleared explicitly.
     unsafe {
         c.pre_exec(move || {
-            if libc::dup2(fd, 3) < 0 {
+            if libc::dup2(fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
