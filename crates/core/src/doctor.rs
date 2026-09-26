@@ -1,7 +1,7 @@
 //! `doctor`: a read-only health report. Every input is injected (the environment, the file system probes, the
 //! backend, the parsed PE, the app's directory listing and the prefix audit), so each check is unit-testable
-//! without the host; the CLI gathers the real inputs. Nothing here writes or spawns (except the backend's
-//! `version()` helper), and no input can make it panic.
+//! without the host; `rt_api::host::doctor` gathers the real inputs. Nothing here writes or spawns (except the
+//! backend's `version()` helper), and no input can make it panic.
 //!
 //! **Consumers must not parse [`Check::text`]**: it is prose for people, may change between versions and carries
 //! escaped, shortened excerpts of untrusted data (DLL names, error messages). [`Area`] and [`Status`] and the
@@ -15,8 +15,8 @@
 //! managed (.NET) program (decided by `dotnet`: the recorded Wine Mono, not the prefix) and at most [`MAX_D3D_ROUTES`] (5) Graphics checks that predict the Direct3D route per
 //! family (an installed app report only: `d3d_routes`).
 //!
-//! **Direct3D route.** `d3d_routes` is the CLI's prediction of what each imported Direct3D family will run on
-//! (DXVK, vkd3d-proton, or Wine's built-in): computed from the recorded packages and the host's Vulkan verdict,
+//! **Direct3D route.** `d3d_routes` is `rt_api::host::doctor`'s prediction of what each imported Direct3D family
+//! will run on (DXVK, vkd3d-proton, or Wine's built-in): computed from the recorded packages and the host's Vulkan verdict,
 //! never from prefix files. `doctor` only prints it; a DXVK/vkd3d-proton route is followed by "Vulkan not
 //! verified" when the injected probe's verdict is unknown.
 //!
@@ -141,7 +141,7 @@ pub trait FsProbe {
     fn list(&self, dir: &Path, cap: usize) -> ListResult;
 }
 
-/// What the read-only audit of a prefix found (the CLI converts `backend_wine::AuditReport`).
+/// What the read-only audit of a prefix found (`rt_api::host::doctor` converts `backend_wine::AuditReport`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrefixAudit {
     /// `dosdevices` entries other than `c:`.
@@ -196,7 +196,7 @@ pub struct DoctorInput<'a> {
     pub app_dir: Option<&'a ListResult>,
     pub prefix: PrefixState,
     /// `Some` for an installed app: the result of the backend's check of the app's own `HOME` directory (the
-    /// CLI passes `backend_wine::check_app_home`), `Err` with its text. `run` refuses such an app, so `doctor`
+    /// gatherer passes `backend_wine::check_app_home`), `Err` with its text. `run` refuses such an app, so `doctor`
     /// must not call it healthy.
     pub app_home: Option<Result<(), &'a str>>,
     /// The prefix directory (its `system32`/`syswow64` count as DLL sources), if there is one.
@@ -233,7 +233,8 @@ pub struct DoctorInput<'a> {
 }
 
 /// Whether the program is managed (.NET) and, for an installed app, whether Wine Mono is recorded for it. The
-/// CLI computes it from `PeInfo::dotnet` and the app's recorded dependencies (never from prefix files).
+/// gatherer (`rt_api::host::doctor`) computes it from `PeInfo::dotnet` and the app's recorded dependencies (never
+/// from prefix files).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DotnetState {
     NotManaged,
