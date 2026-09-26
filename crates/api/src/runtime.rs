@@ -131,6 +131,8 @@ mod tests {
         !s.chars().any(|c| c.is_control() || is_format(c))
     }
 
+    /// A legal `WinPath` component (no control characters) that still carries a bidi override and zero-width.
+    const HOSTILE_FILE: &str = "x\u{202e}y\u{200b}z";
     const HOSTILE: &str = "a\x1b[31m\u{202e}b\u{200b}c\nd\u{0085}e";
 
     #[test]
@@ -180,6 +182,7 @@ mod tests {
         let long = format!("{HOSTILE}{}", "z".repeat(900));
         let env = add(&rt, "h", |m| {
             m.name = HOSTILE.into();
+            m.executable = format!("C:\\a\\{HOSTILE_FILE}{}.exe", "e".repeat(200));
             m.version = Some(long.clone());
             m.environment = HOSTILE.into();
             m.subsystem = HOSTILE.into();
@@ -204,7 +207,7 @@ mod tests {
         let mut all = vec![
             d.name,
             d.architecture,
-            d.executable,
+            d.executable.clone(),
             d.environment,
             d.backend.id,
             d.backend.version,
@@ -221,6 +224,12 @@ mod tests {
 
         assert!(d.version.unwrap().len() <= TEXT_MAX);
         assert!(d.dependencies[0].version.len() <= TEXT_MAX);
+        assert!(
+            d.executable.starts_with(r"C:\a\xyz") && !d.executable.contains('\u{202e}'),
+            "{}",
+            d.executable
+        );
+        assert!(i_product_name_is_cleaned(&rt));
         let s = &rt.apps().apps[0];
         assert!(clean(&s.name) && s.version.as_deref().is_some_and(clean));
         // the bare (non-hostile) case is untouched
@@ -229,6 +238,11 @@ mod tests {
         let p = rt.app("p").unwrap();
         assert_eq!((p.name.as_str(), p.version.as_deref()), ("App", Some("1.0")));
         assert_eq!(p.executable, r"C:\app\a.exe");
+    }
+
+    fn i_product_name_is_cleaned(rt: &Runtime) -> bool {
+        let i = rt.app("h").unwrap().installer.unwrap();
+        clean(&i.product_name.unwrap())
     }
 
     #[test]
@@ -342,7 +356,10 @@ mod tests {
         let (d, rt) = rt();
         let env = add(&rt, "g", |_| {});
         // /tmp is never grantable; /var/tmp is.
-        let vt = tempfile::tempdir_in("/var/tmp").unwrap();
+        let Ok(vt) = tempfile::tempdir_in("/var/tmp") else {
+            eprintln!("SKIPPED permissions_lists_grants: /var/tmp is not a writable directory");
+            return;
+        };
         let saves = vt.path().join("saves");
         std::fs::create_dir(&saves).unwrap();
         std::fs::write(
@@ -448,5 +465,109 @@ mod tests {
     fn error_messages_are_cleaned_and_bounded() {
         let e = ApiError::new(ErrorKind::Internal, format!("{HOSTILE}{}", "m".repeat(2000)));
         assert!(clean(&e.message) && e.message.len() <= 512);
+    }
+
+    #[test]
+    fn an_unknown_error_kind_still_deserialises() {
+        let e: ApiError = serde_json::from_str(r#"{"kind":"some_future_kind","message":"x"}"#).unwrap();
+        assert_eq!((e.kind, e.message.as_str()), (ErrorKind::Unknown, "x"));
+    }
+
+    #[test]
+    fn path_bound_shows_a_maximal_grant_path_whole() {
+        let p = format!("/{}", "d".repeat(PATH_MAX - 1));
+        let v = PermissionsView::from_profile(
+            &rt_sandbox::Permissions {
+                filesystem: vec![rt_sandbox::FsGrant {
+                    path: p.clone().into(),
+                    access: rt_sandbox::Access::Ro,
+                }],
+                ..Default::default()
+            },
+            PermSource::File,
+        );
+        assert_eq!(v.filesystem[0].path, p);
+    }
+
+    /// Every string of every result (keys too) is free of control and format characters. A string field added
+    /// to a wire type must be filled with hostile text here, or this guard proves nothing about it.
+    fn walk(v: &serde_json::Value, at: &str) {
+        match v {
+            serde_json::Value::String(s) => assert!(clean(s), "{at}: {s:?}"),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, at)),
+            serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+                assert!(clean(k), "{at}: key {k:?}");
+                walk(x, k);
+            }),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn no_string_anywhere_holds_an_invisible_character() {
+        let (d, rt) = rt();
+        let hostile_installer = InstallerMeta {
+            family: HOSTILE.into(),
+            product_name: Some(HOSTILE.into()),
+            uninstall_command: Some(format!("C:\\{HOSTILE_FILE}\\u.exe {HOSTILE}")),
+        };
+        let dep = |id: &str| DependencyRecord {
+            id: id.into(),
+            version: HOSTILE.into(),
+            sha256: "0".repeat(64),
+            installed_at: 1,
+            consent: None,
+        };
+        add(&rt, "h1", |m| {
+            m.name = HOSTILE.into();
+            m.version = Some(HOSTILE.into());
+            m.executable = format!("C:\\{HOSTILE_FILE}\\{HOSTILE_FILE}.exe");
+            m.environment = HOSTILE.into();
+            m.subsystem = HOSTILE.into();
+            m.backend = BackendInfo {
+                id: HOSTILE.into(),
+                version: HOSTILE.into(),
+            };
+            m.installer = Some(hostile_installer.clone());
+            m.dependencies = vec![dep(HOSTILE)];
+        });
+        add(&rt, "plain", |_| {});
+        // a grant whose directory name carries a format character: the validator refuses it, which is an error
+        // path whose message may quote the path
+        let env = add(&rt, "g", |_| {});
+        let ctx = ctx(d.path());
+        if let Ok(vt) = tempfile::tempdir_in("/var/tmp") {
+            let odd = vt.path().join(format!("od{}d", '\u{202e}'));
+            std::fs::create_dir(&odd).unwrap();
+            std::fs::write(
+                env.root().join("permissions.toml"),
+                format!(
+                    "version = 1\n[[filesystem]]\npath = {:?}\naccess = \"ro\"\n",
+                    odd.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            let err = rt.permissions_with(&env, &ctx).unwrap_err();
+            walk(&serde_json::to_value(&err).unwrap(), "grant error");
+        }
+        std::fs::remove_file(env.root().join("permissions.toml")).ok();
+        walk(&serde_json::to_value(rt.version()).unwrap(), "version");
+        walk(&serde_json::to_value(rt.apps()).unwrap(), "apps");
+        for id in ["h1", "plain", "g"] {
+            walk(&serde_json::to_value(rt.app(id).unwrap()).unwrap(), id);
+            let env = rt.env(id).unwrap();
+            walk(
+                &serde_json::to_value(rt.permissions_with(&env, &ctx).unwrap()).unwrap(),
+                id,
+            );
+        }
+        walk(&serde_json::to_value(rt.compat()).unwrap(), "compat");
+        for e in [
+            rt.app(HOSTILE).unwrap_err(),
+            rt.app("nope").unwrap_err(),
+            ApiError::new(ErrorKind::Internal, HOSTILE),
+        ] {
+            walk(&serde_json::to_value(e).unwrap(), "error");
+        }
     }
 }
