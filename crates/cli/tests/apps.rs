@@ -2308,7 +2308,10 @@ fn install_managed(r: &Rig) -> String {
     let p = r.input("managed.exe", &managed_exe());
     let o = r.rt(&[OsString::from("install"), p.into_os_string()]);
     assert_ok(&o);
-    installed_id(&o)
+    let id = installed_id(&o);
+    let all = format!("{}{}", s(&o.stdout), s(&o.stderr));
+    assert!(all.contains(&format!("run `runtime deps {id} --install`")), "{all}");
+    id
 }
 
 #[test]
