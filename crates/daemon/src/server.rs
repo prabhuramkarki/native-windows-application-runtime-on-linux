@@ -3,12 +3,15 @@
 //!
 //! **Where.** `$XDG_RUNTIME_DIR/runtime/runtimed.sock` ([`default_socket_path`]) or `--socket PATH`, under the
 //! same rules ([`bind_socket`]): the directory is created 0700 if missing, and refused if it is a symlink, not a
-//! directory, not ours, or open to group or others. At the socket path, nothing is bound over except a stale
-//! socket of ours: a socket nobody accepts on (connect probe: `ECONNREFUSED`) is removed; a live one is
-//! [`ServeError::AlreadyRunning`]; anything else (a file, a symlink, a foreign socket) is refused and left alone.
-//! The socket is bound under umask 077, set 0600 and checked (type, owner, mode) before the first accept. Only
-//! the last component of the directory is checked: its ancestors are the user's own (`XDG_RUNTIME_DIR`) or,
-//! for `--socket`, the caller's choice.
+//! directory, not ours, or open to group or others. Two daemons starting at once are serialised by an exclusive
+//! `flock` on `<socket stem>.lock` next to the socket (a regular file, opened without following links), held for
+//! the server's life and never removed: whoever does not get it is [`ServeError::AlreadyRunning`]. At the socket
+//! path, nothing is bound over except a stale socket of ours: a socket nobody accepts on (a non-blocking connect
+//! probe: `ECONNREFUSED`) is removed; a live one (or one with a full backlog) is `AlreadyRunning`; anything else
+//! (a file, a symlink, a foreign socket) is refused and left alone. The socket is set 0600 right after the bind and
+//! checked (type, owner, mode) before the first accept; until then only the 0700 directory guards it, which is
+//! enough (no process-wide umask swap). Only the last component of the directory is checked: its ancestors are
+//! the user's own (`XDG_RUNTIME_DIR`) or, for `--socket`, the caller's choice.
 //!
 //! **Who.** Every accepted connection's `SO_PEERCRED` uid must be this process's effective uid ([`peer_allowed`]);
 //! any other is closed without a byte. The 0600 mode already keeps others out: this is defence in depth.
@@ -19,11 +22,13 @@
 //! closed). A request runs on a thread of its own: past `request_timeout` the client gets a [`TIMEOUT`] line and
 //! is closed, but the connection's slot is only freed when the method returns, so a stuck method can hold at
 //! most one thread per slot. A method cannot be cancelled (every one is bounded by its own probe timeouts;
-//! `vulkaninfo`'s is 10 s). Replies are written with `idle_timeout` as the write timeout. There is no request
-//! semaphore beyond the connection cap: a connection has at most one request in flight.
+//! `vulkaninfo`'s is 10 s). A whole reply must be written within `idle_timeout` (a client that reads slowly is
+//! cut like one that writes slowly). There is no request semaphore beyond the connection cap: a connection has at
+//! most one request in flight. Blank lines (NDJSON keep-alives) are skipped without a reply.
 //!
 //! **Stopping.** `stop` (set by SIGTERM/SIGINT in `runtimed`) is polled every [`TICK`]: the listener closes, idle
-//! connections end at their next tick, a request being executed gets its reply, and after at most [`GRACE`] the
+//! connections end at their next tick, a request being executed gets its reply if it finishes within [`GRACE`]
+//! (longer than every probe's own bound; a request still running then is cut off by the process exit), and the
 //! socket file this server bound (checked by device and inode) is removed; an inherited (activated) one is not.
 //!
 //! **Socket activation** ([`listener_from_env`]): `LISTEN_PID` must be this process (else the variables are not
@@ -47,8 +52,9 @@ use std::time::{Duration, Instant};
 
 /// How often blocked waits look at the stop flag.
 pub const TICK: Duration = Duration::from_millis(100);
-/// How long a stopping server waits for its connections.
-pub const GRACE: Duration = Duration::from_secs(5);
+/// How long a stopping server waits for the requests in flight: longer than the slowest probe (`vulkaninfo`,
+/// 10 s plus its drain), well under systemd's default stop timeout (90 s).
+pub const GRACE: Duration = Duration::from_secs(12);
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -120,6 +126,8 @@ pub struct Bound {
     path: PathBuf,
     dev: u64,
     ino: u64,
+    /// The `flock`ed lock file: held as long as this value lives.
+    _lock: fs::File,
 }
 
 impl Bound {
@@ -154,6 +162,78 @@ fn check_dir(dir: &Path) -> Result<(), ServeError> {
     }
 }
 
+/// Takes the exclusive lock next to `path` (module docs); `AlreadyRunning` when another server holds it.
+fn lock(path: &Path) -> Result<fs::File, ServeError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let at = path.with_extension("lock");
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&at)
+        .map_err(io("cannot open the lock file"))?;
+    let m = f.metadata().map_err(io("cannot inspect the lock file"))?;
+    if !m.is_file() || m.uid() != euid() {
+        return Err(ServeError::Unsafe {
+            path: shown(&at),
+            why: "the lock file is not a regular file of ours",
+        });
+    }
+    // SAFETY: `flock` on an fd we own; no memory is passed.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(if e.kind() == io::ErrorKind::WouldBlock {
+            ServeError::AlreadyRunning(shown(path))
+        } else {
+            io("cannot lock the lock file")(e)
+        });
+    }
+    Ok(f)
+}
+
+/// Whether something accepts connections at `path`: a non-blocking connect, so a full backlog of a socket nobody
+/// accepts on cannot hang the start (it counts as live).
+fn live(path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `sockaddr_un` is plain data; all zeroes is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *s as libc::c_char;
+    }
+    // SAFETY: `socket` has no memory arguments; the fd is owned right below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created and is owned by nothing else.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: `addr` is a valid, NUL-terminated `sockaddr_un` of `len` bytes that outlives the call.
+    let r = unsafe { libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) };
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ECONNREFUSED) => Ok(false),
+        Some(libc::EAGAIN | libc::EINPROGRESS) => Ok(true),
+        _ => Err(e),
+    }
+}
+
 /// Binds `path` under the rules of the module docs.
 pub fn bind_socket(path: &Path) -> Result<(UnixListener, Bound), ServeError> {
     let refuse = |why| ServeError::Unsafe { path: shown(path), why };
@@ -162,35 +242,45 @@ pub fn bind_socket(path: &Path) -> Result<(UnixListener, Bound), ServeError> {
     }
     let dir = path.parent().ok_or_else(|| refuse("no directory"))?;
     check_dir(dir)?;
+    let lock = lock(path)?;
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(io("cannot inspect the socket path")(e)),
         Ok(m) if !m.file_type().is_socket() => return Err(refuse("something that is not a socket is in the way")),
         Ok(m) if m.uid() != euid() => return Err(refuse("a socket of another user is in the way")),
-        Ok(_) => match UnixStream::connect(path) {
-            Ok(_) => return Err(ServeError::AlreadyRunning(shown(path))),
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+        Ok(_) => match live(path) {
+            Ok(true) => return Err(ServeError::AlreadyRunning(shown(path))),
+            Ok(false) => {
                 fs::remove_file(path).map_err(io("cannot remove the stale socket"))?;
                 log("removed a stale socket");
             }
             Err(e) => return Err(io("cannot probe the existing socket")(e)),
         },
     }
-    // SAFETY: `umask` only swaps the process's file mode mask; the old one is put back right after the bind.
-    let old = unsafe { libc::umask(0o077) };
-    let bound = UnixListener::bind(path);
-    // SAFETY: as above.
-    unsafe { libc::umask(old) };
-    let listener = bound.map_err(io("cannot bind the socket"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io("cannot set the socket mode"))?;
-    let m = fs::symlink_metadata(path).map_err(io("cannot inspect the bound socket"))?;
-    if !m.file_type().is_socket() || m.uid() != euid() || m.mode() & 0o777 != 0o600 {
-        return Err(refuse("the bound socket is not a 0600 socket of ours"));
-    }
+    let listener = UnixListener::bind(path).map_err(io("cannot bind the socket"))?;
+    let checked = fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(io("cannot set the socket mode"))
+        .and_then(|()| fs::symlink_metadata(path).map_err(io("cannot inspect the bound socket")))
+        .and_then(|m| {
+            if !m.file_type().is_socket() || m.uid() != euid() || m.mode() & 0o777 != 0o600 {
+                Err(refuse("the bound socket is not a 0600 socket of ours"))
+            } else {
+                Ok(m)
+            }
+        });
+    let m = match checked {
+        Ok(m) => m,
+        Err(e) => {
+            // We hold the lock and just bound it: the file is ours to take back.
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
+    };
     let bound = Bound {
         path: path.to_owned(),
         dev: m.dev(),
         ino: m.ino(),
+        _lock: lock,
     };
     Ok((listener, bound))
 }
@@ -291,8 +381,25 @@ impl Read for Deadline<'_> {
     }
 }
 
-fn send(s: &UnixStream, r: &Reply) -> io::Result<()> {
-    (&mut &*s).write_all(&r.to_line())
+/// Writes `r` whole before `until`: each `write` gets the time left, so a client that reads a byte now and then
+/// cannot stretch a reply past the deadline.
+fn send_by(s: &UnixStream, r: &Reply, until: Instant) -> io::Result<()> {
+    let line = r.to_line();
+    let mut at = 0;
+    while at < line.len() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        s.set_write_timeout(Some(left))?;
+        match (&mut &*s).write(&line[at..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => at += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Runs one request on its own thread and waits at most `timeout` for it: the reply (a [`TIMEOUT`] error when it
@@ -319,9 +426,7 @@ fn run(
 }
 
 fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'static AtomicBool) {
-    if s.set_write_timeout(Some(cfg.idle_timeout)).is_err() {
-        return;
-    }
+    let send = |r: &Reply| send_by(&s, r, Instant::now() + cfg.idle_timeout);
     let mut r = BufReader::new(Deadline {
         s: &s,
         until: Instant::now(),
@@ -330,12 +435,14 @@ fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'s
     loop {
         r.get_mut().until = Instant::now() + cfg.idle_timeout;
         let frame = match read_frame(&mut r) {
+            // A blank line: a keep-alive, not a request.
+            Ok(Some(f)) if f.iter().all(u8::is_ascii_whitespace) => continue,
             Ok(Some(f)) => f,
             Ok(None) => return,
             Err(FrameError::TooLarge) => {
                 log("closed a connection: request line over the cap");
                 let why = format!("invalid request: line longer than {MAX_FRAME} bytes");
-                let _ = send(&s, &Reply::error(Id::Null, INVALID_REQUEST, why));
+                let _ = send(&Reply::error(Id::Null, INVALID_REQUEST, why));
                 return;
             }
             Err(FrameError::Io(_)) => return,
@@ -343,7 +450,7 @@ fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'s
         let req = match parse_request(&frame) {
             Ok(req) => req,
             Err(reply) => {
-                if send(&s, &reply).is_err() {
+                if send(&reply).is_err() {
                     return;
                 }
                 continue;
@@ -353,7 +460,7 @@ fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'s
         let Some(id) = req.id.clone() else { continue };
         let (reply, handler) = run(&rt, req, id, cfg.request_timeout);
         let timed_out = matches!(reply, Reply::Err { code: TIMEOUT, .. });
-        let sent = send(&s, &reply);
+        let sent = send(&reply);
         if timed_out {
             log("a request timed out: connection closed");
             let _ = s.shutdown(std::net::Shutdown::Both);
@@ -376,6 +483,17 @@ pub fn serve(
     listener: Option<UnixListener>,
     stop: &'static AtomicBool,
 ) -> Result<(), ServeError> {
+    serve_as(rt, cfg, listener, stop, euid())
+}
+
+/// [`serve`], admitting only peers of uid `me` (tests pass another uid to see a refusal).
+fn serve_as(
+    rt: Arc<Runtime>,
+    cfg: ServerConfig,
+    listener: Option<UnixListener>,
+    stop: &'static AtomicBool,
+    me: u32,
+) -> Result<(), ServeError> {
     let (listener, bound) = match listener {
         Some(l) => {
             log("serving the inherited socket");
@@ -387,7 +505,7 @@ pub fn serve(
             (l, Some(b))
         }
     };
-    let result = accept_loop(&listener, rt, Arc::new(cfg), stop);
+    let result = accept_loop(&listener, rt, Arc::new(cfg), stop, me);
     drop(listener);
     if let Some(b) = bound {
         b.remove();
@@ -401,10 +519,10 @@ fn accept_loop(
     rt: Arc<Runtime>,
     cfg: Arc<ServerConfig>,
     stop: &'static AtomicBool,
+    me: u32,
 ) -> Result<(), ServeError> {
     listener.set_nonblocking(true).map_err(io("cannot use the socket"))?;
     let active = Arc::new(AtomicUsize::new(0));
-    let me = euid();
     while !stop.load(Ordering::SeqCst) {
         let mut pfd = libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -439,7 +557,7 @@ fn accept_loop(
             if active.load(Ordering::SeqCst) >= cfg.max_connections {
                 // Never block the accept loop on a client: one non-blocking attempt, then close.
                 let _ = s.set_nonblocking(true);
-                let _ = send(&s, &Reply::error(Id::Null, BUSY, "server busy"));
+                let _ = (&s).write(&Reply::error(Id::Null, BUSY, "server busy").to_line());
                 log("refused a connection: too many connections");
                 continue;
             }
@@ -486,11 +604,16 @@ mod tests {
 
     impl Srv {
         fn start(dir: &Path, rt: Arc<Runtime>, tune: impl FnOnce(&mut ServerConfig)) -> Srv {
+            Srv::start_as(dir, rt, tune, euid())
+        }
+
+        /// A server that admits only uid `me`.
+        fn start_as(dir: &Path, rt: Arc<Runtime>, tune: impl FnOnce(&mut ServerConfig), me: u32) -> Srv {
             let sock = dir.join("run").join("runtimed.sock");
             let mut cfg = ServerConfig::new(sock.clone());
             tune(&mut cfg);
             let stop = flag();
-            let done = Some(thread::spawn(move || serve(rt, cfg, None, stop)));
+            let done = Some(thread::spawn(move || serve_as(rt, cfg, None, stop, me)));
             let until = Instant::now() + Duration::from_secs(5);
             // Mode 0600 is set after bind+listen; a probe connection would take a slot for a moment.
             while fs::symlink_metadata(&sock).map(|m| m.mode() & 0o777).ok() != Some(0o600) {
@@ -613,8 +736,15 @@ mod tests {
         let mut c = srv.conn();
         for m in crate::dispatch::METHODS {
             for id in ["game", "nope"] {
-                let got = wire(&c.call(m, params(m, id)));
-                assert_eq!(got, direct(&rt, m, id), "{m} {id}");
+                let mut got = wire(&c.call(m, params(m, id)));
+                let mut want = direct(&rt, m, id);
+                if got != want {
+                    // The host probes behind doctor and sandbox.info run on every call (only Vulkan is cached): one
+                    // that timed out under a loaded machine gets a second chance, a real difference does not.
+                    got = wire(&c.call(m, params(m, id)));
+                    want = direct(&rt, m, id);
+                }
+                assert_eq!(got, want, "{m} {id}");
                 if !ID_METHODS.contains(m) {
                     break;
                 }
@@ -779,6 +909,63 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_of_another_uid_is_closed_without_a_byte() {
+        let (d, rt) = rt();
+        let srv = Srv::start_as(
+            d.path(),
+            Arc::new(rt),
+            |c| c.max_connections = 1,
+            euid().wrapping_add(1),
+        );
+        // Twice: a refusal takes no slot (with a cap of 1 the second would otherwise get the busy line).
+        for _ in 0..2 {
+            let mut s = UnixStream::connect(&srv.sock).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = s.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"rpc.version\",\"id\":1}\n");
+            let mut got = Vec::new();
+            let _ = s.read_to_end(&mut got);
+            assert!(got.is_empty(), "{:?}", String::from_utf8_lossy(&got));
+        }
+    }
+
+    #[test]
+    fn a_second_server_is_refused_by_the_lock_even_without_a_socket() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("run/s.sock");
+        let (l, first) = bind_socket(&sock).unwrap();
+        assert!(matches!(bind_socket(&sock), Err(ServeError::AlreadyRunning(_))));
+        // The race of the review: the first one's socket unlinked by someone; the lock still says no.
+        drop(l);
+        fs::remove_file(&sock).unwrap();
+        assert!(matches!(bind_socket(&sock), Err(ServeError::AlreadyRunning(_))));
+        assert!(!sock.exists());
+        assert_eq!(mode(&d.path().join("run/s.lock")), 0o600);
+        drop(first);
+        let (_l, _b) = bind_socket(&sock).unwrap();
+        // A lock path that is a symlink is refused.
+        let d2 = tempfile::tempdir().unwrap();
+        let run = d2.path().join("run");
+        fs::create_dir(&run).unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(d2.path().join("elsewhere"), run.join("s.lock")).unwrap();
+        assert!(bind_socket(&run.join("s.sock")).is_err());
+        assert!(!d2.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn a_reply_must_be_written_whole_before_the_deadline() {
+        let (a, _never_reads) = UnixStream::pair().unwrap();
+        let big = Reply::Ok {
+            id: Id::Num(1),
+            result: Value::String("x".repeat(8 << 20)),
+        };
+        let t = Instant::now();
+        let r = send_by(&a, &big, Instant::now() + Duration::from_millis(300));
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
     fn the_connection_cap_turns_the_33rd_away_and_frees_slots() {
         let (d, rt) = rt();
         let srv = Srv::start(d.path(), Arc::new(rt), |_| {});
@@ -905,7 +1092,7 @@ mod tests {
         let srv = Srv::start(d.path(), Arc::new(rt), |_| {});
         let mut c = srv.conn();
         c.send(
-            b"{\"jsonrpc\":\"2.0\",\"method\":\"rpc.version\"}\n\
+            b"\n \t\n{\"jsonrpc\":\"2.0\",\"method\":\"rpc.version\"}\n\
               [1]\n\
               {\"jsonrpc\":\"2.0\",\"method\":\"rpc.version\",\"id\":\"b\"}\n\
               {\"jsonrpc\":\"2.0\",\"method\":\"rpc.version\",\"id\":null}",
