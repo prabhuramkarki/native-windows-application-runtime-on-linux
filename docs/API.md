@@ -2,9 +2,9 @@
 
 `runtimed` serves the runtime's API (`rt_api`) as JSON-RPC 2.0 over an owner-only Unix socket. A GUI, a tray applet
 or a script asks it what the CLI would print, as typed JSON. By default it is **read-only**. Started with `--write`,
-it also runs, installs and removes apps, installs dependencies and changes permissions and the display driver: each
+it also runs, installs, imports and removes apps, installs dependencies and changes permissions and the display driver: each
 such change is a **job** that runs the `runtime` CLI next to `runtimed`, whose output clients follow by long-polling
-([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.0**.
+([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.1**.
 
 The CLI does not need the daemon. Every `runtime` command works on its own, except the two that exist to talk to it:
 `runtime rpc` and `runtime daemon-status`.
@@ -126,6 +126,7 @@ sandboxes, the app lock, the refusals while an app is running, the grant rules. 
 - `apps.run`: `runtime run <id> -- <args...>` (always sandboxed: there is no parameter for `--unsandboxed` or
   `--debug`);
 - `apps.install`: `runtime install [--name=N] [--exe=E] [--silent] [--network] -- <path>`;
+- `apps.import`: `runtime import [--silent] [--network] -- <path>`;
 - `apps.remove`: `runtime remove -- <id>`;
 - `deps.install`: `runtime deps --install --plan-digest=<hex> [--yes=<pkg>]... -- <id>`;
 - `permissions.set`: `runtime permissions --set=<expr>... -- <id>`;
@@ -157,8 +158,9 @@ Stop when `job.state` is `succeeded`, `failed` or `cancelled`: the last event is
   output is not shown, and the job ends.
 
 A job's `JobInfo` is `{jobId, kind, app, state, exitCode, signal, createdAt, startedAt, endedAt, dropped}`: `kind` is
-`run`, `install`, `remove`, `depsInstall`, `permissionsSet`, `permissionsReset` or `displaySet`; `app` is `null` for
-an install (the CLI derives the id: read it from the `Installed: <id>` line or `apps.list`); times are Unix ms;
+`run`, `install`, `import`, `remove`, `depsInstall`, `permissionsSet`, `permissionsReset` or `displaySet`; `app` is
+`null` for an install or an import (the CLI derives the id: read it from the `Installed: <id>` line or `apps.list`);
+times are Unix ms;
 `exitCode` and `signal` are `null` until known.
 
 **States.** `queued` (only between the start and the spawn), `running`, then one of: `succeeded` (exit 0),
@@ -225,6 +227,7 @@ socket; if it is killed outright, each job's `runtime` gets SIGTERM from the ker
 | `deps.plan` | `{"id"}` | `DepsPlanView` |
 | `apps.run` | `{"id", "args"?}` | `JobStarted` (write mode) |
 | `apps.install` | `{"path", "name"?, "exe"?, "silent"?, "network"?}` | `JobStarted` (write mode) |
+| `apps.import` | `{"path", "silent"?, "network"?}` | `JobStarted` (write mode) |
 | `apps.remove` | `{"id"}` | `JobStarted` (write mode) |
 | `deps.install` | `{"id", "planDigest", "consent"}` | `JobStarted` (write mode) |
 | `permissions.set` | `{"id", "set"}` | `JobStarted` (write mode) |
@@ -253,7 +256,7 @@ The API version (semver), the runtime's crate version, the protocol name, and wh
 methods (`runtimed --write`). A 0.1 daemon has no `write`: treat it as `false`.
 
 ```json
-{"api": "0.2.0", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
+{"api": "0.2.1", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
 ```
 
 ### `apps.list`
@@ -281,14 +284,17 @@ One app. The fields:
 - `environment` and `subsystem`;
 - `installer`: `null`, or `{family, productName, uninstallCommand}`;
 - `dependencies`: `[{id, version, installedAt}]`;
-- `prefix`: `{exists, hasDriveC}`, probed without following symlinks.
+- `prefix`: `{exists, hasDriveC}`, probed without following symlinks;
+- `package` (0.2.1): `null`, or, for an app imported from a `.wrun`, `{id, version, digest, requestedDependencies,
+  requestedPermissions}`: what the package asked for, recorded and never granted. A 0.2.0 daemon leaves it out;
+  clients read a missing `package` as `null`.
 
 ```json
 {
   "architecture": "x86_64", "backend": {"id": "wine", "version": "10.0"}, "created": 1790451200,
   "dependencies": [], "environment": "default", "executable": "C:\\app\\a.exe", "id": "notepad",
-  "installer": null, "name": "Notepad", "prefix": {"exists": true, "hasDriveC": true}, "subsystem": "gui",
-  "version": "1.0"
+  "installer": null, "name": "Notepad", "package": null, "prefix": {"exists": true, "hasDriveC": true},
+  "subsystem": "gui", "version": "1.0"
 }
 ```
 
@@ -302,7 +308,10 @@ The app's sandbox profile. `source` is `default` (no `permissions.toml`) or `fil
 - `network`: `allow` or `deny`;
 - `display`, `audio`, `gpu`: booleans;
 - `filesystem`: `[{path, access}]`, where `access` is `ro` or `rw`;
-- `limits`: `{memoryMb, cpuPercent, tasks, tasksDefault, explicit}`.
+- `limits`: `{memoryMb, cpuPercent, tasks, tasksDefault, explicit}`;
+- `requested` (0.2.1): for an app imported from a `.wrun`, the permissions its package requested that this profile
+  does not grant, as `runtime permissions --set` expressions (`network=allow`, `gpu=on`, ...). Display only: grant
+  one with `permissions.set`. Empty otherwise; a 0.2.0 daemon leaves it out (read as empty).
 
 An invalid file is an `unavailable` error, never a silent default.
 
@@ -310,7 +319,7 @@ An invalid file is an `unavailable` error, never a silent default.
 {
   "audio": true, "display": true, "filesystem": [], "gpu": true,
   "limits": {"cpuPercent": null, "explicit": false, "memoryMb": null, "tasks": 4096, "tasksDefault": true},
-  "network": "deny", "source": "default"
+  "network": "deny", "requested": [], "source": "default"
 }
 ```
 
@@ -452,6 +461,21 @@ CLI judges the file itself. `name` (at most 256 bytes) and `exe` (1,024) are pas
 runtime rpc apps.install '{"path": "/home/me/Downloads/setup.exe", "silent": true}'
 ```
 
+### `apps.import`
+
+Params: `{"path": "/abs/file.wrun", "silent"?: bool, "network"?: bool}`. Imports a `.wrun` package as
+`runtime import` does: the app gets the id its manifest names (an app with that id already installed fails the job
+and is left alone), and what the package requests (dependencies, permissions) is recorded and printed with the
+command that would grant it. **Nothing is granted, downloaded or run**: dependencies still need `deps.install` and
+their consent, permissions `permissions.set`. `path` is checked as `apps.install`'s; there is no `name` or `exe` (the
+manifest has them). `silent` and `network` are the user's choices for an installer package (the job fails, exit 1,
+when either is set for a portable one). The job's `app` is `null`; the id is in the `Installed: <id>` event, and the
+job's first lines are the package summary (as `runtime inspect`), including that it is unsigned.
+
+```sh
+runtime rpc apps.import '{"path": "/home/me/Downloads/example.wrun"}'
+```
+
 ### `apps.remove`
 
 Params: `{"id"}`. Stops the app's Wine processes and deletes the app, as `runtime remove`. Refused (a `failed` job,
@@ -510,7 +534,7 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 
 ## Versioning and compatibility
 
-- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.0**. Until 1.0:
+- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.1**. Until 1.0:
   - a **breaking** change bumps the **minor** version: a method removed or renamed, a param changed, a result
     member removed or retyped, an enum value removed;
   - an **additive** change bumps the **patch** version: a new method, a new result member, a new enum value, a new
@@ -527,6 +551,9 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
   a read-only daemon answers `read_only`. Everything else is additive: the write methods, `rpc.version.write`, and
   `deps.plan`'s `digest`, `sha256` and `consentText`. A 0.2 client reading a 0.1 daemon's `deps.plan` gets an
   empty `digest`, and the bundled client refuses `deps_install` with it before sending.
+- **0.2.1 is additive**: the `apps.import` method and its job kind `import`, `apps.get`'s `package` and
+  `permissions.get`'s `requested`. A 0.2.0 daemon answers `apps.import` `-32601`; the GUI offers a `.wrun` only to a
+  0.2.1 daemon.
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
@@ -623,7 +650,7 @@ edge is used by these two commands alone.
 ```sh
 sock=$XDG_RUNTIME_DIR/runtime/runtimed.sock
 printf '%s\n' '{"jsonrpc":"2.0","method":"rpc.version","id":1}' | socat - UNIX-CONNECT:$sock
-# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.0","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
+# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.1","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
 printf '%s\n' '{"jsonrpc":"2.0","method":"apps.get","params":{"id":"nope"},"id":"a"}' | nc -U -N $sock
 # {"error":{"code":-32000,"data":{"kind":"not_found"},"message":"no app named nope is installed"},"id":"a","jsonrpc":"2.0"}
 ```

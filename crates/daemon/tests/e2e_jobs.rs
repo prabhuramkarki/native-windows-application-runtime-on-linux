@@ -11,7 +11,7 @@
 mod support;
 
 use rt_api::jobs::{EventKind, JobEvent, JobInfo, JobState};
-use rt_daemon::client::{Client, InstallParams};
+use rt_daemon::client::{Client, ImportParams, InstallParams};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -278,6 +278,68 @@ fn the_real_runtime_as_jobs_install_permissions_display_deps_run_remove() {
     let id = c.remove(&app).unwrap().job_id;
     assert_eq!(follow(&mut c, &id).0.state, JobState::Succeeded);
     assert!(c.apps().unwrap().apps.is_empty());
+}
+
+/// Phase 6D: `apps.import` of a portable `.wrun` (built by the real `runtime pack`) through the real `runtime` and a
+/// fake Wine. The app gets the manifest's id, `permissions.get` shows the request as not granted, the profile is the
+/// default one (nothing granted), and a read-only daemon refuses the method.
+#[test]
+fn the_real_runtime_imports_a_package_as_a_job_and_grants_nothing() {
+    let (s, env) = real();
+    let pkg = s.root.join("pkg");
+    fs::create_dir_all(pkg.join("payload/App")).unwrap();
+    fs::copy(fixture("hello64.exe"), pkg.join("payload/App/hello64.exe")).unwrap();
+    fs::write(
+        pkg.join("wrun.toml"),
+        "format = 1\nid = \"demo\"\nname = \"Demo\"\nversion = \"1.0\"\narch = \"x86_64\"\n\n[entry]\n\
+         kind = \"portable\"\nexe = \"payload/App/hello64.exe\"\n\n[permissions]\nnetwork = \"allow\"\n",
+    )
+    .unwrap();
+    let file = s.root.join("demo.wrun");
+    let o = std::process::Command::new(s.bin.join("runtime"))
+        .env("RUNTIME_DATA_DIR", &s.data)
+        .env("HOME", &s.home)
+        .arg("pack")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let params = ImportParams {
+        path: file.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let mut ro = s.start(false, &refs(&env));
+    let e = s.client().import(&params).unwrap_err();
+    assert_eq!(e.api_error().unwrap().kind, rt_api::ErrorKind::ReadOnly);
+    ro.signal(libc::SIGTERM);
+    assert!(ro.wait(Duration::from_secs(10)).success());
+    let _d = s.daemon(&refs(&env));
+    let mut c = s.client();
+    let id = c.import(&params).unwrap().job_id;
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!(
+        (info.state, info.kind, info.app.as_deref()),
+        (JobState::Succeeded, rt_api::jobs::JobKind::Import, None),
+        "{ev:?}"
+    );
+    assert!(ev.iter().any(|e| e.text == "Installed: demo"), "{ev:?}");
+    assert!(ev.iter().any(|e| e.text.contains("unsigned")), "{ev:?}");
+    assert!(c.apps().unwrap().apps.iter().any(|a| a.id == "demo"));
+    let p = c.permissions("demo").unwrap();
+    assert_eq!(p.requested, ["network=allow"]);
+    assert_eq!(
+        (p.source, p.network),
+        (rt_api::PermSource::Default, rt_api::NetworkView::Deny)
+    );
+    assert!(!s.data.join("apps/demo/permissions.toml").exists());
+    // The same package again: the id is taken, the job fails, the app stays.
+    let id = c.import(&params).unwrap().job_id;
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!((info.state, info.exit_code), (JobState::Failed, Some(1)), "{ev:?}");
+    assert!(ev.iter().any(|e| e.text.contains("already installed")), "{ev:?}");
+    assert_eq!(c.apps().unwrap().apps.len(), 1);
 }
 
 /// Spec D11: what an app's sandbox would bind never includes the write-capable socket, its directory or an ancestor

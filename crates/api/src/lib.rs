@@ -20,6 +20,6 @@ pub use runtime::Runtime;
 pub use types::*;
 
 /// The version of this API (semver): bumped when a method or a wire type changes.
-pub const API_VERSION: &str = "0.2.0";
+pub const API_VERSION: &str = "0.2.1";
 /// The wire protocol the daemon speaks over its socket.
 pub const PROTOCOL: &str = "jsonrpc-2.0-ndjson";

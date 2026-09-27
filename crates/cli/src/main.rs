@@ -439,6 +439,17 @@ mod daemon_argv {
                 };
                 assert_eq!((&file, &n, &e, si, ne), (path, name, exe, *silent, *network));
             }
+            JobSpec::Import { path, silent, network } => {
+                let Cmd::Import {
+                    file,
+                    silent: si,
+                    network: ne,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not import")
+                };
+                assert_eq!((&file, si, ne), (path, *silent, *network));
+            }
             JobSpec::Remove { app } => {
                 let Cmd::Remove { app: a } = cmd else {
                     panic!("{spec:?}: not remove")
@@ -527,6 +538,18 @@ mod daemon_argv {
                 network,
             });
         }
+        for (path, silent, network) in [
+            ("/-x/My App.wrun", false, false),
+            ("/--silent", true, false),
+            ("/-n/--network", false, true),
+            ("/a.wrun", true, true),
+        ] {
+            specs.push(JobSpec::Import {
+                path: path.into(),
+                silent,
+                network,
+            });
+        }
         for driver in [Driver::Auto, Driver::X11, Driver::Wayland] {
             specs.push(JobSpec::DisplaySet { app: id("a"), driver });
         }
@@ -546,7 +569,7 @@ mod daemon_argv {
         let mut kinds: Vec<_> = specs.iter().map(|s| format!("{:?}", s.kind())).collect();
         kinds.sort();
         kinds.dedup();
-        assert_eq!(kinds.len(), 7, "one sample per variant at least: {kinds:?}");
+        assert_eq!(kinds.len(), 8, "one sample per variant at least: {kinds:?}");
         specs.iter().for_each(check);
     }
 }
