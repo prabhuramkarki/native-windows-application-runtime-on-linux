@@ -5129,3 +5129,8 @@ fn the_installer_sandbox_never_binds_the_daemons_socket() {
         "{envs:?}"
     );
 }
+
+// ================================================================ .wrun packages
+
+#[path = "apps/package.rs"]
+mod package;

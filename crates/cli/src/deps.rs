@@ -362,7 +362,17 @@ pub(crate) fn format_plan(app: &str, ap: &AppPlan, manifest: &Manifest, install:
             Action::AlreadyInstalled => ALREADY.to_owned(),
             Action::Blocked { reason } => format!("blocked: {}", safe(reason)),
         };
-        let _ = writeln!(o, "  {}: {what}", package_line(manifest.get(&e.package), &e.package));
+        // Information only: consent is bound to the entries (the plan digest), not to this reason.
+        let why = if ap.is_requested(&e.package) {
+            format!(" ({})", rt_deps::REQUESTED_REASON)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            o,
+            "  {}: {what}{why}",
+            package_line(manifest.get(&e.package), &e.package)
+        );
     }
     for w in &ap.warnings {
         let _ = writeln!(o, "warning: {}", safe(w));
