@@ -45,6 +45,7 @@
 | 5C Portal "ask" flows | deferred | a running bubblewrap sandbox cannot gain mounts; needs a different design (per-run grants) |
 | 6A API crate + read-only daemon | done (merged) | `rt_api` (typed, sanitised read-only API; host gathering moved out of the CLI), `runtimed` (JSON-RPC 2.0 NDJSON, owner-only Unix socket, peer uid, caps and deadlines, systemd socket activation), `rt_daemon::client`, `runtime rpc`/`daemon-status`; `docs/API.md` |
 | 6B Mutating methods + job events | implemented on branch `phase-6b-daemon-write`, pending merge | `runtimed --write`: run/install/remove/deps.install/permissions/display as jobs running the `runtime` CLI with a validated argv (`rt_api::jobs`); long-polled cleaned output (`jobs.poll`); consent by plan digest + exact package/version/sha256, re-checked by `runtime deps --install --plan-digest`; process groups, PDEATHSIG, pid-reuse-safe cancel; socket must be in `$XDG_RUNTIME_DIR`; API 0.2.0; `docs/API.md`, `docs/SECURITY.md`. Follow-ups: re-check the `runtime` version when the file changes; a real-Wine cancel e2e with a long-running fixture; re-digest under the app lock in `deps --install`; `progress` events if the GUI needs them |
+| 6C GUI client | implemented on branch `phase-6c-gui`, pending merge | `runtime-gui` (GTK 4 + libadwaita, `crates/gui`, outside `default-members`, its own CI job): a toolkit-free view model; a backend with one request thread and at most 4 long-poll job followers; apps list with search; run/stop; install and remove dialogs; permissions editor (typed choices only); per-package consent dialog sending the plan digest unmodified; a jobs panel with plain-text logs; read-only and no-daemon states. Tests: view model, e2e against the real `runtimed`, widget tests under Xvfb. Manual `docs/GUI-CHECKLIST.md` (GNOME, KDE) not yet run. Follow-ups: an accessibility pass (Orca, keyboard); the gui CI job's first hosted run; display-driver setting and resource-limit editing |
 | 6C-6D GUI, plugins | not started | GUI toolkit GTK4 + libadwaita (6C); licence MIT OR Apache-2.0 and name `runtime` defaults |
 
 **Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are only partly met: no game was recorded; .NET runs: met for Mono-compatible console programs (Phase 4F: Wine Mono 9.4.0 per app, a C# console fixture with threads and GC verified under the hardened sandbox); a real .NET Framework 4.8 GUI app is not claimed. `doctor` predicts a deliberately broken environment (met).
@@ -82,7 +83,7 @@
 
 1. **Project licence** (MIT/Apache-2.0 vs GPL). Permissive keeps Native Mode clean-room-able; if permissive, never copy Wine/ReactOS code into own components.
 2. **Wine sourcing:** system `wine` only (simple) vs runtime-managed Wine builds downloaded with consent (reproducible; needed by Phase 4).
-3. **GUI toolkit** for Phase 6: Tauri (TypeScript, matches §37) vs GTK4-rs (native look on GNOME/KDE).
+3. **GUI toolkit** for Phase 6: Tauri (TypeScript, matches §37) vs GTK4-rs (native look on GNOME/KDE). Settled: GTK 4 + libadwaita (Phase 6C).
 4. **Project/binary name** (`runtime` is a placeholder and collides with generic names).
 
 ---

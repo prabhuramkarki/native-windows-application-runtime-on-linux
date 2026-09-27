@@ -11,3 +11,10 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
+
+# target-lexicon (via system-deps -> cfg-expr) runs only in the gtk-rs `-sys` build scripts of `runtime-gui`; it is
+# never linked into a binary (`cargo tree --workspace -i target-lexicon -e normal` is empty). The LLVM exception only relaxes
+# Apache-2.0's attribution for compiled output. Scoped to this one crate, not a global allow.
+[[licenses.exceptions]]
+crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]

@@ -1211,14 +1211,108 @@ must not exist, and why it does not:
 - **Group-writable installs are refused.** A umask of 002 makes cargo install `runtime` and `~/.cargo/bin`
   group-writable; `runtimed --write` refuses to start and names `chmod g-w,o-w <path>`. A private group with only
   the user in it would be harmless, but the check does not try to tell.
-- **How a GUI presents consent is the GUI's responsibility** (6C). The API only accepts consent to the exact package,
-  version, hash and licence text it reported.
+- **How a GUI presents consent is the GUI's responsibility.** The API only accepts consent to the exact package,
+  version, hash and licence text it reported. `runtime-gui`'s presentation is in the next section.
 - **Event text is cleaned by the daemon, but a client cannot know the process at the socket is the daemon.** Clients
   must clean or escape every string they show; `runtime rpc` does, the typed client helpers do not.
 - **Output after `runtime` exits** from a process it left holding the pipes is drained and dropped (a note says so).
   Members left in a job's group after it ended on its own are not killed; after a cancel they are.
 - **No real-Wine test of cancelling a long-running app yet**: cancel is tested at process level (fake `runtime`,
   process groups, grandchildren, SIGTERM-ignoring members) and a real sandboxed run is tested end to end.
+
+## The GUI client (Phase 6C)
+
+`runtime-gui` (GTK 4 + libadwaita, `crates/gui`) is one more same-uid client of `runtimed`. It adds no privilege and
+no new way around anything the daemon or the CLI guards.
+
+### Trust model
+
+Unchanged from the daemon sections above. The GUI runs as the user, with the user's own rights. It holds no secret
+and itself stores nothing: no settings file, no cache. GTK's file chooser may record recently used files, as in
+any GTK app. It opens no network connection. It uses only the daemon's Unix
+socket, plus whatever GTK itself uses: the session bus for accessibility, portals and single-instance activation.
+
+### What it never does
+
+- **Talk to anything but `runtimed`.** It goes through `rt_daemon::client::Client` only, so the client's socket
+  checks (owner, mode, peer uid) apply. A test scans `crates/gui/src` and fails on the in-process API
+  (`rt_api::Runtime`), `process::Command` or the CLI crate. The view model and the backend must not name a toolkit.
+- **Start a process or a service.** With no daemon it shows `systemctl --user start runtimed.socket` as text to
+  copy, and a Retry button. If the user enabled `runtimed.socket`, connecting starts the user's own service by
+  socket activation; that is the unit's documented behaviour, not a GUI action.
+- **Build an argv, pass an environment or ask for an unsandboxed run.** It sends typed parameters. The API has no
+  unsandboxed parameter, and the daemon validates everything (the 6B section above).
+- **Block its main loop on the daemon.** Calls run on a request thread and on at most 4 job followers, each with the
+  client's deadline. A hung daemon shows up as a failed command, never a frozen window. Followers back off (0.5 s
+  doubling to 8 s) and never poll in a tight loop.
+
+### Consent presentation
+
+Every package that needs consent is shown with:
+- its version;
+- its full sha256;
+- its full terms text (scrollable);
+- its own **unchecked** box, "I accept the terms above for <package> <version>".
+
+There is no "accept all" control. Cancel is the default and the close response. The Install button counts what was
+accepted, for example "Install (1 of 2 accepted)". Every choice is reset to not accepted whenever the dialog opens and
+whenever it closes without Install (Cancel, Escape): a box ticked in a dialog that was cancelled never counts later.
+Choices can only be accepted, and the plan only installed, while the dialog is open.
+
+The view model sends `deps.install` with the plan's digest exactly as `deps.plan` returned it. The consent items are
+the raw `{package, version, sha256}` of entries the user accepted one at a time; nothing else can become a consent
+item. An entry can never be accepted when it lacks its version, sha256 or terms, is listed twice, or would be shown
+differently from what is sent (cleaning changed it). The plan is dropped once it is sent. `consent_mismatch` shows
+"The dependency plan changed since it was shown. Review it again." and fetches a fresh plan, which starts
+unaccepted; nothing is re-sent. A new plan answer while the dialog is open closes the dialog with "The dependency
+plan changed while it was shown. Review it again." (its choices start over). The daemon and then the CLI re-check all of this regardless.
+
+### Text and markup
+
+Every string from the daemon passes `rt_core::clean_text` again before a widget sees it. That removes control and
+format characters (bidi, zero-width) and bounds the length. No daemon string is parsed as Pango markup:
+- labels have `use-markup` off, and rows turn off `AdwPreferencesRow`'s default-on `use-markup`;
+- properties that are always markup (the status page description, About's comments) get `markup_escape_text` of
+  the cleaned string;
+- job output goes into a plain, read-only text view.
+
+A widget test shows an app named `<b>x</b> &amp; <span size="99999">` literally in the list, the page heading and the
+header. The consent test checks that terms containing `<b>`, `&` and an ESC sequence appear as literal, cleaned text.
+
+### Read-only and unreachable
+
+- A daemon without `--write`, or one older than API 0.2, makes every write control insensitive, with the reason as
+  its tooltip, and shows a banner. The view model also refuses the matching intents with no command sent (tested
+  against a real read-only `runtimed`).
+- An unreachable daemon, or a socket the client refuses, has its own page. Refused means wrong owner or mode; that
+  page quotes the reason, and nothing is sent to that socket.
+
+### Memory bounds
+
+Each followed job's log keeps at most 5,000 lines and 1 MiB: the oldest go first, behind one "[earlier lines
+dropped]" line. Lines the daemon dropped are noted too. At most 16 followed logs are kept (so at most about 16 MiB of
+log text); the oldest ended one goes first. The jobs panel lists at most 30 jobs. The log view only appends new
+lines and deletes dropped ones, so each update costs what it adds.
+
+Job output crosses to the UI with back-pressure: a follower may have at most 8 unhandled messages in flight. It waits
+before handing over a ninth, and so stops polling the daemon, whose own per-job bounds (2,000 events, 512 KiB) then
+apply. The UI handles everything waiting in one main-loop turn and renders once. A chatty job therefore cannot grow
+the channel or keep the main loop busy without end.
+
+### Known bounds
+
+- **The terms are shown, not proven read.** There is no scroll-to-end gate; this is deliberate.
+- **A program started from a terminal is not a job:** Stop cannot end it. Run then reports the daemon's `app_busy`,
+  or the CLI's lock refusal in the job's log.
+- **File chooser paths are passed as they are.** In a sandboxed session a portal path (`/run/user/<uid>/doc/…`) may
+  not be readable by the CLI; the job's log says so. The view model refuses a folder grant path that is relative,
+  not UTF-8, contains `:`, or has a control or format character. The CLI's grant rules (no home, no `~/.ssh`, …)
+  remain the real guard.
+- **One window per socket.** A plain second launch raises the first window (`GApplication` uniqueness). A launch with
+  `--socket` is a separate instance, so a window for another socket always opens.
+- **GTK's own session-bus use** (accessibility, portals, `GApplication` uniqueness) is GTK's, not this project's.
+- **A narrow window** collapses to one pane; keyboard and screen-reader use are only checked by hand
+  (docs/GUI-CHECKLIST.md). An accessibility pass is a follow-up.
 
 ## Roadmap
 
