@@ -41,6 +41,9 @@
 //!    (nothing past the declared size is written), and the bytes actually written are counted against
 //!    [`Limits::max_total_bytes`] while streaming. Entries read into memory for analysis go through
 //!    `read_capped`, which is `take(declared + 1)`. Declared sizes are never trusted for allocation.
+//!    [`extract_verified`] (and [`copy_verified`] for one entry) additionally hash every file while streaming and
+//!    compare it with a caller-supplied sha256 (`.wrun` packages); a file without one is refused before anything
+//!    is created.
 //!
 //! **Not covered:** `create_new` + planned names stop everything the archive itself can do, but a process that
 //! can write into the destination while it is being extracted could swap a directory for a symlink. `install`
@@ -48,6 +51,7 @@
 //! returning), and Phase 5's sandbox is the real boundary.
 use crate::text::{clean, quote};
 use crate::winpath::{WinPath, WinPathError};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -192,6 +196,10 @@ pub enum ZipError {
     LiesAboutSize { name: String },
     #[error("entry {name} holds less data than it declares")]
     ShortEntry { name: String },
+    #[error("entry {name} does not match its recorded sha256 (the file was modified)")]
+    Integrity { name: String },
+    #[error("entry {name} is not listed with a sha256")]
+    Unlisted { name: String },
     #[error("more than {max} bytes were extracted")]
     ExtractedTooMuch { max: u64 },
     #[error("cannot analyse more than {max} bytes of candidate programs")]
@@ -670,9 +678,73 @@ fn join(dest: &Path, components: &[String]) -> Result<PathBuf, io::Error> {
 /// Extracts the plan below `dest` (which must exist and be a directory the caller just made). Returns the number
 /// of bytes written. Nothing already present is overwritten: every file is created with `create_new`.
 pub fn extract(archive: &mut Archive, plan: &Plan, dest: &Path, limits: &Limits) -> Result<u64, ZipError> {
+    extract_inner(archive, plan, dest, limits, None)
+}
+
+/// The expected sha256 of a planned file, by its path components (`None`: not listed).
+pub type DigestOf = dyn Fn(&[String]) -> Option<[u8; 32]>;
+
+/// [`extract`] with a sha256 per file: `digest(path components)` names the expected digest, `None` means the file
+/// is not listed. Every file is looked up BEFORE anything is created ([`ZipError::Unlisted`]); each file's bytes are
+/// hashed while streaming and a mismatch is [`ZipError::Integrity`] once the entry ends (the file is left partial:
+/// the caller removes the directory it made).
+pub fn extract_verified(
+    archive: &mut Archive,
+    plan: &Plan,
+    dest: &Path,
+    limits: &Limits,
+    digest: &DigestOf,
+) -> Result<u64, ZipError> {
+    extract_inner(archive, plan, dest, limits, Some(digest))
+}
+
+/// Streams one planned entry into `out`, checking its declared size and that its bytes hash to `expected`.
+/// Returns the number of bytes written. The bytes are counted against [`Limits::max_total_bytes`].
+pub fn copy_verified(
+    archive: &mut Archive,
+    file: &PlannedFile,
+    out: &mut dyn io::Write,
+    expected: [u8; 32],
+    limits: &Limits,
+) -> Result<u64, ZipError> {
+    let mut hasher = Sha256::new();
+    let mut total = 0;
+    copy_entry(archive, file, out, &mut total, limits, Some(&mut hasher))?;
+    check_digest(file, hasher, expected)?;
+    Ok(total)
+}
+
+fn check_digest(file: &PlannedFile, hasher: Sha256, expected: [u8; 32]) -> Result<(), ZipError> {
+    if <[u8; 32]>::from(hasher.finalize()) != expected {
+        return Err(ZipError::Integrity {
+            name: quote(&file.path.join("\\")),
+        });
+    }
+    Ok(())
+}
+
+fn extract_inner(
+    archive: &mut Archive,
+    plan: &Plan,
+    dest: &Path,
+    limits: &Limits,
+    digest: Option<&DigestOf>,
+) -> Result<u64, ZipError> {
     let io_err = |name: &[String], source| ZipError::Io {
         name: quote(&name.join("\\")),
         source,
+    };
+    let expected: Vec<Option<[u8; 32]>> = match digest {
+        None => vec![None; plan.files.len()],
+        Some(digest) => plan
+            .files
+            .iter()
+            .map(|f| {
+                digest(&f.path).map(Some).ok_or_else(|| ZipError::Unlisted {
+                    name: quote(&f.path.join("\\")),
+                })
+            })
+            .collect::<Result<_, _>>()?,
     };
     for dir in &plan.dirs {
         let path = join(dest, dir).map_err(|e| io_err(dir, e))?;
@@ -683,40 +755,63 @@ pub fn extract(archive: &mut Archive, plan: &Plan, dest: &Path, limits: &Limits)
             .map_err(|e| io_err(dir, e))?;
     }
     let mut total = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    for f in &plan.files {
+    for (f, expected) in plan.files.iter().zip(expected) {
         let path = join(dest, &f.path).map_err(|e| io_err(&f.path, e))?;
-        let shown = || quote(&f.path.join("\\"));
         let mut out = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o644)
             .open(&path)
             .map_err(|e| io_err(&f.path, e))?;
-        let mut entry = archive.by_index(f.index).map_err(|e| format_err(&e))?;
-        let mut written = 0u64;
-        loop {
-            let n = entry.read(&mut buf).map_err(|e| io_err(&f.path, e))?;
-            if n == 0 {
-                break;
-            }
-            written += n as u64;
-            if written > f.size {
-                return Err(ZipError::LiesAboutSize { name: shown() });
-            }
-            if total + n as u64 > limits.max_total_bytes {
-                return Err(ZipError::ExtractedTooMuch {
-                    max: limits.max_total_bytes,
-                });
-            }
-            total += n as u64;
-            io::Write::write_all(&mut out, &buf[..n]).map_err(|e| io_err(&f.path, e))?;
-        }
-        if written != f.size {
-            return Err(ZipError::ShortEntry { name: shown() });
+        let mut hasher = expected.map(|_| Sha256::new());
+        copy_entry(archive, f, &mut out, &mut total, limits, hasher.as_mut())?;
+        if let (Some(hasher), Some(expected)) = (hasher, expected) {
+            check_digest(f, hasher, expected)?;
         }
     }
     Ok(total)
+}
+
+/// Streams one entry into `out` through a fixed 64 KiB buffer: more bytes than declared is an error at the first
+/// excess chunk, fewer is an error at the end, and `total` (the bytes of this extraction so far) stays within
+/// [`Limits::max_total_bytes`].
+fn copy_entry(
+    archive: &mut Archive,
+    f: &PlannedFile,
+    out: &mut dyn io::Write,
+    total: &mut u64,
+    limits: &Limits,
+    mut hasher: Option<&mut Sha256>,
+) -> Result<(), ZipError> {
+    let shown = || quote(&f.path.join("\\"));
+    let io_err = |source| ZipError::Io { name: shown(), source };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut entry = archive.by_index(f.index).map_err(|e| format_err(&e))?;
+    let mut written = 0u64;
+    loop {
+        let n = entry.read(&mut buf).map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        written += n as u64;
+        if written > f.size {
+            return Err(ZipError::LiesAboutSize { name: shown() });
+        }
+        if *total + n as u64 > limits.max_total_bytes {
+            return Err(ZipError::ExtractedTooMuch {
+                max: limits.max_total_bytes,
+            });
+        }
+        *total += n as u64;
+        if let Some(h) = hasher.as_deref_mut() {
+            h.update(&buf[..n]);
+        }
+        out.write_all(&buf[..n]).map_err(io_err)?;
+    }
+    if written != f.size {
+        return Err(ZipError::ShortEntry { name: shown() });
+    }
+    Ok(())
 }
 
 /// Reads `src` to its end, handing out at most `size + 1` bytes: memory is bounded by the DECLARED size whatever
