@@ -949,6 +949,7 @@ mod tests {
             facts: rt_deps::Facts {
                 imports: vec![],
                 extra_capabilities: vec![],
+                requested: vec![],
             },
             plan: rt_deps::Plan {
                 entries,
@@ -965,6 +966,41 @@ mod tests {
             entry("dxvk", Action::Install, ConsentState::NotNeeded),
             entry("vkd3d-proton", Action::AlreadyInstalled, ConsentState::NotNeeded),
         ])
+    }
+
+    #[test]
+    fn a_requested_dependency_is_planned_and_changes_the_digest() {
+        let m = rt_deps::Manifest::bundled();
+        let id = AppId::parse("game").unwrap();
+        let mut md = rt_core::Metadata::new(
+            id.clone(),
+            "Game".into(),
+            None,
+            "x86_64",
+            &rt_core::WinPath::parse("C:\\game.exe").unwrap(),
+            rt_core::BackendInfo {
+                id: "wine".into(),
+                version: "wine-10.0".into(),
+            },
+            "gui",
+        );
+        let vulkan = |_: Option<(u32, u32)>| rt_core::VulkanVerdict::Unknown;
+        let before = rt_deps::plan_for_pe(&md, Err("not read"), m, &vulkan);
+        md.package = Some(rt_core::PackageMeta {
+            id: "game".into(),
+            version: "1.0".into(),
+            digest: "ab".repeat(32),
+            requested_dependencies: vec!["vcrun2022".into()],
+            requested_permissions: vec![],
+        });
+        let after = rt_deps::plan_for_pe(&md, Err("not read"), m, &vulkan);
+        assert!(after.is_requested("vcrun2022"));
+        let e = after.plan.entries.iter().find(|e| e.package == "vcrun2022").unwrap();
+        assert_eq!(
+            (&e.action, e.consent),
+            (&rt_deps::Action::Install, rt_deps::ConsentState::Needed)
+        );
+        assert_ne!(plan_digest(&id, &before, m), plan_digest(&id, &after, m));
     }
 
     #[test]

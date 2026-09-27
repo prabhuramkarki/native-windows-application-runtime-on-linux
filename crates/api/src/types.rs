@@ -151,6 +151,9 @@ pub struct AppDetail {
     pub installer: Option<InstallerView>,
     pub dependencies: Vec<DependencyView>,
     pub prefix: PrefixState,
+    /// What the `.wrun` package this app was imported from requested (0.2.1, additive; absent from older daemons).
+    #[serde(default)]
+    pub package: Option<PackageView>,
 }
 
 impl AppDetail {
@@ -171,6 +174,30 @@ impl AppDetail {
             installer: m.installer.as_ref().map(InstallerView::from_meta),
             dependencies: m.dependencies.iter().map(DependencyView::from_record).collect(),
             prefix: PrefixState::probe(env),
+            package: m.package.as_ref().map(PackageView::from_meta),
+        }
+    }
+}
+
+/// `Metadata::package`: requests only, none of them granted by the import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageView {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
+    pub requested_dependencies: Vec<String>,
+    pub requested_permissions: Vec<String>,
+}
+
+impl PackageView {
+    fn from_meta(p: &rt_core::PackageMeta) -> PackageView {
+        PackageView {
+            id: text(&p.id),
+            version: text(&p.version),
+            digest: text(&p.digest),
+            requested_dependencies: p.requested_dependencies.iter().map(|d| text(d)).collect(),
+            requested_permissions: p.requested_permissions.iter().map(|e| text(e)).collect(),
         }
     }
 }

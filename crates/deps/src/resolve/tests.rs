@@ -35,6 +35,7 @@ fn imports(names: &[&str]) -> Facts {
     Facts {
         imports: names.iter().map(|s| s.to_string()).collect(),
         extra_capabilities: vec![],
+        requested: vec![],
     }
 }
 
@@ -42,6 +43,7 @@ fn caps(names: &[&str]) -> Facts {
     Facts {
         imports: vec![],
         extra_capabilities: names.iter().map(|s| s.to_string()).collect(),
+        requested: vec![],
     }
 }
 
@@ -302,6 +304,7 @@ fn unsatisfied_capabilities_are_reported() {
     let facts = Facts {
         imports: vec!["mscoree".into()],
         extra_capabilities: vec!["zzz".into(), "aaa".into(), "zzz".into(), long.clone(), "d3d9".into()],
+        requested: vec![],
     };
     let plan = resolve(&facts, &none(), &[], m);
     assert_eq!(plan.unsatisfied[..2], ["aaa", "zzz"]);
@@ -336,6 +339,7 @@ fn extra_capabilities_are_honoured() {
     let both = Facts {
         imports: vec!["msvcp140.dll".into()],
         extra_capabilities: vec!["d3d9".into(), "d3d9".into()],
+        requested: vec![],
     };
     assert_eq!(required_capabilities(&both), ["d3d9", "msvcp140"]);
 }
@@ -477,6 +481,7 @@ fn random_facts_keep_plan_invariants() {
                 .map(|_| pool[rng.below(pool.len())].clone())
                 .collect(),
             extra_capabilities: (0..rng.below(3)).map(|_| pool[rng.below(pool.len())].clone()).collect(),
+            requested: vec![],
         };
         let mut installed = InstalledSet::default();
         for p in &m.packages {
@@ -659,4 +664,34 @@ fn a_plan_with_no_vulkan_package_never_runs_the_closure() {
     let m = manifest(vec![pkg("d", &[], &["w"], false)]);
     let mut plan = resolve(&caps(&["w"]), &none(), &[], &m);
     block_for_vulkan(&mut plan, &m, &|_| panic!("must not probe"));
+}
+
+// ---------------------------------------------------------------- Phase 6D: requested roots
+
+#[test]
+fn requested_packages_are_roots_with_their_requirements_and_consent() {
+    let facts = Facts {
+        requested: vec!["vkd3d-proton".into(), "vcrun2022".into(), "not-in-the-manifest".into()],
+        ..Facts::default()
+    };
+    let plan = resolve(&facts, &none(), &[], &graph());
+    assert_eq!(
+        plan.entries,
+        [
+            entry("dxvk", Action::Install, ConsentState::NotNeeded),
+            entry("vcrun2022", Action::Install, ConsentState::Needed),
+            entry("vkd3d-proton", Action::Install, ConsentState::NotNeeded),
+        ],
+        "an unknown id adds nothing (the caller warns)"
+    );
+    assert!(plan.unsatisfied.is_empty());
+    // Denial still blocks a requested package: a request is not consent.
+    let plan = resolve(&facts, &none(), &["vcrun2022".into()], &graph());
+    assert!(plan.entries.contains(&entry(
+        "vcrun2022",
+        Action::Blocked {
+            reason: "consent denied for \"vcrun2022\"".into()
+        },
+        ConsentState::Denied
+    )));
 }
