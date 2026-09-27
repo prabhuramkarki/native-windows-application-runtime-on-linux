@@ -1,8 +1,10 @@
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 /// Spec D5: valid reverse-DNS that owns no real domain, until the project is named.
 const APP_ID: &str = "local.runtime.Gui";
@@ -20,18 +22,28 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<PathBuf
 }
 
 fn main() -> glib::ExitCode {
-    let _socket = match parse_args(std::env::args_os().skip(1)) {
-        Ok(s) => s,
+    let socket = match parse_args(std::env::args_os().skip(1)) {
+        // No --socket and no runtime dir: an empty path, which the backend reports as "no runtime directory".
+        Ok(s) => s
+            .or_else(|| rt_daemon::client::default_socket_path().ok())
+            .unwrap_or_default(),
         Err(e) => {
             eprintln!("runtime-gui: {e}");
             return glib::ExitCode::from(2);
         }
     };
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(|app| {
-        let w = rt_gui::ui::window();
-        w.set_application(Some(app));
-        w.present();
+    // The window's UI lives as long as the application (a second launch only raises it).
+    let held: RefCell<Option<Rc<rt_gui::ui::Ui>>> = RefCell::default();
+    app.connect_activate(move |app| {
+        if let Some(w) = app.active_window() {
+            w.present();
+            return;
+        }
+        let ui = rt_gui::ui::start(socket.clone());
+        ui.window().set_application(Some(app));
+        ui.window().present();
+        *held.borrow_mut() = Some(ui);
     });
     // Our own arguments are parsed above; GApplication gets none of them.
     app.run_with_args::<&str>(&[])

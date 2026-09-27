@@ -814,3 +814,78 @@ fn shown_removes_invisible_characters_and_bounds() {
     );
     assert!(Path::new(START_HINT).is_relative());
 }
+
+// ------------------------------------------------------------------------------------------------ Tasks 4-5: display
+
+#[test]
+fn at_most_max_logs_followed_logs_are_kept_oldest_ended_first() {
+    let mut m = ready(true);
+    for i in 0..MAX_LOGS + 4 {
+        m.update(Msg::JobStarted {
+            what: Cmd::Run("game".into()),
+            job_id: format!("j{i}"),
+        });
+        // j1 stays live; the others end.
+        if i != 1 {
+            m.update(Msg::JobEvents(events(
+                &format!("j{i}"),
+                JobState::Succeeded,
+                1,
+                &["x"],
+                0,
+            )));
+        }
+    }
+    assert_eq!(m.logs().count(), MAX_LOGS);
+    assert!(m.log("j1").is_some(), "a live job's log is not dropped");
+    assert!(m.log("j0").is_none() && m.log("j2").is_none());
+    assert!(m.log(&format!("j{}", MAX_LOGS + 3)).is_some());
+}
+
+fn doctor_json() -> DoctorView {
+    serde_json::from_value(json!({
+        "subject": {"kind": "app", "id": "game", "name": null, "version": null},
+        "verdict": "may_fail",
+        "checks": [{"area": "imports", "status": "warn", "text": "needs <b>x</b> & \u{1b}[2J\u{202e}y"}],
+        "missingDependencies": 1, "notes": []
+    }))
+    .unwrap()
+}
+
+#[test]
+fn the_page_is_shown_as_cleaned_lines() {
+    let mut m = ready(true);
+    m.update(Msg::AppLoaded(Box::new(AppData {
+        detail: detail("game"),
+        permissions: Ok(perms(&["/data/mu\u{200b}sic"])),
+        doctor: Ok(doctor_json()),
+        graphics: Err(rpc("unavailable")),
+        sandbox: Err(ClientError::Rpc {
+            code: -32000,
+            message: "no \u{1b}bwrap".into(),
+            kind: Some("unavailable".into()),
+        }),
+    })));
+    let sections = m.page_sections();
+    let names: Vec<&str> = sections.iter().map(|s| s.0).collect();
+    assert_eq!(names, ["Checks", "Graphics", "Sandbox"]);
+    let all: Vec<&Line> = sections.iter().flat_map(|s| &s.1).collect();
+    assert!(
+        all.iter()
+            .any(|l| l.title == "imports" && l.detail == "warn: needs <b>x</b> & [2Jy"),
+        "{all:?}"
+    );
+    for l in &all {
+        assert!(!l.title.contains(HIDDEN) && !l.detail.contains(HIDDEN), "{l:?}");
+    }
+    assert!(sections[2].1[0].detail.contains("no bwrap"), "{:?}", sections[2].1);
+    let p = m.page_permissions().unwrap().unwrap();
+    assert!(p.display && !p.network);
+    assert_eq!(p.grants[0].path, "/data/mu\u{200b}sic", "raw: what a revoke sends back");
+    assert_eq!(p.grants[0].shown, "/data/music");
+    assert_eq!(p.grants[0].access, "read-only");
+    assert!(p.limits.contains("512 tasks"), "{}", p.limits);
+    assert_eq!(m.page_status().as_deref(), Some("Not running"));
+    m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Running)]));
+    assert_eq!(m.page_status().as_deref(), Some("Running (job j1)"));
+}

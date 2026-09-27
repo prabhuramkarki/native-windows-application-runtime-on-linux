@@ -4,9 +4,11 @@
 //! nothing. Pure data: no I/O, no threads, no clock.
 mod consent;
 mod forms;
+mod page;
 
 pub use consent::{ConsentChoice, ConsentState, EntryRow};
 pub use forms::{InstallForm, PermChange};
+pub use page::{GrantRow, Line, PermRows};
 
 use rt_api::jobs::{ConsentItem, EventKind, JobEvents, JobInfo, JobKind, JobState};
 use rt_api::{
@@ -25,6 +27,8 @@ pub const READ_ONLY: &str = "This runtimed is read-only (started without `--writ
 pub const PLAN_CHANGED: &str = "The dependency plan changed since it was shown. Review it again.";
 /// Most lines kept per job log (spec D11).
 pub const LOG_MAX: usize = 5000;
+/// Most followed job logs kept (the oldest ended one goes first).
+pub const MAX_LOGS: usize = 16;
 /// The first line of a log that lost its oldest lines.
 pub const EARLIER_DROPPED: &str = "[earlier lines dropped]";
 /// Longest message shown (errors, notices, reasons), in characters.
@@ -186,6 +190,7 @@ impl AppPage {
 pub struct LogBuffer {
     lines: VecDeque<String>,
     cut: bool,
+    added: u64,
     job: Option<JobInfo>,
 }
 
@@ -199,12 +204,17 @@ impl LogBuffer {
     pub fn job(&self) -> Option<&JobInfo> {
         self.job.as_ref()
     }
+    /// Grows with every line added: the UI redraws a log only when it changed.
+    pub fn version(&self) -> u64 {
+        self.added
+    }
     fn push(&mut self, line: String) {
         if self.lines.len() == LOG_MAX {
             self.lines.pop_front();
             self.cut = true;
         }
         self.lines.push_back(line);
+        self.added += 1;
     }
 
     /// Adds a poll's events; true when this poll ended the job (the first final state seen).
@@ -374,8 +384,12 @@ impl Model {
                 vec![]
             }
             Msg::JobStarted { job_id, .. } => {
-                // ponytail: every followed job's log is kept for the session; cap the count if sessions get long.
                 self.logs.push((job_id.clone(), LogBuffer::default()));
+                if self.logs.len() > MAX_LOGS {
+                    let ended = |(_, l): &(String, LogBuffer)| l.job.as_ref().is_some_and(|j| is_final(j.state));
+                    let oldest = self.logs.iter().position(ended).unwrap_or(0);
+                    self.logs.remove(oldest);
+                }
                 vec![Cmd::Follow(job_id), Cmd::ListJobs]
             }
             Msg::JobEvents(ev) => {
@@ -541,6 +555,11 @@ impl Model {
 
     pub fn consent(&self) -> Option<&ConsentState> {
         self.plan.as_ref()
+    }
+
+    /// The followed jobs' logs, oldest first.
+    pub fn logs(&self) -> impl Iterator<Item = (&str, &LogBuffer)> {
+        self.logs.iter().map(|(id, l)| (id.as_str(), l))
     }
 
     pub fn log(&self, job: &str) -> Option<&LogBuffer> {
