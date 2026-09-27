@@ -22,9 +22,11 @@
 //!
 //! * `id`: a constant `[a-z0-9-]{1,32}` word, recorded as the app's `backend.id`.
 //! * `version`: spawns nothing outside `Launcher::run_helper`.
-//! * `capabilities`: constant ([`Capabilities`]). The platform refuses what they exclude before it creates
-//!   anything: `rt_core::install` (architecture, subsystem), `rt_installer::install_via_installer` (`installers`),
-//!   `rt_deps::install_plan` (`dependency_packages`), `rt_core::run` (`dotnet`, for an app with Wine Mono recorded).
+//! * `capabilities`: constant ([`Capabilities`]). The platform refuses what they exclude before it creates or
+//!   starts anything: `rt_core::install` (architecture, subsystem), `rt_installer::install_via_installer`
+//!   (`installers`; the installed program's architecture), `rt_deps::install_plan` and `runtime deps --install`
+//!   (`dependency_packages`), `rt_core::run` (the recorded architecture; `dotnet` for an app with Wine Mono
+//!   recorded; `sandboxable` for a sandboxed run).
 //! * `prepare`: creates the prefix so that `env.drive_c()` exists and is the guest's `C:`; idempotent; helpers
 //!   only through the backend's `Launcher`.
 //! * `command`: describes and never spawns; never calls `env_clear`; refuses an exe or cwd outside `env.drive_c()`
@@ -39,9 +41,9 @@
 //! prohibitions are reviewed, not proven.
 //!
 //! **What the platform assumes of every backend** (audit of Phase 6D): the prefix layout (`drive_c` is `C:`; the
-//! install services copy programs below it and `resolve_under` maps metadata paths into it); the program
-//! command carries `WINEPREFIX = env.prefix()` when it is to run in the app sandbox (`rt_sandbox` derives the app
-//! from it and refuses a command without it: a backend that does not set it can run only `--unsandboxed`).
+//! install services copy programs below it and `resolve_under` maps metadata paths into it). A backend whose
+//! command carries `WINEPREFIX = env.prefix()` declares `sandboxable` (`rt_sandbox` derives the app from it; the
+//! conformance suite checks it); one that does not is refused for sandboxed runs by `rt_core::run`.
 //! Gated by a capability because they read or write Wine's own layout: the installer pipeline (`system.reg`,
 //! `user.reg`, `.lnk` files, `msiexec.exe` in `system32`: `installers`); dependency packages (DLL overrides and
 //! Wine configuration in `user.reg`, `reg.exe`, the `wineserver`-in-`/proc` busy check: `dependency_packages`);
@@ -78,17 +80,28 @@ pub struct Capabilities {
     pub installers: bool,
     /// `rt_deps` may install packages into its prefix (DLL overrides, Wine configuration).
     pub dependency_packages: bool,
+    /// Its program command may run in the app sandbox: it sets `WINEPREFIX` to `env.prefix()`, from which
+    /// `rt_sandbox` derives the app. Without it `rt_core::run` refuses a sandboxed run before anything starts
+    /// (only `--unsandboxed` runs it). `installers` and `dependency_packages` need it (their programs run sandboxed).
+    pub sandboxable: bool,
 }
 
 impl Capabilities {
-    /// `Ok` when `backend` (whose capabilities these are) runs programs of `arch` and `subsystem`.
-    pub fn check(&self, backend: &'static str, arch: pe::Arch, subsystem: pe::Subsystem) -> Result<(), Unsupported> {
-        if !self.arches.contains(&arch) {
-            return Err(Unsupported::Arch {
+    /// `Ok` when `backend` runs programs of `arch` (the installer pipeline's winner, a recorded app at `run`).
+    pub fn check_arch(&self, backend: &'static str, arch: pe::Arch) -> Result<(), Unsupported> {
+        if self.arches.contains(&arch) {
+            Ok(())
+        } else {
+            Err(Unsupported::Arch {
                 backend,
                 arch: format!("{arch:?}").to_lowercase(),
-            });
+            })
         }
+    }
+
+    /// `Ok` when `backend` (whose capabilities these are) runs programs of `arch` and `subsystem`.
+    pub fn check(&self, backend: &'static str, arch: pe::Arch, subsystem: pe::Subsystem) -> Result<(), Unsupported> {
+        self.check_arch(backend, arch)?;
         if !self.subsystems.contains(&subsystem) {
             return Err(Unsupported::Subsystem {
                 backend,
@@ -121,9 +134,10 @@ pub enum Want {
 }
 
 /// The containment check of `command`, for every backend: `p` is absolute, has no `..`, is component-wise below
-/// `env.drive_c()` (else [`BackendError::OutsideDriveC`]), has no symlink on the way (`drive_c` itself included)
-/// and is a regular file or a directory as `want` says (all by `lstat`; else `Failed` naming `what`). Returns the
-/// normalised path: `drive_c` plus the verified components.
+/// `env.drive_c()` and no component (`drive_c` itself and the last one included) is a symlink, else
+/// [`BackendError::OutsideDriveC`]: a link may lead anywhere, so it counts as leaving `drive_c`. The last component
+/// must then be a regular file or a directory as `want` says (else `Failed` naming `what`; a missing one is `Io`).
+/// All by `lstat`, nothing followed. Returns the normalised path: `drive_c` plus the verified components.
 pub fn inside_drive_c(env: &AppEnv, p: &Path, what: &'static str, want: Want) -> Result<PathBuf, BackendError> {
     let root = env.drive_c();
     let outside = || BackendError::OutsideDriveC { what };
@@ -132,22 +146,21 @@ pub fn inside_drive_c(env: &AppEnv, p: &Path, what: &'static str, want: Want) ->
     }
     // `root` is absolute (`AppEnv` guarantees it), so a relative `p` fails here; whole components are compared.
     let rel = p.strip_prefix(&root).map_err(|_| outside())?;
-    let io = |source| BackendError::Io { what, source };
-    let not = |text: &[u8]| BackendError::failed(what, text);
+    let lstat = |p: &Path| std::fs::symlink_metadata(p).map_err(|source| BackendError::Io { what, source });
     let mut cur = root.clone();
-    let mut meta = std::fs::symlink_metadata(&cur).map_err(io)?;
+    let mut meta = lstat(&cur)?;
     for comp in rel.components() {
         if meta.file_type().is_symlink() {
-            return Err(not(b"the path goes through a symbolic link"));
+            return Err(outside());
         }
         cur.push(comp);
-        meta = std::fs::symlink_metadata(&cur).map_err(io)?;
+        meta = lstat(&cur)?;
     }
-    // A final symlink is neither a regular file nor a directory by lstat, so `want` refuses it too.
     let file_type = meta.file_type();
     match want {
-        Want::File if !file_type.is_file() => Err(not(b"not a regular file")),
-        Want::Dir if !file_type.is_dir() => Err(not(b"not a directory")),
+        _ if file_type.is_symlink() => Err(outside()),
+        Want::File if !file_type.is_file() => Err(BackendError::failed(what, b"not a regular file")),
+        Want::Dir if !file_type.is_dir() => Err(BackendError::failed(what, b"not a directory")),
         _ => Ok(cur),
     }
 }
@@ -482,6 +495,7 @@ mod tests {
             dotnet: false,
             installers: false,
             dependency_packages: false,
+            sandboxable: false,
         };
         assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Gui), Ok(()));
         assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Console), Ok(()));

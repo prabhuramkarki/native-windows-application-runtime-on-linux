@@ -507,20 +507,27 @@ fn check_not_busy(env: &AppEnv) -> Result<(), DepsError> {
 
 // ------------------------------------------------------------------------------------------------ installing
 
+/// Packages write DLL overrides and Wine configuration into the prefix: a backend that cannot take them is refused
+/// before any lock, prompt or download. [`install_plan`] checks it; a front end calls it first too, before it
+/// prepares anything of its own for the install (the CLI's sandbox marker).
+pub fn check_backend(backend: &dyn CompatBackend) -> Result<(), DepsError> {
+    if backend.capabilities().dependency_packages {
+        Ok(())
+    } else {
+        Err(rt_core::Unsupported::Feature {
+            backend: backend.id(),
+            feature: "dependency packages",
+        }
+        .into())
+    }
+}
+
 /// Installs what `app`'s plan needs, behind consent (see the module docs). `Err` only for run-level refusals.
 pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsError> {
     if !has_install(&app.plan) {
         return Ok(execute(o, &app.plan, &Decisions::default(), &[]));
     }
-    // Packages write DLL overrides and Wine configuration into the prefix: refused before any lock, prompt or
-    // download on a backend that cannot take them.
-    if !o.backend.capabilities().dependency_packages {
-        return Err(rt_core::Unsupported::Feature {
-            backend: o.backend.id(),
-            feature: "dependency packages",
-        }
-        .into());
-    }
+    check_backend(o.backend)?;
     let _lock = lock_app(o.env)?;
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;

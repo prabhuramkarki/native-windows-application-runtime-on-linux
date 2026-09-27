@@ -22,6 +22,7 @@ const NULL_CAPABILITIES: Capabilities = Capabilities {
     dotnet: false,
     installers: false,
     dependency_packages: false,
+    sandboxable: false,
 };
 
 impl CompatBackend for NullBackend {
@@ -130,6 +131,9 @@ enum Break {
     WrongCwd,
     EmptyCapabilities,
     RelativeDllDir,
+    FollowsFinalSymlink,
+    SandboxableWithoutPrefix,
+    InstallersWithoutSandbox,
 }
 
 struct Broken(Break);
@@ -150,6 +154,14 @@ impl CompatBackend for Broken {
                 arches: &[],
                 ..NULL_CAPABILITIES
             },
+            Break::SandboxableWithoutPrefix => Capabilities {
+                sandboxable: true,
+                ..NULL_CAPABILITIES
+            },
+            Break::InstallersWithoutSandbox => Capabilities {
+                installers: true,
+                ..NULL_CAPABILITIES
+            },
             _ => NULL_CAPABILITIES,
         }
     }
@@ -166,6 +178,19 @@ impl CompatBackend for Broken {
     ) -> Result<Command, BackendError> {
         if matches!(self.0, Break::AcceptsDotDot) && exe.components().any(|c| c.as_os_str() == "..") {
             return Ok(Command::new("/bin/true"));
+        }
+        // Resolves a final link itself (as a backend that canonicalises first would) and checks the target only
+        // lexically: a link inside `drive_c` to a file outside passes.
+        if matches!(self.0, Break::FollowsFinalSymlink)
+            && fs::symlink_metadata(exe).is_ok_and(|m| m.file_type().is_symlink())
+            && exe.starts_with(env.drive_c())
+        {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c")
+                .arg("exit 0")
+                .arg(fs::canonicalize(exe).unwrap())
+                .current_dir(cwd);
+            return Ok(c);
         }
         let mut cmd = null("exit 0").command(env, exe, cwd, args, opts)?;
         match self.0 {
@@ -223,6 +248,9 @@ fn each_broken_backend_fails_exactly_its_check() {
         (Break::WrongCwd, "command-cwd"),
         (Break::EmptyCapabilities, "capabilities"),
         (Break::RelativeDllDir, "dll-dirs-absolute"),
+        (Break::FollowsFinalSymlink, "outside-symlink"),
+        (Break::SandboxableWithoutPrefix, "command-sandboxable"),
+        (Break::InstallersWithoutSandbox, "capabilities"),
     ] {
         assert_eq!(checks(&Broken(b)), [want]);
     }

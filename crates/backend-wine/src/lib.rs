@@ -352,6 +352,7 @@ impl CompatBackend for WineBackend {
             dotnet: true,
             installers: true,
             dependency_packages: true,
+            sandboxable: true,
         }
     }
 
@@ -1545,19 +1546,13 @@ esac
             go(&d, &dir),
             Err(BackendError::Failed { what: "executable", .. })
         ));
-        // a symlink to a regular file INSIDE drive_c, and to one outside
+        // a symlink to a regular file INSIDE drive_c, and to one outside: a link may lead anywhere
         let l1 = dir.join("link-in.exe");
         symlink(&exe, &l1).unwrap();
-        assert!(matches!(
-            go(&l1, &dir),
-            Err(BackendError::Failed { what: "executable", .. })
-        ));
+        outside_error(go(&l1, &dir), "link to a file inside");
         let l2 = dir.join("link-out.exe");
         symlink(r.outside.join("Desktop/canary.txt"), &l2).unwrap();
-        assert!(matches!(
-            go(&l2, &dir),
-            Err(BackendError::Failed { what: "executable", .. })
-        ));
+        outside_error(go(&l2, &dir), "link to a file outside");
         // dangling and missing
         let l3 = dir.join("dangling.exe");
         symlink(r.root.join("nowhere"), &l3).unwrap();
@@ -1575,18 +1570,14 @@ esac
         symlink(r.outside.join("Desktop"), &link).unwrap();
         let b = r.backend();
         let res = b.command(&r.env, &link.join("real.exe"), &dir, &[], &RunOpts::default());
-        assert!(
-            matches!(res, Err(BackendError::Failed { what: "executable", .. })),
-            "{res:?}"
-        );
+        assert!(matches!(res, Err(BackendError::OutsideDriveC { .. })), "{res:?}");
         let (exe, _) = r.exe("Program Files/t/b.exe");
         let res = b.command(&r.env, &exe, &link, &[], &RunOpts::default());
         assert!(
             matches!(
                 res,
-                Err(BackendError::Failed {
-                    what: "working directory",
-                    ..
+                Err(BackendError::OutsideDriveC {
+                    what: "working directory"
                 })
             ),
             "{res:?}"
@@ -1604,10 +1595,7 @@ esac
         let exe = r.env.drive_c().join("Program Files/t/a.exe");
         let b = r.backend();
         let res = b.command(&r.env, &exe, &r.env.drive_c(), &[], &RunOpts::default());
-        assert!(
-            matches!(res, Err(BackendError::Failed { what: "executable", .. })),
-            "{res:?}"
-        );
+        assert!(matches!(res, Err(BackendError::OutsideDriveC { .. })), "{res:?}");
         let res = b.command(
             &r.env,
             &real.join("Program Files/t/a.exe"),

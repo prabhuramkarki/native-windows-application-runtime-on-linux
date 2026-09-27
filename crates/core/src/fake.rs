@@ -55,6 +55,7 @@ pub const FAKE_CAPABILITIES: Capabilities = Capabilities {
     dotnet: true,
     installers: true,
     dependency_packages: true,
+    sandboxable: true,
 };
 
 impl Default for FakeBackend {

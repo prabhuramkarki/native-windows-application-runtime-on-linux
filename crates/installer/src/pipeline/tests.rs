@@ -798,3 +798,33 @@ fn an_unusable_runtime_executable_is_a_sandbox_refusal_and_nothing_runs() {
         );
     }
 }
+
+#[test]
+fn an_installed_program_of_an_architecture_the_backend_lacks_is_refused_and_cleaned_up() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let bytes = fixture("hello-nsis.exe");
+    let path = f.input("hello-nsis.exe", &bytes);
+    // The "installed" program is a copy of the installer itself: the backend supports the other architecture only.
+    let other: &'static [pe::Arch] = match pe::analyze(&bytes).unwrap().arch {
+        pe::Arch::X86 => &[pe::Arch::X86_64],
+        _ => &[pe::Arch::X86],
+    };
+    let script = r#"
+dest_dir="$WINEPREFIX/drive_c/Program Files/HelloNsis"
+mkdir -p "$dest_dir" && cp "$0" "$dest_dir/hello.exe"
+"#;
+    let backend = fake_backend(script).with_capabilities(rt_core::backend::Capabilities {
+        arches: other,
+        ..rt_core::FAKE_CAPABILITIES
+    });
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallerError::Unsupported(rt_core::backend::Unsupported::Arch { .. })
+        ),
+        "{err}"
+    );
+    f.assert_no_app_left();
+}
