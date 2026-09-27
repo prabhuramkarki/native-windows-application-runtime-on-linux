@@ -7,6 +7,7 @@
 //! error's message goes through `safe` on its way to stderr.
 use crate::CmdError;
 use crate::safe::{json_safe, safe};
+use rt_api::VersionInfo;
 use rt_daemon::client::{self, Client};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -36,10 +37,22 @@ pub fn rpc(method: &str, params: Option<&str>, socket: Option<PathBuf>) -> Resul
 pub fn status(socket: Option<PathBuf>) -> Result<u8, CmdError> {
     let path = socket_path(socket)?;
     let head = format!("socket: {}\n", safe(&path.to_string_lossy()));
-    match Client::connect_with(&path, STATUS_TIMEOUT).and_then(|mut c| c.version()) {
-        Ok(v) => {
+    let answer = Client::connect_with(&path, STATUS_TIMEOUT).and_then(|mut c| c.call("rpc.version", Value::Null));
+    let parsed = answer.and_then(|raw| {
+        let v: VersionInfo = serde_json::from_value(raw.clone())
+            .map_err(|_| client::ClientError::Protocol("the result does not have the expected shape"))?;
+        Ok((v, raw.get("write").and_then(Value::as_bool)))
+    });
+    match parsed {
+        Ok((v, write)) => {
+            // A 0.1 daemon has no `write` field: it has no write methods either.
+            let mode = match write {
+                Some(true) => "write".to_owned(),
+                Some(false) => "read-only".to_owned(),
+                None => format!("read-only (API {})", safe(&v.api)),
+            };
             crate::emit(&format!(
-                "{head}reachable: yes\napi: {}\nruntime: {}\nprotocol: {}\n",
+                "{head}reachable: yes\napi: {}\nruntime: {}\nprotocol: {}\nmode: {mode}\n",
                 safe(&v.api),
                 safe(&v.runtime),
                 safe(&v.protocol)
