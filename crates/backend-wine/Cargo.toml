@@ -14,4 +14,6 @@ thiserror.workspace = true
 tracing = "0.1"
 
 [dev-dependencies]
+# The conformance suite (`rt_core::backend::conformance`, behind `testing`).
+runtime-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true

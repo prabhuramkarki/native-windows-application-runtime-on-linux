@@ -16,8 +16,9 @@
 //! # The contract (version [`BACKEND_API_VERSION`])
 //!
 //! [`CompatBackend`] is the only execution seam. Backends are Rust types compiled into the workspace and chosen by
-//! id (`rt_api::backends::select`); there are no plugins (no `dlopen`, no `libloading`: a source scan and a
-//! `cargo deny` ban enforce it; `docs/SECURITY.md` says why). The contract, method by method:
+//! id (`rt_api::backends::select`); there are no plugins and no dynamic loading of code (the source scan in
+//! `tests/conformance.rs` and the `cargo deny` bans enforce it; `docs/SECURITY.md` says why). The contract, method
+//! by method:
 //!
 //! * `id`: a constant `[a-z0-9-]{1,32}` word, recorded as the app's `backend.id`.
 //! * `version`: spawns nothing outside `Launcher::run_helper`.
@@ -57,6 +58,9 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod conformance;
 
 /// The version of the contract above; bumped on any change a backend must react to. `runtime doctor` prints it.
 pub const BACKEND_API_VERSION: u32 = 1;

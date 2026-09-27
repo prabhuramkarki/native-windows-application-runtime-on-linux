@@ -24,11 +24,11 @@
 //! experiment `e2e_debug_run_survives_a_lingering_wineserver` shows that the server ignores `SIGPIPE`, survives
 //! the end of the debug run and serves the next run. Nothing in this crate depends on that being true for
 //! other Wine versions; the e2e test is the tripwire.
-use rt_core::backend::Capabilities;
+use rt_core::backend::{Capabilities, Want, inside_drive_c};
 use rt_core::pe::{Arch, Subsystem};
 use rt_core::{AppEnv, BackendError, CompatBackend, Detail, Launcher, RunOpts};
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -385,7 +385,7 @@ impl CompatBackend for WineBackend {
     /// `<wine> <exe> <args...>` with the backend variables (`HOME` is [`app_home`], which must be a real
     /// directory) and `current_dir(cwd)`. `exe_unix` and `cwd_unix`
     /// are the RESOLVED host paths the caller got from `winpath::resolve_under` (never Windows text: Wine would
-    /// expand `PROGRA~1` and follow links). They are re-checked here because the fake backend does not:
+    /// expand `PROGRA~1` and follow links). They are re-checked here with the contract's `inside_drive_c`:
     /// absolute, no `..`, component-wise under `env.drive_c()`, no symlink on the way, the exe a regular file
     /// and the cwd a directory (all by `lstat`).
     fn command(
@@ -397,10 +397,9 @@ impl CompatBackend for WineBackend {
         opts: &RunOpts,
     ) -> Result<Command, BackendError> {
         check_app_home(env)?;
-        let root = env.drive_c();
         // Wine gets the NORMALISED paths (`drive_c` + the verified components), not the caller's spelling.
-        let exe_unix = check_inside(&root, exe_unix, "executable", Want::File)?;
-        let cwd_unix = check_inside(&root, cwd_unix, "working directory", Want::Dir)?;
+        let exe_unix = inside_drive_c(env, exe_unix, "executable", Want::File)?;
+        let cwd_unix = inside_drive_c(env, cwd_unix, "working directory", Want::Dir)?;
         let mut cmd = self.wine_command(env, if opts.debug { "err+all,fixme-all" } else { "-all" }, opts.dotnet);
         cmd.arg(&exe_unix).args(args).current_dir(&cwd_unix);
         Ok(cmd)
@@ -448,40 +447,6 @@ impl CompatBackend for WineBackend {
             out.current_dir(dir);
         }
         out
-    }
-}
-
-enum Want {
-    File,
-    Dir,
-}
-
-/// See [`WineBackend::command`]. `root` is absolute (`AppEnv` guarantees it), so a relative `p` fails the
-/// `strip_prefix`. Returns the normalised path: `root` plus the verified components.
-fn check_inside(root: &Path, p: &Path, what: &'static str, want: Want) -> Result<PathBuf, BackendError> {
-    let outside = || BackendError::OutsideDriveC { what };
-    if p.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(outside());
-    }
-    let rel = p.strip_prefix(root).map_err(|_| outside())?; // compares whole components
-    let io = |source| BackendError::Io { what, source };
-    let not = |text: &[u8]| BackendError::failed(what, text);
-    // Every step by lstat: a link anywhere on the way (drive_c itself included) is refused.
-    let mut cur = root.to_path_buf();
-    let mut meta = std::fs::symlink_metadata(&cur).map_err(io)?;
-    for comp in rel.components() {
-        if meta.file_type().is_symlink() {
-            return Err(not(b"the path goes through a symbolic link"));
-        }
-        cur.push(comp);
-        meta = std::fs::symlink_metadata(&cur).map_err(io)?;
-    }
-    // A final symlink is neither a regular file nor a directory by lstat, so `want` refuses it too.
-    let file_type = meta.file_type();
-    match want {
-        Want::File if !file_type.is_file() => Err(not(b"not a regular file")),
-        Want::Dir if !file_type.is_dir() => Err(not(b"not a directory")),
-        _ => Ok(cur),
     }
 }
 
