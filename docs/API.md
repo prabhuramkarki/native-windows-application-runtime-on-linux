@@ -167,7 +167,9 @@ before it started, or through the SIGTERM it was sent, ending other than with ex
 cancel `succeeded`; one that ended on its own before the cancel reached it keeps its own result.
 
 **Cancel.** `jobs.cancel` sends SIGTERM to the job's process group and SIGKILL 5 s later if `runtime` has not
-exited; once it has, whatever is left of the group gets SIGKILL. `runtime run` passes SIGTERM on to the sandbox,
+exited; once it has, whatever is left of the group has the rest of those 5 s to stop, then gets SIGKILL (the job ends
+when the group is empty, or after that SIGKILL). A cancel that arrives after `runtime` already exited leaves the job's
+result as it is, and gives what is left of the group SIGTERM, then SIGKILL 5 s later. `runtime run` passes SIGTERM on to the sandbox,
 which dies with it. A signal is never sent to a process group whose leader was already reaped, so a reused pid is
 never signalled.
 
@@ -547,7 +549,9 @@ every job runs it. `--write` also requires, before it starts:
 
 - the socket (bound, or inherited from systemd) resolves inside `$XDG_RUNTIME_DIR`, which must be a 0700 directory of
   the user (not `/`). No sandbox profile can see that directory, so no sandboxed app can reach a write-capable socket;
-- `$XDG_RUNTIME_DIR/runtime/job-cwd` is (or is created as) a 0700 directory of the user;
+- `$XDG_RUNTIME_DIR/runtime/job-cwd` is (or is created as) a 0700 directory of the user. The daemon takes a
+  directory of its own in it (`d-<32 hex>/`, marked live by an `flock` on `d-<32 hex>.lock` held for its life), and
+  removes only the directories of daemons that are gone, never another live daemon's;
 - `runtime` is a regular file (not a symlink) owned by the user or root and writable only by its owner, in a
   directory with the same property. With a umask of 002 (the Ubuntu default) cargo installs both group-writable:
   `runtimed` then says so and names the fix, `chmod g-w,o-w <path>`. The same check runs before every job;

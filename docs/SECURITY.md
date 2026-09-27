@@ -1184,13 +1184,15 @@ must not exist, and why it does not:
   and reaps it under the job's lock; every group signal is sent under that lock while the leader is unreaped, so the
   process group id is still the job's own.
 - **A job outliving the daemon**: on SIGTERM the daemon cancels every job (SIGTERM to its group, SIGKILL 5 s later,
-  and SIGKILL to what is left of the group once the leader is gone) and waits for them before it removes the socket.
+  and, once the leader is gone, SIGKILL to what is left of the group at the end of the same grace) and waits for them
+  before it removes the socket.
   If the daemon is killed, `PR_SET_PDEATHSIG` sends each job's `runtime` SIGTERM; `runtime run` passes it to bwrap,
   whose `--die-with-parent` takes the sandbox down. The unit uses `KillMode=mixed` so systemd does not bypass the
   ordered cancel.
 - **A job inheriting what it should not**: the environment is an allowlist of the daemon's own variables (never a
-  client's), the working directory is a fresh empty directory per job (so `runtime run <id>` cannot fall back to a
-  file of that name), stdin is `/dev/null`, and every daemon fd is close-on-exec.
+  client's), the working directory is a fresh empty directory per job, inside a directory of this daemon's own that
+  another daemon's startup never removes while this one lives (an `flock` marks it live) (so `runtime run <id>` cannot
+  fall back to a file of that name), stdin is `/dev/null`, and every daemon fd is close-on-exec.
 - **A replaced `runtime`**: before `--write` starts and before every job, the binary must be a regular file (not a
   symlink) owned by the user or root and writable only by its owner, in a directory with the same property; at
   startup it must also report the daemon's own version.
