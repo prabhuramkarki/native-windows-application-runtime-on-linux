@@ -372,6 +372,45 @@ fn a_failed_installer_import_leaves_no_app_and_no_staged_file() {
         0,
         "the staged installer is removed"
     );
+
+    // A killed import (SIGTERM from a job cancel, SIGKILL) never ran its cleanup: the next import sweeps what a dead
+    // process left, and only that. Pid 999999999 is above any pid_max; this test's own pid is alive.
+    let dead = staging.join("import-999999999-1");
+    let live = staging.join(format!("import-{}-1", std::process::id()));
+    let other = staging.join("import-x-1");
+    for d in [&dead, &live, &other] {
+        fs::create_dir(d).unwrap();
+        fs::write(d.join("setup.msi"), b"left behind").unwrap();
+    }
+    assert_fails(&r.rt(&["import".as_ref(), wrun.as_os_str(), "--silent".as_ref()]));
+    assert!(!dead.exists(), "a dead import's staging directory was kept");
+    assert!(
+        live.join("setup.msi").exists(),
+        "a live import's staging directory was removed"
+    );
+    assert!(
+        other.join("setup.msi").exists(),
+        "a name that is not import-<pid>-<n> was removed"
+    );
+}
+
+/// A cancelled import can leave its half-built app (a signal skips the cleanup). The id is fixed, so a retry is
+/// refused until `runtime remove` clears it; then it succeeds.
+#[test]
+fn a_half_built_app_is_removed_and_the_import_retried() {
+    let r = rig();
+    let wrun = demo(&r);
+    // What `Store::create` leaves when the process dies before the metadata is written.
+    let env = r.data.join("apps/demo");
+    for d in ["", "config", "cache", "logs", "runtime", "registry", "prefix/drive_c"] {
+        fs::create_dir_all(env.join(d)).unwrap();
+    }
+    let err = assert_fails(&r.rt(&["import".as_ref(), wrun.as_os_str()]));
+    assert!(err.contains("runtime remove demo"), "{err}");
+    assert_ok(&r.rt(&["remove", "demo"]));
+    assert!(!env.exists());
+    assert_ok(&r.rt(&["import".as_ref(), wrun.as_os_str()]));
+    assert!(env.join("metadata.json").is_file());
 }
 
 #[test]

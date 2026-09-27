@@ -154,7 +154,8 @@ Success criteria:
   summary as `inspect`.
 - **Decision W13: staging for installer-kind.** The installer file is extracted (verified) to
   `<data root>/staging/import-<pid>-<nanos>` (directory 0700 created on demand, file `create_new` 0600), passed to
-  `install_via_installer`, and removed afterwards on every path. No `tempfile` in production code.
+  `install_via_installer`, and removed afterwards on every path. No `tempfile` in production code. (As built: a
+  signal skips that removal, so each import first removes the `import-<pid>-*` directories of dead processes.)
 
 ## 3. The `.wrun` v1 format
 

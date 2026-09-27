@@ -82,10 +82,10 @@ fn perm_rows(p: &PermissionsView) -> PermRows {
             })
             .collect(),
         limits: limits.join(", "),
+        // One `shown` over the whole line cleans every item in it.
         requested: (!p.requested.is_empty()).then(|| {
-            let list: Vec<String> = p.requested.iter().map(|r| shown(r, TEXT_MAX)).collect();
             shown(
-                &format!("Requested by the package (not granted): {}", list.join(", ")),
+                &format!("Requested by the package (not granted): {}", p.requested.join(", ")),
                 MAX_SHOWN,
             )
         }),

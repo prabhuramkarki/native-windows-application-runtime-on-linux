@@ -94,7 +94,8 @@ enum Cmd {
     /// Install a `.wrun` package as the app its manifest names (needs Wine). An app with that id already installed
     /// is refused and left alone. The package can only REQUEST: its dependencies and permissions are recorded and
     /// shown with the commands that grant them (`runtime deps <app> --install`, `runtime permissions <app>
-    /// --set=...`); nothing is granted, downloaded or run.
+    /// --set=...`); nothing is granted, downloaded or run. An import that was killed can leave a half-built app
+    /// under the package's id: `runtime remove <app>` clears it, then import again.
     Import {
         file: PathBuf,
         /// Installer packages only: run the installer non-interactively (as `install --silent`)
