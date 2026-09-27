@@ -450,3 +450,71 @@ fn requests_exprs_are_canonical_strings_from_the_enums_only() {
     assert_eq!(all.exprs(), ["network=allow", "display=off", "audio=on", "gpu=off"]);
     assert!(Requests::default().exprs().is_empty());
 }
+
+// ---------------------------------------------------------------- name encoding (review M5)
+
+/// The valid package plus one entry whose raw name bytes are `raw` (written under an ASCII placeholder, so the
+/// UTF-8 flag is NOT set, then patched in both headers).
+fn with_raw_name(raw: &[u8]) -> Vec<u8> {
+    let placeholder = format!("payload/{}", "q".repeat(raw.len() - "payload/".len()));
+    let mut files = payload();
+    files.push((Box::leak(placeholder.clone().into_boxed_str()), b"x".to_vec()));
+    rename_everywhere(package_of(&valid_manifest(), &files), placeholder.as_bytes(), raw)
+}
+
+#[test]
+fn a_name_that_is_not_utf8_is_refused() {
+    let e = open_err(&with_raw_name(b"payload/\xff\xfe"));
+    assert!(matches!(&e, E::Layout(m) if m.contains("not UTF-8")), "{e}");
+}
+
+#[test]
+fn utf8_bytes_without_the_utf8_flag_are_an_ambiguous_name() {
+    // Read as UTF-8 this is `payload/é`; without the flag the zip crate decodes it as CP437 (`payload/├⌐`).
+    let e = open_err(&with_raw_name("payload/é".as_bytes()));
+    assert!(
+        matches!(&e, E::Layout(m) if m.contains("ambiguous name encoding")),
+        "{e}"
+    );
+    // The same name written WITH the flag (the writer sets it for non-ASCII) is a plain unlisted file.
+    let mut files = payload();
+    files.push(("payload/é", b"x".to_vec()));
+    let e = open_err(&package_of(&valid_manifest(), &files));
+    assert!(!e.to_string().contains("ambiguous"), "{e}");
+}
+
+#[test]
+fn a_unicode_path_extra_field_renames_consistently_or_is_refused() {
+    // Info-ZIP 0x7075: the crate replaces BOTH the raw and the decoded name, so the package rules and the planner
+    // see one name (`payload/zz`), never two. Here it names a file the manifest does not list: refused.
+    let mut crc = flate2::Crc::new();
+    crc.update(b"payload/qq");
+    let mut field = vec![1u8];
+    field.extend_from_slice(&crc.sum().to_le_bytes());
+    field.extend_from_slice(b"payload/zz");
+    let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    w.start_file("wrun.toml", stored()).unwrap();
+    w.write_all(valid_manifest().as_bytes()).unwrap();
+    for (p, d) in payload() {
+        w.start_file(p, stored()).unwrap();
+        w.write_all(&d).unwrap();
+    }
+    let mut opts = zip::write::FullFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o644);
+    // The writer validates a 0x7075 field against the name it does not know yet: write it under an unused id,
+    // then patch the id in both headers.
+    opts.add_extra_data(0x6666, field, false).unwrap();
+    w.start_file("payload/qq", opts).unwrap();
+    w.write_all(b"x").unwrap();
+    let zip = rename_everywhere(
+        w.finish().unwrap().into_inner(),
+        b"\x66\x66\x0f\x00",
+        b"\x75\x70\x0f\x00",
+    );
+    let e = open_err(&zip);
+    assert!(
+        matches!(&e, E::Layout(m) if m.contains("\"payload/zz\" is not listed")),
+        "{e}"
+    );
+}

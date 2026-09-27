@@ -699,7 +699,9 @@ pub fn extract_verified(
 }
 
 /// Streams one planned entry into `out`, checking its declared size and that its bytes hash to `expected`.
-/// Returns the number of bytes written. The bytes are counted against [`Limits::max_total_bytes`].
+/// Returns the number of bytes written. Only this entry's bytes are counted against [`Limits::max_total_bytes`]
+/// (the count starts at 0 on every call): the bound across a whole archive is the planner's, which capped the sum
+/// of the declared sizes at `open`, together with streaming stopping at each entry's declared size.
 pub fn copy_verified(
     archive: &mut Archive,
     file: &PlannedFile,
