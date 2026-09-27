@@ -682,7 +682,7 @@ pub fn extract(archive: &mut Archive, plan: &Plan, dest: &Path, limits: &Limits)
 }
 
 /// The expected sha256 of a planned file, by its path components (`None`: not listed).
-pub type DigestOf = dyn Fn(&[String]) -> Option<[u8; 32]>;
+pub type DigestOf<'a> = dyn Fn(&[String]) -> Option<[u8; 32]> + 'a;
 
 /// [`extract`] with a sha256 per file: `digest(path components)` names the expected digest, `None` means the file
 /// is not listed. Every file is looked up BEFORE anything is created ([`ZipError::Unlisted`]); each file's bytes are
@@ -693,7 +693,7 @@ pub fn extract_verified(
     plan: &Plan,
     dest: &Path,
     limits: &Limits,
-    digest: &DigestOf,
+    digest: &DigestOf<'_>,
 ) -> Result<u64, ZipError> {
     extract_inner(archive, plan, dest, limits, Some(digest))
 }
@@ -728,7 +728,7 @@ fn extract_inner(
     plan: &Plan,
     dest: &Path,
     limits: &Limits,
-    digest: Option<&DigestOf>,
+    digest: Option<&DigestOf<'_>>,
 ) -> Result<u64, ZipError> {
     let io_err = |name: &[String], source| ZipError::Io {
         name: quote(&name.join("\\")),
