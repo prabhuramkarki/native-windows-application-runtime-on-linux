@@ -28,7 +28,7 @@
 
 ---
 
-## 0. Status as of 2026-09-26 (written after Phase 5B; the per-phase specs/plans and `git log` are the detail)
+## 0. Status as of 2026-09-27 (updated after Phase 6D; the per-phase specs/plans and `git log` are the detail)
 
 | Phase | State | Notes |
 |---|---|---|
@@ -44,11 +44,13 @@
 | 5B seccomp, Landlock, limits | done | hidden `runtime sandbox-init` shim (seccomp deny-list, best-effort Landlock), cgroup limits via `systemd-run --user`, the INSTALLER sandbox uses the same shim |
 | 5C Portal "ask" flows | deferred | a running bubblewrap sandbox cannot gain mounts; needs a different design (per-run grants) |
 | 6A API crate + read-only daemon | done (merged) | `rt_api` (typed, sanitised read-only API; host gathering moved out of the CLI), `runtimed` (JSON-RPC 2.0 NDJSON, owner-only Unix socket, peer uid, caps and deadlines, systemd socket activation), `rt_daemon::client`, `runtime rpc`/`daemon-status`; `docs/API.md` |
-| 6B Mutating methods + job events | implemented on branch `phase-6b-daemon-write`, pending merge | `runtimed --write`: run/install/remove/deps.install/permissions/display as jobs running the `runtime` CLI with a validated argv (`rt_api::jobs`); long-polled cleaned output (`jobs.poll`); consent by plan digest + exact package/version/sha256, re-checked by `runtime deps --install --plan-digest`; process groups, PDEATHSIG, pid-reuse-safe cancel; socket must be in `$XDG_RUNTIME_DIR`; API 0.2.0; `docs/API.md`, `docs/SECURITY.md`. Follow-ups: re-check the `runtime` version when the file changes; a real-Wine cancel e2e with a long-running fixture; re-digest under the app lock in `deps --install`; `progress` events if the GUI needs them |
-| 6C GUI client | implemented on branch `phase-6c-gui`, pending merge | `runtime-gui` (GTK 4 + libadwaita, `crates/gui`, outside `default-members`, its own CI job): a toolkit-free view model; a backend with one request thread and at most 4 long-poll job followers; apps list with search; run/stop; install and remove dialogs; permissions editor (typed choices only); per-package consent dialog sending the plan digest unmodified; a jobs panel with plain-text logs; read-only and no-daemon states. Tests: view model, e2e against the real `runtimed`, widget tests under Xvfb. Manual `docs/GUI-CHECKLIST.md` (GNOME, KDE) not yet run. Follow-ups: an accessibility pass (Orca, keyboard); the gui CI job's first hosted run; display-driver setting and resource-limit editing |
-| 6C-6D GUI, plugins | not started | GUI toolkit GTK4 + libadwaita (6C); licence MIT OR Apache-2.0 and name `runtime` defaults |
+| 6B Mutating methods + job events | done (merged) | `runtimed --write`: run/install/remove/deps.install/permissions/display as jobs running the `runtime` CLI with a validated argv (`rt_api::jobs`); long-polled cleaned output (`jobs.poll`); consent by plan digest + exact package/version/sha256, re-checked by `runtime deps --install --plan-digest`; process groups, PDEATHSIG, pid-reuse-safe cancel; socket must be in `$XDG_RUNTIME_DIR`; API 0.2.0; `docs/API.md`, `docs/SECURITY.md`. Follow-ups: re-check the `runtime` version when the file changes; a real-Wine cancel e2e with a long-running fixture; re-digest under the app lock in `deps --install`; `progress` events if the GUI needs them |
+| 6C GUI client | done (merged) | `runtime-gui` (GTK 4 + libadwaita, `crates/gui`, outside `default-members`, its own CI job): a toolkit-free view model; a backend with one request thread and at most 4 long-poll job followers; apps list with search; run/stop; install and remove dialogs; permissions editor (typed choices only); per-package consent dialog sending the plan digest unmodified; a jobs panel with plain-text logs; read-only and no-daemon states. Tests: view model, e2e against the real `runtimed`, widget tests under Xvfb. Manual `docs/GUI-CHECKLIST.md` (GNOME, KDE) not yet run. Follow-ups: an accessibility pass (Orca, keyboard); the gui CI job's first hosted run; display-driver setting and resource-limit editing |
+| 6D Backend interface + `.wrun` | implemented on branch `phase-6d-backend-and-package`, pending merge | `CompatBackend` is the one execution seam, with a written contract (`BACKEND_API_VERSION = 1`, printed by `doctor`) and capabilities (arches, subsystems, `dotnet`, `installers`, `dependency_packages`, `sandboxable`) enforced in install, the installer pipeline, deps and run; a conformance suite over Wine, the fake and a test-only null backend (which installs and runs a fixture through the unmodified services); backends compiled in and selected by recorded id (`rt_api::backends`), no plugins (source scan + `cargo deny` bans). `.wrun` v1 (`runtime-package`): zip + strict TOML manifest + per-file sha256, hostile and mutation tests, reproducible `pack`; `runtime pack/inspect/unpack/import`; import is request-only (no `permissions.toml`, no dependency install, fixed id, collision refused), metadata schema 4 records the requests; `apps.import` job (API 0.2.1); the GUI install dialog imports `.wrun` and the app page shows requested permissions. Licence MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`); `docs/ARCHITECTURE.md`, `docs/README.md`, `docs/WRUN.md`. Not built: package signing (`wrun.sig` reserved and refused), a package preview method, a non-Wine backend; Phase 6's desktop notifications and nightly compat runs were not built either. Follow-ups: gate `runtime display` by a capability when a second backend arrives; the 64 KiB manifest caps a portable package at about 450 files |
 
 **Phase 4 exit criteria, honestly:** D3D11 renders via DXVK on three devices (met, recorded); "a real D3D9/11 game" and "a .NET 4.8 app runs" are only partly met: no game was recorded; .NET runs: met for Mono-compatible console programs (Phase 4F: Wine Mono 9.4.0 per app, a C# console fixture with threads and GC verified under the hardened sandbox); a real .NET Framework 4.8 GUI app is not claimed. `doctor` predicts a deliberately broken environment (met).
+
+**Phase 6 / v1.0 exit criteria, honestly (after 6D):** none is met yet, so this is not 1.0. ">=25 matrix apps tested with statuses": the matrix holds 18 records, all test fixtures, all `manual:` evidence from one host, and no real application. "API semver-stable": the API is 0.2.1 (additive versioning, documented in `docs/API.md`), not declared stable. "install -> launch -> uninstall from the GUI on GNOME and KDE": the flows exist and are tested against a real `runtimed` under Xvfb, but `docs/GUI-CHECKLIST.md` has not been run on either desktop, and the `gui` CI job has not run on a hosted runner.
 
 **Known follow-ups (from review ledgers; none blocks use):**
 - .NET: record a real .NET Framework 4.x application (GUI: WinForms/WPF) under Wine Mono; a Wine upgrade needs a new Wine Mono pin.
@@ -81,10 +83,10 @@
 
 ### Open decisions for you
 
-1. **Project licence** (MIT/Apache-2.0 vs GPL). Permissive keeps Native Mode clean-room-able; if permissive, never copy Wine/ReactOS code into own components.
+1. **Project licence** (MIT/Apache-2.0 vs GPL). Permissive keeps Native Mode clean-room-able; if permissive, never copy Wine/ReactOS code into own components. Settled: MIT OR Apache-2.0 (Phase 6D: `LICENSE-MIT`, `LICENSE-APACHE`, `license.workspace` on every crate); the rule against copying Wine/ReactOS code stands (`docs/THIRD_PARTY.md`).
 2. **Wine sourcing:** system `wine` only (simple) vs runtime-managed Wine builds downloaded with consent (reproducible; needed by Phase 4).
 3. **GUI toolkit** for Phase 6: Tauri (TypeScript, matches §37) vs GTK4-rs (native look on GNOME/KDE). Settled: GTK 4 + libadwaita (Phase 6C).
-4. **Project/binary name** (`runtime` is a placeholder and collides with generic names).
+4. **Project/binary name** (`runtime` is a placeholder and collides with generic names). Still open: `runtime` is kept as the default for now.
 
 ---
 
@@ -241,6 +243,7 @@ struct AppEnv    // id, root dir, metadata.json, backend id, arch
 - **Public Rust API crate** (`Runtime`, `Application`, `Environment`, `Process`, `Dependency`, §42) — the CLI is re-implemented as a thin client of it.
 - **`runtimed`** on a **Unix domain socket** with systemd user socket activation; JSON-RPC (or varlink) with **event streams** (install progress, logs). No TCP.
 - **Backend plugin interface** frozen & versioned: `CompatBackend`, `GraphicsBackend`, `WindowBackend`, `AudioBackend`, `CpuBackend`. Register by capability (§39).
+  *As built (6D):* only `CompatBackend` is frozen, as a compiled-in seam selected by id, not a plugin interface (no dynamic loading; `docs/SECURITY.md` says why). `GraphicsBackend`, `WindowBackend`, `AudioBackend` and `CpuBackend` are not defined: none has a second implementation or a caller (graphics is manifest data in `rt_deps`, audio and display are Wine configuration, CPU is Phase 9), so defining them now would be a guess Phases 7-9 would have to break (spec Decision B2).
 - **GUI manager** (toolkit per Open Decision 3): apps, environments, dependencies, logs, permissions, diagnostics (§26 screens).
 - **`.wrun` package** (§43): manifest + reproducible env recipe; `.exe`/`.msi` remain first-class.
 - Notifications (D-Bus `org.freedesktop.Notifications` via `zbus`), clipboard/drag-drop via Wine's Wayland support (verify; document gaps).

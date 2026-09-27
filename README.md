@@ -1,8 +1,38 @@
 # Native Windows application runtime on Linux
 
-A Linux command-line runtime that runs Windows applications through Wine, one isolated Wine prefix per app.
+A Linux runtime that runs Windows applications through Wine, one isolated Wine prefix per app, with a command-line
+front end, a local daemon and a GTK desktop client.
 
-**Status: Phase 5B (bubblewrap sandbox plus seccomp, Landlock and resource limits), an early MVP.** `runtime run` starts every
+## Status
+
+**Phases 0 to 6 of the [roadmap](docs/superpowers/plans/2026-09-21-runtime-master-roadmap.md) are implemented, as
+scoped by their plans. This is not a 1.0 release.** The crates are at version 0.0.1 and nothing has been pushed or
+published. Left out on purpose, and recorded in the roadmap: portal "ask" flows (5C, deferred), desktop notifications,
+nightly compatibility runs in CI, package signing, and any backend other than Wine.
+
+What works, and is tested: install of portable `.exe` and `.zip` programs and of `.msi`/NSIS/Inno/InstallShield/WiX
+installers (the installers run sandboxed); `runtime run` in a per-app bubblewrap sandbox with seccomp, Landlock and
+resource limits; pinned, verified dependency packages with per-package consent (DXVK, VKD3D-Proton, the VC++ runtime,
+Wine Mono); `runtimed` (a JSON-RPC API over an owner-only Unix socket, read-only or `--write`); `runtime-gui`; `.wrun`
+packages (`pack`, `inspect`, `unpack`, `import`); and a written, conformance-tested backend contract with Wine as its
+only real backend.
+
+What is not claimed: that any particular real-world application or game works. The
+[compatibility matrix](docs/COMPAT.md) lists only test fixtures (console programs, installers, a D3D11 clear, a .NET
+console program), every one recorded by hand on one development host.
+
+The v1.0 exit criteria that are still open:
+
+- **At least 25 matrix apps tested with statuses** (roadmap, Phase 6 exit). The matrix has no real application yet.
+- **Install, launch and uninstall from the GUI on GNOME and KDE.** The manual [GUI checklist](docs/GUI-CHECKLIST.md)
+  has not been run on either desktop.
+- **CI on a hosted runner.** The `gui` job and the `wine-e2e` job have never run on a hosted runner; every result so
+  far is from local runs.
+- **A semver-stable API.** The daemon API is at 0.2.1 and may still change.
+
+## Sandbox
+
+`runtime run` starts every
 program in a bubblewrap sandbox built from the app's permissions (default: no network, no host files, only its own
 prefix writable; display, audio and GPU on), and refuses to run without a working `bwrap` (`sudo apt install
 bubblewrap`) unless you pass `--unsandboxed`. Inside it, a small launcher (`runtime sandbox-init`, hidden) applies a
@@ -25,6 +55,10 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 |---|---|
 | `install <file.exe\|file.zip> [--name N] [--exe PATH]` | Creates an app with its own hardened Wine prefix and copies the program in. For a zip, `--exe` names the program inside it. |
 | `install <file.msi\|installer.exe> [--silent] [--network] [--exe PATH]` | Installs a `.msi` or a recognised `.exe` installer (Inno Setup, NSIS, InstallShield, WiX Burn) through a `bwrap` sandbox with no display, network or host filesystem access by default. `--silent` runs it non-interactively with its family's standard silent flags; `--network` allows it network access while it runs; display, audio and D-Bus environment variables are never passed into the sandbox either way (with `--network`, an installer that guesses the host's X display can still reach it where the X server grants same-user access without a cookie; see `docs/SECURITY.md`). `--exe` names the installed program directly (a path inside the installed prefix, e.g. `Program Files\App\app.exe`), skipping automatic discovery. |
+| `pack <DIR> -o <FILE>` | Builds a `.wrun` package from `DIR` (`wrun.toml` and `payload/`), reproducibly, and prints its digest. See [docs/WRUN.md](docs/WRUN.md). |
+| `inspect <FILE> [--json]` | Shows what a `.wrun` package is and what it would request, after verifying every file. Installs, runs and writes nothing. |
+| `unpack <FILE> -o <DIR>` | Extracts a `.wrun` package into a new directory, verifying every file. Runs nothing. |
+| `import <FILE> [--silent] [--network]` | Installs a `.wrun` package as the app its manifest names. An existing app with that id is refused and left alone. The package's dependencies and permissions are only recorded as requests and shown with the commands that grant them; nothing is granted, downloaded or run. `--silent` and `--network` apply to installer packages only. |
 | `run <app\|file> [--debug] [--unsandboxed] [-- args...]` | Runs an installed app in its sandbox (see `permissions` and `sandbox`); a `.exe`/`.zip` path is installed first (a new app on every call, default profile). Refuses to start when bubblewrap is missing or cannot create a sandbox. `--unsandboxed` runs this once WITHOUT the sandbox and says so. Ctrl-C (or SIGTERM to `runtime`) ends the sandboxed program. The exit code is the program's, `& 0xff` (128+N when it was killed by signal N). |
 | `sandbox <app>` | Shows the app's sandbox without running anything: whether bubblewrap works, the seccomp filter and the host's Landlock ABI (or why Landlock is unavailable), the `sandbox-init` launcher, the profile, its resource limits and whether systemd user scopes work, the requested pieces the host lacks, what the profile cannot enforce, and the full command line (`systemd-run` scope, `bwrap`, the launcher's Landlock rules). |
 | `list [--json]` | Lists installed apps. |
@@ -272,6 +306,7 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/core`: app ids, data dir, Windows path handling, metadata and store, install/run services,
   `doctor`, the `CompatBackend` trait and the `Launcher` (the one place child processes are started).
 - `crates/backend-wine`: the system-Wine backend: discovery, prefix creation and hardening.
+- `crates/package`: `rt_package`, the `.wrun` v1 reader and reproducible writer (Phase 6D).
 - `crates/installer`, `crates/desktop`: installer pipeline and sandbox (Phase 3), desktop entries.
 - `crates/deps`: the dependency engine: bundled manifest, resolver, verified HTTPS fetch, archive and installer
   package installers (Phase 4A).
@@ -287,5 +322,13 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
   `runtime rpc` and `runtime daemon-status`).
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
 
+How the crates fit together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Every document: [docs/README.md](docs/README.md).
 The roadmap and the phase plans, with notes on where the code departs from them, are in
 `docs/superpowers/plans/`. Third-party components and licences: [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
+
+## Licence
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Unless you state
+otherwise, any contribution you intentionally submit for inclusion in this project, as defined in the Apache-2.0
+licence, is dual-licensed as above, without any additional terms or conditions. Third-party components keep their
+own licences ([docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)); Wine is run as a separate program and never linked.

@@ -205,4 +205,122 @@ Task 1 first. Task 2 needs 1. Task 3 is independent of 1-2 (may run in parallel 
 
 ## As built
 
-(Filled in after implementation.)
+Branch `phase-6d-backend-and-package`, commits `decfaec` onward. Reviews:
+`.superpowers/sdd/2026-09-27-phase-6d/` (Tasks 1-3: approve with fixes, 1 Important; Task 4: approve; Tasks 5-6:
+approve with 1 Important). Both Important findings were fixed. No new third-party crate: `Cargo.lock` gained only
+`runtime-package` and dependency edges between existing crates (`sha2` for `runtime-core`; `runtime-core` with
+`testing` and `runtime-installer` as dev-dependencies of `runtime-core`).
+
+**Task 1 (the contract, capabilities, registry).**
+- `Capabilities::check(&self, backend: &'static str, arch, subsystem)`: it takes the backend id, because
+  `Unsupported` names the backend. `Capabilities::check_arch` was added for the installer pipeline and `run`.
+- Error variants: `InstallError::Unsupported`, `InstallerError::Unsupported`, `DepsError::Unsupported` and
+  `RunAppError::Unsupported { id, source }`.
+- `rt_core` re-exports `pe`, so `backend-wine` needs no new dependency.
+- The audit is written into the `rt_core::backend` module docs:
+  - "what the platform assumes of every backend": the `drive_c` layout, and `WINEPREFIX` for sandboxing;
+  - "Wine-specific, stays concrete (B5)": doctor's Wine checks, the Wine-shaped `sandbox` fallback,
+    `harden_cause`, `runtime display`, and the `wineserver` busy checks.
+- The CLI selects backends through the registry, and `backend_of` uses the recorded `backend.id` for run, deps,
+  display, remove and uninstall. `doctor` prints `backend wine, interface 1`.
+
+**Task 2 (conformance).**
+- `live_checks(b, scratch, launcher, program: &[u8], expect_exit)`: the live check needs a program with a known exit
+  code, and for Wine that is a real PE.
+- Wine's containment check moved to core as `rt_core::backend::inside_drive_c`, shared by Wine and `FakeBackend`.
+- Review fix I1: every symlink on the way (in `drive_c`, an intermediate directory, the final component, or the cwd)
+  is now `OutsideDriveC`; Wine returned `Failed` for these before. The checks `outside-dotdot`, `outside-absolute` and
+  `outside-symlink` cover every case the spec lists and require exactly `OutsideDriveC`.
+- Broken backends: 13, each failing exactly one named check. They include `FollowsFinalSymlink`,
+  `SandboxableWithoutPrefix` and `InstallersWithoutSandbox`.
+- Review fix M2: a new capability, **`sandboxable`**, not in the spec.
+  - Meaning: the command carries `WINEPREFIX = env.prefix()`.
+  - A conformance check, `command-sandboxable`, tests it.
+  - `installers || dependency_packages` imply it.
+  - `rt_core::run` refuses a sandboxed run without it (only `--unsandboxed` runs such a backend).
+  - Wine and the fake declare it; the null backend does not.
+- Review fix M1: `rt_deps::check_backend` runs in the CLI before `rt_sandbox::mark`, so a refused `deps --install`
+  leaves no sandbox marker.
+- Review fix M3: the installer pipeline checks the installed program's architecture, and `run` checks the recorded
+  architecture. The recorded subsystem is informational and not checked at run.
+- The deps refusal is proven with `FakeBackend` (`dependency_packages: false`), not with the null backend.
+- M4, gating `runtime display` by a capability, is deferred to the arrival of a second backend.
+- The live tier passed on real Wine.
+
+**Task 3 (`runtime-package`).**
+- `unzip::extract_verified` takes a borrowing digest closure (`&DigestOf`), and `copy_verified` serves
+  `verify`/`extract_one`. `ZipError` gained `Integrity` and `Unlisted`.
+- The manifest is written by a hand-written canonical emitter: the `toml` `display` feature would pull in a new
+  crate.
+- `pack` stores (does not deflate) a file whose deflate ratio would trip the reader's 1000:1 bomb guard; otherwise
+  the writer would produce packages its own reader refuses.
+- `pack` refuses anything in DIR other than `wrun.toml` and `payload/`, rather than silently leaving it out.
+- Dependency ids are checked for grammar only in `rt_package`; the CLI checks that they exist in the bundled
+  manifest.
+- `digests()` keys are full `payload/...` paths.
+- No checked-in fixtures: the tests build archives in memory.
+- Review fix M5: three name-encoding tests (not UTF-8, UTF-8 bytes without the flag, the Info-ZIP 0x7075 field).
+- Known v1 limit (controller ruling): the 64 KiB manifest cap holds about 450 payload files. A test pins it (400
+  pack, 600 fail), and larger apps ship as installer-kind packages.
+
+**Task 4 (install integration).**
+- New `InstallError` variants: `IdTaken`, `Mismatch { expected, found }`, `Package(&'static str)` and
+  `WrunPackage`. New `InstallerError::IdTaken` and `MetaError::BadPackage`.
+- W11 is enforced in `rt_core::install` itself, not the CLI, so `run <file>` and the API are covered too.
+- `rt_deps`: a requested root is shown through `AppPlan::is_requested` and `REQUESTED_REASON`; `PlanEntry` has no
+  new field. An unknown requested id is a warning and is not planned.
+- `SCHEMA_VERSION = 4` applies to every app written by this version, including plain installs and `deps` state
+  writes, not only imports (the existing schema policy).
+- `AppDetail.package` is additive.
+- Review minors left as they are:
+  - the installer pipeline validates `opts.package` only after the installer ran (the CLI always builds a valid
+    record);
+  - `plan_digest` does not bind "requested", and the reason is kept out of the consent prompt;
+  - `package.digest` is recorded, never re-verified (documented in SECURITY.md).
+
+**Task 5 (CLI).**
+- `rt_api::requests_not_granted` and the additive `PermissionsView.requested`. `deps` plan lines for requested
+  roots end with "(requested by the package)", display only.
+- The tests are in `crates/cli/tests/apps/package.rs`, included from `apps.rs` to reuse the fake-Wine rig.
+- **Exit code:** `--silent`/`--network` on a portable package exits 1, not 2.
+- W13 staging layout: `<data>/staging/import-<pid>-<nanos>/<installer file name>`. The installer's name is kept,
+  because the pipeline derives its extension and provisional name from it.
+- Files are opened with `O_NONBLOCK` and must fstat as regular, so a FIFO cannot block.
+- Import checks the manifest arch against the default backend early. The subsystem is checked by core and the
+  installer pipeline. For installer-kind packages the manifest `arch` is not compared with the installed PE; the
+  metadata records the real one. Review M1: the early check is defence in depth under Wine.
+- Installer-kind packages ignore the manifest `name`; the installer's own name wins, as with `install`.
+- The bwrap-gated real-Wine test `e2e_import_of_an_installer_package` passes.
+
+**Task 6 (API, daemon, GUI).**
+- `apps.import` is a write method, API `0.2.1`.
+- `api_at_least` compares `[major, minor, patch]`, and the GUI refuses to send a `.wrun` to an older daemon
+  (`NO_IMPORT`, with the reason).
+- The install dialog adds a `.wrun` filter and hides the name entry. The Silent and Network switches stay visible
+  for a portable package, whose job then fails with the CLI's message. Hiding them would need a package preview
+  method, a follow-up.
+- The requested-permissions line is one cleaned, bounded, plain label (`perm-requested`). Review M2: the per-item
+  clean was dropped as redundant.
+- Review fix I1: a signal skipped the staging cleanup. `Staged::new` now sweeps every `import-<pid>-<digits>`
+  directory whose `/proc/<pid>` is gone. A test covers a dead pid (removed), a live pid (kept) and a non-pid name
+  (kept). Spec W13 carries the same as-built note.
+- A killed import can leave a half-built app. A test pins that re-import is refused with "`runtime remove`" in the
+  message, and that remove then re-import works. `runtime import --help` and `docs/API.md` say so.
+- Not fixed, pre-existing, shared with `install`: a closed stdout or stderr panics with exit 101, leaving a
+  consistent state.
+
+**Task 7 (licences and docs).**
+- `LICENSE-APACHE` is the apache.org text (sha256 `cfc7749b...`), identical to the copies in the `encoding_rs` and
+  `env_home` crates; `LICENSE-MIT` names "Prabhuram Karki", 2026.
+- `license = "MIT OR Apache-2.0"` in `[workspace.package]` and `license.workspace = true` in all 12 crates.
+  `cargo deny` needed no change, because `[licenses.private] ignore = true` was already set.
+- New: `docs/ARCHITECTURE.md`, `docs/README.md` and `docs/WRUN.md`. `docs/WRUN.md`'s example is a real session.
+- Updated: README (a Status section that states the open v1.0 criteria, the new commands, a Licence section),
+  `docs/SECURITY.md` (the 6D section), `docs/THIRD_PARTY.md` and the roadmap (the 6B/6C rows, a 6D row, the Phase 6
+  exit criteria, the B2 note, and the licence decision settled).
+
+**Commit trailers.** The session's attribution rule and this plan both name `Co-Authored-By: Claude Opus 5.5`. Most
+commits carry it; `decfaec`, `cdc184f`, `60851a9`, `b5cea6c` and `244eef1` carry `Claude Sonnet 5`.
+
+**Environment note.** This host's `/tmp` tmpfs hits `EDQUOT` during long real-Wine runs. Point `TMPDIR` at
+`target/` for those runs.
