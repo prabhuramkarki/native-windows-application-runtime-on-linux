@@ -1,6 +1,8 @@
 //! The GTK layer: widgets built from the view model, which decides everything. The only way in is [`Ui::dispatch`]
 //! on the GTK thread: the model's `update`, each `Cmd` to the backend (which never blocks), then a render. Backend
-//! messages cross from its threads through an unbounded channel read by a future on the GTK main loop ([`start`]).
+//! messages cross from its threads through a channel read by a future on the GTK main loop ([`start`]), which handles
+//! everything waiting in one go and renders once. Job output is credit-limited: a follower waits while
+//! [`MAX_PENDING_EVENTS`] of its messages are unhandled, so a chatty job cannot flood the channel or the UI.
 mod about;
 mod app;
 mod apps;
@@ -11,7 +13,7 @@ mod permissions;
 pub mod text;
 mod window;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Credits};
 use crate::vm::{Action, Cmd, Conn, Model, Msg};
 use gtk4 as gtk;
 use gtk4::prelude::*;
@@ -43,26 +45,48 @@ pub struct Ui {
     jobs_key: RefCell<String>,
     selected_job: RefCell<Option<String>>,
     last_followed: RefCell<Option<String>>,
-    log_shown: RefCell<(Option<String>, u64)>,
+    log_view: RefCell<jobs::LogView>,
+    /// The open consent dialog (closed when the model no longer considers it open).
+    consent_dialog: RefCell<Option<adw::AlertDialog>>,
     /// Set while widgets are updated from the model: the signals that fires are not user intents.
     rendering: Cell<bool>,
 }
 
-/// The GUI on a real backend for `socket`: backend messages reach [`Ui::dispatch`] on the GTK main loop.
+/// Most job-output messages handed to the UI and not handled yet.
+pub const MAX_PENDING_EVENTS: usize = 8;
+/// Most messages handled per main-loop turn (then one render).
+const BATCH: usize = 64;
+
+/// The GUI on a real backend for `socket`: backend messages reach [`Ui::dispatch_all`] on the GTK main loop.
 pub fn start(socket: PathBuf) -> Rc<Ui> {
     let (tx, mut rx) = futures_channel::mpsc::unbounded::<Msg>();
+    let credits = Arc::new(Credits::new(MAX_PENDING_EVENTS));
+    let c = credits.clone();
     let backend = Backend::spawn(
         socket.clone(),
         Arc::new(move |m| {
+            if matches!(m, Msg::JobEvents(_)) {
+                c.acquire(|| tx.is_closed());
+            }
             let _ = tx.unbounded_send(m);
         }),
     );
     let ui = Ui::new(Box::new(move |c| backend.send(c)), &socket);
     let weak = Rc::downgrade(&ui);
     glib::spawn_future_local(async move {
-        while let Ok(m) = rx.recv().await {
+        while let Ok(first) = rx.recv().await {
             let Some(ui) = weak.upgrade() else { break };
-            ui.dispatch(m);
+            let mut batch = vec![first];
+            while batch.len() < BATCH
+                && let Ok(m) = rx.try_recv()
+            {
+                batch.push(m);
+            }
+            let events = batch.iter().filter(|m| matches!(m, Msg::JobEvents(_))).count();
+            ui.dispatch_all(batch);
+            for _ in 0..events {
+                credits.release();
+            }
         }
     });
     ui
@@ -93,7 +117,8 @@ impl Ui {
             jobs_key: RefCell::default(),
             selected_job: RefCell::default(),
             last_followed: RefCell::default(),
-            log_shown: RefCell::default(),
+            log_view: RefCell::default(),
+            consent_dialog: RefCell::default(),
             rendering: Cell::new(false),
         });
         let weak = Rc::downgrade(&ui);
@@ -169,22 +194,44 @@ impl Ui {
 
     /// The only way the model changes: update, send its commands, render.
     pub fn dispatch(self: &Rc<Self>, msg: Msg) {
+        self.dispatch_all(vec![msg]);
+    }
+
+    /// Several messages, then one render.
+    pub fn dispatch_all(self: &Rc<Self>, msgs: Vec<Msg>) {
         if self.rendering.get() {
             return;
         }
-        // Job progress, selections and the notice leave the lists and the page as they are (focus stays put).
-        let rebuild = !matches!(
-            msg,
-            Msg::JobEvents(_) | Msg::JobList(_) | Msg::Accept(..) | Msg::Dismiss
-        );
-        let cmds = self.model.borrow_mut().update(msg);
-        for c in cmds {
-            (self.send)(c);
+        let mut rebuild = false;
+        for msg in msgs {
+            // Job progress, selections, the dialog and the notice leave the lists and the page as they are (focus
+            // stays put).
+            rebuild |= !matches!(
+                msg,
+                Msg::JobEvents(_)
+                    | Msg::JobList(_)
+                    | Msg::Accept(..)
+                    | Msg::ConsentOpened
+                    | Msg::ConsentClosed
+                    | Msg::Refused(_)
+                    | Msg::Dismiss
+            );
+            let cmds = self.model.borrow_mut().update(msg);
+            for c in cmds {
+                (self.send)(c);
+            }
         }
         self.render(rebuild);
     }
 
     fn render(self: &Rc<Self>, rebuild: bool) {
+        // A consent dialog the model closed (a new plan replaced the one it shows) goes away.
+        if !self.model().consent_open() {
+            let open = self.consent_dialog.borrow_mut().take();
+            if let Some(d) = open {
+                d.force_close();
+            }
+        }
         self.rendering.set(true);
         let m = self.model.borrow();
         let w = &self.w;

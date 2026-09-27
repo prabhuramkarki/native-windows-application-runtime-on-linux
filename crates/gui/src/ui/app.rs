@@ -132,22 +132,19 @@ fn confirm_remove(ui: &Rc<Ui>) {
 }
 
 fn open_consent(ui: &Rc<Ui>) {
-    let (d, checks, digest) = {
+    // Every choice starts unaccepted, whatever happened in an earlier dialog.
+    ui.dispatch(Msg::ConsentOpened);
+    let (d, checks) = {
         let m = ui.model();
-        let Some(c) = m.consent() else { return };
-        let (d, checks) = consent::dialog(c);
-        (d, checks, c.digest().to_owned())
+        let Some(c) = m.consent().filter(|_| m.consent_open()) else {
+            return;
+        };
+        consent::dialog(c)
     };
-    // The dialog acts only while the model still holds the plan it shows.
-    let same = move |ui: &Ui| ui.model().consent().is_some_and(|c| c.digest() == digest);
-    let same = Rc::new(same);
     for (package, check) in checks {
-        let (weak, d2, same) = (Rc::downgrade(ui), d.clone(), same.clone());
+        let (weak, d2) = (Rc::downgrade(ui), d.clone());
         check.connect_toggled(move |c| {
             let Some(ui) = weak.upgrade() else { return };
-            if !same(&ui) {
-                return;
-            }
             ui.dispatch(Msg::Accept(package.clone(), c.is_active()));
             if let Some(label) = ui.model().consent().map(|c| c.install_label()) {
                 d2.set_response_label("install", &label);
@@ -156,11 +153,15 @@ fn open_consent(ui: &Rc<Ui>) {
     }
     let weak = Rc::downgrade(ui);
     d.connect_response(None, move |_, r| {
-        if let (Some(ui), "install") = (weak.upgrade(), r)
-            && same(&ui)
-        {
-            ui.dispatch(Msg::InstallDeps);
-        }
+        let Some(ui) = weak.upgrade() else { return };
+        ui.consent_dialog.borrow_mut().take();
+        // Anything but Install (Cancel, Escape, closing) resets every choice.
+        ui.dispatch(if r == "install" {
+            Msg::InstallDeps
+        } else {
+            Msg::ConsentClosed
+        });
     });
+    *ui.consent_dialog.borrow_mut() = Some(d.clone());
     d.present(Some(&ui.w.window));
 }

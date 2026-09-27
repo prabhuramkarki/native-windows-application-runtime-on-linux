@@ -115,9 +115,11 @@ fn gui(s: &Scratch) -> Rc<Ui> {
 fn close(ui: Rc<Ui>) {
     ui.window().destroy();
     drop(ui);
-    iterate_until(WAIT, "the window to go", || {
-        glib::MainContext::default().pending() || true
-    });
+    let ctx = glib::MainContext::default();
+    let until = Instant::now() + Duration::from_secs(2);
+    while ctx.pending() && Instant::now() < until {
+        ctx.iteration(false);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ scenarios
@@ -477,6 +479,181 @@ fn a_followed_jobs_output_is_shown_in_order() {
     close(ui);
 }
 
+// ------------------------------------------------------------------------------------------------ review fixes
+
+fn checks_of(d: &adw::AlertDialog) -> Vec<gtk::CheckButton> {
+    let root: gtk::Widget = d.clone().upcast();
+    ["vcrun", "dx"]
+        .iter()
+        .map(|p| find(&root, &format!("consent-check-{p}")).unwrap().downcast().unwrap())
+        .collect()
+}
+
+fn deps_sent(sent: &RefCell<Vec<Cmd>>) -> Vec<Cmd> {
+    sent.borrow()
+        .iter()
+        .filter(|c| matches!(c, Cmd::DepsInstall { .. }))
+        .cloned()
+        .collect()
+}
+
+fn a_cancelled_consent_is_forgotten() {
+    let (ui, sent) = recorded();
+    opened(&ui, true, canned_plan());
+    // Tick, then Cancel.
+    click(&ui, "btn-deps");
+    let d = dialog(&ui, "consent-dialog");
+    checks_of(&d)[0].set_active(true);
+    assert_eq!(d.response_label("install"), "Install (1 of 2 accepted)");
+    d.emit_by_name::<()>("response", &[&"cancel"]);
+    assert_eq!(ui.model().consent().unwrap().accepted_count(), 0);
+    d.force_close();
+    iterate_until(WAIT, "the dialog to go", || {
+        find(ui.window().upcast_ref(), "consent-dialog").is_none()
+    });
+    // Reopen: the box is unticked, the label says so, and Install sends no consent.
+    click(&ui, "btn-deps");
+    let d = dialog(&ui, "consent-dialog");
+    assert!(checks_of(&d).iter().all(|c| !c.is_active()));
+    assert_eq!(d.response_label("install"), "Install (0 of 2 accepted)");
+    d.emit_by_name::<()>("response", &[&"install"]);
+    match &deps_sent(&sent)[..] {
+        [Cmd::DepsInstall { consent, digest, .. }] => {
+            assert!(consent.is_empty(), "{consent:?}");
+            assert_eq!(digest, DIGEST);
+        }
+        c => panic!("{c:?}"),
+    }
+    close(ui);
+}
+
+fn a_new_plan_closes_an_open_consent_dialog() {
+    let (ui, sent) = recorded();
+    opened(&ui, true, canned_plan());
+    click(&ui, "btn-deps");
+    let d = dialog(&ui, "consent-dialog");
+    checks_of(&d)[0].set_active(true);
+    // A second Plan answer arrives (same digest: the choices are new all the same).
+    ui.dispatch(Msg::PlanLoaded {
+        id: "game".into(),
+        plan: canned_plan(),
+    });
+    iterate_until(WAIT, "the dialog to close", || {
+        find(ui.window().upcast_ref(), "consent-dialog").is_none()
+    });
+    assert_eq!(ui.model().notice(), Some(rt_gui::vm::PLAN_REPLACED));
+    assert_eq!(ui.model().consent().unwrap().accepted_count(), 0);
+    // The stale dialog's Install does nothing.
+    d.emit_by_name::<()>("response", &[&"install"]);
+    assert!(deps_sent(&sent).is_empty());
+    close(ui);
+}
+
+/// The log view is exactly the model's log after large, trimmed batches (append-only drawing).
+fn the_log_view_follows_the_model_through_trimming() {
+    use rt_api::jobs::{EventKind, JobEvent, JobEvents, JobInfo, JobKind, JobState};
+    let (ui, _) = recorded();
+    opened(&ui, true, canned_plan());
+    ui.dispatch(Msg::JobStarted {
+        what: Cmd::Run("game".into()),
+        job_id: "j1".into(),
+    });
+    let view = get(&ui, "job-log").downcast::<gtk::TextView>().unwrap();
+    let mut seq = 1;
+    let batch = |seq: &mut u64, n: usize, width: usize| {
+        let events = (0..n)
+            .map(|i| {
+                *seq += 1;
+                JobEvent {
+                    seq: *seq,
+                    ts: 0,
+                    kind: EventKind::Stdout,
+                    text: format!("{} {}", *seq, "y".repeat(width + i % 7)),
+                }
+            })
+            .collect();
+        JobEvents {
+            events,
+            next_seq: *seq,
+            dropped: 0,
+            job: JobInfo {
+                job_id: "j1".into(),
+                kind: JobKind::Run,
+                app: Some("game".into()),
+                state: JobState::Running,
+                exit_code: None,
+                signal: None,
+                created_at: 0,
+                started_at: None,
+                ended_at: None,
+                dropped: 0,
+            },
+        }
+    };
+    for (n, width) in [(10, 5), (2100, 5), (2100, 5), (2100, 5), (300, 4000), (3, 5)] {
+        ui.dispatch(Msg::JobEvents(batch(&mut seq, n, width)));
+        let b = view.buffer();
+        let shown = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
+        let m = ui.model();
+        let log = m.log("j1").unwrap();
+        let mut want = log.lines().collect::<Vec<_>>().join("\n");
+        want.push('\n');
+        assert!(
+            shown == want,
+            "after {n}x{width}: {} vs {} lines",
+            shown.lines().count(),
+            log.len()
+        );
+        assert!(log.bytes() <= rt_gui::vm::LOG_BYTES);
+    }
+    close(ui);
+}
+
+fn the_remove_dialog_and_about_show_daemon_text_literally() {
+    let (ui, _) = recorded();
+    ui.dispatch(Msg::Connected(VersionInfo {
+        api: "0.2.0".into(),
+        runtime: HOSTILE.into(),
+        protocol: "jsonrpc-2.0-ndjson".into(),
+        write: true,
+    }));
+    ui.dispatch(Msg::Apps(
+        serde_json::from_value(
+            serde_json::json!({"apps": [{"id": "evil", "name": HOSTILE, "version": null,
+            "architecture": "x86_64", "executable": "e", "created": 0}], "skipped": 0}),
+        )
+        .unwrap(),
+    ));
+    ui.dispatch(Msg::Open("evil".into()));
+    let mut data = app_data("evil");
+    data.detail.name = HOSTILE.into();
+    ui.dispatch(Msg::AppLoaded(Box::new(data)));
+    click(&ui, "btn-remove");
+    let d = dialog(&ui, "remove-dialog");
+    let root: gtk::Widget = d.clone().upcast();
+    let body: Vec<gtk::Label> = labels(&root)
+        .into_iter()
+        .filter(|l| l.label().contains(HOSTILE))
+        .collect();
+    assert_eq!(body.len(), 1, "the body names the app");
+    assert_eq!(body[0].text(), body[0].label(), "parsed as markup");
+    d.emit_by_name::<()>("response", &[&"cancel"]);
+    d.force_close();
+    // About: its comments are markup, so the daemon's text is escaped there.
+    WidgetExt::activate_action(ui.window(), "win.about", None).unwrap();
+    let mut about = None;
+    iterate_until(WAIT, "About", || {
+        about = find(ui.window().upcast_ref(), "about-dialog");
+        about.is_some()
+    });
+    let about = about.unwrap().downcast::<adw::AboutDialog>().unwrap();
+    let escaped = glib::markup_escape_text(HOSTILE).to_string();
+    assert!(about.comments().contains(&escaped), "{}", about.comments());
+    assert!(!about.comments().contains(HOSTILE));
+    about.force_close();
+    close(ui);
+}
+
 /// Points HOME and every XDG directory at `dir` and keeps GTK off the user's session bus and settings, before GTK
 /// starts: the tests never read or write the user's own configuration.
 fn isolate(dir: &std::path::Path) {
@@ -507,6 +684,10 @@ fn isolate(dir: &std::path::Path) {
         std::env::set_var("XDG_RUNTIME_DIR", &run);
         std::env::set_var("GSETTINGS_BACKEND", "memory");
         std::env::set_var("GTK_A11Y", "none");
+        // The software renderer: the same drawing path with or without GL (Xvfb has none).
+        if std::env::var_os("GSK_RENDERER").is_none() {
+            std::env::set_var("GSK_RENDERER", "cairo");
+        }
         std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
     }
 }
@@ -556,6 +737,19 @@ fn main() {
         (
             "a_followed_jobs_output_is_shown_in_order",
             a_followed_jobs_output_is_shown_in_order,
+        ),
+        ("a_cancelled_consent_is_forgotten", a_cancelled_consent_is_forgotten),
+        (
+            "a_new_plan_closes_an_open_consent_dialog",
+            a_new_plan_closes_an_open_consent_dialog,
+        ),
+        (
+            "the_log_view_follows_the_model_through_trimming",
+            the_log_view_follows_the_model_through_trimming,
+        ),
+        (
+            "the_remove_dialog_and_about_show_daemon_text_literally",
+            the_remove_dialog_and_about_show_daemon_text_literally,
         ),
     ];
     for (name, t) in tests {

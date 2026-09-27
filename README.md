@@ -182,7 +182,7 @@ needs consent is shown with its version, sha256 and full terms, and has its own 
 permissions and follows each job's output. It talks only to `runtimed` (it never runs `runtime` itself and never
 starts a daemon), so changes need a `runtimed --write` (the systemd unit passes it). With a read-only daemon every
 change control is disabled with the reason; with no daemon it shows how to start one. `--socket PATH` picks another
-socket.
+socket (and opens its own window: a plain second launch only raises the first).
 
 Building it needs the GTK >= 4.12 and libadwaita >= 1.5 development files (`apt install libgtk-4-dev
 libadwaita-1-dev`) and Rust 1.92 or newer. It is not a default workspace member: plain `cargo build` never needs GTK.

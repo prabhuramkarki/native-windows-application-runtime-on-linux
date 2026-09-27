@@ -1,7 +1,7 @@
 //! The jobs panel (spec D11): `jobs.list` plus the jobs this GUI follows, Cancel on live ones, and the selected
 //! followed job's output in a plain, read-only text view (never markup).
 use super::{Ui, text};
-use crate::vm::{Action, Model, Msg, TEXT_MAX, is_live, shown};
+use crate::vm::{Action, EARLIER_DROPPED, Model, Msg, TEXT_MAX, is_live, shown};
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
@@ -89,31 +89,76 @@ pub fn render(ui: &Rc<Ui>, m: &Model) {
     ui.redraw_log_from(m);
 }
 
+/// What the log view shows: which job, up to which version, how many kept lines, and whether the note is first.
+#[derive(Default)]
+pub struct LogView {
+    job: Option<String>,
+    version: u64,
+    lines: usize,
+    note: bool,
+}
+
 impl Ui {
     fn redraw_log(&self) {
         let m = self.model();
         self.redraw_log_from(&m);
     }
 
-    /// The selected job's log, redrawn only when it changed.
+    /// The selected job's log: only the new lines are appended, and lines the model dropped are deleted from the
+    /// top, so a chatty job costs what it adds, not the whole log per update.
     fn redraw_log_from(&self, m: &Model) {
         let sel = self.selected_job.borrow().clone();
         let log = sel.as_deref().and_then(|id| m.log(id));
-        let now = (sel.clone(), log.map_or(0, |l| l.version()));
-        if *self.log_shown.borrow() == now {
+        let mut v = self.log_view.borrow_mut();
+        let buf = self.w.job_log.buffer();
+        let Some(log) = log else {
+            if v.job.is_some() || sel.is_none() {
+                buf.set_text("");
+            }
+            *v = LogView {
+                job: sel,
+                ..LogView::default()
+            };
+            return;
+        };
+        if v.job == sel && v.version == log.version() {
             return;
         }
-        *self.log_shown.borrow_mut() = now;
-        let buf = self.w.job_log.buffer();
-        match log {
-            Some(l) => {
-                let mut s = l.lines().collect::<Vec<_>>().join("\n");
-                s.push('\n');
-                buf.set_text(&s);
-                buf.place_cursor(&buf.end_iter());
-                self.w.job_log.scroll_mark_onscreen(&buf.get_insert());
+        match log.since(v.version).filter(|_| v.job == sel) {
+            Some(new) => {
+                let mut end = buf.end_iter();
+                for l in new {
+                    buf.insert(&mut end, l);
+                    buf.insert(&mut end, "\n");
+                    v.lines += 1;
+                }
+                let excess = v.lines.saturating_sub(log.kept());
+                if excess > 0 {
+                    let top = i32::from(v.note);
+                    let line = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+                    let mut from = buf.iter_at_line(top).unwrap_or_else(|| buf.end_iter());
+                    let mut to = buf.iter_at_line(top + line(excess)).unwrap_or_else(|| buf.end_iter());
+                    buf.delete(&mut from, &mut to);
+                    v.lines -= excess;
+                }
+                if log.cut() && !v.note {
+                    buf.insert(&mut buf.start_iter(), &format!("{EARLIER_DROPPED}\n"));
+                    v.note = true;
+                }
             }
-            None => buf.set_text(""),
+            None => {
+                let text: String = log.lines().flat_map(|l| [l, "\n"]).collect();
+                buf.set_text(&text);
+                *v = LogView {
+                    job: sel,
+                    version: 0,
+                    lines: log.kept(),
+                    note: log.cut(),
+                };
+            }
         }
+        v.version = log.version();
+        buf.place_cursor(&buf.end_iter());
+        self.w.job_log.scroll_mark_onscreen(&buf.get_insert());
     }
 }

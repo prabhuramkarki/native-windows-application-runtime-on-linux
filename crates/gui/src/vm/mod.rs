@@ -23,12 +23,16 @@ pub const START_HINT: &str = "systemctl --user start runtimed.socket";
 /// Why every write control is off on a read-only daemon (spec D7).
 pub const READ_ONLY: &str = "This runtimed is read-only (started without `--write`). The shipped unit passes `--write`; \
                              see docs/API.md, Running it under systemd.";
+/// The notice when a new plan replaced the one an open consent dialog showed.
+pub const PLAN_REPLACED: &str = "The dependency plan changed while it was shown. Review it again.";
 /// The notice after `consent_mismatch` (spec 5.3).
 pub const PLAN_CHANGED: &str = "The dependency plan changed since it was shown. Review it again.";
 /// Most lines kept per job log (spec D11).
 pub const LOG_MAX: usize = 5000;
 /// Most followed job logs kept (the oldest ended one goes first).
 pub const MAX_LOGS: usize = 16;
+/// Most bytes kept per job log (the daemon itself keeps 512 KiB per job).
+pub const LOG_BYTES: usize = 1 << 20;
 /// The first line of a log that lost its oldest lines.
 pub const EARLIER_DROPPED: &str = "[earlier lines dropped]";
 /// Longest message shown (errors, notices, reasons), in characters.
@@ -98,6 +102,12 @@ pub enum Msg {
     Refresh,
     /// The notice was closed.
     Dismiss,
+    /// The consent dialog was opened (every choice starts unaccepted).
+    ConsentOpened,
+    /// It closed without Install (every choice is reset).
+    ConsentClosed,
+    /// The UI refused something locally (a file with no local path): the reason, as the notice.
+    Refused(&'static str),
     // Backend results.
     Connected(VersionInfo),
     ConnectFailed(ConnError),
@@ -185,12 +195,14 @@ impl AppPage {
     }
 }
 
-/// A followed job's output: at most [`LOG_MAX`] lines, oldest dropped first behind one [`EARLIER_DROPPED`] line.
+/// A followed job's output: at most [`LOG_MAX`] lines and [`LOG_BYTES`] bytes, oldest dropped first behind one
+/// [`EARLIER_DROPPED`] line.
 #[derive(Debug, Default)]
 pub struct LogBuffer {
     lines: VecDeque<String>,
     cut: bool,
     added: u64,
+    bytes: usize,
     job: Option<JobInfo>,
 }
 
@@ -208,13 +220,38 @@ impl LogBuffer {
     pub fn version(&self) -> u64 {
         self.added
     }
+    /// The lines [`LogBuffer::lines`] yields (the note included).
+    pub fn len(&self) -> usize {
+        self.lines.len() + usize::from(self.cut)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Older lines were dropped (the first line is [`EARLIER_DROPPED`]).
+    pub fn cut(&self) -> bool {
+        self.cut
+    }
+    /// The kept lines (without the note).
+    pub fn kept(&self) -> usize {
+        self.lines.len()
+    }
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    /// The lines added after `version`, or `None` when some of them were dropped already (redraw everything).
+    pub fn since(&self, version: u64) -> Option<impl Iterator<Item = &str>> {
+        let new = usize::try_from(self.added.checked_sub(version)?).ok()?;
+        (new <= self.lines.len()).then(|| self.lines.iter().skip(self.lines.len() - new).map(String::as_str))
+    }
     fn push(&mut self, line: String) {
-        if self.lines.len() == LOG_MAX {
-            self.lines.pop_front();
-            self.cut = true;
-        }
+        self.bytes += line.len();
         self.lines.push_back(line);
         self.added += 1;
+        while self.lines.len() > LOG_MAX || (self.bytes > LOG_BYTES && self.lines.len() > 1) {
+            let old = self.lines.pop_front().expect("more than one line");
+            self.bytes -= old.len();
+            self.cut = true;
+        }
     }
 
     /// Adds a poll's events; true when this poll ended the job (the first final state seen).
@@ -256,6 +293,10 @@ pub struct Model {
     /// Followed jobs, oldest first.
     logs: Vec<(String, LogBuffer)>,
     notice: Option<String>,
+    /// The consent dialog is open (only then can a choice be accepted or the plan installed).
+    consent_open: bool,
+    /// A write command was sent for this app and its job is not in the job list yet (`true`: it started).
+    pending: Option<(String, bool)>,
 }
 
 impl Default for Model {
@@ -275,10 +316,28 @@ impl Model {
             jobs: vec![],
             logs: vec![],
             notice: None,
+            consent_open: false,
+            pending: None,
         }
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
+        let cmds = self.step(msg);
+        // A second click before the job shows up in the list must not send a second command.
+        for c in &cmds {
+            if let Cmd::Run(id)
+            | Cmd::Remove(id)
+            | Cmd::PermReset(id)
+            | Cmd::PermSet { id, .. }
+            | Cmd::DepsInstall { id, .. } = c
+            {
+                self.pending = Some((id.clone(), false));
+            }
+        }
+        cmds
+    }
+
+    fn step(&mut self, msg: Msg) -> Vec<Cmd> {
         match msg {
             Msg::Search(s) => {
                 self.filter = s.trim().to_lowercase();
@@ -289,6 +348,7 @@ impl Model {
                     return vec![];
                 }
                 self.plan = None;
+                self.consent_open = false;
                 self.page = Some(AppPage {
                     id: id.clone(),
                     data: None,
@@ -304,15 +364,28 @@ impl Model {
             Msg::Remove => self.gated(Action::Remove, |m| Cmd::Remove(m.page_id())),
             Msg::Plan => self.gated(Action::Plan, |m| Cmd::Plan(m.page_id())),
             Msg::Accept(package, yes) => {
-                if let Some(p) = &mut self.plan {
+                // Only a box in the open dialog accepts anything.
+                if let Some(p) = self.plan.as_mut().filter(|_| self.consent_open) {
                     p.accept(&package, yes);
                 }
                 vec![]
             }
+            Msg::ConsentOpened | Msg::ConsentClosed => {
+                if let Some(p) = &mut self.plan {
+                    p.reset();
+                }
+                self.consent_open = matches!(msg, Msg::ConsentOpened) && self.plan.is_some();
+                vec![]
+            }
+            Msg::Refused(why) => self.refuse(why),
             Msg::InstallDeps => {
                 if let Err(why) = self.can(Action::InstallDeps) {
                     return self.refuse(why);
                 }
+                if !self.consent_open {
+                    return self.refuse("review the plan in the Install dependencies dialog first");
+                }
+                self.consent_open = false;
                 // The plan is dropped once sent: a second install needs a fresh plan.
                 let (id, digest, consent) = self.plan.take().expect("can() checked the plan").into_install();
                 vec![Cmd::DepsInstall { id, digest, consent }]
@@ -356,6 +429,7 @@ impl Model {
             }
             Msg::ConnectFailed(ConnError { socket, error }) => {
                 let socket = shown(&socket.to_string_lossy(), rt_api::PATH_MAX);
+                self.pending = None;
                 self.conn = match error {
                     ClientError::Unsafe { .. } => Conn::Refused(shown(&error.to_string(), MAX_SHOWN)),
                     ClientError::NoRuntimeDir | ClientError::Unreachable { .. } => Conn::Unreachable { socket },
@@ -379,11 +453,19 @@ impl Model {
             }
             Msg::PlanLoaded { id, plan } => {
                 if self.page.as_ref().is_some_and(|p| p.id == id) {
+                    // A dialog showing the old plan closes: it must not act on one it does not show.
+                    if self.consent_open {
+                        self.consent_open = false;
+                        self.notice = Some(PLAN_REPLACED.to_owned());
+                    }
                     self.plan = Some(ConsentState::new(id, plan));
                 }
                 vec![]
             }
             Msg::JobStarted { job_id, .. } => {
+                if let Some((_, started)) = &mut self.pending {
+                    *started = true;
+                }
                 self.logs.push((job_id.clone(), LogBuffer::default()));
                 if self.logs.len() > MAX_LOGS {
                     let ended = |(_, l): &(String, LogBuffer)| l.job.as_ref().is_some_and(|j| is_final(j.state));
@@ -393,6 +475,13 @@ impl Model {
                 vec![Cmd::Follow(job_id), Cmd::ListJobs]
             }
             Msg::JobEvents(ev) => {
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.1 && ev.job.app.as_ref() == Some(&p.0))
+                {
+                    self.pending = None;
+                }
                 let info = ev.job.clone();
                 match self.jobs.iter_mut().find(|j| j.job_id == info.job_id) {
                     Some(j) => *j = info,
@@ -405,11 +494,20 @@ impl Model {
                 if ended { self.reload() } else { vec![] }
             }
             Msg::JobList(jobs) => {
+                if self.pending.as_ref().is_some_and(|p| p.1) {
+                    self.pending = None;
+                }
                 self.jobs = jobs;
                 vec![]
             }
             Msg::Failed { what, error } => {
                 let kind = error.api_error().map(|e| e.kind);
+                if matches!(
+                    what,
+                    Cmd::Run(_) | Cmd::Remove(_) | Cmd::PermReset(_) | Cmd::PermSet { .. } | Cmd::DepsInstall { .. }
+                ) {
+                    self.pending = None;
+                }
                 match what {
                     Cmd::DepsInstall { id, .. } if kind == Some(ErrorKind::ConsentMismatch) => {
                         self.notice = Some(PLAN_CHANGED.to_owned());
@@ -422,6 +520,7 @@ impl Model {
                     {
                         self.page = None;
                         self.plan = None;
+                        self.consent_open = false;
                         vec![]
                     }
                     what => {
@@ -479,7 +578,13 @@ impl Model {
 
     fn app_busy(&self) -> bool {
         let id = self.page.as_ref().map(|p| &p.id);
-        self.jobs.iter().any(|j| j.app.as_ref() == id && is_live(j.state))
+        self.pending.as_ref().is_some_and(|p| Some(&p.0) == id)
+            || self.jobs.iter().any(|j| j.app.as_ref() == id && is_live(j.state))
+    }
+
+    /// The consent dialog is open (the UI closes one the model no longer considers open).
+    pub fn consent_open(&self) -> bool {
+        self.consent_open
     }
 
     pub fn conn(&self) -> &Conn {

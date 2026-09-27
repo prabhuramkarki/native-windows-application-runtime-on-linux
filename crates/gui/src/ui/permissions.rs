@@ -69,10 +69,13 @@ pub fn group(ui: &Rc<Ui>, m: &Model) -> Option<adw::PreferencesGroup> {
             glib::spawn_future_local(async move {
                 let d = gtk::FileDialog::builder().title("Choose a folder").modal(true).build();
                 if let Ok(f) = d.select_folder_future(Some(&win)).await
-                    && let (Some(path), Some(ui)) = (f.path(), weak.upgrade())
+                    && let Some(ui) = weak.upgrade()
                 {
                     // The view model refuses a path it cannot grant safely (with a message).
-                    ui.dispatch(Msg::Permission(PermChange::Grant { path, rw }));
+                    ui.dispatch(match f.path() {
+                        Some(path) => Msg::Permission(PermChange::Grant { path, rw }),
+                        None => Msg::Refused(super::install::NOT_LOCAL),
+                    });
                 }
             });
         });
