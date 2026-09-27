@@ -7,14 +7,14 @@ mod forms;
 mod page;
 
 pub use consent::{ConsentChoice, ConsentState, EntryRow};
-pub use forms::{InstallForm, PermChange};
+pub use forms::{InstallForm, PermChange, is_package};
 pub use page::{GrantRow, Line, PermRows};
 
 use rt_api::jobs::{ConsentItem, EventKind, JobEvents, JobInfo, JobKind, JobState};
 use rt_api::{
     AppDetail, AppList, DepsPlanView, DoctorView, ErrorKind, GraphicsView, PermissionsView, SandboxView, VersionInfo,
 };
-use rt_daemon::client::{ClientError, InstallParams};
+use rt_daemon::client::{ClientError, ImportParams, InstallParams};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -27,6 +27,8 @@ pub const READ_ONLY: &str = "This runtimed is read-only (started without `--writ
 pub const PLAN_REPLACED: &str = "The dependency plan changed while it was shown. Review it again.";
 /// The notice after `consent_mismatch` (spec 5.3).
 pub const PLAN_CHANGED: &str = "The dependency plan changed since it was shown. Review it again.";
+/// Why a `.wrun` is not sent to a daemon older than API 0.2.1 (it has no `apps.import`).
+pub const NO_IMPORT: &str = "This runtimed cannot import .wrun packages (it needs API 0.2.1); update the runtime.";
 /// Most lines kept per job log (spec D11).
 pub const LOG_MAX: usize = 5000;
 /// Most followed job logs kept (the oldest ended one goes first).
@@ -140,6 +142,8 @@ pub enum Cmd {
     Cancel(String),
     Remove(String),
     Install(InstallParams),
+    /// A `.wrun` package (`apps.import`).
+    Import(ImportParams),
     DepsInstall {
         id: String,
         digest: String,
@@ -388,10 +392,21 @@ impl Model {
                 let (id, digest, consent) = self.plan.take().expect("can() checked the plan").into_install();
                 vec![Cmd::DepsInstall { id, digest, consent }]
             }
-            Msg::Install(form) => match self.can(Action::Install).and_then(|()| forms::install_params(&form)) {
-                Ok(p) => vec![Cmd::Install(p)],
-                Err(why) => self.refuse(why),
-            },
+            Msg::Install(form) => {
+                let cmd = self.can(Action::Install).and_then(|()| {
+                    if !forms::is_package(&form.path) {
+                        forms::install_params(&form).map(Cmd::Install)
+                    } else if self.imports() {
+                        forms::import_params(&form).map(Cmd::Import)
+                    } else {
+                        Err(NO_IMPORT)
+                    }
+                });
+                match cmd {
+                    Ok(c) => vec![c],
+                    Err(why) => self.refuse(why),
+                }
+            }
             Msg::Permission(change) => {
                 let grants = self.permissions().map_or(&[][..], |p| &p.filesystem[..]);
                 match self
@@ -418,7 +433,7 @@ impl Model {
             }
             Msg::Connected(v) => {
                 self.conn = Conn::Ready {
-                    write: v.write && api_at_least(&v.api, 0, 2),
+                    write: v.write && api_at_least(&v.api, [0, 2, 0]),
                     api: shown(&v.api, TEXT_MAX),
                     runtime: shown(&v.runtime, TEXT_MAX),
                 };
@@ -558,6 +573,11 @@ impl Model {
         matches!(self.conn, Conn::Ready { write: true, .. })
     }
 
+    /// The daemon has `apps.import` (API 0.2.1).
+    fn imports(&self) -> bool {
+        matches!(&self.conn, Conn::Ready { api, .. } if api_at_least(api, [0, 2, 1]))
+    }
+
     fn page_id(&self) -> String {
         self.page.as_ref().map(|p| p.id.clone()).unwrap_or_default()
     }
@@ -682,11 +702,11 @@ fn write_target(c: &Cmd) -> Option<&str> {
     }
 }
 
-/// `major.minor` of an API version is at least the given one (an unreadable version is not).
-fn api_at_least(api: &str, major: u64, minor: u64) -> bool {
+/// `major.minor.patch` of an API version is at least `want` (a missing patch is 0; an unreadable version is not).
+fn api_at_least(api: &str, want: [u64; 3]) -> bool {
     let mut parts = api.split('.').map(str::parse::<u64>);
-    match (parts.next(), parts.next()) {
-        (Some(Ok(a)), Some(Ok(b))) => (a, b) >= (major, minor),
+    match (parts.next(), parts.next(), parts.next().unwrap_or(Ok(0))) {
+        (Some(Ok(a)), Some(Ok(b)), Ok(c)) => [a, b, c] >= want,
         _ => false,
     }
 }
@@ -719,6 +739,7 @@ fn label(c: &Cmd) -> &'static str {
         Cmd::Cancel(_) => "Cancel",
         Cmd::Remove(_) => "Remove",
         Cmd::Install(_) => "Install",
+        Cmd::Import(_) => "Import",
         Cmd::DepsInstall { .. } => "Installing dependencies",
         Cmd::PermSet { .. } | Cmd::PermReset(_) => "Changing permissions",
         Cmd::ListJobs => "Listing jobs",
