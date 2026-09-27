@@ -157,7 +157,12 @@ fn serve(sh: &Arc<Shared>, rx: mpsc::Receiver<Cmd>) {
 
 /// A new connection and its `rpc.version`, reported either way.
 fn connect(sh: &Shared) -> Option<Client> {
-    match Client::connect(&sh.socket).and_then(|mut c| c.version().map(|v| (c, v))) {
+    // An empty socket path: no --socket and no XDG_RUNTIME_DIR.
+    let client = match sh.socket.as_os_str().is_empty() {
+        true => Err(ClientError::NoRuntimeDir),
+        false => Client::connect(&sh.socket),
+    };
+    match client.and_then(|mut c| c.version().map(|v| (c, v))) {
         Ok((c, v)) => {
             (sh.sink)(Msg::Connected(v));
             Some(c)
