@@ -122,6 +122,10 @@ impl ConsentState {
         }
     }
 
+    /// The plan's digest as `deps.plan` gave it (a dialog checks it still shows this plan).
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
     /// The app the plan is for (raw id).
     pub fn app(&self) -> &str {
         &self.app

@@ -2,7 +2,12 @@
 //! on the GTK thread: the model's `update`, each `Cmd` to the backend (which never blocks), then a render. Backend
 //! messages cross from its threads through an unbounded channel read by a future on the GTK main loop ([`start`]).
 mod about;
+mod app;
 mod apps;
+mod consent;
+mod install;
+mod jobs;
+mod permissions;
 pub mod text;
 mod window;
 
@@ -30,6 +35,15 @@ pub struct Ui {
     app_ids: RefCell<Vec<String>>,
     /// Write controls and the action each needs: their sensitivity and tooltip follow `Model::can`.
     controls: RefCell<Vec<(gtk::Widget, Action)>>,
+    /// The same for the app page's controls (replaced with the page).
+    page_controls: RefCell<Vec<(gtk::Widget, Action)>>,
+    /// The app page's status line.
+    status: RefCell<Option<gtk::Label>>,
+    /// The jobs panel: what its list shows, the selected job, the newest followed one, and the log drawn.
+    jobs_key: RefCell<String>,
+    selected_job: RefCell<Option<String>>,
+    last_followed: RefCell<Option<String>>,
+    log_shown: RefCell<(Option<String>, u64)>,
     /// Set while widgets are updated from the model: the signals that fires are not user intents.
     rendering: Cell<bool>,
 }
@@ -74,6 +88,12 @@ impl Ui {
             socket: crate::vm::shown(&socket.to_string_lossy(), rt_api::PATH_MAX),
             app_ids: RefCell::default(),
             controls: RefCell::default(),
+            page_controls: RefCell::default(),
+            status: RefCell::default(),
+            jobs_key: RefCell::default(),
+            selected_job: RefCell::default(),
+            last_followed: RefCell::default(),
+            log_shown: RefCell::default(),
             rendering: Cell::new(false),
         });
         let weak = Rc::downgrade(&ui);
@@ -116,6 +136,14 @@ impl Ui {
         });
         w.window.add_action(&refresh);
         w.window.add_action(&about);
+        for b in [&w.btn_install, &w.btn_install_empty] {
+            let ui2 = weak.clone();
+            b.connect_clicked(move |_| {
+                if let Some(ui) = ui2.upgrade() {
+                    install::open(&ui);
+                }
+            });
+        }
         ui.control(&w.btn_install, Action::Install);
         ui.control(&w.btn_install_empty, Action::Install);
         ui.render(true);
@@ -133,6 +161,10 @@ impl Ui {
     /// Registers a write control: sensitive only when `action` is possible, else insensitive with the reason.
     fn control(&self, w: &impl IsA<gtk::Widget>, action: Action) {
         self.controls.borrow_mut().push((w.clone().upcast(), action));
+    }
+
+    fn page_control(&self, w: &impl IsA<gtk::Widget>, action: Action) {
+        self.page_controls.borrow_mut().push((w.clone().upcast(), action));
     }
 
     /// The only way the model changes: update, send its commands, render.
@@ -175,37 +207,20 @@ impl Ui {
         w.banner_notice.set_revealed(m.notice().is_some());
         if rebuild {
             apps::render(self, &m);
-            self.render_page(&m);
+            self.page_controls.borrow_mut().clear();
+            *self.status.borrow_mut() = None;
+            app::render(self, &m);
         }
-        for (widget, action) in self.controls.borrow().iter() {
+        if let Some(s) = self.status.borrow().as_ref() {
+            s.set_label(&m.page_status().unwrap_or_default());
+        }
+        jobs::render(self, &m);
+        for (widget, action) in self.controls.borrow().iter().chain(self.page_controls.borrow().iter()) {
             let can = m.can(*action);
             widget.set_sensitive(can.is_ok());
             widget.set_tooltip_text(can.err());
         }
         drop(m);
         self.rendering.set(false);
-    }
-
-    fn render_page(self: &Rc<Self>, m: &Model) {
-        let page = &self.w.page;
-        while let Some(c) = page.first_child() {
-            page.remove(&c);
-        }
-        let Some(p) = m.page() else {
-            self.w.page_nav.set_title("App");
-            page.append(
-                &adw::StatusPage::builder()
-                    .icon_name("application-x-executable-symbolic")
-                    .title("Choose an app")
-                    .vexpand(true)
-                    .build(),
-            );
-            return;
-        };
-        let title = p.title();
-        self.w.page_nav.set_title(&title);
-        let heading = text::label(&title);
-        heading.add_css_class("title-1");
-        page.append(&heading);
     }
 }
