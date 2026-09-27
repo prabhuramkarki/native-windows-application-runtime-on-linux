@@ -5033,3 +5033,56 @@ fn the_daemons_argv_with_hostile_values_has_only_the_intended_effect() {
     assert_ok(&o);
     assert_eq!(r.app_dirs(), ["papp"]);
 }
+
+/// Spec D11, the installer half (the app sandbox half is `crates/daemon/tests/e2e_jobs.rs`): what the installer
+/// sandbox binds, with the network on, never includes `$XDG_RUNTIME_DIR`, the write-capable socket or an ancestor
+/// of it (it binds only the system trees, the shim and the prefix, and drops the session variables).
+#[test]
+fn the_installer_sandbox_never_binds_the_daemons_socket() {
+    let r = rig();
+    let dir = r.plant("inst", "I");
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse("inst").unwrap()).unwrap();
+    assert_eq!(env.root(), dir);
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let xdg = PathBuf::from(format!("/run/user/{uid}"));
+    let sock = xdg.join("runtime/runtimed.sock");
+    let sb = rt_installer::InstallerSandbox::new("/usr/bin/bwrap", env!("CARGO_BIN_EXE_runtime"));
+    let mut cmd = Command::new("/bin/true");
+    cmd.env_clear()
+        .env("HOME", r.root.join("home"))
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("WAYLAND_DISPLAY", "wayland-0");
+    let opts = rt_installer::SandboxOpts {
+        allow_network: true,
+        extra_ro_binds: vec![],
+    };
+    let wrapped = sb.wrap(cmd, &env, &opts);
+    let argv: Vec<String> = wrapped.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert!(argv.iter().any(|a| a == "--bind"), "not a real render: {argv:?}");
+    let mut seen = 0;
+    for (i, a) in argv.iter().enumerate() {
+        if a == "--" {
+            break;
+        }
+        if matches!(
+            a.as_str(),
+            "--bind" | "--ro-bind" | "--bind-try" | "--ro-bind-try" | "--dev-bind" | "--dev-bind-try"
+        ) {
+            seen += 1;
+            for p in [Path::new(&argv[i + 1]), Path::new(&argv[i + 2])] {
+                assert!(!sock.starts_with(p) && !p.starts_with(&xdg), "{a} {p:?}: {argv:?}");
+            }
+        }
+    }
+    assert!(seen >= 3, "{argv:?}");
+    let envs: Vec<_> = wrapped
+        .get_envs()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !envs.iter().any(|k| k == "XDG_RUNTIME_DIR" || k == "WAYLAND_DISPLAY"),
+        "{envs:?}"
+    );
+}

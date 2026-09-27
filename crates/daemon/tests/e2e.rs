@@ -178,6 +178,7 @@ fn rpc_and_daemon_status_against_the_real_daemon() {
         out.contains("reachable: yes") && out.contains(&format!("api: {}", rt_api::API_VERSION)),
         "{out}"
     );
+    assert!(out.contains("mode: read-only\n"), "{out}");
 
     let v = json_out(&s.rpc(&sock, &["rpc.version"]));
     assert_eq!(v["api"], rt_api::API_VERSION);
@@ -430,4 +431,44 @@ fn a_hostile_daemon_never_crashes_the_cli_or_reaches_the_terminal() {
     assert_eq!(o.status.code(), Some(1));
     assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     assert!(text(&o.stdout).contains("reachable: no"), "{}", text(&o.stdout));
+}
+
+#[test]
+fn daemon_status_shows_the_mode_and_an_older_daemons_api() {
+    let s = Scratch::new();
+    // A 0.1 daemon: no `write` in its version.
+    let sock = fake(&s, 1, |c, req| {
+        let v =
+            json!({"jsonrpc": "2.0", "id": req["id"], "result": {"api": "0.1.0", "runtime": "0.0.1", "protocol": "p"}});
+        let _ = c.write_all(format!("{v}\n").as_bytes());
+    });
+    let o = s.status(&sock);
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        text(&o.stdout).contains("mode: read-only (API 0.1.0)\n"),
+        "{}",
+        text(&o.stdout)
+    );
+    let sock = fake(&s, 1, |c, req| {
+        let v = json!({"jsonrpc": "2.0", "id": req["id"],
+            "result": {"api": "0.2.0", "runtime": "0.0.1", "protocol": "p", "write": true}});
+        let _ = c.write_all(format!("{v}\n").as_bytes());
+    });
+    assert!(text(&s.status(&sock).stdout).contains("mode: write\n"));
+}
+
+#[test]
+fn hostile_job_events_reach_the_terminal_escaped() {
+    let s = Scratch::new();
+    let sock = fake(&s, 1, |c, req| {
+        let ev = json!({"seq": 1, "ts": 1, "kind": "stdout", "text": NASTY});
+        let job = json!({"jobId": NASTY, "kind": "run", "app": NASTY, "state": "running", "exitCode": null,
+            "signal": null, "createdAt": 1, "startedAt": 1, "endedAt": null, "dropped": 0});
+        let v = json!({"jsonrpc": "2.0", "id": req["id"],
+            "result": {"events": [ev], "nextSeq": 1, "dropped": 0, "job": job}});
+        let _ = c.write_all(format!("{v}\n").as_bytes());
+    });
+    let o = s.rpc(&sock, &["jobs.poll", r#"{"jobId": "x", "afterSeq": 0}"#]);
+    assert_terminal_safe("job events", &o.stdout);
+    assert_eq!(json_out(&o)["events"][0]["text"], NASTY, "escaping is lossless");
 }

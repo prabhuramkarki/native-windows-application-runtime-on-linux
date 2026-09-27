@@ -15,10 +15,12 @@
 //! terminal escapes them (the CLI's `rpc` does).
 use crate::protocol::{DOMAIN, FrameError, MAX_FRAME, read_frame_max};
 use crate::server;
+use rt_api::jobs::{ConsentItem, Driver, JobEvents, JobInfo, JobList, JobStarted};
 use rt_api::{
     ApiError, AppDetail, AppList, CompatView, DepsPlanView, DoctorView, ErrorKind, GraphicsView, PermissionsView,
     SandboxView, VersionInfo,
 };
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::{self, BufReader, Read, Write};
@@ -48,6 +50,9 @@ pub enum ClientError {
     Io(io::Error),
     #[error("bad reply from the daemon: {0}")]
     Protocol(&'static str),
+    /// Something this daemon cannot do (an older API); nothing was sent.
+    #[error("{0}")]
+    Unsupported(&'static str),
     /// A JSON-RPC error reply. `message` is the daemon's text (bounded, not cleaned).
     #[error("{message} (code {code}{})", kind.as_ref().map(|k| format!(", kind {k}")).unwrap_or_default())]
     Rpc {
@@ -71,6 +76,24 @@ impl ClientError {
             _ => None,
         }
     }
+}
+
+/// `apps.install`'s params.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallParams {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub silent: bool,
+    pub network: bool,
+}
+
+/// The deadline of a `jobs.poll` call: its wait plus 15 s, never under [`TIMEOUT`].
+pub fn poll_timeout(wait_ms: u32) -> Duration {
+    (Duration::from_millis(wait_ms.into()) + Duration::from_secs(15)).max(TIMEOUT)
 }
 
 /// `$XDG_RUNTIME_DIR/runtime/runtimed.sock`, where `runtimed` listens by default.
@@ -100,6 +123,10 @@ impl Client {
     /// An error reply leaves the connection usable; any other failure (a timeout, a bad reply) ends it: later
     /// calls fail at once instead of reading a stale reply.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
+        self.call_by(method, params, self.timeout)
+    }
+
+    fn call_by(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, ClientError> {
         if self.broken {
             return Err(ClientError::Protocol("the connection failed earlier"));
         }
@@ -115,7 +142,7 @@ impl Client {
         line.push(b'\n');
         self.next = self.next.wrapping_add(1);
         self.broken = true;
-        let until = Instant::now() + self.timeout;
+        let until = Instant::now() + timeout;
         let sent = write_by(&self.s, &line, until);
         // The daemon may have answered and closed (busy, oversize) before our write: its reply says more than
         // the write error does.
@@ -175,6 +202,56 @@ impl Client {
     }
     pub fn deps_plan(&mut self, id: &str) -> Result<DepsPlanView, ClientError> {
         self.typed("deps.plan", json!({ "id": id }))
+    }
+
+    // Write mode (`runtimed --write`): each start returns the job's id; `jobs.*` follow it.
+
+    pub fn run_app(&mut self, id: &str, args: &[String]) -> Result<JobStarted, ClientError> {
+        self.typed("apps.run", json!({ "id": id, "args": args }))
+    }
+    pub fn install(&mut self, p: &InstallParams) -> Result<JobStarted, ClientError> {
+        let params = serde_json::to_value(p).map_err(|_| ClientError::Protocol("unserialisable params"))?;
+        self.typed("apps.install", params)
+    }
+    pub fn remove(&mut self, id: &str) -> Result<JobStarted, ClientError> {
+        self.typed("apps.remove", json!({ "id": id }))
+    }
+    /// `digest` is the `deps.plan` digest shown to the user; `consent` exactly what they accepted. An empty digest
+    /// (a 0.1 daemon's plan has none) is refused before anything is sent.
+    pub fn deps_install(&mut self, id: &str, digest: &str, consent: &[ConsentItem]) -> Result<JobStarted, ClientError> {
+        if digest.is_empty() {
+            return Err(ClientError::Unsupported(
+                "this daemon's deps.plan has no digest (API 0.1): it cannot install dependencies",
+            ));
+        }
+        self.typed(
+            "deps.install",
+            json!({ "id": id, "planDigest": digest, "consent": consent }),
+        )
+    }
+    pub fn permissions_set(&mut self, id: &str, set: &[String]) -> Result<JobStarted, ClientError> {
+        self.typed("permissions.set", json!({ "id": id, "set": set }))
+    }
+    pub fn permissions_reset(&mut self, id: &str) -> Result<JobStarted, ClientError> {
+        self.typed("permissions.reset", json!({ "id": id }))
+    }
+    pub fn display_set(&mut self, id: &str, driver: Driver) -> Result<JobStarted, ClientError> {
+        self.typed("display.set", json!({ "id": id, "driver": driver }))
+    }
+    /// The events after `after`, waiting up to `wait_ms` (the call's deadline is [`poll_timeout`]).
+    pub fn job_poll(&mut self, id: &str, after: u64, wait_ms: u32) -> Result<JobEvents, ClientError> {
+        let params = json!({ "jobId": id, "afterSeq": after, "waitMs": wait_ms });
+        let v = self.call_by("jobs.poll", params, poll_timeout(wait_ms))?;
+        serde_json::from_value(v).map_err(|_| ClientError::Protocol("the result does not have the expected shape"))
+    }
+    pub fn job_status(&mut self, id: &str) -> Result<JobInfo, ClientError> {
+        self.typed("jobs.status", json!({ "jobId": id }))
+    }
+    pub fn job_cancel(&mut self, id: &str) -> Result<JobInfo, ClientError> {
+        self.typed("jobs.cancel", json!({ "jobId": id }))
+    }
+    pub fn jobs(&mut self) -> Result<Vec<JobInfo>, ClientError> {
+        self.typed::<JobList>("jobs.list", Value::Null).map(|l| l.jobs)
     }
 }
 
@@ -433,6 +510,112 @@ mod tests {
         assert!(c.call("apps.get", json!([1])).is_err());
         assert_eq!(c.version().unwrap(), direct.version());
         stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A write-mode server over `rt` whose jobs run the fake `runtime` of `crate::jobs::tests`.
+    fn write_daemon(dir: &Path, rt: Runtime, jobs: crate::jobs::Jobs) -> (PathBuf, &'static AtomicBool) {
+        let sock = run_dir(dir).join("d.sock");
+        let cfg = ServerConfig::new(sock.clone());
+        let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let ctx = crate::dispatch::Ctx::new(Arc::new(rt), Some(jobs), stop);
+        thread::spawn(move || serve(Arc::new(ctx), cfg, None));
+        let until = Instant::now() + Duration::from_secs(5);
+        use std::os::unix::fs::MetadataExt;
+        while fs::symlink_metadata(&sock).map(|m| m.mode() & 0o777).ok() != Some(0o600) {
+            assert!(Instant::now() < until, "the server did not come up");
+            thread::sleep(Duration::from_millis(10));
+        }
+        (sock, stop)
+    }
+
+    #[test]
+    fn every_job_helper_starts_the_job_it_names() {
+        use rt_api::jobs::{Driver, JobKind, JobState};
+        let (d, rt) = rt();
+        plant(d.path(), "game", "Game");
+        let digest = rt.deps_plan("game").unwrap().digest;
+        let f = crate::jobs::tests::fx_with(|c| c.max_running = 20);
+        let (sock, stop) = write_daemon(d.path(), rt, f.jobs.clone());
+        let mut c = Client::connect(&sock).unwrap();
+        assert!(c.version().unwrap().write);
+        let starts: Vec<(Result<rt_api::jobs::JobStarted, ClientError>, JobKind, &str)> = vec![
+            (c.run_app("a1", &["-x".into()]), JobKind::Run, "run\0a1\0--\0-x\0"),
+            (
+                c.install(&InstallParams {
+                    path: "/in/setup.exe".into(),
+                    name: Some("--network".into()),
+                    ..Default::default()
+                }),
+                JobKind::Install,
+                "install\0--name=--network\0--\0/in/setup.exe\0",
+            ),
+            (c.remove("a2"), JobKind::Remove, "remove\0--\0a2\0"),
+            (
+                c.permissions_set("a3", &["gpu=off".into()]),
+                JobKind::PermissionsSet,
+                "permissions\0--set=gpu=off\0--\0a3\0",
+            ),
+            (
+                c.permissions_reset("a4"),
+                JobKind::PermissionsReset,
+                "permissions\0--reset\0--\0a4\0",
+            ),
+            (
+                c.display_set("a5", Driver::Wayland),
+                JobKind::DisplaySet,
+                "display\0--\0a5\0wayland\0",
+            ),
+        ];
+        for (r, kind, argv) in starts {
+            let id = r.unwrap().job_id;
+            let info = f.wait_end(&id);
+            assert_eq!((info.kind, info.state), (kind, JobState::Succeeded));
+            let key = argv
+                .trim_end_matches('\0')
+                .rsplit('\0')
+                .next()
+                .unwrap()
+                .replace('/', "_");
+            assert_eq!(
+                fs::read(f.fake.join(format!("argv.{key}"))).unwrap(),
+                argv.as_bytes(),
+                "{kind:?}"
+            );
+            assert_eq!(c.job_status(&id).unwrap(), info);
+        }
+        let id = c.deps_install("game", &digest, &[]).unwrap().job_id;
+        f.wait_end(&id);
+        let e = c.deps_install("game", &"0".repeat(64), &[]).unwrap_err();
+        assert_eq!(e.api_error().unwrap().kind, ErrorKind::ConsentMismatch);
+        // An empty digest (a 0.1 daemon's plan) is refused here, before anything is sent.
+        assert!(matches!(
+            c.deps_install("game", "", &[]),
+            Err(ClientError::Unsupported(_))
+        ));
+        // poll, list, cancel
+        let ev = c.job_poll(&id, 0, 0).unwrap();
+        assert_eq!(ev.events[0].text, "queued");
+        assert_eq!(c.jobs().unwrap().len(), 7);
+        f.mode(Some("a6"), "wait");
+        let id = c.remove("a6").unwrap().job_id;
+        f.wait_for(&id, "ready");
+        let last = c.job_poll(&id, 0, 0).unwrap().next_seq;
+        // A long poll longer than the client's own default timeout's margin still works (per-call deadline).
+        let t = Instant::now();
+        assert!(c.job_poll(&id, last, 300).unwrap().events.is_empty());
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        assert_eq!(c.job_cancel(&id).unwrap().job_id, id);
+        assert_eq!(f.wait_end(&id).state, JobState::Cancelled);
+        let e = c.job_status("nope").unwrap_err();
+        assert_eq!(e.api_error().unwrap().kind, ErrorKind::NotFound);
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_long_poll_gets_a_deadline_past_its_wait() {
+        assert_eq!(poll_timeout(0), TIMEOUT);
+        assert_eq!(poll_timeout(25_000), Duration::from_secs(40));
+        assert_eq!(poll_timeout(30_000), Duration::from_secs(45));
     }
 
     #[test]
