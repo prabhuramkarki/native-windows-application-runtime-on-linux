@@ -1178,6 +1178,8 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "libc",
+ "runtime-core",
+ "runtime-installer",
  "runtime-pe",
  "serde",
  "serde_json",

@@ -25,4 +25,8 @@ sha2.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+# `tests/conformance.rs` only: the suite and `FakeBackend` (`testing`), the installer pipeline's refusal of a
+# backend by capability.
+runtime-core = { path = ".", features = ["testing"] }
+runtime-installer = { path = "../installer" }
 tempfile.workspace = true

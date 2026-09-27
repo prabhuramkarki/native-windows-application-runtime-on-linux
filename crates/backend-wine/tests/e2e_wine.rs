@@ -435,3 +435,26 @@ fn e2e_debug_run_survives_a_lingering_wineserver() {
     sb.backend.stop(&sb.env).expect("stop");
     sb.assert_no_wineserver();
 }
+
+/// The live tier of the backend conformance suite (`rt_core::backend::conformance::live_checks`) over real Wine:
+/// `prepare` twice, `hello64.exe` launched through `Launcher::spawn` exits with 7, `stop` on the idle prefix.
+#[test]
+#[ignore = "needs Wine and the mingw fixtures; run with --ignored --test-threads=1"]
+fn e2e_conformance_live_tier() {
+    use rt_core::backend::conformance::{Scratch, live_checks};
+    let sb = Sandbox::new();
+    let root = sb._tmp.path().join("conformance");
+    fs::create_dir(&root).unwrap();
+    let scratch = Scratch::new(&root);
+    let failures = live_checks(
+        &sb.backend,
+        &scratch,
+        &sb.launcher,
+        &fs::read(fixture("hello64.exe")).unwrap(),
+        7,
+    );
+    // The guard stops the Sandbox's own prefix only: stop this one too (idempotent) before judging.
+    let _ = sb.backend.stop(&scratch.env);
+    let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    assert!(failures.is_empty(), "wine fails the live tier:\n{}", text.join("\n"));
+}
