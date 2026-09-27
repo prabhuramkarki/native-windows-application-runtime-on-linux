@@ -322,13 +322,15 @@ fn main() -> ExitCode {
 }
 
 /// The parser is the oracle for `runtimed`'s argv (`rt_api::jobs::JobSpec::argv`): with hostile values, every shape
-/// parses to exactly the intended command (the `deps` shape is pinned in `deps::tests`).
+/// parses to exactly the intended command. [`daemon_argv::check`] matches `JobSpec` without a wildcard arm, so a new
+/// variant does not compile until its argv is checked here.
 #[cfg(test)]
 mod daemon_argv {
     use super::{Cli, Cmd};
     use clap::Parser;
     use rt_api::jobs::{Driver, JobSpec};
     use rt_core::AppId;
+    use std::ffi::OsString;
 
     fn parse(spec: &JobSpec) -> Cmd {
         Cli::try_parse_from(std::iter::once("runtime".into()).chain(spec.argv()))
@@ -340,102 +342,154 @@ mod daemon_argv {
         AppId::parse(s).unwrap()
     }
 
-    #[test]
-    fn run_passes_every_argument_to_the_program_and_never_a_flag() {
-        let hostile = ["-x", "--", ";", "--unsandboxed", "--debug", "$(id)", "a b"];
-        let Cmd::Run {
-            target,
-            debug,
-            unsandboxed,
-            args,
-        } = parse(&JobSpec::Run {
-            app: id("notepad"),
-            args: hostile.map(String::from).to_vec(),
-        })
-        else {
-            panic!("not run")
-        };
-        assert_eq!((target.as_str(), debug, unsandboxed), ("notepad", false, false));
-        assert_eq!(args, hostile.map(std::ffi::OsString::from));
-        let Cmd::Run { target, args, .. } = parse(&JobSpec::Run {
-            app: id("notepad"),
-            args: vec![],
-        }) else {
-            panic!("not run")
-        };
-        assert_eq!((target.as_str(), args.len()), ("notepad", 0));
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// `spec` parses to exactly the command it means (every flag it does not set stays off).
+    fn check(spec: &JobSpec) {
+        let cmd = parse(spec);
+        match spec {
+            JobSpec::Run { app, args } => {
+                let Cmd::Run {
+                    target,
+                    debug,
+                    unsandboxed,
+                    args: a,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not run")
+                };
+                assert_eq!((target.as_str(), debug, unsandboxed), (app.as_str(), false, false));
+                assert_eq!(a, args.iter().map(OsString::from).collect::<Vec<_>>());
+            }
+            JobSpec::Install {
+                path,
+                name,
+                exe,
+                silent,
+                network,
+            } => {
+                let Cmd::Install {
+                    file,
+                    name: n,
+                    exe: e,
+                    silent: si,
+                    network: ne,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not install")
+                };
+                assert_eq!((&file, &n, &e, si, ne), (path, name, exe, *silent, *network));
+            }
+            JobSpec::Remove { app } => {
+                let Cmd::Remove { app: a } = cmd else {
+                    panic!("{spec:?}: not remove")
+                };
+                assert_eq!(a, app.as_str());
+            }
+            JobSpec::DepsInstall { app, plan_digest, yes } => {
+                let Cmd::Deps(a) = cmd else {
+                    panic!("{spec:?}: not deps")
+                };
+                assert!(a.sub.is_none(), "{spec:?}: routed to a subcommand");
+                assert_eq!(
+                    (
+                        a.app.as_deref(),
+                        a.install,
+                        &a.yes,
+                        a.plan_digest.as_deref(),
+                        a.discard_interrupted
+                    ),
+                    (Some(app.as_str()), true, yes, Some(plan_digest.as_str()), None)
+                );
+            }
+            JobSpec::PermissionsSet { app, set } => {
+                let Cmd::Permissions {
+                    app: a,
+                    set: s,
+                    reset,
+                    json,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not permissions")
+                };
+                assert_eq!((a.as_str(), &s, reset, json), (app.as_str(), set, false, false));
+            }
+            JobSpec::PermissionsReset { app } => {
+                let Cmd::Permissions {
+                    app: a,
+                    set,
+                    reset,
+                    json,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not permissions")
+                };
+                assert_eq!((a.as_str(), set.len(), reset, json), (app.as_str(), 0, true, false));
+            }
+            JobSpec::DisplaySet { app, driver } => {
+                let Cmd::Display { app: a, choice } = cmd else {
+                    panic!("{spec:?}: not display")
+                };
+                assert_eq!((a.as_str(), choice.as_deref()), (app.as_str(), Some(driver.as_str())));
+            }
+        }
     }
 
     #[test]
-    fn install_values_stay_values() {
+    fn every_job_spec_parses_as_intended_with_hostile_values() {
+        let hostile = ["-x", "--", ";", "--unsandboxed", "--debug", "$(id)", "a b"];
+        let mut specs = vec![
+            JobSpec::Run {
+                app: id("notepad"),
+                args: strings(&hostile),
+            },
+            JobSpec::Run {
+                app: id("notepad"),
+                args: vec![],
+            },
+            JobSpec::Remove { app: id("a-b") },
+            JobSpec::PermissionsSet {
+                app: id("a"),
+                set: strings(&["--reset", "--json", "--", "network=allow"]),
+            },
+            JobSpec::PermissionsReset { app: id("a") },
+        ];
         for (name, exe, silent, network) in [
             (Some("--network"), Some("--silent"), false, false),
             (Some("-n"), Some("--"), true, false),
             (None, Some("a=b --network"), false, true),
             (None, None, false, false),
         ] {
-            let path = "/-x/My Setup.exe";
-            let Cmd::Install {
-                file,
-                name: n,
-                exe: e,
-                silent: si,
-                network: ne,
-            } = parse(&JobSpec::Install {
-                path: path.into(),
+            specs.push(JobSpec::Install {
+                path: "/-x/My Setup.exe".into(),
                 name: name.map(String::from),
                 exe: exe.map(String::from),
                 silent,
                 network,
-            })
-            else {
-                panic!("not install")
-            };
-            assert_eq!(
-                (file.to_str().unwrap(), n.as_deref(), e.as_deref(), si, ne),
-                (path, name, exe, silent, network)
-            );
+            });
         }
-    }
-
-    #[test]
-    fn remove_permissions_and_display_act_on_the_id() {
-        let Cmd::Remove { app } = parse(&JobSpec::Remove { app: id("a-b") }) else {
-            panic!("not remove")
-        };
-        assert_eq!(app, "a-b");
-        let set = vec![
-            "--reset".to_owned(),
-            "--json".into(),
-            "--".into(),
-            "network=allow".into(),
-        ];
-        let Cmd::Permissions {
-            app,
-            set: s,
-            reset,
-            json,
-        } = parse(&JobSpec::PermissionsSet {
-            app: id("a"),
-            set: set.clone(),
-        })
-        else {
-            panic!("not permissions")
-        };
-        assert_eq!((app.as_str(), s, reset, json), ("a", set, false, false));
-        let Cmd::Permissions { app, set, reset, json } = parse(&JobSpec::PermissionsReset { app: id("a") }) else {
-            panic!("not permissions")
-        };
-        assert_eq!((app.as_str(), set.len(), reset, json), ("a", 0, true, false));
-        for (driver, want) in [
-            (Driver::Auto, "auto"),
-            (Driver::X11, "x11"),
-            (Driver::Wayland, "wayland"),
+        for driver in [Driver::Auto, Driver::X11, Driver::Wayland] {
+            specs.push(JobSpec::DisplaySet { app: id("a"), driver });
+        }
+        // `list` and `cache` are also `deps` subcommands: after `--` they are the app.
+        for (app, yes) in [
+            ("notepad", vec![]),
+            ("notepad", strings(&["vcrun2022", "-p", "--install", "--"])),
+            ("list", vec![]),
+            ("cache", strings(&["x"])),
         ] {
-            let Cmd::Display { app, choice } = parse(&JobSpec::DisplaySet { app: id("a"), driver }) else {
-                panic!("not display")
-            };
-            assert_eq!((app.as_str(), choice.as_deref()), ("a", Some(want)));
+            specs.push(JobSpec::DepsInstall {
+                app: id(app),
+                plan_digest: "ab".repeat(32),
+                yes,
+            });
         }
+        let mut kinds: Vec<_> = specs.iter().map(|s| format!("{:?}", s.kind())).collect();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds.len(), 7, "one sample per variant at least: {kinds:?}");
+        specs.iter().for_each(check);
     }
 }

@@ -49,6 +49,9 @@ pub enum JobKind {
     PermissionsSet,
     PermissionsReset,
     DisplaySet,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `succeeded` = exit 0; `failed` = any other exit or a spawn failure; `cancelled` = ended after `jobs.cancel`.
@@ -61,6 +64,9 @@ pub enum JobState {
     Succeeded,
     Failed,
     Cancelled,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `progress` is reserved (never emitted in 0.2).
@@ -72,6 +78,9 @@ pub enum EventKind {
     Stderr,
     State,
     Progress,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A job's state. Times are Unix milliseconds; `exit_code`/`signal` are `None` until known.
@@ -166,9 +175,9 @@ impl DepsInstallParams {
 
 // ------------------------------------------------------------------------------------------------ specs
 
-/// A validated mutation. Built only by [`JobSpec::from_request`] and [`Runtime::deps_install_spec`].
+/// A validated mutation. Built only by [`JobSpec::from_request`] and [`Runtime::deps_install_spec`]. Deliberately
+/// exhaustive: the CLI's parser-oracle test matches every variant, so a new one cannot ship without its argv check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum JobSpec {
     Run {
         app: AppId,
@@ -467,11 +476,13 @@ fn program_args(args: Vec<String>) -> Result<Vec<String>, ApiError> {
 // ------------------------------------------------------------------------------------------------ consent
 
 /// The digest of a dependency plan (spec 5.3), 64 lowercase hex: what `deps.plan` reports and what `deps.install`
-/// and `runtime deps --install --plan-digest` compare. The only implementation.
+/// and `runtime deps --install --plan-digest` compare. The only implementation. Each entry binds the package, its
+/// manifest version and sha256, the sha256 of its consent text (`rt_deps::consent_text`, what a prompt shows and a
+/// consent record hashes), its action and consent state; so a client's consent is to exactly that text.
 pub fn plan_digest(id: &AppId, plan: &rt_deps::AppPlan, manifest: &rt_deps::Manifest) -> String {
     use rt_deps::{Action, ConsentState};
     let mut h = Sha256::new();
-    h.update(format!("rt-deps-plan-v1\n{id}\n"));
+    h.update(format!("rt-deps-plan-v2\n{id}\n"));
     for e in &plan.plan.entries {
         let m = manifest.get(&e.package);
         let action = match e.action {
@@ -485,13 +496,22 @@ pub fn plan_digest(id: &AppId, plan: &rt_deps::AppPlan, manifest: &rt_deps::Mani
             ConsentState::Denied => "denied",
         };
         h.update(format!(
-            "{}\0{}\0{}\0{action}\0{consent}\n",
+            "{}\0{}\0{}\0{}\0{action}\0{consent}\n",
             e.package,
             m.map_or("", |m| &m.version),
-            m.map_or("", |m| &m.sha256)
+            m.map_or("", |m| &m.sha256),
+            m.map_or_else(String::new, |m| sha256_hex(rt_deps::consent_text(m).as_bytes()))
         ));
     }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hex(&h.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
 }
 
 /// A plan digest's form: 64 lowercase hex digits.
@@ -950,14 +970,18 @@ mod tests {
         assert!(base.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         assert_eq!(base, plan_digest(&id, &gated_plan(), m), "not stable");
         // Pinned: the formula is a contract between runtimed and runtime (spec 5.3).
-        let mut text = String::from("rt-deps-plan-v1\ngame\n");
+        let mut text = String::from("rt-deps-plan-v2\ngame\n");
         for (p, a, c) in [
             ("vcrun2022", "install", "needed"),
             ("dxvk", "install", "notNeeded"),
             ("vkd3d-proton", "alreadyInstalled", "notNeeded"),
         ] {
             let pkg = m.get(p).unwrap();
-            text.push_str(&format!("{p}\0{}\0{}\0{a}\0{c}\n", pkg.version, pkg.sha256));
+            let licence: String = Sha256::digest(rt_deps::consent_text(pkg).as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            text.push_str(&format!("{p}\0{}\0{}\0{licence}\0{a}\0{c}\n", pkg.version, pkg.sha256));
         }
         let want: String = Sha256::digest(text.as_bytes())
             .iter()
@@ -995,12 +1019,21 @@ mod tests {
             .sha256
             .replacen(&p.sha256[..1], if p.sha256.starts_with('0') { "1" } else { "0" }, 1);
         changed.push(plan_digest(&id, &gated_plan(), &m3));
+        // Only the consent text (the download address it shows) differs: the user consented to another text.
+        let mut m4 = m.clone();
+        m4.packages
+            .iter_mut()
+            .find(|p| p.id == "vcrun2022")
+            .unwrap()
+            .url
+            .push('x');
+        changed.push(plan_digest(&id, &gated_plan(), &m4));
         for (i, c) in changed.iter().enumerate() {
             assert_ne!(*c, base, "change {i} kept the digest");
         }
-        // An entry with no manifest record hashes empty version and sha256.
+        // An entry with no manifest record hashes empty version, sha256 and licence hash.
         let lone = app_plan(vec![entry("nope", Action::Install, ConsentState::NotNeeded)]);
-        let want: String = Sha256::digest(b"rt-deps-plan-v1\ngame\nnope\0\0\0install\0notNeeded\n")
+        let want: String = Sha256::digest(b"rt-deps-plan-v2\ngame\nnope\0\0\0\0install\0notNeeded\n")
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
@@ -1231,6 +1264,21 @@ mod tests {
         ] {
             assert_eq!(round_trip(k), s);
         }
+        // A newer daemon's kind, state or event kind never breaks an older client.
+        let j: JobInfo = serde_json::from_value(json!({
+            "jobId": "x", "kind": "stop", "app": null, "state": "paused", "exitCode": null, "signal": null,
+            "createdAt": 1, "startedAt": null, "endedAt": null, "dropped": 0
+        }))
+        .unwrap();
+        assert_eq!((j.kind, j.state), (JobKind::Unknown, JobState::Unknown));
+        let e: JobEvent = serde_json::from_value(json!({"seq": 1, "ts": 1, "kind": "percent", "text": ""})).unwrap();
+        assert_eq!(e.kind, EventKind::Unknown);
+        // A client-sent driver is never read leniently.
+        assert!(serde_json::from_value::<Driver>(json!("vnc")).is_err());
+        // A 0.1 daemon's deps.plan has no digest: it reads as empty (such a daemon has no deps.install).
+        let old: DepsPlanView =
+            serde_json::from_value(json!({"entries": [], "unsatisfied": [], "warnings": []})).unwrap();
+        assert_eq!(old.digest, "");
         for (d, s) in [
             (Driver::Auto, "auto"),
             (Driver::X11, "x11"),

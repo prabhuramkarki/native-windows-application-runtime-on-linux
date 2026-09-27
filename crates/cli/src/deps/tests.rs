@@ -382,44 +382,6 @@ fn the_plan_digest_guard_refuses_any_other_plan() {
     assert!(check_plan_digest(r.env.id(), &other, &r.manifest, Some(&d)).is_err());
 }
 
-/// The parser is the oracle for `runtimed`'s argv: every `deps.install` argv parses to exactly the intended args,
-/// whatever the consented package ids and the app id look like.
-#[test]
-fn the_daemons_deps_install_argv_parses_as_intended() {
-    use rt_api::jobs::JobSpec;
-    let d = "ab".repeat(32);
-    for (app, yes) in [
-        ("notepad", vec![]),
-        (
-            "notepad",
-            vec!["vcrun2022".to_owned(), "-p".into(), "--install".into(), "--".into()],
-        ),
-        ("list", vec![]),
-        ("cache", vec!["x".into()]),
-    ] {
-        let spec = JobSpec::DepsInstall {
-            app: AppId::parse(app).unwrap(),
-            plan_digest: d.clone(),
-            yes: yes.clone(),
-        };
-        let cli = crate::Cli::try_parse_from(std::iter::once("runtime".into()).chain(spec.argv())).unwrap();
-        let crate::Cmd::Deps(a) = cli.cmd else {
-            panic!("not deps")
-        };
-        assert!(a.sub.is_none(), "{app}: routed to a subcommand");
-        assert_eq!(
-            (
-                a.app.as_deref(),
-                a.install,
-                a.yes,
-                a.plan_digest.as_deref(),
-                a.discard_interrupted
-            ),
-            (Some(app), true, yes, Some(d.as_str()), None)
-        );
-    }
-}
-
 #[test]
 fn every_yes_must_name_a_gated_package_the_plan_installs() {
     let r = three();

@@ -169,8 +169,9 @@ cleaned message):
   stays the flag's value.
 - **Program args (`apps.run`):** at most 64, each at most 4,096 bytes, 64 KiB in total, no NUL; otherwise verbatim
   (they reach only the program).
-- **`driver`:** the enum. **`planDigest`:** 64 lowercase hex. **`consent`:** at most 64 items, no duplicates, each
-  field bounded; matched against the plan (5.3), so only manifest package ids ever reach `--yes=`.
+- **`driver`:** the enum (an unknown value is a params shape error, -32602). **`planDigest`:** 64 lowercase hex.
+  **`consent`:** at most 64 items, each field bounded; matched against the plan (5.3; a duplicate item is
+  `consent_mismatch`), so only manifest package ids ever reach `--yes=`.
 
 Argv shapes (after the program path). Every value either is validated to not start with `-` or sits after `--` or
 inside `--flag=`:
@@ -205,9 +206,10 @@ SIGTERM with the default action; the sandboxes they start die with their parent.
 
 ### 5.3 Consent (`deps.install`)
 
-1. `deps.plan` returns `digest = sha256("rt-deps-plan-v1\n" + id + "\n" + for each entry in plan order:
-   package "\0" version "\0" sha256 "\0" action "\0" consent "\n")`, hex. Entries with no manifest record use empty
-   version/sha256. The function lives in `rt_api` and is the only implementation.
+1. `deps.plan` returns `digest = sha256("rt-deps-plan-v2\n" + id + "\n" + for each entry in plan order:
+   package "\0" version "\0" sha256 "\0" hex(sha256(consent_text)) "\0" action "\0" consent "\n")`, hex, where
+   `consent_text` is `rt_deps::consent_text` of the package (what a prompt shows and a consent record hashes), so the
+   digest binds the exact text the client showed. Entries with no manifest record use empty version/sha256/text hash. The function lives in `rt_api` and is the only implementation.
 2. `deps.install {id, planDigest, consent}`: the daemon recomputes the plan (same `Runtime::deps_plan`), refuses with
    `consent_mismatch` when the digest differs, or when any `consent` item does not equal `{package, version,
    sha256}` of an entry with `action: install` and `consent: needed`. A needed entry the client did not list is
