@@ -8,6 +8,11 @@
 //! | `Unavailable`      | `unavailable`      | the request is fine but the host cannot answer: no data directory,  |
 //! |                    |                    | unreadable/corrupt app metadata, an invalid, oversized, symlinked   |
 //! |                    |                    | or unreadable `permissions.toml` (never a silent default)           |
+//! | `ReadOnly`         | `read_only`        | a write method on a daemon started without `--write`                |
+//! | `ConsentMismatch`  | `consent_mismatch` | `deps.install`: the plan changed since it was shown, or a consent   |
+//! |                    |                    | item is not exactly a consent-gated package of it                   |
+//! | `Busy`             | `busy`             | the daemon already runs its maximum of jobs                         |
+//! | `AppBusy`          | `app_busy`         | a job for this app is still live                                    |
 //! | `Unknown`          | (any other string) | deserialisation fallback for a newer daemon's kind; never produced here |
 //! | `Internal`         | `internal`         | a bug: reserved for the daemon's catch-all (panic, serialisation)   |
 //!
@@ -23,6 +28,10 @@ pub enum ErrorKind {
     InvalidArgument,
     Unavailable,
     Internal,
+    ReadOnly,
+    ConsentMismatch,
+    Busy,
+    AppBusy,
     /// A kind this client does not know (a newer daemon's): deserialisation never fails on it.
     #[serde(other)]
     Unknown,
