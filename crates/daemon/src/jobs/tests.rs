@@ -33,6 +33,7 @@ case "$mode" in
   sleep) trap '' TERM; echo ready; sleep 60 ;;
   child) sleep 60 & echo $! > "$F/grandchild.$key"; echo ready; wait ;;
   slow) echo first; sleep 0.4; echo late ;;
+  orphan) (sleep 2; echo late) & echo ready ;;
 esac
 "#;
 
@@ -643,4 +644,28 @@ fn child_env_is_the_allowlist_and_runtime_variables() {
     });
     let names: Vec<_> = got.iter().map(|(k, _)| k.to_str().unwrap()).collect();
     assert_eq!(names, ["PATH", "RUNTIME_WINE", "DISPLAY"]);
+}
+
+/// A process the child left behind still holds the output pipes: the job ends DRAIN after the leader, says that
+/// later output is not shown, and its final state event stays the last event.
+#[test]
+fn the_final_state_event_is_the_last_even_when_a_grandchild_holds_the_output() {
+    let f = fx();
+    f.mode(Some("a"), "orphan");
+    let id = f.start(remove("a"));
+    let t = Instant::now();
+    let i = f.wait_end(&id);
+    assert!(
+        t.elapsed() < Duration::from_millis(1900),
+        "waited for the grandchild: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(i.state, JobState::Succeeded);
+    std::thread::sleep(Duration::from_millis(1500));
+    let ev = f.events(&id);
+    assert_eq!(ev.last().unwrap().text, "succeeded (exit 0)", "{ev:?}");
+    assert!(!ev.iter().any(|e| e.text == "late"), "{ev:?}");
+    let note = &ev[ev.len() - 2];
+    assert_eq!(note.kind, EventKind::Stderr);
+    assert!(note.text.contains("still holds its output"), "{ev:?}");
 }
