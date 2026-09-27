@@ -214,11 +214,16 @@ Task 1 -> Task 2 (needs `plan_digest`, `argv`) and Task 3 (needs `JobSpec`); Tas
 - **The supervisor polls** `waitid(WNOHANG | WNOWAIT)` every 20 ms (it also escalates the cancel), instead of blocking.
 - **The final state event is always the last event**: output a leftover process writes after `runtime` exited (1 s
   drain) is dropped, with a note.
-- **Cancel** also SIGKILLs what is left of a cancelled job's group once the leader exited (spec 5.6 said "left
-  alone"; the Tasks 3-5 review showed a TERM-ignoring helper would survive). **`cancelled`** only when the cancel
+- **Cancel** also SIGKILLs what is left of a cancelled job's group once the leader exited, at the end of the same
+  grace (spec 5.6 said "left alone"; the Tasks 3-5 review showed a TERM-ignoring helper would survive; the final
+  review asked for the grace). A cancel that finds the leader already exited keeps its result and gives the rest of
+  the group SIGTERM, then SIGKILL after the grace. **`cancelled`** only when the cancel
   stopped the job; exit 0 is `succeeded`.
-- **Job directory** (spec D8): each job runs in a fresh 0700 subdirectory named after its id, removed after the reap;
-  the shared directory must only be ours and 0700 (a stray file there used to block every job).
+- **Job directory** (spec D8): each daemon takes `job-cwd/d-<32 hex>/`, marked live by an `flock` on
+  `d-<32 hex>.lock` for its life, and at startup removes only the `d-*` directories whose lock is free (final review
+  I1: a second `runtimed --write` used to remove a live daemon's job directories before the socket lock refused it);
+  each job runs in a fresh 0700 subdirectory of it named after the job id, removed after the reap; the shared
+  directory must only be ours and 0700 (a stray file there used to block every job).
 - **`runtime` binary checks** (spec D10) also cover its directory, and each refusal names the fix (`chmod g-w,o-w
   <path>`): a umask-002 `cargo install` is group-writable and is refused.
 - **`--write`** also requires `XDG_RUNTIME_DIR` to be a 0700 directory of the user (not `/`), and reads
