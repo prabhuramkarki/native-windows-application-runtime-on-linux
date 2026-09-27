@@ -1130,3 +1130,54 @@ fn a_sandbox_that_refuses_starts_nothing() {
     let logs: Vec<_> = fs::read_dir(env.logs_dir()).unwrap().collect();
     assert!(logs.is_empty(), "no log file for a run that never started: {logs:?}");
 }
+
+#[test]
+fn a_backend_that_is_not_sandboxable_is_refused_a_sandboxed_run_before_anything_starts() {
+    let f = fx("exit 0");
+    f.app("app");
+    let b = FakeBackend::new().with_capabilities(crate::backend::Capabilities {
+        sandboxable: false,
+        ..crate::FAKE_CAPABILITIES
+    });
+    let sb = Arc::new(RecordingSandbox::default());
+    let e = start_with(&f, &b, "app", Some(sb.clone())).err().unwrap();
+    assert!(
+        matches!(
+            e,
+            RunAppError::Unsupported {
+                source: crate::backend::Unsupported::Feature { .. },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(sb.seen.lock().unwrap().is_empty(), "the sandbox saw a command");
+    assert!(!b.calls().iter().any(|c| matches!(c, Call::Command { .. })));
+    // Unsandboxed, the same backend runs it.
+    assert_eq!(start_with(&f, &b, "app", None).unwrap().wait().unwrap().exit_code, 0);
+}
+
+#[test]
+fn an_app_recorded_for_an_architecture_the_backend_lacks_is_refused_at_run() {
+    let f = fx("exit 0");
+    let env = f.app("app");
+    let mut md = f.store.read_metadata(&env).unwrap();
+    md.architecture = "x86".into();
+    f.store.write_metadata(&env, &md).unwrap();
+    let b = FakeBackend::new().with_capabilities(crate::backend::Capabilities {
+        arches: &[pe::Arch::X86_64],
+        ..crate::FAKE_CAPABILITIES
+    });
+    let e = start_with(&f, &b, "app", None).err().unwrap();
+    assert!(
+        matches!(
+            e,
+            RunAppError::Unsupported {
+                source: crate::backend::Unsupported::Arch { .. },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(b.calls().is_empty(), "{:?}", b.calls());
+}

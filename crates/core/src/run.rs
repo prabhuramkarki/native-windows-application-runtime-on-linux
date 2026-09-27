@@ -271,15 +271,28 @@ fn launch(
         debug: opts.debug,
         dotnet: p.metadata.has_dependency(DOTNET_PACKAGE_ID),
     };
-    // Wine Mono is recorded but the backend cannot use it: a refusal, not a silent run without it.
-    if run_opts.dotnet && !backend.capabilities().dotnet {
-        return Err(RunAppError::Unsupported {
-            id: id.clone(),
-            source: Unsupported::Feature {
-                backend: backend.id(),
-                feature: "managed (.NET) programs with Wine Mono",
-            },
-        });
+    // What the backend cannot do is refused before anything starts: the recorded architecture (`check_known`
+    // allowed only x86/x86_64), Wine Mono it cannot use (not a silent run without it), a sandbox it cannot enter.
+    let caps = backend.capabilities();
+    let unsupported = |source| RunAppError::Unsupported { id: id.clone(), source };
+    let arch = if p.metadata.architecture == "x86" {
+        pe::Arch::X86
+    } else {
+        pe::Arch::X86_64
+    };
+    caps.check_arch(backend.id(), arch).map_err(unsupported)?;
+    let feature = if run_opts.dotnet && !caps.dotnet {
+        Some("managed (.NET) programs with Wine Mono")
+    } else if opts.sandbox.is_some() && !caps.sandboxable {
+        Some("running in the app sandbox (run it with --unsandboxed)")
+    } else {
+        None
+    };
+    if let Some(feature) = feature {
+        return Err(unsupported(Unsupported::Feature {
+            backend: backend.id(),
+            feature,
+        }));
     }
     let sink = if opts.debug {
         LogSink::Tee((env.terminal)())

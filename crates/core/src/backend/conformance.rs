@@ -3,8 +3,9 @@
 //!
 //! * [`static_checks`] start no process: id grammar and stability, capabilities, absolute `dll_dirs`, and
 //!   `command` (no side effect on the scratch tree, an absolute program, `args` verbatim, `current_dir` the given
-//!   cwd, no `LD_PRELOAD`/`LD_LIBRARY_PATH`, `OutsideDriveC` for `..` escapes and absolute paths outside, a refusal
-//!   through a symlinked `drive_c` entry), and `settle` keeping the program and arguments.
+//!   cwd, no `LD_PRELOAD`/`LD_LIBRARY_PATH`, exactly `OutsideDriveC` for `..` in the exe or the cwd, absolute paths
+//!   outside, an exe or cwd that is or goes through a symlink, and a symlinked `drive_c`; a `sandboxable` backend's
+//!   command sets `WINEPREFIX` to the prefix), and `settle` keeping the program and arguments.
 //! * [`live_checks`] run the backend: `prepare` twice, a program launched through `Launcher::spawn` reports the
 //!   expected exit code, `stop` succeeds on the idle environment (twice).
 //!
@@ -64,13 +65,15 @@ impl Scratch {
 }
 
 /// The paths the static checks use, created on first use: a program inside `drive_c`, real files outside it (one
-/// in `outside/`, one in the prefix next to `drive_c`) and a link inside `drive_c` to `outside/`.
+/// in `outside/`, one in the prefix next to `drive_c`), a directory link inside `drive_c` to `outside/` and a
+/// final-component link to `outside/evil.exe`.
 struct Layout {
     exe: PathBuf,
     dir: PathBuf,
     outside_exe: PathBuf,
     dotdot_exe: PathBuf,
-    linked_exe: PathBuf,
+    link_dir: PathBuf,
+    final_link_exe: PathBuf,
 }
 
 fn layout(s: &Scratch) -> Layout {
@@ -81,17 +84,22 @@ fn layout(s: &Scratch) -> Layout {
     fs::write(&exe, b"MZ").expect("the program");
     let outside_exe = s.outside().join("evil.exe");
     fs::write(&outside_exe, b"MZ").expect("outside/evil.exe");
+    fs::create_dir_all(s.outside().join("sub")).expect("outside/sub");
     fs::write(s.env.prefix().join("evil.exe"), b"MZ").expect("prefix/evil.exe");
-    let link = drive_c.join("Program Files/link");
-    if fs::symlink_metadata(&link).is_err() {
-        symlink(s.outside(), &link).expect("the link");
+    let link_dir = drive_c.join("Program Files/link");
+    let final_link_exe = dir.join("final.exe");
+    for (target, link) in [(s.outside(), &link_dir), (outside_exe.clone(), &final_link_exe)] {
+        if fs::symlink_metadata(link).is_err() {
+            symlink(target, link).expect("a link");
+        }
     }
     Layout {
         exe,
         dir,
         outside_exe,
         dotdot_exe: drive_c.join("../evil.exe"),
-        linked_exe: link.join("evil.exe"),
+        link_dir,
+        final_link_exe,
     }
 }
 
@@ -187,9 +195,12 @@ pub fn static_checks(b: &dyn CompatBackend, scratch: &Scratch) -> Vec<Failure> {
 
     let caps = b.capabilities();
     out.ensure(
-        !caps.arches.is_empty() && !caps.subsystems.is_empty() && b.capabilities() == caps,
+        !caps.arches.is_empty()
+            && !caps.subsystems.is_empty()
+            && b.capabilities() == caps
+            && (caps.sandboxable || !(caps.installers || caps.dependency_packages)),
         "capabilities",
-        || format!("empty or not constant: {caps:?}"),
+        || format!("empty, not constant, or sandboxed features without `sandboxable`: {caps:?}"),
     );
     let dirs = b.dll_dirs();
     out.ensure(dirs.iter().all(|d| d.is_absolute()), "dll-dirs-absolute", || {
@@ -239,25 +250,68 @@ pub fn static_checks(b: &dyn CompatBackend, scratch: &Scratch) -> Vec<Failure> {
         format!("sets {loader:?}")
     });
 
-    let outside = |r: Result<Command, BackendError>| matches!(r, Err(BackendError::OutsideDriveC { .. }));
-    let dotdot = b.command(env, &l.dotdot_exe, &l.dir, &[], &opts);
-    out.ensure(outside(dotdot), "outside-dotdot", || {
-        format!("{:?} was not OutsideDriveC", l.dotdot_exe)
+    // Every escape must be refused as `OutsideDriveC`: an `Io` or any other error is not a refusal of the path.
+    let escapes = |cases: &[(&str, &Path, &Path)]| -> Vec<String> {
+        cases
+            .iter()
+            .filter(|(_, exe, cwd)| {
+                !matches!(
+                    b.command(env, exe, cwd, &[], &opts),
+                    Err(BackendError::OutsideDriveC { .. })
+                )
+            })
+            .map(|(name, exe, cwd)| format!("{name} (exe {exe:?}, cwd {cwd:?})"))
+            .collect()
+    };
+    let drive_c = env.drive_c();
+    let parent_of_dir = l.dir.join("..");
+    let parent_of_drive_c = drive_c.join("..");
+    let failed = escapes(&[
+        ("`..` in the exe", &l.dotdot_exe, &l.dir),
+        ("`..` in the cwd, staying inside", &l.exe, &parent_of_dir),
+        ("`..` in the cwd, leaving", &l.exe, &parent_of_drive_c),
+    ]);
+    out.ensure(failed.is_empty(), "outside-dotdot", || {
+        format!("not OutsideDriveC: {failed:?}")
     });
-    let abs_exe = b.command(env, &l.outside_exe, &l.dir, &[], &opts);
-    let abs_cwd = b.command(env, &l.exe, &scratch.outside(), &[], &opts);
-    out.ensure(outside(abs_exe) && outside(abs_cwd), "outside-absolute", || {
-        format!(
-            "{:?} or the cwd {:?} was not OutsideDriveC",
-            l.outside_exe,
-            scratch.outside()
-        )
+    let outside_dir = scratch.outside();
+    let failed = escapes(&[
+        ("an exe outside", &l.outside_exe, &l.dir),
+        ("a cwd outside", &l.exe, &outside_dir),
+    ]);
+    out.ensure(failed.is_empty(), "outside-absolute", || {
+        format!("not OutsideDriveC: {failed:?}")
     });
-    out.ensure(
-        b.command(env, &l.linked_exe, &l.dir, &[], &opts).is_err(),
-        "outside-symlink",
-        || format!("{:?} (through a link to outside/) was accepted", l.linked_exe),
-    );
+    let through_link = l.link_dir.join("evil.exe");
+    let mut failed = escapes(&[
+        ("an exe through a directory link", &through_link, &l.dir),
+        ("an exe that is a link", &l.final_link_exe, &l.dir),
+        ("a cwd that is a link", &l.exe, &l.link_dir),
+        ("a cwd through a link", &l.exe, &l.link_dir.join("sub")),
+    ]);
+    // `drive_c` itself a link to a real copy: lexically everything is inside. Put back afterwards.
+    let real = env.prefix().join("drive_c.conformance-real");
+    if fs::rename(&drive_c, &real).is_ok() {
+        if symlink(&real, &drive_c).is_ok() {
+            failed.extend(escapes(&[("a symlinked drive_c", &l.exe, &l.dir)]));
+            let _ = fs::remove_file(&drive_c);
+        }
+        let _ = fs::rename(&real, &drive_c);
+    }
+    out.ensure(failed.is_empty(), "outside-symlink", || {
+        format!("not OutsideDriveC: {failed:?}")
+    });
+
+    // A backend that may run in the app sandbox names the app by `WINEPREFIX` (`rt_sandbox` derives it from there).
+    if caps.sandboxable {
+        let prefix = cmd
+            .get_envs()
+            .find(|(k, _)| k.as_bytes() == b"WINEPREFIX")
+            .and_then(|(_, v)| v);
+        out.ensure(prefix == Some(env.prefix().as_os_str()), "command-sandboxable", || {
+            format!("sandboxable, but WINEPREFIX is {prefix:?}, not {:?}", env.prefix())
+        });
+    }
 
     let original = argv(&cmd);
     let cwd = cmd.get_current_dir().map(Path::to_owned);

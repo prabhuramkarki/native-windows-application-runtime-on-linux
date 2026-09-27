@@ -636,6 +636,10 @@ fn run_after_create(
 
     let winner_bytes = read_bounded_regular_file(&env.drive_c().join(&winner_path));
     let pe_info = winner_bytes.as_deref().and_then(|b| pe::analyze(b).ok());
+    // The installed program must be one the backend runs (the error path removes the environment).
+    if let Some(info) = &pe_info {
+        backend.capabilities().check_arch(backend.id(), info.arch)?;
+    }
     let (architecture, subsystem) = arch_and_subsystem(pe_info.as_ref());
 
     // Hoisted (Task 7's Ruling 4) so it is still in scope below, at the `.desktop`/icon-writing call site: the
