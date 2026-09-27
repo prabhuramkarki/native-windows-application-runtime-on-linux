@@ -8,6 +8,7 @@ pub mod dispatch;
 pub mod jobs;
 pub mod protocol;
 pub mod server;
+pub mod write;
 
 #[cfg(test)]
 pub(crate) mod testutil {

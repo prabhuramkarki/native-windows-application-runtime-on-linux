@@ -93,6 +93,19 @@ pub struct JobsConfig {
     pub env: Arc<dyn Fn() -> Vec<(OsString, OsString)> + Send + Sync>,
 }
 
+impl std::fmt::Debug for JobsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobsConfig")
+            .field("runtime_exe", &self.runtime_exe)
+            .field("cwd", &self.cwd)
+            .field("max_running", &self.max_running)
+            .field("keep_finished", &self.keep_finished)
+            .field("keep_for", &self.keep_for)
+            .field("term_grace", &self.term_grace)
+            .finish_non_exhaustive()
+    }
+}
+
 impl JobsConfig {
     /// The production limits (spec 5.4, 5.6) for `runtime_exe` and `cwd`.
     pub fn new(runtime_exe: PathBuf, cwd: PathBuf) -> JobsConfig {
@@ -439,6 +452,11 @@ impl Jobs {
         v
     }
 
+    /// How long a cancel waits before SIGKILL.
+    pub fn term_grace(&self) -> Duration {
+        self.s.cfg.term_grace
+    }
+
     /// Refuses new jobs, cancels every live one and waits up to `within` for them to be reaped.
     pub fn shutdown(&self, within: Duration) {
         let jobs: Vec<Arc<Job>> = {
@@ -463,7 +481,7 @@ impl Jobs {
     }
 
     #[cfg(test)]
-    fn signals_sent(&self, id: &str) -> Vec<i32> {
+    pub(crate) fn signals_sent(&self, id: &str) -> Vec<i32> {
         lock(&self.s.find(id).unwrap().data).signals.clone()
     }
 }
@@ -737,4 +755,4 @@ fn new_id() -> Result<String, ApiError> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

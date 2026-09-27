@@ -358,7 +358,7 @@ mod tests {
         let mut cfg = ServerConfig::new(sock.clone());
         cfg.max_connections = max;
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
-        thread::spawn(move || serve(Arc::new(rt), cfg, None, stop));
+        thread::spawn(move || serve(Arc::new(crate::dispatch::Ctx::new(Arc::new(rt), None, stop)), cfg, None));
         let until = Instant::now() + Duration::from_secs(5);
         use std::os::unix::fs::MetadataExt;
         while fs::symlink_metadata(&sock).map(|m| m.mode() & 0o777).ok() != Some(0o600) {

@@ -122,6 +122,13 @@ pub struct JobEvents {
     pub job: JobInfo,
 }
 
+/// `jobs.list`: live jobs first (oldest first), then finished ones, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobList {
+    pub jobs: Vec<JobInfo>,
+}
+
 /// What every job-starting method returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
