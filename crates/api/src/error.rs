@@ -37,6 +37,20 @@ pub enum ErrorKind {
     Unknown,
 }
 
+impl ErrorKind {
+    /// Every kind this crate or the daemon produces (all but [`ErrorKind::Unknown`]), for documentation checks.
+    pub const ALL: &'static [ErrorKind] = &[
+        ErrorKind::NotFound,
+        ErrorKind::InvalidArgument,
+        ErrorKind::Unavailable,
+        ErrorKind::Internal,
+        ErrorKind::ReadOnly,
+        ErrorKind::ConsentMismatch,
+        ErrorKind::Busy,
+        ErrorKind::AppBusy,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
 #[error("{kind:?}: {message}")]
@@ -54,5 +68,33 @@ impl ApiError {
             kind,
             message: rt_core::clean_text(message.as_ref(), MAX_MESSAGE),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`ErrorKind::ALL`] lists every kind but `Unknown`: a new variant does not compile here until it is placed.
+    #[test]
+    fn all_lists_every_produced_kind() {
+        let listed = |k: ErrorKind| match k {
+            ErrorKind::NotFound
+            | ErrorKind::InvalidArgument
+            | ErrorKind::Unavailable
+            | ErrorKind::Internal
+            | ErrorKind::ReadOnly
+            | ErrorKind::ConsentMismatch
+            | ErrorKind::Busy
+            | ErrorKind::AppBusy => true,
+            ErrorKind::Unknown => false,
+        };
+        assert!(ErrorKind::ALL.iter().all(|k| listed(*k)));
+        // Each listed variant once: 8 arms above say true.
+        let mut names: Vec<String> = ErrorKind::ALL.iter().map(|k| format!("{k:?}")).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 8);
+        assert_eq!(ErrorKind::ALL.len(), 8);
     }
 }

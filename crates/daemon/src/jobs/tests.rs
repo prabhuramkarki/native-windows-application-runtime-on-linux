@@ -36,6 +36,8 @@ case "$mode" in
   orphan) (sleep 2; echo late) & echo ready ;;
   stubborn) (trap '' TERM; exec sleep 60) & echo $! > "$F/grandchild.$key"; echo ready; wait ;;
   graceful) trap 'echo bye; exit 0' TERM; echo ready; while :; do sleep 0.05; done ;;
+  member) (trap 'sleep 0.1; echo stopped > "$F/member.$key"; exit 0' TERM; while :; do sleep 0.05; done) & echo ready; wait ;;
+  failorphan) (sleep 2; echo late) & echo ready; exit 3 ;;
 esac
 "#;
 
@@ -454,8 +456,8 @@ fn cancel_kills_the_whole_group() {
         assert!(Instant::now() < until, "the grandchild survived");
         std::thread::sleep(Duration::from_millis(10));
     }
-    // SIGTERM, then (the leader gone) SIGKILL for whatever is left of the group.
-    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM, libc::SIGKILL]);
+    // SIGTERM took the whole group down: nothing was left to SIGKILL.
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM]);
 }
 
 #[test]
@@ -597,6 +599,19 @@ fn the_runtime_binary_must_be_a_regular_file_only_we_can_write() {
             "{mode:o}: {m}"
         );
     }
+    // A long path is cut, the remedy is not.
+    let deep = f.root.join("d".repeat(250)).join("e".repeat(250));
+    fs::create_dir_all(&deep).unwrap();
+    fs::set_permissions(f.root.join("d".repeat(250)), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&deep, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::copy(&exe, deep.join("runtime")).unwrap();
+    fs::set_permissions(deep.join("runtime"), fs::Permissions::from_mode(0o775)).unwrap();
+    let m = msg(&deep.join("runtime"), euid());
+    assert!(
+        m.starts_with("writable by its group or others (mode 775): run: chmod g-w,o-w /"),
+        "{m}"
+    );
+    assert!(m.len() <= 512 && m.ends_with("..."), "{} {m}", m.len());
     // Its directory too: whoever may write there may swap the file.
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(f.root.join("bin"), fs::Permissions::from_mode(0o775)).unwrap();
@@ -703,9 +718,13 @@ fn cancel_kills_what_is_left_of_the_group_after_the_leader_exits() {
     let id = f.start(remove("a"));
     f.wait_for(&id, "ready");
     let gc: i32 = f.read("grandchild", "a").trim().parse().unwrap();
+    let t = Instant::now();
     f.jobs.cancel(&id).unwrap();
     let i = f.wait_end(&id);
     assert_eq!((i.state, i.signal), (JobState::Cancelled, Some(libc::SIGTERM)));
+    // It had the same grace as the leader (term_grace, 300 ms here), and the job ended only once it was gone.
+    assert!(t.elapsed() >= Duration::from_millis(300), "{:?}", t.elapsed());
+    assert!(!alive(gc));
     let until = Instant::now() + Duration::from_secs(1);
     while alive(gc) {
         assert!(
@@ -742,7 +761,17 @@ fn a_job_that_finished_is_not_reported_cancelled() {
         "the drain was not cut short: {:?}",
         t.elapsed()
     );
-    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGKILL]);
+    // SIGTERM was enough for the process holding the output.
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM]);
+    // A job that failed on its own keeps `failed (exit 3)`, however soon the cancel comes.
+    f.mode(Some("c"), "failorphan");
+    let id = f.start(remove("c"));
+    f.wait_for(&id, "ready");
+    std::thread::sleep(Duration::from_millis(100));
+    f.jobs.cancel(&id).unwrap();
+    let i = f.wait_end(&id);
+    assert_eq!((i.state, i.exit_code), (JobState::Failed, Some(3)));
+    assert_eq!(states(&f.events(&id)).last().unwrap(), "failed (exit 3)");
 }
 
 #[test]
@@ -755,4 +784,44 @@ fn a_poll_after_the_largest_seq_is_empty_not_a_panic() {
         .poll(&id, u64::MAX, Duration::from_millis(50), &AtomicBool::new(false))
         .unwrap();
     assert!(e.events.is_empty() && e.dropped == 0 && e.next_seq == u64::MAX);
+}
+
+/// A group member that stops cleanly on SIGTERM gets the grace to do so: it is not SIGKILLed the moment `runtime`
+/// exits.
+#[test]
+fn group_members_get_the_grace_after_the_leader_dies() {
+    let f = fx_with(|c| c.term_grace = Duration::from_secs(2));
+    f.mode(Some("a"), "member");
+    let id = f.start(remove("a"));
+    f.wait_for(&id, "ready");
+    f.jobs.cancel(&id).unwrap();
+    let i = f.wait_end(&id);
+    assert_eq!(i.state, JobState::Cancelled);
+    assert_eq!(
+        f.read("member", "a").trim(),
+        "stopped",
+        "the member was killed before it could stop"
+    );
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM]);
+}
+
+/// A leader that already exited but was not yet noticed (the supervisor looks every 20 ms) is not "cancelled".
+#[test]
+fn a_cancel_right_after_a_failure_keeps_the_failure() {
+    let f = fx_with(|c| c.max_running = 40);
+    for n in 0..20 {
+        let key = format!("r{n}");
+        f.mode(Some(&key), "exit 3");
+        let id = f.start(remove(&key));
+        while f.jobs.status(&id).unwrap().state == JobState::Queued {
+            std::thread::yield_now();
+        }
+        // Cancel as soon as it runs: sometimes before it exited, sometimes just after.
+        std::thread::sleep(Duration::from_millis(n % 5));
+        f.jobs.cancel(&id).unwrap();
+        let i = f.wait_end(&id);
+        if i.exit_code == Some(3) {
+            assert_eq!(i.state, JobState::Failed, "run {n}: {i:?}");
+        }
+    }
 }
