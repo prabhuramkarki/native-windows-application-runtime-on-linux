@@ -96,6 +96,11 @@ pub struct InstallerOpts {
     /// its `sandbox-init` shim. One that cannot be used makes the sandbox refuse to run the installer at all
     /// ([`crate::InstallerSandbox`]), never run it unhardened.
     pub runtime_exe: PathBuf,
+    /// A fixed app id (`.wrun` import): used unchanged; `AlreadyExists` is [`InstallerError::IdTaken`], never a
+    /// retry, and nothing of the existing app is read or changed.
+    pub id: Option<AppId>,
+    /// Recorded in the metadata (schema 4): what the imported package requested.
+    pub package: Option<rt_core::PackageMeta>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +151,9 @@ pub enum InstallerError {
     /// The installer sandbox's pre-flight check ([`crate::InstallerSandbox::check`]) failed: the reason.
     #[error("the installer sandbox refused to start: {0} (nothing was run; nothing was installed)")]
     SandboxRefused(String),
+    /// The fixed id is taken; nothing of the existing app was read or changed.
+    #[error("an app with the id `{0}` already exists (nothing was changed; `runtime remove {0}` first to replace it)")]
+    IdTaken(AppId),
     #[error("the chosen --exe {0} is not a file inside this app's environment")]
     ExeOverrideNotAFile(String),
     /// The backend's capabilities exclude the installer pipeline (checked before anything is read or created).
@@ -216,8 +224,12 @@ pub fn install_via_installer(
     let base = AppId::slug(&provisional_name);
 
     // Stage 4: create the environment. `AlreadyExists` means a losing race: pick again, never touch the winner's
-    // directory (mirrors `rt_core::install_with`'s own retry loop and its "never remove a foreign dir" rule).
-    let mut id = unique_id(store, &base)?;
+    // directory (mirrors `rt_core::install_with`'s own retry loop and its "never remove a foreign dir" rule). A
+    // fixed id is never retried.
+    let mut id = match &opts.id {
+        Some(fixed) => fixed.clone(),
+        None => unique_id(store, &base)?,
+    };
     let mut env = None;
     for _ in 0..CREATE_ATTEMPTS {
         match store.create(&id) {
@@ -225,6 +237,7 @@ pub fn install_via_installer(
                 env = Some(created);
                 break;
             }
+            Err(StoreError::AlreadyExists) if opts.id.is_some() => return Err(InstallerError::IdTaken(id)),
             Err(StoreError::AlreadyExists) => id = unique_id(store, &base)?,
             Err(e) => return Err(e.into()),
         }
@@ -683,6 +696,7 @@ fn run_after_create(
         product_name,
         uninstall_command,
     });
+    md.package = opts.package.clone();
     md.validate()?;
     store.write_metadata(env, &md)?;
 

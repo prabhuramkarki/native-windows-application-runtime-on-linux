@@ -326,6 +326,8 @@ fn the_null_backend_refuses_what_its_capabilities_exclude_and_creates_nothing() 
         allow_network: false,
         exe_override: None,
         runtime_exe: PathBuf::from("/nonexistent/runtime"),
+        id: None,
+        package: None,
     };
     let e = rt_installer::install_via_installer(&store, &b, launcher(), &nsis, opts).unwrap_err();
     assert!(matches!(e, rt_installer::InstallerError::Unsupported(_)), "{e:?}");

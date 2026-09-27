@@ -50,6 +50,8 @@ pub fn run(
             allow_network: network,
             exe_override: exe,
             runtime_exe: crate::runtime_exe(),
+            id: None,
+            package: None,
         };
         return match rt_installer::install_via_installer(&store, &*backend, launcher, file, opts)? {
             rt_installer::InstallOutcome::Installed {

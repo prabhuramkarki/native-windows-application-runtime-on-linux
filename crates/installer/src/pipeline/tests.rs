@@ -95,6 +95,8 @@ fn opts() -> InstallerOpts {
         allow_network: false,
         exe_override: None,
         runtime_exe: std::env::current_exe().unwrap(),
+        id: None,
+        package: None,
     }
 }
 
@@ -404,6 +406,80 @@ fn exe_override_skips_discovery_and_installs_the_named_file() {
         panic!("expected Installed, got {outcome:?}");
     };
     assert_eq!(executable.to_string(), "C:\\App\\two.exe");
+}
+
+// ---------------------------------------------------------------- package mode: fixed id and package record
+
+fn package_meta(id: &str) -> rt_core::PackageMeta {
+    rt_core::PackageMeta {
+        id: id.into(),
+        version: "1.0".into(),
+        digest: "ab".repeat(32),
+        requested_dependencies: vec!["vcrun2022".into()],
+        requested_permissions: vec!["network=allow".into()],
+    }
+}
+
+#[test]
+fn a_taken_fixed_id_is_refused_and_the_existing_app_is_untouched() {
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let id = AppId::parse("my-app").unwrap();
+    let env = f.store.create(&id).unwrap();
+    fs::write(env.root().join("config/keep"), "precious").unwrap();
+    let listing = || {
+        let mut v: Vec<_> = walkdir(f.apps());
+        v.sort();
+        v
+    };
+    let before = listing();
+    let backend = FakeBackend::new();
+    let opts = InstallerOpts {
+        id: Some(id.clone()),
+        package: Some(package_meta("my-app")),
+        ..opts()
+    };
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
+    assert!(matches!(&err, InstallerError::IdTaken(taken) if *taken == id), "{err}");
+    assert_eq!(listing(), before, "the existing app changed");
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+    assert_eq!(fs::read_dir(f.apps()).unwrap().count(), 1, "another id was tried");
+}
+
+/// Every path below `dir` with its bytes.
+fn walkdir(dir: PathBuf) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.push((p.clone(), Vec::new()));
+            out.extend(walkdir(p));
+        } else {
+            out.push((p.clone(), fs::read(&p).unwrap()));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_fixed_id_and_the_package_record_are_used_as_given() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let backend = fake_backend(AMBIGUOUS_SCRIPT);
+    let opts = InstallerOpts {
+        exe_override: Some("App/two.exe".to_owned()),
+        id: Some(AppId::parse("my-app").unwrap()),
+        package: Some(package_meta("my-app")),
+        ..opts()
+    };
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap();
+    let InstallOutcome::Installed { id, .. } = outcome else {
+        panic!("expected Installed, got {outcome:?}");
+    };
+    assert_eq!(id.as_str(), "my-app");
+    let md = f.store.read_metadata(&f.store.get(&id).unwrap()).unwrap();
+    assert_eq!(md.package, Some(package_meta("my-app")));
 }
 
 // ---------------------------------------------------------------- cleanup on a late failure (after the run)
