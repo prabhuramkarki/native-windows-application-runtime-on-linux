@@ -9,7 +9,10 @@
 //! **Output.** Two reader threads per job drain the pipes to EOF (a child never blocks on a full pipe). A line ends at
 //! `\n`, `\r` or `\r\n`; a longer line than [`LINE_MAX`] is cut (the rest up to its end dropped, the text ending in
 //! ` [cut]`); text is decoded lossily and `clean_text`ed. Events live in a ring bounded at [`MAX_EVENTS`] events and
-//! [`MAX_EVENT_BYTES`] of text; evictions are counted in `dropped`.
+//! [`MAX_EVENT_BYTES`] of text; evictions are counted in `dropped`. After the leader exits the supervisor waits up to
+//! 1 s for both pipes to reach EOF; if a process the child started still holds them, a `stderr` note says so, the job
+//! ends, and whatever that process writes later is drained and dropped. So the final `state` event is always the
+//! job's last event.
 //!
 //! **Pid reuse.** The supervisor learns of the leader's exit with `waitid(.., WEXITED | WNOWAIT | WNOHANG)`, which
 //! leaves the zombie: while it is unreaped its pid, and so the group id, cannot be reused. Group signals are sent only
@@ -125,6 +128,8 @@ struct Data {
     term_at: Option<Instant>,
     killed: bool,
     readers_open: u8,
+    /// The final state event was pushed: later output (a grandchild's) is drained and dropped.
+    closed: bool,
     /// Every signal sent to the group (the tests' pid-reuse guard).
     signals: Vec<i32>,
 }
@@ -229,6 +234,7 @@ impl Shared {
         d.ended_at = Some(self.now_ms());
         d.pid = None;
         self.set_state(job, d, state, &text);
+        d.closed = true;
     }
 
     /// Sends `sig` to the job's group, only while its leader is unreaped (the caller holds the job's lock).
@@ -346,6 +352,7 @@ impl Jobs {
                     term_at: None,
                     killed: false,
                     readers_open: 0,
+                    closed: false,
                     signals: vec![],
                 }),
                 cv: Condvar::new(),
@@ -565,6 +572,14 @@ fn supervise(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>) {
         }
         d = job.cv.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
     }
+    if d.readers_open > 0 {
+        s.push(
+            job,
+            &mut d,
+            EventKind::Stderr,
+            "output after runtime ended is not shown: a process it started still holds its output".into(),
+        );
+    }
     let mut status = 0;
     // SAFETY: `pid` is our child, exited and not yet reaped; reaping under the job's lock is what makes every group
     // signal (sent under the same lock while `pid` is set) safe from pid reuse.
@@ -624,7 +639,9 @@ fn read_lines(s: &Shared, job: &Job, mut pipe: Box<dyn Read + Send>, kind: Event
         line.clear();
         *cut = false;
         let mut d = lock(&job.data);
-        s.push(job, &mut d, kind, text);
+        if !d.closed {
+            s.push(job, &mut d, kind, text);
+        }
     };
     loop {
         let n = match pipe.read(&mut buf) {
