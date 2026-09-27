@@ -205,7 +205,7 @@ exit 5
         "the Uninstall DisplayName wins over the provisional file-stem name"
     );
     assert_eq!(md.executable, "C:\\Program Files\\HelloNsis\\hello.exe");
-    assert_eq!(md.schema_version, 3, "new installs write schema 3");
+    assert_eq!(md.schema_version, 4, "new installs write schema 4");
     let installer = md.installer.as_ref().expect("installer field (added in schema v2)");
     assert_eq!(installer.family, "nsis");
     assert_eq!(installer.product_name.as_deref(), Some("Hello Nsis"));

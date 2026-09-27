@@ -40,7 +40,8 @@ pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, i
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{
     BackendInfo, ConsentRecord, DOTNET_PACKAGE_ID, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN,
-    MAX_NAME_LEN, MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
+    MAX_NAME_LEN, MAX_REQUESTED_DEPENDENCIES, MIN_SCHEMA_VERSION, MetaError, Metadata, PackageMeta,
+    REQUESTABLE_PERMISSIONS, SCHEMA_VERSION,
 };
 /// The PE model the backend contract speaks ([`Capabilities`]), for backends that do not depend on it directly.
 pub use pe;

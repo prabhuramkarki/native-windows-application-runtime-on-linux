@@ -72,7 +72,16 @@ pub fn run(
     if silent || network {
         warn("--silent/--network only apply to .msi/.exe installers; ignored for a portable exe or a zip archive");
     }
-    let outcome = rt_core::install(&store, &*backend, file, &InstallOpts { name, exe })?;
+    let outcome = rt_core::install(
+        &store,
+        &*backend,
+        file,
+        &InstallOpts {
+            name,
+            exe,
+            ..InstallOpts::default()
+        },
+    )?;
     print_installed(&store, &outcome.id, &outcome.executable.to_string(), &outcome.warnings)?;
     crate::deps::print_hint(&store, &outcome.id);
     Ok(0)
