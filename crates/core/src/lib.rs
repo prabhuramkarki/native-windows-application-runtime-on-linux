@@ -24,12 +24,14 @@ pub(crate) mod text;
 pub mod unzip;
 pub mod winpath;
 
-pub use backend::{BackendError, CompatBackend, Detail, RunOpts, allowed_env};
+pub use backend::{
+    BACKEND_API_VERSION, BackendError, Capabilities, CompatBackend, Detail, RunOpts, Unsupported, allowed_env,
+};
 pub use cache::Cached;
 pub use dirs::{DirsError, apps_dir, apps_dir_from, data_root, data_root_from};
 pub use display::{DRIVERS_KEY, GraphicsDriver, driver_from_value};
 #[cfg(any(test, feature = "testing"))]
-pub use fake::{Call, FakeBackend};
+pub use fake::{Call, FAKE_CAPABILITIES, FakeBackend};
 pub use graphics::{
     HostVulkan, VulkanDevice, VulkanVerdict, host_verdict, judge, parse_vulkaninfo_summary, probe_host,
 };
@@ -38,8 +40,11 @@ pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, i
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{
     BackendInfo, ConsentRecord, DOTNET_PACKAGE_ID, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN,
-    MAX_NAME_LEN, MIN_SCHEMA_VERSION, MetaError, Metadata, SCHEMA_VERSION,
+    MAX_NAME_LEN, MAX_REQUESTED_DEPENDENCIES, MIN_SCHEMA_VERSION, MetaError, Metadata, PackageMeta,
+    REQUESTABLE_PERMISSIONS, SCHEMA_VERSION,
 };
+/// The PE model the backend contract speaks ([`Capabilities`]), for backends that do not depend on it directly.
+pub use pe;
 pub use proc::{HelperOutput, RunError};
 pub use run::{
     ResolvedProgram, RunAppError, RunOptions, RunOutcome, Started, Target, TargetKind, classify, exit_code,

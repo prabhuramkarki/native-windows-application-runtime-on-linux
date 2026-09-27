@@ -489,14 +489,10 @@ mod tests {
     fn fake_cmd(fx: &Fx, script: &str, debug: bool) -> Command {
         let b = FakeBackend::with_script(script);
         b.prepare(&fx.env).unwrap();
-        b.command(
-            &fx.env,
-            Path::new("/app.exe"),
-            &fx.env.drive_c(),
-            &[],
-            &RunOpts { debug, dotnet: false },
-        )
-        .unwrap()
+        let exe = fx.env.drive_c().join("app.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        b.command(&fx.env, &exe, &fx.env.drive_c(), &[], &RunOpts { debug, dotnet: false })
+            .unwrap()
     }
 
     /// stderr of `env` as lines.

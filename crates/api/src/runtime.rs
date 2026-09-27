@@ -104,7 +104,13 @@ impl Runtime {
         } else {
             PermSource::Default
         };
-        Ok(PermissionsView::from_profile(&loaded.unwrap_or_default(), source))
+        let profile = loaded.unwrap_or_default();
+        let mut view = PermissionsView::from_profile(&profile, source);
+        // Informational: unreadable metadata only means no requests are shown (the profile is what matters).
+        if let Some(pkg) = self.store.read_metadata(env).ok().and_then(|md| md.package) {
+            view.requested = requests_not_granted(&profile, &pkg.requested_permissions);
+        }
+        Ok(view)
     }
 
     pub fn compat(&self) -> CompatView {
@@ -122,6 +128,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use rt_core::{BackendInfo, DependencyRecord, InstallerMeta, Metadata, WinPath, is_format};
+    use rt_sandbox::Permissions;
     use std::path::Path;
 
     fn rt() -> (tempfile::TempDir, Runtime) {
@@ -445,7 +452,7 @@ mod tests {
         assert_eq!(
             v,
             VersionInfo {
-                api: "0.2.0".into(),
+                api: "0.2.1".into(),
                 runtime: env!("CARGO_PKG_VERSION").into(),
                 protocol: "jsonrpc-2.0-ndjson".into(),
                 write: false
@@ -459,6 +466,36 @@ mod tests {
         let j = serde_json::to_value(&v).unwrap();
         assert_eq!(serde_json::from_value::<T>(j.clone()).unwrap(), v);
         j
+    }
+
+    #[test]
+    fn a_request_is_listed_until_the_profile_grants_it() {
+        let all: Vec<String> = rt_core::REQUESTABLE_PERMISSIONS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        // The default profile: network deny, display/audio/gpu on.
+        assert_eq!(
+            requests_not_granted(&Permissions::default(), &all),
+            ["network=allow", "display=off", "audio=off", "gpu=off"]
+        );
+        let p = Permissions {
+            network: rt_sandbox::Network::Allow,
+            display: false,
+            audio: false,
+            gpu: false,
+            ..Permissions::default()
+        };
+        assert_eq!(
+            requests_not_granted(&p, &all),
+            ["network=deny", "display=on", "audio=on", "gpu=on"]
+        );
+        assert_eq!(
+            requests_not_granted(&p, &["bogus".into()]),
+            ["bogus"],
+            "an unknown EXPR is never granted"
+        );
+        assert!(requests_not_granted(&p, &[]).is_empty());
     }
 
     #[test]
@@ -477,6 +514,13 @@ mod tests {
                 installed_at: 1,
                 consent: None,
             }];
+            m.package = Some(rt_core::PackageMeta {
+                id: "r".into(),
+                version: "1.0".into(),
+                digest: "ab".repeat(32),
+                requested_dependencies: vec!["vcrun2022".into()],
+                requested_permissions: vec!["network=allow".into()],
+            });
         });
         round_trip(rt.version());
         let list = rt.apps();
@@ -485,6 +529,9 @@ mod tests {
         let d = round_trip(rt.app("r").unwrap());
         assert!(d["installer"]["productName"].is_string() && d["prefix"]["hasDriveC"].is_boolean());
         assert!(d["dependencies"][0]["installedAt"].is_number());
+        assert_eq!(d["package"]["requestedPermissions"][0], "network=allow");
+        assert_eq!(d["package"]["requestedDependencies"][0], "vcrun2022");
+        assert_eq!(d["package"]["digest"], "ab".repeat(32));
         let env = rt.env("r").unwrap();
         let p = rt.permissions_with(&env, &ctx(_d.path())).unwrap();
         let j = round_trip(p);
@@ -493,6 +540,11 @@ mod tests {
             (Some("default"), Some("deny"))
         );
         assert!(j["limits"]["tasksDefault"].is_boolean());
+        assert_eq!(
+            j["requested"],
+            serde_json::json!(["network=allow"]),
+            "requested, not granted"
+        );
         round_trip(GrantView {
             path: "/x".into(),
             access: AccessView::Ro,
@@ -681,6 +733,7 @@ mod tests {
             facts: rt_deps::Facts {
                 imports: vec![],
                 extra_capabilities: vec![],
+                requested: vec![],
             },
             plan: rt_deps::Plan {
                 entries: vec![rt_deps::PlanEntry {

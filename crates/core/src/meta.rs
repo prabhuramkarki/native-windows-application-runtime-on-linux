@@ -22,11 +22,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The schema version this crate writes.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 /// The oldest schema version this crate still reads, so `MIN_SCHEMA_VERSION..=SCHEMA_VERSION` is accepted. Each
 /// version only added a `#[serde(default)]` field: schema 1 (Phase 2) had no `installer` (added in 2), and neither
-/// 1 nor 2 has `dependencies` (added in 3). So no field-by-field migration code exists: `installer: None` and
-/// `dependencies: []` for an older file already ARE its correct v3 reading. Frozen v1/v2 bytes in the tests guard it.
+/// 1 nor 2 has `dependencies` (added in 3), and no version before 4 has `package` (added in 4). So no field-by-field
+/// migration code exists: `installer: None`, `dependencies: []` and `package: None` for an older file already ARE its
+/// correct v4 reading. Frozen v1/v2 bytes in the tests guard it. An older runtime refuses a v4 file (schema policy).
 pub const MIN_SCHEMA_VERSION: u32 = 1;
 /// Most [`DependencyRecord`]s one app may record. The bundled manifest has about a dozen packages; the cap keeps a
 /// hostile file's validation cheap and a full list of realistic records well inside [`MAX_FILE_BYTES`].
@@ -37,6 +38,22 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_NAME_LEN: usize = 256;
 /// Longest of every other string field, in bytes.
 pub const MAX_FIELD_LEN: usize = 1024;
+/// Most dependencies a package record may name (the `.wrun` manifest's own cap).
+pub const MAX_REQUESTED_DEPENDENCIES: usize = 16;
+/// The only permission requests a package record may hold: canonical EXPRs built from enums by the package reader,
+/// never text copied from a package.
+pub const REQUESTABLE_PERMISSIONS: &[&str] = &[
+    "network=allow",
+    "network=deny",
+    "display=on",
+    "display=off",
+    "audio=on",
+    "audio=off",
+    "gpu=on",
+    "gpu=off",
+];
+/// Longest package version (the `.wrun` manifest's own cap).
+const MAX_PACKAGE_VERSION: usize = 64;
 /// Longest message kept from a parse error (those can quote file content).
 const MAX_MESSAGE_LEN: usize = 256;
 
@@ -70,6 +87,9 @@ pub enum MetaError {
     DuplicateDependency,
     #[error("field `{field}` must be exactly 64 lowercase hex digits")]
     BadSha256 { field: &'static str },
+    /// The field's content is not quoted: it is untrusted.
+    #[error("field `package.{0}` is not valid")]
+    BadPackage(&'static str),
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }
@@ -126,6 +146,64 @@ pub struct ConsentRecord {
     pub licence_text_sha256: String,
 }
 
+/// What a `.wrun` package asked for when this app was imported (schema version 4). Requests only: nothing here was
+/// granted, `rt_deps` plans the dependencies as roots behind the usual consent, and the sandbox never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageMeta {
+    /// The package id: always the app's own id.
+    pub id: String,
+    pub version: String,
+    /// Lowercase hex sha256 of the package's raw `wrun.toml` (the package digest).
+    pub digest: String,
+    /// Dependency package ids (deps id grammar), unique, at most [`MAX_REQUESTED_DEPENDENCIES`].
+    pub requested_dependencies: Vec<String>,
+    /// Unique members of [`REQUESTABLE_PERMISSIONS`].
+    pub requested_permissions: Vec<String>,
+}
+
+/// `[a-z0-9][a-z0-9._-]{0,63}`: the dependency manifest's id grammar (`rt_deps` depends on this crate, not the
+/// other way round, hence the copy).
+fn valid_dep_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+fn unique(v: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(v.len());
+    v.iter().all(|s| seen.insert(s.as_str()))
+}
+
+impl PackageMeta {
+    fn validate(&self, app: &AppId) -> Result<(), MetaError> {
+        if self.id != app.as_str() {
+            return Err(MetaError::BadPackage("id"));
+        }
+        let version_ok = (1..=MAX_PACKAGE_VERSION).contains(&self.version.len())
+            && self
+                .version
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'~' | b'-'));
+        if !version_ok {
+            return Err(MetaError::BadPackage("version"));
+        }
+        sha256_hex("package.digest", &self.digest)?;
+        let deps = &self.requested_dependencies;
+        if deps.len() > MAX_REQUESTED_DEPENDENCIES || !deps.iter().all(|d| valid_dep_id(d)) || !unique(deps) {
+            return Err(MetaError::BadPackage("requestedDependencies"));
+        }
+        let perms = &self.requested_permissions;
+        if !perms.iter().all(|p| REQUESTABLE_PERMISSIONS.contains(&p.as_str())) || !unique(perms) {
+            return Err(MetaError::BadPackage("requestedPermissions"));
+        }
+        Ok(())
+    }
+}
+
 /// The contents of `metadata.json`. The public fields make it easy to build; `serde` alone does not validate,
 /// so read and write only through [`Metadata::parse`], [`Metadata::read`] and [`Metadata::write_atomic`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +230,9 @@ pub struct Metadata {
     /// as empty. At most [`MAX_DEPENDENCIES`], ids unique.
     #[serde(default)]
     pub dependencies: Vec<DependencyRecord>,
+    /// `Some` when this app was imported from a `.wrun` package (schema version 4): what it requested.
+    #[serde(default)]
+    pub package: Option<PackageMeta>,
 }
 
 fn cap(field: &'static str, value: &str, max: usize) -> Result<(), MetaError> {
@@ -270,6 +351,7 @@ impl Metadata {
                 .map_or(0, |d| d.as_secs()),
             installer: None,
             dependencies: Vec::new(),
+            package: None,
         }
     }
 
@@ -325,6 +407,9 @@ impl Metadata {
             if !seen.insert(d.id.as_str()) {
                 return Err(MetaError::DuplicateDependency);
             }
+        }
+        if let Some(p) = &self.package {
+            p.validate(&self.id)?;
         }
         Ok(())
     }
@@ -433,6 +518,7 @@ pub(crate) fn sample(id: &str) -> Metadata {
         created: 1_700_000_000,
         installer: None,
         dependencies: Vec::new(),
+        package: None,
     }
 }
 
@@ -474,8 +560,8 @@ mod tests {
         m.write_atomic(&path).unwrap();
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
-        // New saves write schema 3 (the literal, not the constant, so a bump has to touch this test).
-        for key in ["\"schemaVersion\": 3", "\"created\"", "\"backend\"", "\"executable\""] {
+        // New saves write schema 4 (the literal, not the constant, so a bump has to touch this test).
+        for key in ["\"schemaVersion\": 4", "\"created\"", "\"backend\"", "\"executable\""] {
             assert!(text.contains(key), "{key} missing in {text}");
         }
         let mut none_version = m.clone();
@@ -530,25 +616,25 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_accepts_1_to_3_and_rejects_everything_else() {
-        for v in [0u64, 4, 99, u64::MAX] {
+    fn schema_version_accepts_1_to_4_and_rejects_everything_else() {
+        for v in [0u64, 5, 99, u64::MAX] {
             let err = Metadata::parse(&with("schemaVersion", Some(serde_json::json!(v)))).unwrap_err();
             assert!(matches!(err, MetaError::SchemaVersion(n) if n == v), "{v}: {err:?}");
         }
         // Both ends of the supported range parse (the sample's own shape already carries `installer: None`).
-        for v in [1u64, 2, 3] {
+        for v in [1u64, 2, 3, 4] {
             let bytes = with("schemaVersion", Some(serde_json::json!(v)));
             Metadata::parse(&bytes).unwrap_or_else(|e| panic!("schemaVersion {v} should parse: {e}"));
         }
         // An unknown future version with a shape we do not know is still reported as the version.
-        let err = Metadata::parse(br#"{"schemaVersion":4,"totally":"different"}"#).unwrap_err();
-        assert!(matches!(err, MetaError::SchemaVersion(4)), "{err:?}");
-        for bad in [0u32, 4] {
+        let err = Metadata::parse(br#"{"schemaVersion":5,"totally":"different"}"#).unwrap_err();
+        assert!(matches!(err, MetaError::SchemaVersion(5)), "{err:?}");
+        for bad in [0u32, 5] {
             let mut m = sample("app");
             m.schema_version = bad;
             assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(n)) if n == u64::from(bad)));
         }
-        for good in [1, 2, 3] {
+        for good in [1, 2, 3, 4] {
             let mut m = sample("app");
             m.schema_version = good;
             m.validate().unwrap();
@@ -1081,6 +1167,7 @@ mod tests {
             created: 1_700_000_000,
             installer,
             dependencies: Vec::new(),
+            package: None,
         }
     }
 
@@ -1169,7 +1256,7 @@ mod tests {
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
         for key in [
-            "\"schemaVersion\": 3",
+            "\"schemaVersion\": 4",
             "\"dependencies\"",
             "\"installedAt\"",
             "\"givenAt\"",
@@ -1331,5 +1418,107 @@ mod tests {
         m.dependencies = vec![dep(&long), dep(&long)];
         let msg = m.validate().unwrap_err().to_string();
         assert!(msg.len() < 128 && !msg.contains('\u{1b}'), "{msg:?}");
+    }
+
+    // ---------------------------------------------------------------- Phase 6D Task 4: schema v4, package
+
+    fn package(id: &str) -> PackageMeta {
+        PackageMeta {
+            id: id.into(),
+            version: "1.2.0".into(),
+            digest: HASH_A.into(),
+            requested_dependencies: vec!["vcrun2022".into(), "dxvk".into()],
+            requested_permissions: vec!["network=allow".into(), "gpu=on".into()],
+        }
+    }
+
+    #[test]
+    fn v4_round_trip_preserves_the_package_record_in_camel_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        let mut m = sample("app");
+        m.package = Some(package("app"));
+        m.write_atomic(&path).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), m);
+        let text = fs::read_to_string(&path).unwrap();
+        for key in [
+            "\"schemaVersion\": 4",
+            "\"package\"",
+            "\"requestedDependencies\"",
+            "\"requestedPermissions\"",
+            "\"network=allow\"",
+        ] {
+            assert!(text.contains(key), "{key} missing in {text}");
+        }
+    }
+
+    #[test]
+    fn a_v3_file_without_a_package_key_still_reads_as_none() {
+        let mut v: serde_json::Value = serde_json::from_str(&json(&sample("app"))).unwrap();
+        v["schemaVersion"] = serde_json::json!(3);
+        assert!(v.as_object_mut().unwrap().remove("package").is_some());
+        let m = Metadata::parse(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!((m.schema_version, m.package), (3, None));
+    }
+
+    #[test]
+    fn the_package_record_is_bounded_on_write_and_read() {
+        type Set = fn(&mut PackageMeta);
+        let bad: Vec<(&str, Set)> = vec![
+            ("17 dependencies", |p| {
+                p.requested_dependencies = (0..17).map(|i| format!("p{i}")).collect()
+            }),
+            ("duplicate dependency", |p| {
+                p.requested_dependencies = vec!["a".into(), "a".into()]
+            }),
+            ("uppercase dependency", |p| p.requested_dependencies = vec!["VC".into()]),
+            ("traversal dependency", |p| {
+                p.requested_dependencies = vec!["../x".into()]
+            }),
+            ("empty dependency", |p| p.requested_dependencies = vec![String::new()]),
+            ("long dependency", |p| p.requested_dependencies = vec!["a".repeat(65)]),
+            ("unknown permission", |p| {
+                p.requested_permissions = vec!["filesystem=/".into()]
+            }),
+            ("bad value", |p| p.requested_permissions = vec!["network=maybe".into()]),
+            ("padded permission", |p| {
+                p.requested_permissions = vec!["network=allow ".into()]
+            }),
+            ("duplicate permission", |p| {
+                p.requested_permissions = vec!["gpu=on".into(), "gpu=on".into()]
+            }),
+            ("digest", |p| p.digest = HASH_A.to_uppercase()),
+            ("empty version", |p| p.version = String::new()),
+            ("version charset", |p| p.version = "1 0".into()),
+            ("long version", |p| p.version = "1".repeat(65)),
+            ("other id", |p| p.id = "other".into()),
+        ];
+        for (what, set) in bad {
+            let mut m = sample("app");
+            let mut p = package("app");
+            set(&mut p);
+            m.package = Some(p);
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, MetaError::BadPackage(_) | MetaError::BadSha256 { .. }),
+                "{what}: {err:?}"
+            );
+            let bytes = serde_json::to_vec(&m).unwrap();
+            assert!(Metadata::parse(&bytes).is_err(), "read accepted {what}");
+            assert!(m.write_atomic(&tempfile::tempdir().unwrap().path().join("m")).is_err());
+        }
+        // The limits themselves are fine: 16 ids, every permission EXPR, an empty request list.
+        let mut m = sample("app");
+        let mut p = package("app");
+        p.requested_dependencies = (0..16).map(|i| format!("p{i}")).collect();
+        p.requested_permissions = REQUESTABLE_PERMISSIONS.iter().map(|s| (*s).to_owned()).collect();
+        m.package = Some(p);
+        m.validate().unwrap();
+        m.package = Some(PackageMeta {
+            requested_dependencies: vec![],
+            requested_permissions: vec![],
+            ..package("app")
+        });
+        m.validate().unwrap();
     }
 }

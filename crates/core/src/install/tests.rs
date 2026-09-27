@@ -1,6 +1,7 @@
 use super::*;
 use crate::fake::{Call, FakeBackend};
 use crate::testutil::*;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
@@ -110,14 +111,14 @@ impl Fx {
 fn named(name: &str) -> InstallOpts {
     InstallOpts {
         name: Some(name.into()),
-        exe: None,
+        ..InstallOpts::default()
     }
 }
 
 fn with_exe(exe: &str) -> InstallOpts {
     InstallOpts {
-        name: None,
         exe: Some(exe.into()),
+        ..InstallOpts::default()
     }
 }
 
@@ -155,7 +156,8 @@ fn a_portable_exe_installs_end_to_end() {
     assert_eq!(md.architecture, "x86_64");
     assert_eq!(md.executable, "C:\\Program Files\\runtime-fixture\\hello64.exe");
     assert_eq!(md.environment, "default");
-    assert_eq!(md.schema_version, 3, "new installs write schema 3");
+    assert_eq!(md.schema_version, 4, "new installs write schema 4");
+    assert_eq!(md.package, None);
     assert!(md.dependencies.is_empty());
     assert_eq!(md.backend.id, "fake");
     assert_eq!(md.backend.version, "fake-1.0");
@@ -184,6 +186,41 @@ fn a_32_bit_exe_is_accepted_and_recorded_as_x86() {
     );
     let md = f.store.read_metadata(&f.store.get(&out.id).unwrap()).unwrap();
     assert_eq!(md.architecture, "x86");
+}
+
+#[test]
+fn a_program_the_backend_cannot_run_is_refused_before_anything_is_created() {
+    use crate::backend::{Capabilities, Unsupported};
+    let only64 = Capabilities {
+        arches: &[Arch::X86_64],
+        ..FakeBackend::new().capabilities()
+    };
+    let f = fx_with(FakeBackend::new().with_capabilities(only64));
+    let e = f
+        .run(
+            &f.input("hello32.exe", &fixture("hello32.exe")),
+            &InstallOpts::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, InstallError::Unsupported(Unsupported::Arch { backend: "fake", arch }) if arch == "x86"),
+        "{e:?}"
+    );
+    f.assert_nothing_created("x86 on an x86-64-only backend");
+    // A console program on a GUI-only backend.
+    let gui_only = Capabilities {
+        subsystems: &[Subsystem::Gui],
+        ..FakeBackend::new().capabilities()
+    };
+    let f = fx_with(FakeBackend::new().with_capabilities(gui_only));
+    let e = f
+        .run(&f.input("hello64.exe", &hello64()), &InstallOpts::default())
+        .unwrap_err();
+    assert!(
+        matches!(&e, InstallError::Unsupported(Unsupported::Subsystem { .. })),
+        "{e:?}"
+    );
+    f.assert_nothing_created("console on a GUI-only backend");
 }
 
 #[test]
@@ -577,6 +614,9 @@ impl Wrap {
 }
 
 impl CompatBackend for Wrap {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }
@@ -1476,4 +1516,194 @@ fn install_error_cause_looks_through_cleanup_problems() {
         e.to_string(),
         "a DLL is not an application; in addition: a; in addition: b"
     );
+}
+
+// ---------------------------------------------------------------- Phase 6D: package mode (subtree, digests, fixed id)
+
+fn sha(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+/// A `.wrun`-shaped archive: `wrun.toml` first, then `payload/App/app.exe`, `payload/App/data.txt` and `extra`.
+fn package_zip(extra: &[Raw]) -> Vec<u8> {
+    let mut entries = vec![
+        Raw::file("wrun.toml", b"format = 1\n"),
+        Raw::file("payload/App/app.exe", &prog()),
+        Raw::file("payload/App/data.txt", b"data"),
+    ];
+    entries.extend_from_slice(extra);
+    raw_zip(&entries)
+}
+
+fn package_digests() -> BTreeMap<String, [u8; 32]> {
+    BTreeMap::from([
+        ("payload/App/app.exe".to_owned(), sha(&prog())),
+        ("payload/App/data.txt".to_owned(), sha(b"data")),
+    ])
+}
+
+fn package_meta() -> PackageMeta {
+    PackageMeta {
+        id: "example-app".into(),
+        version: "1.2.0".into(),
+        digest: "ab".repeat(32),
+        requested_dependencies: vec!["vcrun2022".into()],
+        requested_permissions: vec!["network=allow".into()],
+    }
+}
+
+fn package_opts() -> InstallOpts {
+    InstallOpts {
+        name: Some("Example App".into()),
+        exe: Some("App/app.exe".into()),
+        id: Some(AppId::parse("example-app").unwrap()),
+        subtree: Some("payload".into()),
+        digests: Some(package_digests()),
+        package: Some(package_meta()),
+        expect_arch: Some(Arch::X86_64),
+    }
+}
+
+/// Every path below `dir` with its bytes: equal before and after means nothing was touched.
+fn tree_with_contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    tree(dir)
+        .into_iter()
+        .map(|p| {
+            let bytes = if p.ends_with('/') {
+                Vec::new()
+            } else {
+                fs::read(dir.join(&p)).unwrap()
+            };
+            (p, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn a_package_subtree_installs_under_program_files_with_its_fixed_id_and_record() {
+    let f = fx();
+    let path = f.input("example.wrun", &package_zip(&[]));
+    let out = f.ok(&path, &package_opts());
+    assert_eq!(out.id.as_str(), "example-app");
+    assert_eq!(
+        out.executable.to_string(),
+        "C:\\Program Files\\example-app\\App\\app.exe"
+    );
+    let env = f.store.get(&out.id).unwrap();
+    let dir = env.drive_c().join("Program Files/example-app");
+    assert_eq!(
+        tree(&dir),
+        ["App/", "App/app.exe", "App/data.txt"],
+        "nothing from outside the subtree"
+    );
+    assert_eq!(fs::read(dir.join("App/app.exe")).unwrap(), prog());
+    let md = f.store.read_metadata(&env).unwrap();
+    assert_eq!(md.package, Some(package_meta()));
+    assert_eq!(md.name, "Example App");
+    assert_eq!(md.schema_version, 4);
+}
+
+#[test]
+fn an_unlisted_package_file_is_refused_before_anything_is_created() {
+    let f = fx();
+    let path = f.input("x.wrun", &package_zip(&[Raw::file("payload/extra.txt", b"x")]));
+    let err = f.run(&path, &package_opts()).unwrap_err();
+    assert!(
+        matches!(err.cause(), InstallError::Zip(ZipError::Unlisted { .. })),
+        "{err:?}"
+    );
+    f.assert_nothing_created("unlisted");
+}
+
+#[test]
+fn a_flipped_payload_byte_fails_the_install_and_removes_the_app() {
+    let f = fx();
+    let path = f.input("x.wrun", &package_zip(&[]));
+    let mut opts = package_opts();
+    opts.digests
+        .as_mut()
+        .unwrap()
+        .insert("payload/App/data.txt".into(), sha(b"dat4"));
+    let err = f.run(&path, &opts).unwrap_err();
+    assert!(
+        matches!(err.cause(), InstallError::Zip(ZipError::Integrity { .. })),
+        "{err:?}"
+    );
+    f.assert_no_app_left("integrity");
+}
+
+#[test]
+fn a_listed_file_missing_from_the_archive_or_a_special_entry_is_refused() {
+    let f = fx();
+    let mut opts = package_opts();
+    opts.digests
+        .as_mut()
+        .unwrap()
+        .insert("payload/App/gone.txt".into(), sha(b"x"));
+    let err = f.run(&f.input("a.wrun", &package_zip(&[])), &opts).unwrap_err();
+    assert!(matches!(err, InstallError::Package(_)), "{err:?}");
+    let link = Raw::special("payload/App/link", 0o120_777, b"/etc/passwd");
+    let err = f
+        .run(&f.input("b.wrun", &package_zip(&[link])), &package_opts())
+        .unwrap_err();
+    assert!(matches!(err, InstallError::Package(_)), "{err:?}");
+    f.assert_nothing_created("missing or special");
+}
+
+#[test]
+fn package_options_on_a_portable_exe_are_refused() {
+    let f = fx();
+    let err = f.run(&f.input("app.exe", &prog()), &package_opts()).unwrap_err();
+    assert!(matches!(err, InstallError::Package(_)), "{err:?}");
+    f.assert_nothing_created("exe with digests");
+}
+
+#[test]
+fn an_arch_mismatch_is_refused_before_anything_is_created() {
+    let f = fx();
+    let opts = InstallOpts {
+        expect_arch: Some(Arch::X86),
+        ..package_opts()
+    };
+    let err = f.run(&f.input("x.wrun", &package_zip(&[])), &opts).unwrap_err();
+    assert!(
+        matches!(&err, InstallError::Mismatch { expected, found } if expected == "x86" && found == "x86_64"),
+        "{err:?}"
+    );
+    f.assert_nothing_created("arch mismatch");
+}
+
+#[test]
+fn a_taken_fixed_id_is_refused_and_the_existing_app_is_untouched() {
+    let f = fx();
+    let existing = f.ok(&f.input("hello64.exe", &hello64()), &named("Example App"));
+    assert_eq!(existing.id.as_str(), "example-app");
+    let before = tree_with_contents(&f.apps());
+    let calls = f.backend.calls().len();
+    let err = f
+        .run(&f.input("x.wrun", &package_zip(&[])), &package_opts())
+        .unwrap_err();
+    assert!(
+        matches!(&err, InstallError::IdTaken(id) if id.as_str() == "example-app"),
+        "{err:?}"
+    );
+    assert_eq!(tree_with_contents(&f.apps()), before, "the existing app changed");
+    assert_eq!(f.backend.calls().len(), calls, "the backend was called");
+    // No second id was tried either.
+    assert_eq!(f.store.list().len(), 1);
+}
+
+#[test]
+fn a_plain_install_of_a_wrun_package_is_refused_with_the_import_hint() {
+    let f = fx();
+    let err = f
+        .run(&f.input("x.zip", &package_zip(&[])), &InstallOpts::default())
+        .unwrap_err();
+    assert!(matches!(err, InstallError::WrunPackage), "{err:?}");
+    assert_eq!(err.to_string(), "this is a .wrun package: use `runtime import`");
+    f.assert_nothing_created("wrun via install");
+    // A zip that merely contains a wrun.toml somewhere else is an ordinary archive.
+    let zip = raw_zip(&[Raw::file("app.exe", &prog()), Raw::file("wrun.toml", b"")]);
+    f.ok(&f.input("y.zip", &zip), &InstallOpts::default());
 }

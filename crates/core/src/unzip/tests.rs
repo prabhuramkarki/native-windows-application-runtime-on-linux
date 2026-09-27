@@ -1312,3 +1312,77 @@ fn the_guarded_reader_masks_from_the_files_real_cursor_not_from_zero() {
     g.read_exact(&mut buf).unwrap();
     assert_eq!(buf, [0xAA; 8]);
 }
+
+// ---------------------------------------------------------------- verified extraction (per-file sha256)
+
+fn sha(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
+#[test]
+fn extract_verified_writes_files_whose_streamed_bytes_match_their_digest() {
+    let zip = raw_zip(&[Raw::file("d/a.txt", b"hello"), Raw::deflated("b.bin", &[7u8; 5000])]);
+    let mut o = open_default(&zip).unwrap();
+    let (_t, dest) = dest();
+    let digest = |p: &[String]| match p.join("/").as_str() {
+        "d/a.txt" => Some(sha(b"hello")),
+        "b.bin" => Some(sha(&[7u8; 5000])),
+        _ => None,
+    };
+    let n = extract_verified(&mut o.archive, &o.plan, &dest, &Limits::default(), &digest).unwrap();
+    assert_eq!(n, 5005);
+    assert_eq!(tree(&dest), ["b.bin", "d/", "d/a.txt"]);
+}
+
+#[test]
+fn extract_verified_refuses_a_digest_mismatch_found_while_streaming() {
+    let zip = raw_zip(&[Raw::file("a.txt", b"hello"), Raw::file("b.txt", b"tampered")]);
+    let mut o = open_default(&zip).unwrap();
+    let (_t, dest) = dest();
+    let digest = |p: &[String]| {
+        Some(if p[0] == "a.txt" {
+            sha(b"hello")
+        } else {
+            sha(b"original")
+        })
+    };
+    let err = extract_verified(&mut o.archive, &o.plan, &dest, &Limits::default(), &digest).unwrap_err();
+    assert!(
+        matches!(&err, ZipError::Integrity { name } if name == "\"b.txt\""),
+        "{err}"
+    );
+}
+
+#[test]
+fn extract_verified_refuses_an_unlisted_file_before_creating_anything() {
+    let zip = raw_zip(&[Raw::file("d/a.txt", b"hello"), Raw::file("extra.txt", b"x")]);
+    let mut o = open_default(&zip).unwrap();
+    let (_t, dest) = dest();
+    let digest = |p: &[String]| (p.join("/") == "d/a.txt").then(|| sha(b"hello"));
+    let err = extract_verified(&mut o.archive, &o.plan, &dest, &Limits::default(), &digest).unwrap_err();
+    assert!(
+        matches!(&err, ZipError::Unlisted { name } if name.contains("extra.txt")),
+        "{err}"
+    );
+    assert!(tree(&dest).is_empty(), "{:?}", tree(&dest));
+}
+
+#[test]
+fn copy_verified_streams_one_entry_and_checks_size_and_digest() {
+    let zip = raw_zip(&[Raw::file("a", b"hello"), Raw::file("short", &[1u8; 10]).declared(20)]);
+    let mut o = open_default(&zip).unwrap();
+    let limits = Limits::default();
+    let mut out = Vec::new();
+    let a = o.plan.files[0].clone();
+    assert_eq!(
+        copy_verified(&mut o.archive, &a, &mut out, sha(b"hello"), &limits).unwrap(),
+        5
+    );
+    assert_eq!(out, b"hello");
+    let err = copy_verified(&mut o.archive, &a, &mut io::sink(), sha(b"other"), &limits).unwrap_err();
+    assert!(matches!(err, ZipError::Integrity { .. }), "{err}");
+    let short = o.plan.files[1].clone();
+    let err = copy_verified(&mut o.archive, &short, &mut io::sink(), sha(&[1u8; 10]), &limits).unwrap_err();
+    assert!(matches!(err, ZipError::ShortEntry { .. }), "{err}");
+}

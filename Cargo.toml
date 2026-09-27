@@ -13,6 +13,7 @@ default-members = [
     "crates/deps",
     "crates/desktop",
     "crates/installer",
+    "crates/package",
     "crates/pe",
     "crates/sandbox",
 ]
@@ -21,6 +22,7 @@ default-members = [
 version = "0.0.1"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 # as_chunks needs 1.88 (is_multiple_of 1.87)
 rust-version = "1.88"
 

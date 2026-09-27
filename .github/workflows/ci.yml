@@ -44,8 +44,9 @@ jobs:
   # fixture gui64.exe runs only as the dependency engine's "hanging installer" (its message box waits on Wine's
   # null-driver desktop until the 20 s deadline kills the sandbox); the other fixtures are console programs.
   #
-  # THIS JOB HAS NEVER RUN ON A HOSTED RUNNER AND DOES NOT GATE ANYTHING (`continue-on-error`). Everything in it was
-  # verified only locally, on Ubuntu 26.04 with its own Wine 10.0 (10.0~repack-12ubuntu1) and bubblewrap 0.11.1.
+  # THIS JOB DOES NOT GATE ANYTHING (`continue-on-error`). It has run on a hosted runner once (commit 9cf1e27,
+  # 2026-09-26) and passed; everything in it was verified locally, on Ubuntu 26.04 with its own Wine 10.0
+  # (10.0~repack-12ubuntu1) and bubblewrap 0.11.1.
   # Remove `continue-on-error` only after green hosted runs show it is stable.
   #
   # Why a container: the real-Wine tests need Wine 10 (the dependency tests refuse anything older up front), and

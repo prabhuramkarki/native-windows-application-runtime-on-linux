@@ -95,6 +95,8 @@ fn opts() -> InstallerOpts {
         allow_network: false,
         exe_override: None,
         runtime_exe: std::env::current_exe().unwrap(),
+        id: None,
+        package: None,
     }
 }
 
@@ -205,7 +207,7 @@ exit 5
         "the Uninstall DisplayName wins over the provisional file-stem name"
     );
     assert_eq!(md.executable, "C:\\Program Files\\HelloNsis\\hello.exe");
-    assert_eq!(md.schema_version, 3, "new installs write schema 3");
+    assert_eq!(md.schema_version, 4, "new installs write schema 4");
     let installer = md.installer.as_ref().expect("installer field (added in schema v2)");
     assert_eq!(installer.family, "nsis");
     assert_eq!(installer.product_name.as_deref(), Some("Hello Nsis"));
@@ -322,6 +324,26 @@ fn silent_on_an_unrecognised_installer_family_creates_nothing() {
 }
 
 #[test]
+fn a_backend_without_installer_support_is_refused_before_anything_is_created() {
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let backend = FakeBackend::new().with_capabilities(rt_core::backend::Capabilities {
+        installers: false,
+        ..FakeBackend::new().capabilities()
+    });
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallerError::Unsupported(rt_core::backend::Unsupported::Feature { backend: "fake", .. })
+        ),
+        "{err}"
+    );
+    assert!(!f.apps().exists());
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
 fn unrecognised_file_formats_are_refused_before_anything_is_created() {
     let f = fx();
     let backend = FakeBackend::new();
@@ -386,6 +408,80 @@ fn exe_override_skips_discovery_and_installs_the_named_file() {
     assert_eq!(executable.to_string(), "C:\\App\\two.exe");
 }
 
+// ---------------------------------------------------------------- package mode: fixed id and package record
+
+fn package_meta(id: &str) -> rt_core::PackageMeta {
+    rt_core::PackageMeta {
+        id: id.into(),
+        version: "1.0".into(),
+        digest: "ab".repeat(32),
+        requested_dependencies: vec!["vcrun2022".into()],
+        requested_permissions: vec!["network=allow".into()],
+    }
+}
+
+#[test]
+fn a_taken_fixed_id_is_refused_and_the_existing_app_is_untouched() {
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let id = AppId::parse("my-app").unwrap();
+    let env = f.store.create(&id).unwrap();
+    fs::write(env.root().join("config/keep"), "precious").unwrap();
+    let listing = || {
+        let mut v: Vec<_> = walkdir(f.apps());
+        v.sort();
+        v
+    };
+    let before = listing();
+    let backend = FakeBackend::new();
+    let opts = InstallerOpts {
+        id: Some(id.clone()),
+        package: Some(package_meta("my-app")),
+        ..opts()
+    };
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap_err();
+    assert!(matches!(&err, InstallerError::IdTaken(taken) if *taken == id), "{err}");
+    assert_eq!(listing(), before, "the existing app changed");
+    assert!(backend.calls().is_empty(), "{:?}", backend.calls());
+    assert_eq!(fs::read_dir(f.apps()).unwrap().count(), 1, "another id was tried");
+}
+
+/// Every path below `dir` with its bytes.
+fn walkdir(dir: PathBuf) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            out.push((p.clone(), Vec::new()));
+            out.extend(walkdir(p));
+        } else {
+            out.push((p.clone(), fs::read(&p).unwrap()));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_fixed_id_and_the_package_record_are_used_as_given() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let backend = fake_backend(AMBIGUOUS_SCRIPT);
+    let opts = InstallerOpts {
+        exe_override: Some("App/two.exe".to_owned()),
+        id: Some(AppId::parse("my-app").unwrap()),
+        package: Some(package_meta("my-app")),
+        ..opts()
+    };
+    let outcome = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts).unwrap();
+    let InstallOutcome::Installed { id, .. } = outcome else {
+        panic!("expected Installed, got {outcome:?}");
+    };
+    assert_eq!(id.as_str(), "my-app");
+    let md = f.store.read_metadata(&f.store.get(&id).unwrap()).unwrap();
+    assert_eq!(md.package, Some(package_meta("my-app")));
+}
+
 // ---------------------------------------------------------------- cleanup on a late failure (after the run)
 
 /// Delegates to a `FakeBackend`, but can fail `version`/`command` on demand (mirrors
@@ -416,6 +512,9 @@ impl Wrap {
 }
 
 impl CompatBackend for Wrap {
+    fn capabilities(&self) -> rt_core::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }
@@ -774,4 +873,34 @@ fn an_unusable_runtime_executable_is_a_sandbox_refusal_and_nothing_runs() {
             backend.calls()
         );
     }
+}
+
+#[test]
+fn an_installed_program_of_an_architecture_the_backend_lacks_is_refused_and_cleaned_up() {
+    let Some(_bwrap) = require_real_bwrap() else { return };
+    let f = fx();
+    let bytes = fixture("hello-nsis.exe");
+    let path = f.input("hello-nsis.exe", &bytes);
+    // The "installed" program is a copy of the installer itself: the backend supports the other architecture only.
+    let other: &'static [pe::Arch] = match pe::analyze(&bytes).unwrap().arch {
+        pe::Arch::X86 => &[pe::Arch::X86_64],
+        _ => &[pe::Arch::X86],
+    };
+    let script = r#"
+dest_dir="$WINEPREFIX/drive_c/Program Files/HelloNsis"
+mkdir -p "$dest_dir" && cp "$0" "$dest_dir/hello.exe"
+"#;
+    let backend = fake_backend(script).with_capabilities(rt_core::backend::Capabilities {
+        arches: other,
+        ..rt_core::FAKE_CAPABILITIES
+    });
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallerError::Unsupported(rt_core::backend::Unsupported::Arch { .. })
+        ),
+        "{err}"
+    );
+    f.assert_no_app_left();
 }

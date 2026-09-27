@@ -803,7 +803,16 @@ fn wine(input: &DoctorInput<'_>, out: &mut Out) {
             format!("Wine is not usable: {}", clean(why, 250)),
         ),
         Ok(backend) => match backend.version() {
-            Ok(v) => out.add(Area::Runtime, Status::Ok, format!("Wine: {}", clean(&v, 80))),
+            Ok(v) => out.add(
+                Area::Runtime,
+                Status::Ok,
+                format!(
+                    "Wine: {}; backend {}, interface {}",
+                    clean(&v, 80),
+                    backend.id(),
+                    crate::BACKEND_API_VERSION
+                ),
+            ),
             Err(e) => out.add(
                 Area::Runtime,
                 Status::Warn,

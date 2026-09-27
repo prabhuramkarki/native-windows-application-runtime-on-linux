@@ -4,11 +4,15 @@
 //! Only compiled under `cfg(any(test, feature = "testing"))`; dependents enable the `testing` feature through a
 //! dev-dependency only, so it is never in a default or release build.
 //!
-//! POSIX only: `command` builds `/bin/sh -c <script> <exe> <args...>`, so inside the script `$0` is the exe path and
+//! `command` refuses an exe or cwd outside `drive_c` like every backend (`backend::inside_drive_c`), so the exe must
+//! be a real file below `drive_c` (a test writes one). POSIX only: it builds `/bin/sh -c <script> <exe> <args...>`,
+//! so inside the script `$0` is the exe path and
 //! `"$@"` are the arguments verbatim (no shell ever parses them). Scripts can check the child's environment with
 //! `/usr/bin/env >&2` (stderr goes to the log file), and exit codes with `exit N`. Like a real backend it sets
 //! `WINEPREFIX` on the command, so tests can prove that the launcher re-applies backend variables.
+use crate::backend::{Capabilities, Want, inside_drive_c};
 use crate::{AppEnv, AppId, BackendError, CompatBackend, RunOpts};
+use pe::{Arch, Subsystem};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
@@ -40,8 +44,19 @@ pub struct FakeBackend {
     script: String,
     fail_prepare: bool,
     dll_dirs: Vec<PathBuf>,
+    capabilities: Capabilities,
     calls: Mutex<Vec<Call>>,
 }
+
+/// [`FakeBackend`]'s default capabilities: both architectures and subsystems, every feature.
+pub const FAKE_CAPABILITIES: Capabilities = Capabilities {
+    arches: &[Arch::X86, Arch::X86_64],
+    subsystems: &[Subsystem::Gui, Subsystem::Console],
+    dotnet: true,
+    installers: true,
+    dependency_packages: true,
+    sandboxable: true,
+};
 
 impl Default for FakeBackend {
     fn default() -> Self {
@@ -61,6 +76,7 @@ impl FakeBackend {
             script: script.to_owned(),
             fail_prepare: false,
             dll_dirs: Vec::new(),
+            capabilities: FAKE_CAPABILITIES,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -73,6 +89,12 @@ impl FakeBackend {
 
     pub fn with_dll_dirs(mut self, dirs: Vec<PathBuf>) -> FakeBackend {
         self.dll_dirs = dirs;
+        self
+    }
+
+    /// Declares `capabilities` instead of [`FAKE_CAPABILITIES`] (the refusals by capability are tested with it).
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> FakeBackend {
+        self.capabilities = capabilities;
         self
     }
 
@@ -93,6 +115,10 @@ impl CompatBackend for FakeBackend {
 
     fn version(&self) -> Result<String, BackendError> {
         Ok("fake-1.0".into())
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     fn prepare(&self, env: &AppEnv) -> Result<(), BackendError> {
@@ -124,6 +150,9 @@ impl CompatBackend for FakeBackend {
             debug: opts.debug,
             dotnet: opts.dotnet,
         });
+        // The contract's containment, as every backend keeps it (`inside_drive_c`).
+        let exe_unix = inside_drive_c(env, exe_unix, "executable", Want::File)?;
+        let cwd_unix = inside_drive_c(env, cwd_unix, "working directory", Want::Dir)?;
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
             .arg(&self.script)
@@ -157,9 +186,17 @@ mod tests {
         (tmp, env)
     }
 
+    /// `drive_c/app.exe` (created, with `drive_c`, if missing).
+    fn exe(env: &AppEnv) -> PathBuf {
+        fs::create_dir_all(env.drive_c()).unwrap();
+        let exe = env.drive_c().join("app.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        exe
+    }
+
     fn run_log(b: &FakeBackend, env: &AppEnv, args: &[OsString]) -> (Option<i32>, String) {
         let cmd = b
-            .command(env, Path::new("/x/app.exe"), &env.drive_c(), args, &RunOpts::default())
+            .command(env, &exe(env), &env.drive_c(), args, &RunOpts::default())
             .unwrap();
         let l = Launcher::with_host_env([("PATH", "/usr/bin:/bin")]);
         let r = l.spawn(cmd, env, LogSink::LogOnly).unwrap();
@@ -196,9 +233,10 @@ mod tests {
         let b = FakeBackend::new();
         b.prepare(&env).unwrap();
         let args = vec![OsString::from("a b"), OsString::from("--x")];
+        let exe = exe(&env);
         b.command(
             &env,
-            Path::new("/x/app.exe"),
+            &exe,
             &env.drive_c(),
             &args,
             &RunOpts {
@@ -213,7 +251,7 @@ mod tests {
             [
                 Call::Command {
                     app: env.id().clone(),
-                    exe: "/x/app.exe".into(),
+                    exe,
                     cwd: env.drive_c(),
                     args,
                     debug: true,
@@ -229,6 +267,25 @@ mod tests {
             FakeBackend::new().with_dll_dirs(vec!["/d".into()]).dll_dirs(),
             [PathBuf::from("/d")]
         );
+    }
+
+    #[test]
+    fn the_command_refuses_an_exe_or_cwd_outside_drive_c() {
+        let (_t, env) = env();
+        let b = FakeBackend::new();
+        let inside = exe(&env);
+        fs::write(env.prefix().join("evil.exe"), b"MZ").unwrap();
+        for (e, cwd) in [
+            (env.prefix().join("evil.exe"), env.drive_c()),
+            (env.drive_c().join("../evil.exe"), env.drive_c()),
+            (inside.clone(), env.prefix()),
+        ] {
+            let r = b.command(&env, &e, &cwd, &[], &RunOpts::default());
+            assert!(
+                matches!(r, Err(BackendError::OutsideDriveC { .. })),
+                "{e:?} {cwd:?}: {r:?}"
+            );
+        }
     }
 
     #[test]
@@ -251,7 +308,10 @@ mod tests {
             .to_vec();
         let (code, log) = run_log(&b, &env, &args);
         assert_eq!(code, Some(0));
-        let want = "/x/app.exe\n<a b>\n<$(touch pwned)>\n<x;y>\n<l1\nl2>\n<'q'>\n<`id`>\n<*>\n<-n>\n";
+        let log = log
+            .strip_prefix(&format!("{}\n", exe(&env).display()))
+            .unwrap_or_else(|| panic!("$0 is not the exe: {log}"));
+        let want = "<a b>\n<$(touch pwned)>\n<x;y>\n<l1\nl2>\n<'q'>\n<`id`>\n<*>\n<-n>\n";
         assert_eq!(log, want);
         assert!(!env.drive_c().join("pwned").exists());
     }

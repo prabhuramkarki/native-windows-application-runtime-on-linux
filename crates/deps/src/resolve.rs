@@ -18,6 +18,9 @@ pub struct Facts {
     pub imports: Vec<String>,
     /// Capabilities known from elsewhere (installer family, MSI facts), as manifest `provides` names.
     pub extra_capabilities: Vec<String>,
+    /// Package ids an imported `.wrun` requested (`Metadata::package`): planned as roots, behind the same consent
+    /// as any other package. Ids not in the manifest add nothing (the caller warns).
+    pub requested: Vec<String>,
 }
 
 /// Packages the runtime itself recorded as installed for this app (never inferred from prefix files).
@@ -102,6 +105,7 @@ pub fn resolve(facts: &Facts, installed: &InstalledSet, denied: &[String], manif
     let mut stack: Vec<&str> = required
         .iter()
         .filter_map(|c| provider.get(c.as_str()).copied())
+        .chain(facts.requested.iter().map(String::as_str))
         .collect();
     // `required` is sorted; clipping can only merge neighbours, so dedup after it keeps the result sorted-unique.
     let mut unsatisfied: Vec<String> = required
