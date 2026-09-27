@@ -103,6 +103,16 @@ pub struct AppPlan {
     pub warnings: Vec<String>,
 }
 
+/// Why a plan entry that [`AppPlan::is_requested`] is there, for front ends to show next to it.
+pub const REQUESTED_REASON: &str = "requested by the package";
+
+impl AppPlan {
+    /// Whether `package` is in the plan because the imported package requested it ([`REQUESTED_REASON`]).
+    pub fn is_requested(&self, package: &str) -> bool {
+        self.facts.requested.iter().any(|r| r == package)
+    }
+}
+
 pub struct Orchestrator<'a> {
     pub manifest: &'a Manifest,
     /// Passed to the fetcher, which creates and checks it.
@@ -315,6 +325,15 @@ pub fn plan_for_pe(
         Err(why) => warnings.push(line(&format!(
             "cannot read the app's executable ({why}); the plan does not include what it imports"
         ))),
+    }
+    for id in md.package.iter().flat_map(|p| &p.requested_dependencies) {
+        if manifest.get(id).is_some() {
+            facts.requested.push(id.clone());
+        } else {
+            warnings.push(line(&format!(
+                "the package requested {id:?}, which is not an available dependency package; it is not planned"
+            )));
+        }
     }
     let mut plan = resolve(&facts, &state::installed_set(md), &[], manifest);
     block_for_vulkan(&mut plan, manifest, vulkan);

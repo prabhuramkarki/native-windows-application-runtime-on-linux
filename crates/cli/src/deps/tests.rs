@@ -100,6 +100,7 @@ impl Rig {
         let facts = rt_deps::Facts {
             imports: imports.iter().map(|s| (*s).to_owned()).collect(),
             extra_capabilities: vec![],
+            requested: vec![],
         };
         let md = self.store.read_metadata(&self.env).unwrap();
         let plan = rt_deps::resolve(&facts, &rt_deps::installed_set(&md), &[], &self.manifest);

@@ -477,6 +477,13 @@ mod tests {
                 installed_at: 1,
                 consent: None,
             }];
+            m.package = Some(rt_core::PackageMeta {
+                id: "r".into(),
+                version: "1.0".into(),
+                digest: "ab".repeat(32),
+                requested_dependencies: vec!["vcrun2022".into()],
+                requested_permissions: vec!["network=allow".into()],
+            });
         });
         round_trip(rt.version());
         let list = rt.apps();
@@ -485,6 +492,9 @@ mod tests {
         let d = round_trip(rt.app("r").unwrap());
         assert!(d["installer"]["productName"].is_string() && d["prefix"]["hasDriveC"].is_boolean());
         assert!(d["dependencies"][0]["installedAt"].is_number());
+        assert_eq!(d["package"]["requestedPermissions"][0], "network=allow");
+        assert_eq!(d["package"]["requestedDependencies"][0], "vcrun2022");
+        assert_eq!(d["package"]["digest"], "ab".repeat(32));
         let env = rt.env("r").unwrap();
         let p = rt.permissions_with(&env, &ctx(_d.path())).unwrap();
         let j = round_trip(p);
@@ -681,6 +691,7 @@ mod tests {
             facts: rt_deps::Facts {
                 imports: vec![],
                 extra_capabilities: vec![],
+                requested: vec![],
             },
             plan: rt_deps::Plan {
                 entries: vec![rt_deps::PlanEntry {

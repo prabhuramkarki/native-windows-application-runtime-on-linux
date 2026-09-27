@@ -176,6 +176,7 @@ impl Rig {
         let facts = Facts {
             imports: imports.iter().map(|s| (*s).to_owned()).collect(),
             extra_capabilities: vec![],
+            requested: vec![],
         };
         let plan = resolve(&facts, &state::installed_set(&self.md()), &[], &self.manifest);
         AppPlan {
@@ -303,6 +304,7 @@ fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable
     let facts = Facts {
         imports: vec![],
         extra_capabilities: vec!["d3d11".into(), "x".into()],
+        requested: vec![],
     };
     let unusable = |_: Option<(u32, u32)>| VulkanVerdict::Unusable("no device".into());
     let mut plan = resolve(&facts, &state::installed_set(&r.md()), &[], &r.manifest);
@@ -1574,3 +1576,40 @@ fn execute_never_fetches_a_gated_install_without_consent() {
 }
 
 mod e2e;
+
+// ---------------------------------------------------------------- Phase 6D: what a package requested
+
+#[test]
+fn plan_for_pe_plans_requested_dependencies_as_roots_and_warns_about_unknown_ids() {
+    let (gated, _) = archive("gated", true, &[], &["vcruntime140"]);
+    let m = Manifest { packages: vec![gated] };
+    let mut md = md();
+    let unknown = |_: Option<(u32, u32)>| VulkanVerdict::Unknown;
+    let plain = plan_for_pe(&md, Err("not read"), &m, &unknown);
+    assert!(plain.plan.entries.is_empty() && !plain.is_requested("gated"));
+    md.package = Some(rt_core::PackageMeta {
+        id: "app".into(),
+        version: "1".into(),
+        digest: "ab".repeat(32),
+        requested_dependencies: vec!["gated".into(), "gone\u{1b}".into()],
+        requested_permissions: vec![],
+    });
+    let app = plan_for_pe(&md, Err("not read"), &m, &unknown);
+    assert_eq!(
+        app.plan.entries,
+        [PlanEntry {
+            package: "gated".into(),
+            action: Action::Install,
+            consent: ConsentState::Needed,
+        }],
+        "requested, still behind its consent"
+    );
+    assert!(app.is_requested("gated") && !app.is_requested("other"));
+    assert_eq!(REQUESTED_REASON, "requested by the package");
+    let warning = app
+        .warnings
+        .iter()
+        .find(|w| w.contains("gone"))
+        .expect("a warning for the unknown id");
+    assert!(!warning.contains('\u{1b}'), "{warning:?}");
+}
