@@ -278,7 +278,8 @@ fn grant_commands(m: &Manifest) -> String {
 /// The installer of an installer-kind package, extracted (verified) to
 /// `<data root>/staging/import-<pid>-<nanos>/<its file name>` (the file name is kept: the installer pipeline copies
 /// it into the prefix under that name). The directories are `0700`, the file `create_new` `0600`; the per-import
-/// directory is removed on drop, on every path.
+/// directory is removed on drop, on every path the process itself takes. A signal (a job cancel's SIGTERM, Ctrl-C,
+/// SIGKILL) skips the drop: the next import removes each `import-<pid>-*` whose process is gone ([`sweep`]).
 struct Staged {
     dir: PathBuf,
     file: PathBuf,
@@ -298,6 +299,7 @@ impl Staged {
         if !fs::symlink_metadata(&staging).is_ok_and(|m| m.is_dir()) {
             return Err(format!("{} is not a directory", staging.display()).into());
         }
+        sweep(&staging);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -307,6 +309,29 @@ impl Staged {
             file: dir.join(name),
             dir,
         })
+    }
+}
+
+/// Removes the staging directories of imports that were killed: `import-<pid>-<n>` whose `<pid>` is not a live
+/// process (no `/proc/<pid>`). Best effort; anything else in `staging` is left alone. A reused pid only delays the
+/// removal until that process ends.
+fn sweep(staging: &Path) {
+    let Ok(entries) = fs::read_dir(staging) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("import-"))
+            .and_then(|r| r.split_once('-'))
+            .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !Path::new("/proc").join(pid.to_string()).exists() {
+            // `remove_dir_all` does not follow a symlink at its root: it removes the link.
+            let _ = fs::remove_dir_all(e.path());
+        }
     }
 }
 

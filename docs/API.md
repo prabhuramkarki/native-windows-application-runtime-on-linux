@@ -470,7 +470,10 @@ command that would grant it. **Nothing is granted, downloaded or run**: dependen
 their consent, permissions `permissions.set`. `path` is checked as `apps.install`'s; there is no `name` or `exe` (the
 manifest has them). `silent` and `network` are the user's choices for an installer package (the job fails, exit 1,
 when either is set for a portable one). The job's `app` is `null`; the id is in the `Installed: <id>` event, and the
-job's first lines are the package summary (as `runtime inspect`), including that it is unsigned.
+job's first lines are the package summary (as `runtime inspect`), including that it is unsigned. A cancelled import
+(SIGTERM) can leave a half-built app under the package's id, and a retry is then refused as "already installed":
+`apps.remove` (or `runtime remove <id>`) clears it, and the import can be retried. Its staged installer file is
+removed by the next import.
 
 ```sh
 runtime rpc apps.import '{"path": "/home/me/Downloads/example.wrun"}'
