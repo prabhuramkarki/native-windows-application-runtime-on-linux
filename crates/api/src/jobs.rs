@@ -494,7 +494,8 @@ pub fn plan_digest(id: &AppId, plan: &rt_deps::AppPlan, manifest: &rt_deps::Mani
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn is_digest(s: &str) -> bool {
+/// A plan digest's form: 64 lowercase hex digits.
+pub fn is_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 

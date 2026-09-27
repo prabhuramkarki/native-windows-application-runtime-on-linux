@@ -3,6 +3,8 @@
 //! (not `run`: it would read the whole executable on every start).
 //!
 //! * `runtime deps <app>` prints the plan: no network, no writes.
+//! * `--install --plan-digest HEX` (what `runtimed` passes) first refuses, installing nothing, unless the plan is the
+//!   one whose `rt_api::jobs::plan_digest` the client showed.
 //! * `--install` fetches and installs it through `rt_deps::install_plan`, behind consent: a consent-gated package
 //!   shows its consent text in full, then asks y/N when stdin AND stdout are terminals. Otherwise only
 //!   `--yes <pkg>` consents (the text is still printed). Every `--yes` must name a package the plan installs and that needs consent,
@@ -51,6 +53,10 @@ pub struct DepsArgs {
     /// Repeat for each package; it always takes a package name.
     #[arg(long, value_name = "PKG", requires = "install")]
     yes: Vec<String>,
+    /// For clients that showed the plan to the user (runtimed): the plan's digest as they showed it; refuses,
+    /// installing nothing, when the plan differs
+    #[arg(long, value_name = "HEX", requires = "install", value_parser = parse_digest)]
+    plan_digest: Option<String>,
     /// Undo what an interrupted (killed) install of PKG left in the prefix, so it can be installed again
     #[arg(long, value_name = "PKG", conflicts_with = "install")]
     discard_interrupted: Option<String>,
@@ -72,7 +78,13 @@ pub fn run(args: DepsArgs) -> Result<u8, CmdError> {
     match (args.sub, args.app) {
         (Some(DepsSub::List), _) => crate::emit(&format_manifest(Manifest::bundled())).map(|()| 0),
         (Some(DepsSub::Cache { clear }), _) => cache(&cache_dir()?, clear),
-        (None, Some(app)) => run_app(&app, args.install, &args.yes, args.discard_interrupted.as_deref()),
+        (None, Some(app)) => run_app(
+            &app,
+            args.install,
+            &args.yes,
+            args.plan_digest.as_deref(),
+            args.discard_interrupted.as_deref(),
+        ),
         (None, None) => Err("an app id is required (see `runtime deps --help`)".into()),
     }
 }
@@ -95,7 +107,22 @@ pub(crate) fn app_env(store: &Store, arg: &str) -> Result<AppEnv, CmdError> {
     }
 }
 
-fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> Result<u8, CmdError> {
+/// `--plan-digest`: 64 lowercase hex digits (`rt_api::jobs::plan_digest`'s form).
+fn parse_digest(s: &str) -> Result<String, String> {
+    if rt_api::jobs::is_digest(s) {
+        Ok(s.to_owned())
+    } else {
+        Err("must be 64 lowercase hex digits".into())
+    }
+}
+
+fn run_app(
+    app: &str,
+    install: bool,
+    yes: &[String],
+    plan_digest: Option<&str>,
+    discard: Option<&str>,
+) -> Result<u8, CmdError> {
     let store = crate::store()?;
     let env = app_env(&store, app)?;
     if let Some(pkg) = discard {
@@ -114,6 +141,7 @@ fn run_app(app: &str, install: bool, yes: &[String], discard: Option<&str>) -> R
     if !install {
         return Ok(0);
     }
+    check_plan_digest(env.id(), &plan, manifest, plan_digest)?;
     check_yes(&plan.plan, yes)?;
     crate::sandbox::print_hardening_caveat();
     // An installer package gets a read-write prefix in the installer sandbox, and the helper launcher below is chosen
@@ -161,8 +189,24 @@ pub(crate) fn install_report(o: &Orchestrator, plan: &AppPlan) -> Result<(String
     Ok(format_report(&report))
 }
 
-/// Every `--yes` must name a package the plan installs that needs consent: anything else is a mistake (a typo, or
-/// a package that needs no consent), refused before anything happens.
+/// `--plan-digest`: the plan about to be installed must be the one the client showed (and got consent for); checked
+/// before `--yes`, the mark, the lock or any network.
+pub(crate) fn check_plan_digest(
+    id: &AppId,
+    plan: &AppPlan,
+    manifest: &Manifest,
+    want: Option<&str>,
+) -> Result<(), String> {
+    let Some(want) = want else { return Ok(()) };
+    let got = rt_api::jobs::plan_digest(id, plan, manifest);
+    if got == want {
+        return Ok(());
+    }
+    Err(format!(
+        "the dependency plan changed since it was shown (digest {got}, expected {want}); nothing was installed"
+    ))
+}
+
 /// Whether this `--install` run may start an installer package (any `Installer` package the plan installs, consent
 /// not yet asked: conservative).
 fn may_run_installer(plan: &Plan, manifest: &Manifest) -> bool {
@@ -171,6 +215,8 @@ fn may_run_installer(plan: &Plan, manifest: &Manifest) -> bool {
         .any(|e| e.action == Action::Install && manifest.get(&e.package).is_some_and(|p| p.kind == Kind::Installer))
 }
 
+/// Every `--yes` must name a package the plan installs that needs consent: anything else is a mistake (a typo, or
+/// a package that needs no consent), refused before anything happens.
 pub(crate) fn check_yes(plan: &Plan, yes: &[String]) -> Result<(), String> {
     for y in yes {
         let gated = plan
