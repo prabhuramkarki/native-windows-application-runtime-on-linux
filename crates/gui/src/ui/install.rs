@@ -1,7 +1,8 @@
 //! The install dialog (spec D10): a file from the file chooser, an optional name, silent and network both off. The
-//! result goes to the view model as `Msg::Install`, which validates it before anything is sent.
+//! result goes to the view model as `Msg::Install`, which validates it before anything is sent. A chosen `.wrun`
+//! package hides the name (the package names the app) and is imported (`apps.import`, spec W12).
 use super::{Ui, text};
-use crate::vm::{InstallForm, MAX_SHOWN, Msg, shown};
+use crate::vm::{InstallForm, MAX_SHOWN, Msg, is_package, shown};
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
@@ -13,8 +14,10 @@ use std::rc::Rc;
 
 fn file_dialog() -> gtk::FileDialog {
     let programs = gtk::FileFilter::new();
-    programs.set_name(Some("Windows programs and installers (.exe, .msi, .zip)"));
-    for s in ["exe", "msi", "zip"] {
+    programs.set_name(Some(
+        "Windows programs, installers and packages (.exe, .msi, .zip, .wrun)",
+    ));
+    for s in ["exe", "msi", "zip", "wrun"] {
         programs.add_suffix(s);
     }
     let all = gtk::FileFilter::new();
@@ -64,9 +67,9 @@ pub fn open(ui: &Rc<Ui>) {
     d.set_default_response(Some("cancel"));
     d.set_close_response("cancel");
     let win = ui.w.window.clone();
-    let (p, dd, weak) = (path.clone(), d.clone(), Rc::downgrade(ui));
+    let (p, dd, weak, n) = (path.clone(), d.clone(), Rc::downgrade(ui), name.clone());
     choose.connect_clicked(move |_| {
-        let (p, dd, chosen, win) = (p.clone(), dd.clone(), chosen.clone(), win.clone());
+        let (p, dd, chosen, win, name) = (p.clone(), dd.clone(), chosen.clone(), win.clone(), n.clone());
         let weak = weak.clone();
         glib::spawn_future_local(async move {
             let Ok(file) = file_dialog().open_future(Some(&win)).await else {
@@ -75,6 +78,7 @@ pub fn open(ui: &Rc<Ui>) {
             match file.path() {
                 Some(f) => {
                     chosen.set_label(&shown(&f.to_string_lossy(), MAX_SHOWN));
+                    name.set_visible(!is_package(&f));
                     *p.borrow_mut() = Some(f);
                     dd.set_response_enabled("install", true);
                 }
