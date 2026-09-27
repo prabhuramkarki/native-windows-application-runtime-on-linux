@@ -198,3 +198,33 @@ Task 1 -> Task 2 (needs `plan_digest`, `argv`) and Task 3 (needs `JobSpec`); Tas
 - Pre-approved decisions: execution model (Task 3), consent (1, 2, 4), streams and limits (3, 4), authorization (4), progress as lines (3; no CLI output change), client + CLI (5; no `runtime jobs`, spec D15), docs (6), testing (1-5), non-goals respected.
 - Placeholders: one open fork, decided by a test: whether clap routes `deps ... -- list` to the subcommand (Task 2 Step 1 fixes the rule either way).
 - Types: `JobSpec`, `JobKind`, `JobInfo`, `JobEvent`, `JobEvents`, `JobStarted`, `ConsentItem`, `Jobs`, `JobsConfig`, `Ctx` are named identically across tasks.
+
+## As built (deviations from the text above, and why)
+
+- **Plan digest v2** (review of Tasks 1-2): each entry also binds the sha256 of its consent text (`rt-deps-plan-v2`),
+  so consent recorded by the CLI is always for the text the client showed. `deps.plan`'s `digest` defaults to empty
+  when read from a 0.1 daemon; the client refuses `deps_install` with it.
+- **`JobSpec` is exhaustive** (not `#[non_exhaustive]`), so the CLI's parser-oracle test is one match over every
+  variant. `JobKind`/`JobState`/`EventKind` read unknown values as `Unknown`.
+- **`list`/`cache` app ids** reach the app after `--` (clap does not route them to the subcommands; pinned by a rig test
+  and the oracle), so `deps.install` needs no extra refusal.
+- **`JobsConfig`**: `now` and a new `env` are `Arc<dyn Fn>` (tests inject a clock and an environment);
+  `JobsConfig::new` holds the production limits. `Ctx.rt` is an `Arc<Runtime>`; `stop` moved into `Ctx`, so
+  `serve(ctx, cfg, listener)`.
+- **The supervisor polls** `waitid(WNOHANG | WNOWAIT)` every 20 ms (it also escalates the cancel), instead of blocking.
+- **The final state event is always the last event**: output a leftover process writes after `runtime` exited (1 s
+  drain) is dropped, with a note.
+- **Cancel** also SIGKILLs what is left of a cancelled job's group once the leader exited (spec 5.6 said "left
+  alone"; the Tasks 3-5 review showed a TERM-ignoring helper would survive). **`cancelled`** only when the cancel
+  stopped the job; exit 0 is `succeeded`.
+- **Job directory** (spec D8): each job runs in a fresh 0700 subdirectory named after its id, removed after the reap;
+  the shared directory must only be ours and 0700 (a stray file there used to block every job).
+- **`runtime` binary checks** (spec D10) also cover its directory, and each refusal names the fix (`chmod g-w,o-w
+  <path>`): a umask-002 `cargo install` is group-writable and is refused.
+- **`--write`** also requires `XDG_RUNTIME_DIR` to be a 0700 directory of the user (not `/`), and reads
+  `runtime --version` on a thread against the 5 s deadline (4 KiB, one line).
+- **Unit file**: `KillMode=mixed` (the ordered cancel is not bypassed) and `UMask=0022` (jobs create files as from a
+  terminal; the daemon's own files have explicit modes).
+- **Not done, follow-ups**: a real-Wine e2e that cancels a long-running app (no such fixture); re-checking the
+  `runtime` version when the file changes (startup only now); re-digesting the plan under the app lock inside
+  `deps --install` (review m3 of Tasks 1-2: not a consent bypass); `progress` events.

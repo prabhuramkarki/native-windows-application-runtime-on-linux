@@ -1,8 +1,10 @@
 # The runtime API and `runtimed`
 
-`runtimed` serves the runtime's **read-only** API (`rt_api::Runtime`) as JSON-RPC 2.0 over an owner-only Unix
-socket. A GUI, a tray applet or a script asks it what the CLI would print, as typed JSON. It changes nothing: in API
-0.1.0 every method only reads. Mutating methods and event streams come in 6B.
+`runtimed` serves the runtime's API (`rt_api`) as JSON-RPC 2.0 over an owner-only Unix socket. A GUI, a tray applet
+or a script asks it what the CLI would print, as typed JSON. By default it is **read-only**. Started with `--write`,
+it also runs, installs and removes apps, installs dependencies and changes permissions and the display driver: each
+such change is a **job** that runs the `runtime` CLI next to `runtimed`, whose output clients follow by long-polling
+([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.0**.
 
 The CLI does not need the daemon. Every `runtime` command works on its own, except the two that exist to talk to it:
 `runtime rpc` and `runtime daemon-status`.
@@ -28,7 +30,8 @@ against the daemon's dispatch table by a test (`the_documented_methods_are_the_d
 - **Socket activation.** `LISTEN_PID`/`LISTEN_FDS` (one fd, a listening `AF_UNIX` stream socket) are honoured. See
   [systemd](#running-it-under-systemd).
 
-The security model, and what it does not cover, is in [SECURITY.md](SECURITY.md#the-runtimed-daemon-phase-6a).
+The security model, and what it does not cover, is in [SECURITY.md](SECURITY.md#the-runtimed-daemon-phase-6a) and,
+for write mode, [SECURITY.md](SECURITY.md#the-runtimed-daemon-write-methods-phase-6b).
 
 ## Framing and limits
 
@@ -43,7 +46,8 @@ The security model, and what it does not cover, is in [SECURITY.md](SECURITY.md#
   - Each reply must be written whole within 30 s.
   - Each request has **30 s** to run. After that the client gets `-32002` and the connection is closed. The method
     itself **cannot be cancelled**: it keeps its connection slot until it returns. Every method is bounded by its
-    own probe timeouts; the longest is `vulkaninfo`, at 10 s.
+    own probe timeouts; the longest is `vulkaninfo`, at 10 s. A `jobs.poll` waits at most 25 s, so it never reaches
+    this deadline.
 - **Connections:** at most **32** at once. Connection 33 gets one `-32001` line and is closed.
 - **Requests:** one in flight per connection. Pipelined requests are answered in order.
 - **Replies have no size cap in the daemon.** Clients should cap them. The bundled client accepts 16 MiB, which
@@ -62,8 +66,8 @@ A request is exactly one JSON object:
 - `id` is an integer that fits in i64, or a string of at most 128 bytes without control or format characters, or
   `null`. Any other id (a fraction, a bool, a huge number, a string with an escape character) is `-32600`, answered
   with id `null`. A valid id is echoed exactly.
-- **A request without `id` is a notification.** It gets no reply and is **not executed**: every method only reads,
-  so there is nothing to do.
+- **A request without `id` is a notification.** It gets no reply and is **not executed**, write methods included: a
+  client that cannot learn a job's id must not start one.
 - **Batches (a JSON array) are not supported.** They get one `-32600` with id `null`.
 
 A reply is one of these two shapes:
@@ -81,8 +85,8 @@ Member order is not significant; the daemon writes members in alphabetical order
 |---|---|---|---|
 | -32700 | parse error: not UTF-8, not JSON, a NUL | none | kept |
 | -32600 | invalid request (see above), a batch, a line over 1 MiB | none | kept (closed after an over-long line) |
-| -32601 | method not found (includes every mutating name, e.g. `apps.install`) | none | kept |
-| -32602 | invalid params: not an object, an unknown member, a missing or mistyped `id` | none | kept |
+| -32601 | method not found (a name in neither list, e.g. `apps.uninstall`) | none | kept |
+| -32602 | invalid params: not an object, an unknown member, a missing or mistyped field, an unknown `driver`, `waitMs` over 25000 | none | kept |
 | -32603 | internal error (a bug; the text never says more) | none | kept |
 | -32000 | domain error from `rt_api` | `{"kind": "..."}` | kept |
 | -32001 | server busy (connection cap reached); id is `null` | none | closed |
@@ -90,14 +94,118 @@ Member order is not significant; the daemon writes members in alphabetical order
 
 `data.kind` values for `-32000`:
 
-- `not_found`: a well-formed id names no installed app.
-- `invalid_argument`: the id is not a valid app id.
+- `not_found`: a well-formed id names no installed app; a job id the daemon does not know (never existed, expired,
+  or from an earlier daemon).
+- `invalid_argument`: a value the method refuses: an id that is not a valid app id (or would be read as a file:
+  `x.exe`), a path that is not absolute or has `.`/`..`, a value with a control or format character, a value over
+  its bound, a `planDigest` that is not 64 lowercase hex.
 - `unavailable`: the request is fine but the host cannot answer. Examples: no data directory; corrupt metadata; an
-  invalid, oversized or symlinked `permissions.toml`; an app not prepared by this version.
+  invalid, oversized or symlinked `permissions.toml`; an app not prepared by this version; a `runtime` binary or job
+  directory that is no longer safe to use (the message says what to do, e.g. `run: chmod g-w,o-w <path>`); a daemon
+  that is stopping.
+- `read_only`: a write method on a daemon started without `--write`. Its params are not even read.
+- `consent_mismatch`: `deps.install`'s `planDigest` is not the digest of the plan as it is now, or a `consent` item
+  is not exactly `{package, version, sha256}` of a consent-gated package that plan installs (or names one twice).
+- `busy`: 4 jobs are already running. Nothing is queued: try again later.
+- `app_busy`: a job for this app is still running.
 - `internal`: reserved.
 
 **Switch on `code` and `data.kind`, never on `message`.** A `message` is prose for people. It is cleaned (no
 control or format characters) and bounded, but it may change between versions.
+
+## Write mode and jobs
+
+Write methods exist only on a daemon started with `runtimed --write` (the shipped systemd unit passes it). A
+read-only daemon answers each of them `-32000` kind `read_only`, and `rpc.version` says `"write": false`.
+
+**Every change is a job.** A write method validates its params, starts a job, and returns `{"jobId": "<32 hex>"}` at
+once. The job runs the `runtime` binary next to `runtimed` with an argument list built from the validated params,
+never a shell. So every guard of the CLI applies unchanged: the dependency consent gate, the app and installer
+sandboxes, the app lock, the refusals while an app is running, the grant rules. What each method runs:
+
+- `apps.run`: `runtime run <id> -- <args...>` (always sandboxed: there is no parameter for `--unsandboxed` or
+  `--debug`);
+- `apps.install`: `runtime install [--name=N] [--exe=E] [--silent] [--network] -- <path>`;
+- `apps.remove`: `runtime remove -- <id>`;
+- `deps.install`: `runtime deps --install --plan-digest=<hex> [--yes=<pkg>]... -- <id>`;
+- `permissions.set`: `runtime permissions --set=<expr>... -- <id>`;
+- `permissions.reset`: `runtime permissions --reset -- <id>`;
+- `display.set`: `runtime display -- <id> <driver>`.
+
+Every client value is an app id or an absolute path (neither can start with `-`), sits after `--`, or is inside
+`--flag=value`, so no value can become an option.
+
+The job's process gets only these variables from the daemon's own environment, never any from a client: `HOME PATH
+USER LOGNAME LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES TZ XDG_RUNTIME_DIR XDG_DATA_HOME XDG_CONFIG_HOME
+XDG_CACHE_HOME XDG_SESSION_TYPE DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS PULSE_SERVER` and every
+`RUNTIME_*`. Its working directory is a fresh, empty directory of its own; stdin is `/dev/null`.
+
+**Following a job.** `jobs.poll {"jobId", "afterSeq", "waitMs"}` returns the job's events after `afterSeq`, waiting up
+to `waitMs` ms (at most 25,000) for one, or for the job to end. Pass the returned `nextSeq` as the next `afterSeq`.
+Stop when `job.state` is `succeeded`, `failed` or `cancelled`: the last event is then that state event.
+
+- An event is `{seq, ts, kind, text}`: `seq` starts at 1 and grows by 1; `ts` is Unix milliseconds; `kind` is
+  `stdout` or `stderr` (one line of the job's output) or `state` (`queued`, `running`, then `succeeded (exit 0)`,
+  `failed (exit N)`, `failed (signal N)`, `cancelled (signal N)`, ...). `progress` is reserved and never sent in 0.2.
+- Output lines end at `\n`, `\r` or `\r\n`. A line over 4,096 bytes is cut, its text ending in ` [cut]`. The daemon
+  removes control and format characters from every line. **A client must still clean or escape every string it
+  shows** (event texts included): it cannot know that the process at the socket is a well-behaved daemon, and the
+  bundled client hands strings back as they came (`runtime rpc` escapes them).
+- Memory per job is bounded (2,000 events and 512 KiB of text). The oldest events are dropped first; `dropped` in
+  the reply counts those after `afterSeq` that were dropped before this poll, and `job.dropped` all of them.
+- If a process the job started still holds its output one second after `runtime` exited, a `stderr` note says later
+  output is not shown, and the job ends.
+
+A job's `JobInfo` is `{jobId, kind, app, state, exitCode, signal, createdAt, startedAt, endedAt, dropped}`: `kind` is
+`run`, `install`, `remove`, `depsInstall`, `permissionsSet`, `permissionsReset` or `displaySet`; `app` is `null` for
+an install (the CLI derives the id: read it from the `Installed: <id>` line or `apps.list`); times are Unix ms;
+`exitCode` and `signal` are `null` until known.
+
+**States.** `queued` (only between the start and the spawn), `running`, then one of: `succeeded` (exit 0),
+`failed` (any other exit, or the job could not start: a `stderr` event says why), `cancelled` (the cancel stopped it:
+before it started, or through the SIGTERM it was sent, ending other than with exit 0). A job that exited 0 after a
+cancel `succeeded`; one that ended on its own before the cancel reached it keeps its own result.
+
+**Cancel.** `jobs.cancel` sends SIGTERM to the job's process group and SIGKILL 5 s later if `runtime` has not
+exited; once it has, whatever is left of the group gets SIGKILL. `runtime run` passes SIGTERM on to the sandbox,
+which dies with it. A signal is never sent to a process group whose leader was already reaped, so a reused pid is
+never signalled.
+
+**Consent (`deps.install`).**
+
+1. Call `deps.plan`. Show the user each entry; for each entry with `consent: "needed"`, show its `consentText` (the
+   exact text the CLI prints before it asks), and let the user accept or decline each one.
+2. Call `deps.install` with the plan's `digest` and, for each package the user accepted, its exact
+   `{package, version, sha256}` from the plan. A needed package you do not list is simply not installed (nor what
+   needs it), as at a terminal without `--yes`.
+3. The daemon recomputes the plan and refuses with `consent_mismatch` if its digest differs (the app, the manifest,
+   an installed package, or a licence text changed since you showed it) or if any item is not exactly a
+   consent-gated entry of it. Show the plan again and ask again.
+4. The job's `runtime deps --install --plan-digest=<digest>` recomputes the plan once more and refuses (exit 1,
+   nothing installed) if it changed in between. It prints the licence text in full before it accepts a package, so
+   the job's events show what was accepted.
+
+There is no "yes to all" and no consent that is not a concrete package, version and hash.
+
+**Limits.**
+
+| what | bound | over it |
+|---|---|---|
+| running jobs | 4 | `busy` |
+| live jobs per app | 1 | `app_busy` |
+| finished jobs kept | 100, and at most 1 h | the oldest are forgotten (`not_found`) |
+| events kept per job | 2,000 and 512 KiB of text | the oldest are dropped (counted in `dropped`) |
+| events per poll | 500 | the rest on the next poll |
+| event text | 4,096 bytes | cut, ending ` [cut]` |
+| a poll's `waitMs` | 25,000 | -32602 |
+| polls waiting at once | 8, daemon-wide | a 9th answers at once, as if `waitMs` were 0 |
+| program args of `apps.run` | 64, each 4,096 bytes, 64 KiB in all, no NUL | `invalid_argument` |
+| expressions of `permissions.set` | 1-32, each 4,096 bytes | `invalid_argument` |
+| consent items of `deps.install` | 64 | `invalid_argument` |
+
+Waiting polls take at most 8 of the 32 connection slots. Job ids exist only in the daemon's memory: a restarted
+daemon knows none. Jobs die with the daemon: on SIGTERM it cancels every job and waits for them before it removes its
+socket; if it is killed outright, each job's `runtime` gets SIGTERM from the kernel (`PR_SET_PDEATHSIG`).
 
 ## Methods
 
@@ -139,10 +247,11 @@ Long arrays and texts are cut (`...`).
 
 ### `rpc.version`
 
-The API version (semver), the runtime's crate version, and the protocol name.
+The API version (semver), the runtime's crate version, the protocol name, and whether this daemon has the write
+methods (`runtimed --write`). A 0.1 daemon has no `write`: treat it as `false`.
 
 ```json
-{"api": "0.1.0", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1"}
+{"api": "0.2.0", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
 ```
 
 ### `apps.list`
@@ -300,64 +409,106 @@ the host.
 
 What `runtime deps <app>` would install. It does not use the network and changes nothing. The fields:
 
-- `entries`: dependencies first, each `{package, version, action, consent, blockedReason}`, where:
+- `entries`: dependencies first, each `{package, version, sha256, action, consent, consentText, blockedReason}`,
+  where:
+  - `version` and `sha256` are the bundled manifest's (`null` for a package it does not know);
   - `action` is `install`, `alreadyInstalled` or `blocked`;
   - `consent` is `notNeeded`, `needed` or `denied`;
+  - `consentText` is, for an entry whose `consent` is `needed`, the exact text a consent prompt shows, one string per
+    line (cleaned); otherwise `null`;
 - `unsatisfied`: needed capabilities that no bundled package provides;
-- `warnings`.
+- `warnings`;
+- `digest`: 64 hex digits identifying this plan (the app, and per entry the package, version, sha256, licence text,
+  action and consent). `deps.install` needs it back.
 
 ```json
-{"entries": [], "unsatisfied": [],
+{"digest": "5f0c...", "entries": [], "unsatisfied": [],
  "warnings": ["cannot read the app's executable (not a Windows program or a zip archive (unrecognised format)); the plan does not include what it imports"]}
 ```
 
 ### `apps.run`
 
-Runs an installed app in its sandbox as a job (`runtime run <id> -- <args>`). Write mode only.
+Params: `{"id": "<app id>", "args": ["...", ...]}` (`args` optional). Runs the app in its sandbox, as `runtime run`
+does from a terminal; the job's `stdout`/`stderr` events are the program's output (as the CLI shows it) and its exit
+code is the program's (143 after a cancel). `args` reach only the program, verbatim. An id that `runtime run` would
+read as a file (`x.exe`, `x.zip`) is `invalid_argument`. The job holds the app's slot while the app runs.
+
+```sh
+runtime rpc apps.run '{"id": "notepad", "args": ["C:\\notes.txt"]}'
+# {"jobId": "9c4f0d8e5b1a4f7e8d2c3b6a1f0e9d8c"}
+```
 
 ### `apps.install`
 
-Installs a program or installer as a job (`runtime install`). Write mode only.
+Params: `{"path": "/abs/file", "name"?: str, "exe"?: str, "silent"?: bool, "network"?: bool}`. Installs a portable
+`.exe`, a `.zip` or an installer, as `runtime install`. `path` must be absolute, without `.`/`..` components; the
+CLI judges the file itself. `name` (at most 256 bytes) and `exe` (1,024) are passed as values, never as options.
+`network` gives an installer network access while it runs: a user's choice, off unless set. The job's `app` is
+`null`; the new id is in the `Installed: <id>` event.
+
+```sh
+runtime rpc apps.install '{"path": "/home/me/Downloads/setup.exe", "silent": true}'
+```
 
 ### `apps.remove`
 
-Removes an app as a job (`runtime remove`). Write mode only.
+Params: `{"id"}`. Stops the app's Wine processes and deletes the app, as `runtime remove`. Refused (a `failed` job,
+the reason in a `stderr` event) while the app runs.
 
 ### `deps.install`
 
-Installs the app's dependency plan as a job, given the `digest` of the plan `deps.plan` showed and the exact `{package, version, sha256}` of each consent-gated package the user accepted. Write mode only.
+Params: `{"id", "planDigest": "<64 hex>", "consent": [{"package", "version", "sha256"}, ...]}`. Installs the plan
+`deps.plan` showed; see [Consent](#write-mode-and-jobs) above. `consent_mismatch` when the plan changed or an item is
+not exactly a consent-gated entry of it; no job is started then.
+
+```sh
+d=$(runtime rpc deps.plan '{"id": "game"}' | jq -r .digest)
+runtime rpc deps.install "{\"id\": \"game\", \"planDigest\": \"$d\", \"consent\": []}"
+```
 
 ### `permissions.set`
 
-Changes permissions with `runtime permissions --set` expressions, as a job. Write mode only.
+Params: `{"id", "set": ["network=allow", "fs+=/home/me/Games:rw", ...]}` (1-32 of `runtime permissions --set`'s
+expressions). All are checked before anything is written; a refused one (a grant of `$HOME`, `/`, a secret
+directory, the data directory, `$XDG_RUNTIME_DIR`) fails the job and changes nothing.
 
 ### `permissions.reset`
 
-Returns an app's permissions to the default, as a job. Write mode only.
+Params: `{"id"}`. Deletes the app's `permissions.toml` (back to the default), as `runtime permissions --reset`.
 
 ### `display.set`
 
-Sets an app's Wine graphics driver (`auto`, `x11`, `wayland`), as a job. Write mode only.
+Params: `{"id", "driver": "auto" | "x11" | "wayland"}`. Sets the app's Wine graphics driver, as `runtime display`.
+Another `driver` is -32602.
 
 ### `jobs.poll`
 
-A job's events after `afterSeq`, waiting up to `waitMs` (at most 25000) for one. Write mode only.
+Params: `{"jobId", "afterSeq": u64, "waitMs"?: 0..25000}`. The job's events after `afterSeq` (at most 500), waiting up to
+`waitMs` for one or for the job's end. Result `{events, nextSeq, dropped, job}`: pass `nextSeq` as the next
+`afterSeq`. The client's call deadline must exceed `waitMs` (the bundled client uses `waitMs` + 15 s).
+
+```sh
+runtime rpc jobs.poll '{"jobId": "9c4f0d8e5b1a4f7e8d2c3b6a1f0e9d8c", "afterSeq": 0, "waitMs": 10000}'
+# {"dropped": 0, "events": [{"kind": "state", "seq": 1, "text": "queued", "ts": 1790479513925},
+#   {"kind": "state", "seq": 2, "text": "running", "ts": 1790479513926}, ...], "job": {...}, "nextSeq": 2}
+```
 
 ### `jobs.status`
 
-A job's state. Write mode only.
+Params: `{"jobId"}`. The job's `JobInfo`.
 
 ### `jobs.cancel`
 
-Stops a job (SIGTERM to its process group, SIGKILL 5 s later). Write mode only.
+Params: `{"jobId"}`. Stops the job (see Cancel above) and returns its `JobInfo` as it is at that moment; poll to see it
+end. A job that already ended is left alone.
 
 ### `jobs.list`
 
-Every job the daemon knows: live ones first, then finished ones, newest first. Write mode only.
+Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then finished ones, newest first.
 
 ## Versioning and compatibility
 
-- `API_VERSION` (from `rpc.version`) is semver, currently **0.1.0**. Until 1.0:
+- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.0**. Until 1.0:
   - a **breaking** change bumps the **minor** version: a method removed or renamed, a param changed, a result
     member removed or retyped, an enum value removed;
   - an **additive** change bumps the **patch** version: a new method, a new result member, a new enum value, a new
@@ -366,10 +517,14 @@ Every job the daemon knows: live ones first, then finished ones, newest first. W
 - **Clients must ignore unknown members** in results and replies. The bundled client does.
 - An **unknown `data.kind`** deserialises as `ErrorKind::Unknown`: `ErrorKind` is `#[non_exhaustive]` with a serde
   fallback.
-- The other enums are `#[non_exhaustive]` for Rust callers but have **no** serde fallback. A typed helper of an
-  older client fails with a protocol error ("the result does not have the expected shape") when a newer daemon
-  sends a new enum value. `Client::call` (raw JSON) always works. A client that must span versions checks `api`
-  first.
+- The job enums (`JobKind`, `JobState`, `EventKind`) also read an unknown value as `Unknown`. The other enums are
+  `#[non_exhaustive]` for Rust callers but have **no** serde fallback. A typed helper of an older client fails with a
+  protocol error ("the result does not have the expected shape") when a newer daemon sends a new enum value.
+  `Client::call` (raw JSON) always works. A client that must span versions checks `api` first.
+- **0.2.0 is breaking** by the rule above: the mutating names that were `-32601` in 0.1 are now known methods, which
+  a read-only daemon answers `read_only`. Everything else is additive: the write methods, `rpc.version.write`, and
+  `deps.plan`'s `digest`, `sha256` and `consentText`. A 0.2 client reading a 0.1 daemon's `deps.plan` gets an
+  empty `digest`, and the bundled client refuses `deps_install` with it before sending.
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
@@ -377,15 +532,26 @@ Every job the daemon knows: live ones first, then finished ones, newest first. W
 By hand, in the foreground:
 
 ```sh
-runtimed                         # $XDG_RUNTIME_DIR/runtime/runtimed.sock
+runtimed                         # read-only, $XDG_RUNTIME_DIR/runtime/runtimed.sock
+runtimed --write                 # with the write methods
 runtimed --socket /run/user/1000/rt-test.sock
 ```
 
-It logs one line per event on stderr, and never logs a request's content. SIGTERM or SIGINT stops it (exit 0) and
-removes the socket it bound. Exit 1 means it cannot start (another daemon, an unsafe path, no `XDG_RUNTIME_DIR`); 2
-means bad arguments.
+It logs one line per event on stderr (including `mode: write` or `mode: read-only` at startup), and never logs a
+request's content. SIGTERM or SIGINT stops it (exit 0): it closes the socket to new connections, cancels every job and
+waits for them, lets requests in flight finish (up to 12 s), then removes the socket it bound. Exit 1 means it cannot
+start (another daemon, an unsafe path, no `XDG_RUNTIME_DIR`, a failed `--write` check); 2 means bad arguments.
 
-**`runtime` must sit next to `runtimed`** (same directory). `sandbox.info` names it as the sandbox's launcher.
+**`runtime` must sit next to `runtimed`** (same directory). `sandbox.info` names it as the sandbox's launcher, and
+every job runs it. `--write` also requires, before it starts:
+
+- the socket (bound, or inherited from systemd) resolves inside `$XDG_RUNTIME_DIR`, which must be a 0700 directory of
+  the user (not `/`). No sandbox profile can see that directory, so no sandboxed app can reach a write-capable socket;
+- `$XDG_RUNTIME_DIR/runtime/job-cwd` is (or is created as) a 0700 directory of the user;
+- `runtime` is a regular file (not a symlink) owned by the user or root and writable only by its owner, in a
+  directory with the same property. With a umask of 002 (the Ubuntu default) cargo installs both group-writable:
+  `runtimed` then says so and names the fix, `chmod g-w,o-w <path>`. The same check runs before every job;
+- `runtime --version` answers within 5 s with this daemon's own version.
 
 ### Running it under systemd
 
@@ -403,6 +569,15 @@ How it behaves:
 
 - systemd owns the socket: `%t/runtime/runtimed.sock`, with `SocketMode=0600` and `DirectoryMode=0700`.
 - The first connection starts `runtimed.service`, which serves the inherited socket and never removes it.
+- The service runs `runtimed --write`. Drop `--write` for a read-only daemon. If `runtimed` refuses to start,
+  `journalctl --user -u runtimed` has the reason (for a umask-002 install:
+  `chmod g-w,o-w ~/.cargo/bin ~/.cargo/bin/runtime`).
+- `KillMode=mixed`: `systemctl --user stop` sends SIGTERM to `runtimed` alone, which cancels its jobs in order.
+  `UMask=0022`: jobs create files as a terminal with that umask would; the daemon's own socket and directories have
+  explicit modes.
+- `apps.run` opens windows only if `DISPLAY` / `WAYLAND_DISPLAY` (and `XAUTHORITY`) are in the user manager's
+  environment. Most desktop sessions import them; otherwise `systemctl --user import-environment DISPLAY
+  WAYLAND_DISPLAY XAUTHORITY`.
 - The service has **no sandboxing options**, on purpose. They would change what the daemon's probes see, and
   `NoNewPrivileges=` breaks a setuid bwrap; the unit's comments explain each omission.
 - **Environment:** the daemon reads `RUNTIME_DATA_DIR`, `XDG_DATA_HOME` and `HOME` from the **user manager**, not
@@ -420,8 +595,12 @@ How it behaves:
 runtime rpc rpc.version
 runtime rpc apps.get '{"id": "notepad"}'
 runtime rpc doctor.system --socket /run/user/1000/rt-test.sock
-runtime daemon-status            # exit 0 when a daemon answers, 1 when none does
+runtime daemon-status            # exit 0 when a daemon answers, 1 when none does; says "mode: write" or "read-only"
+runtime rpc apps.remove '{"id": "notepad"}'      # write mode: {"jobId": "..."}
 ```
+
+`runtime daemon-status` prints `mode: write`, `mode: read-only`, or, for a daemon older than 0.2,
+`mode: read-only (API <version>)`. There is no `runtime jobs` command: `runtime rpc jobs.*` covers scripts.
 
 `runtime rpc` is a raw tool for debugging and scripts.
 
@@ -440,7 +619,7 @@ edge is used by these two commands alone.
 ```sh
 sock=$XDG_RUNTIME_DIR/runtime/runtimed.sock
 printf '%s\n' '{"jsonrpc":"2.0","method":"rpc.version","id":1}' | socat - UNIX-CONNECT:$sock
-# {"id":1,"jsonrpc":"2.0","result":{"api":"0.1.0","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1"}}
+# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.0","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
 printf '%s\n' '{"jsonrpc":"2.0","method":"apps.get","params":{"id":"nope"},"id":"a"}' | nc -U -N $sock
 # {"error":{"code":-32000,"data":{"kind":"not_found"},"message":"no app named nope is installed"},"id":"a","jsonrpc":"2.0"}
 ```
@@ -484,4 +663,21 @@ line of at most 16 MiB, be JSON-RPC 2.0, carry the call's id (or `null` on an er
 - Error `message` and `data.kind` are cut to 1,024 characters but not otherwise cleaned. Escape them before showing
   them on a terminal.
 - Typed helpers exist for every method: `version`, `apps`, `app`, `permissions`, `compat`, `doctor_system`,
-  `doctor_app`, `graphics_info`, `sandbox_info`, `deps_plan`.
+  `doctor_app`, `graphics_info`, `sandbox_info`, `deps_plan`; and for write mode `run_app`, `install`
+  (`InstallParams`), `remove`, `deps_install`, `permissions_set`, `permissions_reset`, `display_set`, `job_poll`
+  (its deadline is `waitMs` + 15 s, never under 40 s), `job_status`, `job_cancel`, `jobs`.
+- Strings in results (event texts included) are returned as the daemon sent them. Clean or escape them before you
+  show them.
+
+```rust
+let job = c.remove("notepad")?.job_id;
+let mut after = 0;
+loop {
+    let e = c.job_poll(&job, after, 10_000)?;
+    for ev in &e.events {
+        println!("{:?} {}", ev.kind, rt_core::clean_text(&ev.text, 4096));
+    }
+    after = e.next_seq;
+    if !matches!(e.job.state, JobState::Queued | JobState::Running) { break; }
+}
+```

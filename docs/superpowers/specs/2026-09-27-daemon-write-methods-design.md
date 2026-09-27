@@ -300,3 +300,10 @@ delivers SIGTERM to every job's `runtime`.
   checked by the CLI itself.
 - **Process-group leakage:** a program that leaves the group (`setsid`) survives cancel if it also escaped its
   sandbox's PID namespace, which it cannot; unsandboxed runs are not possible through the API (D5).
+
+## As built
+
+Implemented on branch `phase-6b-daemon-write`. Where the implementation differs from this text (the plan digest v2,
+per-job directories, the cancel of a group's leftovers and the meaning of `cancelled`, the binary-directory and
+`XDG_RUNTIME_DIR` checks, the unit's `KillMode`/`UMask`), the plan's "As built" section says what and why; docs/API.md
+and docs/SECURITY.md describe the result.

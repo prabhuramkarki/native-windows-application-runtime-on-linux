@@ -1081,8 +1081,9 @@ The daemon is a local service for **one user**. The attackers considered are:
   - A 30 s whole-reply write deadline, so slow readers are cut.
   - A 30 s per-request deadline.
   - A panic in a method becomes a generic -32603; its text never reaches the wire or the log.
-- **Read-only.** Every method in API 0.1.0 reads. Mutating names are "method not found". A notification (a request
-  without id) is not executed.
+- **Read-only by default.** Every method in API 0.1.0 reads. Since 0.2 (Phase 6B) a daemon started with `--write`
+  also has write methods, and a read-only one answers them `read_only` (next section). A notification (a request
+  without id) is never executed.
 - **Clean output.** Every free-text field of every result is cleaned at the `rt_api` boundary: control and format
   characters removed, length bounded. Error messages are fixed text or cleaned, and a string id with a control or
   format character is refused instead of echoed. A test walks every string of every method's reply over a hostile
@@ -1136,6 +1137,86 @@ The daemon is a local service for **one user**. The attackers considered are:
   cannot be reached in a test without one: a socket at a place that passes the owner checks always has our uid as
   its peer. It is the same `peer_allowed` the daemon uses, whose comparison is tested.
 - **Raw shell clients** (`socat`, `nc -U`) do none of the client's checks.
+
+## The `runtimed` daemon: write methods (Phase 6B)
+
+With `runtimed --write` the daemon also runs, installs and removes apps, installs dependencies and changes
+permissions and the display driver (API.md, "Write mode and jobs"). This section is what that adds to the Phase 6A
+model above, which still applies in full.
+
+### Threat model
+
+**The daemon adds no privilege.** Every write method starts a job that runs the `runtime` CLI, as the same user,
+with an argument list the daemon built from validated params. A process of this user could run the same `runtime`
+command itself. So the question is not "what may a same-uid client do" (anything that user may do), but whether the
+daemon opens a way around the CLI's own guards, or lets something reach it that could not run `runtime` at all. What
+must not exist, and why it does not:
+
+- **Another uid** reaching a write method: the 0600 socket in a 0700 directory and the `SO_PEERCRED` check (Phase 6A)
+  are unchanged.
+- **A browser or a network peer**: there is no TCP and no HTTP. A request must be one JSON-RPC line on a Unix socket;
+  a web page cannot speak that.
+- **A sandboxed app** (the thing most likely to want an unsandboxed run): `--write` refuses to start unless its socket
+  resolves inside `$XDG_RUNTIME_DIR`, which must be a 0700 directory of the user. Every app sandbox profile mounts an
+  empty tmpfs over that directory, no grant may name it, and the installer sandbox binds only the system trees, its
+  shim and the prefix, and drops the session variables. Tests render both sandboxes (the app sandbox with every
+  switch on, live Wayland and PulseAudio sockets and a grant) and assert no bind source or destination is the socket,
+  an ancestor of it, or anything under `$XDG_RUNTIME_DIR/runtime`.
+- **Argument injection and path traversal**: `rt_api::jobs` validates every param before a job exists. App ids are
+  `AppId`s that `runtime run` would not read as a file (`x.exe` is refused); installer paths are absolute, without
+  `.`/`..`; no value may hold NUL or a control or format character; everything is bounded. Every value is an id or
+  an absolute path (neither starts with `-`), sits after `--`, or is inside `--flag=value`. The CLI's own parser is
+  the test oracle: every argv shape, with values such as `--network`, `--reset`, `--`, `-x` and `;`, parses to
+  exactly the intended command, and the match over the argv shapes is exhaustive, so a new one cannot ship
+  unchecked. There is no shell anywhere.
+- **Invented consent** (`deps.install`): the client must send the digest of the plan it showed (covering each
+  package, version, sha256, the sha256 of its licence text, action and consent state) and, per accepted package, its
+  exact `{package, version, sha256}`. The daemon recomputes the plan and refuses anything else (`consent_mismatch`);
+  only package ids that matched reach `--yes=`. The CLI recomputes the plan once more under `--plan-digest` and
+  refuses before installing anything if it changed, which also covers a `runtime` replaced after the daemon started.
+  There is no "yes to all" parameter.
+- **An unsandboxed or debug run**: no parameter maps to `--unsandboxed` or `--debug`. Program arguments go after
+  `--`, so `--unsandboxed` there is an argument of the program (tested end to end: the run stays sandboxed).
+- **A hostile program's output**: each line is cut at 4,096 bytes, decoded lossily and cleaned (control and format
+  characters removed) before it is stored; a job keeps at most 2,000 events and 512 KiB; readers always drain, so a
+  child never blocks on a full pipe.
+- **Signalling a reused pid**: the supervisor sees the leader's exit with `waitid(WNOWAIT)`, which leaves the zombie,
+  and reaps it under the job's lock; every group signal is sent under that lock while the leader is unreaped, so the
+  process group id is still the job's own.
+- **A job outliving the daemon**: on SIGTERM the daemon cancels every job (SIGTERM to its group, SIGKILL 5 s later,
+  and SIGKILL to what is left of the group once the leader is gone) and waits for them before it removes the socket.
+  If the daemon is killed, `PR_SET_PDEATHSIG` sends each job's `runtime` SIGTERM; `runtime run` passes it to bwrap,
+  whose `--die-with-parent` takes the sandbox down. The unit uses `KillMode=mixed` so systemd does not bypass the
+  ordered cancel.
+- **A job inheriting what it should not**: the environment is an allowlist of the daemon's own variables (never a
+  client's), the working directory is a fresh empty directory per job (so `runtime run <id>` cannot fall back to a
+  file of that name), stdin is `/dev/null`, and every daemon fd is close-on-exec.
+- **A replaced `runtime`**: before `--write` starts and before every job, the binary must be a regular file (not a
+  symlink) owned by the user or root and writable only by its owner, in a directory with the same property; at
+  startup it must also report the daemon's own version.
+
+### Known bounds
+
+- **Same-uid denial of service within the caps**: 4 running jobs, one per app, 8 waiting polls. A same-uid client can
+  fill them; that is the user hurting themselves. `apps.run` holds a running slot for as long as the app runs.
+- **A `runtime` started at a terminal is invisible to the job table.** The app lock and the running-app refusals of
+  the CLI are the real guard between the two, as between two terminals.
+- **The version is checked at startup only.** A `runtime` upgraded under a running daemon is run without a new
+  version check (its file mode and owner are still checked before each job). The consent path is re-checked by the
+  CLI itself. With the directory check, only the user (or root) can swap the file.
+- **Check-then-exec.** The binary is checked by path, then executed by path. Only the user or root can write the file
+  or its directory, so only they could swap it between the two.
+- **Group-writable installs are refused.** A umask of 002 makes cargo install `runtime` and `~/.cargo/bin`
+  group-writable; `runtimed --write` refuses to start and names `chmod g-w,o-w <path>`. A private group with only
+  the user in it would be harmless, but the check does not try to tell.
+- **How a GUI presents consent is the GUI's responsibility** (6C). The API only accepts consent to the exact package,
+  version, hash and licence text it reported.
+- **Event text is cleaned by the daemon, but a client cannot know the process at the socket is the daemon.** Clients
+  must clean or escape every string they show; `runtime rpc` does, the typed client helpers do not.
+- **Output after `runtime` exits** from a process it left holding the pipes is drained and dropped (a note says so).
+  Members left in a job's group after it ended on its own are not killed; after a cancel they are.
+- **No real-Wine test of cancelling a long-running app yet**: cancel is tested at process level (fake `runtime`,
+  process groups, grandchildren, SIGTERM-ignoring members) and a real sandboxed run is tested end to end.
 
 ## Roadmap
 
