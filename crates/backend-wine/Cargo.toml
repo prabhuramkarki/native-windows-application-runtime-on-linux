@@ -3,6 +3,7 @@ name = "runtime-backend-wine"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 rust-version.workspace = true
 
 [lib]
