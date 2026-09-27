@@ -320,3 +320,176 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// The parser is the oracle for `runtimed`'s argv (`rt_api::jobs::JobSpec::argv`): with hostile values, every shape
+/// parses to exactly the intended command. [`daemon_argv::check`] matches `JobSpec` without a wildcard arm, so a new
+/// variant does not compile until its argv is checked here.
+#[cfg(test)]
+mod daemon_argv {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+    use rt_api::jobs::{Driver, JobSpec};
+    use rt_core::AppId;
+    use std::ffi::OsString;
+
+    fn parse(spec: &JobSpec) -> Cmd {
+        Cli::try_parse_from(std::iter::once("runtime".into()).chain(spec.argv()))
+            .unwrap_or_else(|e| panic!("{spec:?}: {e}"))
+            .cmd
+    }
+
+    fn id(s: &str) -> AppId {
+        AppId::parse(s).unwrap()
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// `spec` parses to exactly the command it means (every flag it does not set stays off).
+    fn check(spec: &JobSpec) {
+        let cmd = parse(spec);
+        match spec {
+            JobSpec::Run { app, args } => {
+                let Cmd::Run {
+                    target,
+                    debug,
+                    unsandboxed,
+                    args: a,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not run")
+                };
+                assert_eq!((target.as_str(), debug, unsandboxed), (app.as_str(), false, false));
+                assert_eq!(a, args.iter().map(OsString::from).collect::<Vec<_>>());
+            }
+            JobSpec::Install {
+                path,
+                name,
+                exe,
+                silent,
+                network,
+            } => {
+                let Cmd::Install {
+                    file,
+                    name: n,
+                    exe: e,
+                    silent: si,
+                    network: ne,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not install")
+                };
+                assert_eq!((&file, &n, &e, si, ne), (path, name, exe, *silent, *network));
+            }
+            JobSpec::Remove { app } => {
+                let Cmd::Remove { app: a } = cmd else {
+                    panic!("{spec:?}: not remove")
+                };
+                assert_eq!(a, app.as_str());
+            }
+            JobSpec::DepsInstall { app, plan_digest, yes } => {
+                let Cmd::Deps(a) = cmd else {
+                    panic!("{spec:?}: not deps")
+                };
+                assert!(a.sub.is_none(), "{spec:?}: routed to a subcommand");
+                assert_eq!(
+                    (
+                        a.app.as_deref(),
+                        a.install,
+                        &a.yes,
+                        a.plan_digest.as_deref(),
+                        a.discard_interrupted
+                    ),
+                    (Some(app.as_str()), true, yes, Some(plan_digest.as_str()), None)
+                );
+            }
+            JobSpec::PermissionsSet { app, set } => {
+                let Cmd::Permissions {
+                    app: a,
+                    set: s,
+                    reset,
+                    json,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not permissions")
+                };
+                assert_eq!((a.as_str(), &s, reset, json), (app.as_str(), set, false, false));
+            }
+            JobSpec::PermissionsReset { app } => {
+                let Cmd::Permissions {
+                    app: a,
+                    set,
+                    reset,
+                    json,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not permissions")
+                };
+                assert_eq!((a.as_str(), set.len(), reset, json), (app.as_str(), 0, true, false));
+            }
+            JobSpec::DisplaySet { app, driver } => {
+                let Cmd::Display { app: a, choice } = cmd else {
+                    panic!("{spec:?}: not display")
+                };
+                assert_eq!((a.as_str(), choice.as_deref()), (app.as_str(), Some(driver.as_str())));
+            }
+        }
+    }
+
+    #[test]
+    fn every_job_spec_parses_as_intended_with_hostile_values() {
+        let hostile = ["-x", "--", ";", "--unsandboxed", "--debug", "$(id)", "a b"];
+        let mut specs = vec![
+            JobSpec::Run {
+                app: id("notepad"),
+                args: strings(&hostile),
+            },
+            JobSpec::Run {
+                app: id("notepad"),
+                args: vec![],
+            },
+            JobSpec::Remove { app: id("a-b") },
+            JobSpec::PermissionsSet {
+                app: id("a"),
+                set: strings(&["--reset", "--json", "--", "network=allow"]),
+            },
+            JobSpec::PermissionsReset { app: id("a") },
+        ];
+        for (name, exe, silent, network) in [
+            (Some("--network"), Some("--silent"), false, false),
+            (Some("-n"), Some("--"), true, false),
+            (None, Some("a=b --network"), false, true),
+            (None, None, false, false),
+        ] {
+            specs.push(JobSpec::Install {
+                path: "/-x/My Setup.exe".into(),
+                name: name.map(String::from),
+                exe: exe.map(String::from),
+                silent,
+                network,
+            });
+        }
+        for driver in [Driver::Auto, Driver::X11, Driver::Wayland] {
+            specs.push(JobSpec::DisplaySet { app: id("a"), driver });
+        }
+        // `list` and `cache` are also `deps` subcommands: after `--` they are the app.
+        for (app, yes) in [
+            ("notepad", vec![]),
+            ("notepad", strings(&["vcrun2022", "-p", "--install", "--"])),
+            ("list", vec![]),
+            ("cache", strings(&["x"])),
+        ] {
+            specs.push(JobSpec::DepsInstall {
+                app: id(app),
+                plan_digest: "ab".repeat(32),
+                yes,
+            });
+        }
+        let mut kinds: Vec<_> = specs.iter().map(|s| format!("{:?}", s.kind())).collect();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds.len(), 7, "one sample per variant at least: {kinds:?}");
+        specs.iter().for_each(check);
+    }
+}

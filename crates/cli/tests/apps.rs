@@ -4849,3 +4849,240 @@ fn api_doctor_and_sandbox_info_clean_a_hostile_version_executable_and_grant() {
         "{doc}"
     );
 }
+
+// ================================================================ runtimed's argv (Phase 6B)
+
+/// The digest `deps.plan` reports for `id` in this rig (the rig's GPU meets every package's minimum).
+fn plan_digest_of(r: &Rig, id: &str) -> String {
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse(id).unwrap()).unwrap();
+    let md = store.read_metadata(&env).unwrap();
+    let m = rt_deps::Manifest::bundled();
+    let plan = rt_deps::plan_for_app(&env, &md, m, &|_| rt_core::VulkanVerdict::Usable);
+    rt_api::jobs::plan_digest(env.id(), &plan, m)
+}
+
+/// `runtime <spec.argv()>` in the rig, exactly as `runtimed` would start it (after argv[0]).
+fn rt_spec(r: &Rig, spec: &rt_api::jobs::JobSpec) -> Output {
+    r.rt(&spec.argv())
+}
+
+fn deps_install_spec(id: &str, digest: &str, yes: &[&str]) -> rt_api::jobs::JobSpec {
+    rt_api::jobs::JobSpec::DepsInstall {
+        app: rt_core::AppId::parse(id).unwrap(),
+        plan_digest: digest.into(),
+        yes: yes.iter().map(|y| (*y).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn deps_install_with_a_stale_plan_digest_installs_nothing() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    // A file where the download cache belongs: any fetch would fail on it and leave it changed or not; nothing may
+    // even look at it here.
+    let cache = r.data.join("deps-cache");
+    fs::write(&cache, b"not a directory").unwrap();
+    let right = plan_digest_of(&r, &id);
+    let stale = if right.starts_with('0') { "1" } else { "0" }.to_owned() + &right[1..];
+    let (tree, calls) = (r.tree(), r.calls());
+    for yes in [&[][..], &["vcrun2022"]] {
+        let o = rt_spec(&r, &deps_install_spec(&id, &stale, yes));
+        let err = assert_fails(&o);
+        assert!(
+            err.contains("the dependency plan changed since it was shown") && err.contains("nothing was installed"),
+            "{err}"
+        );
+        assert!(
+            !s(&o.stdout).contains("Package: vcrun2022"),
+            "the licence was offered: {}",
+            s(&o.stdout)
+        );
+        assert_eq!(
+            (r.tree(), r.calls()),
+            (tree.clone(), calls.clone()),
+            "no mark, no lock, no Wine"
+        );
+        assert_eq!(fs::read(&cache).unwrap(), b"not a directory");
+    }
+    // A digest that is not 64 lowercase hex, or one without --install, is a usage error.
+    for bad in [
+        vec![
+            "deps".to_owned(),
+            id.clone(),
+            "--install".into(),
+            "--plan-digest".into(),
+            right.to_uppercase(),
+        ],
+        vec![
+            "deps".into(),
+            id.clone(),
+            "--install".into(),
+            format!("--plan-digest={}", &right[1..]),
+        ],
+        vec!["deps".into(), id.clone(), "--install".into(), "--plan-digest=".into()],
+        vec!["deps".into(), id.clone(), format!("--plan-digest={right}")],
+    ] {
+        let o = r.rt(&bad);
+        assert_eq!(o.status.code(), Some(2), "{bad:?}: {}", s(&o.stderr));
+    }
+    assert_eq!(r.tree(), tree);
+}
+
+#[test]
+fn deps_install_with_the_reported_digest_behaves_exactly_as_without_it() {
+    let r = rig();
+    let id = install_msvcp140(&r);
+    fs::write(r.data.join("deps-cache"), b"not a directory").unwrap();
+    let digest = plan_digest_of(&r, &id);
+    for yes in [&[][..], &["vcrun2022"]] {
+        let with = rt_spec(&r, &deps_install_spec(&id, &digest, yes));
+        let mut plain = vec!["deps".to_owned(), id.clone(), "--install".into()];
+        plain.extend(yes.iter().map(|y| format!("--yes={y}")));
+        let without = r.rt(&plain);
+        assert_eq!(
+            (with.status.code(), s(&with.stdout), s(&with.stderr)),
+            (without.status.code(), s(&without.stdout), s(&without.stderr)),
+            "{yes:?}"
+        );
+        let out = s(&with.stdout);
+        assert!(
+            out.contains("Package: vcrun2022"),
+            "the licence text is shown in full: {out}"
+        );
+        if yes.is_empty() {
+            assert!(out.contains("No consent: vcrun2022 is skipped"), "{out}");
+        } else {
+            assert!(
+                out.contains("Consent given on the command line (--yes vcrun2022)"),
+                "{out}"
+            );
+        }
+    }
+    // An app whose plan is empty: nothing to install, exit 0.
+    let plain = r.install();
+    let o = rt_spec(&r, &deps_install_spec(&plain, &plan_digest_of(&r, &plain), &[]));
+    assert_ok(&o);
+    assert!(s(&o.stdout).ends_with("Nothing to install.\n"), "{}", s(&o.stdout));
+}
+
+/// `runtime deps` has `list` and `cache` subcommands: the daemon's argv puts the app id after `--`, and an app
+/// really named `list` must reach the app path, never the subcommand (spec 5.1's open question, decided here).
+#[test]
+fn deps_install_argv_of_an_app_named_list_or_cache_reaches_the_app() {
+    let r = rig();
+    for name in ["list", "cache"] {
+        r.plant(name, "Shadowed");
+        let o = rt_spec(&r, &deps_install_spec(name, &plan_digest_of(&r, name), &[]));
+        let out = s(&o.stdout);
+        assert!(
+            out.starts_with(&format!("Dependencies of {name}:\n")),
+            "{name}: {out}{}",
+            s(&o.stderr)
+        );
+        assert!(
+            !out.contains("Bundled packages") && !out.contains("Download cache"),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn the_daemons_argv_with_hostile_values_has_only_the_intended_effect() {
+    use rt_api::jobs::JobSpec;
+    let r = rig();
+    // An install named `--network`: a name, not the flag.
+    let exe = r.input("hello64.exe", &fs::read(fixture("hello64.exe")).unwrap());
+    let o = rt_spec(
+        &r,
+        &JobSpec::Install {
+            path: exe,
+            name: Some("--network".into()),
+            exe: None,
+            silent: false,
+            network: false,
+        },
+    );
+    assert_ok(&o);
+    let id = installed_id(&o);
+    assert_eq!(id, "network");
+    let md: serde_json::Value =
+        serde_json::from_slice(&fs::read(r.apps().join(&id).join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(md["name"], "--network");
+    // `--set=--reset` is an expression the grammar refuses; nothing changes (no reset, no file).
+    let (app, home) = perm_app(&r);
+    fs::write(app.join("permissions.toml"), "version = 1\nnetwork = \"allow\"\n").unwrap();
+    let spec = JobSpec::PermissionsSet {
+        app: rt_core::AppId::parse("papp").unwrap(),
+        set: vec!["--reset".into()],
+    };
+    let o = r.cmd().env("HOME", &home).args(spec.argv()).output().unwrap();
+    let err = assert_fails(&o);
+    assert!(err.contains("nothing was changed"), "{err}");
+    assert_eq!(
+        fs::read_to_string(app.join("permissions.toml")).unwrap(),
+        "version = 1\nnetwork = \"allow\"\n"
+    );
+    // `remove -- <id>` removes that app, and only it.
+    let o = rt_spec(
+        &r,
+        &JobSpec::Remove {
+            app: rt_core::AppId::parse(&id).unwrap(),
+        },
+    );
+    assert_ok(&o);
+    assert_eq!(r.app_dirs(), ["papp"]);
+}
+
+/// Spec D11, the installer half (the app sandbox half is `crates/daemon/tests/e2e_jobs.rs`): what the installer
+/// sandbox binds, with the network on, never includes `$XDG_RUNTIME_DIR`, the write-capable socket or an ancestor
+/// of it (it binds only the system trees, the shim and the prefix, and drops the session variables).
+#[test]
+fn the_installer_sandbox_never_binds_the_daemons_socket() {
+    let r = rig();
+    let dir = r.plant("inst", "I");
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse("inst").unwrap()).unwrap();
+    assert_eq!(env.root(), dir);
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let xdg = PathBuf::from(format!("/run/user/{uid}"));
+    let sock = xdg.join("runtime/runtimed.sock");
+    let sb = rt_installer::InstallerSandbox::new("/usr/bin/bwrap", env!("CARGO_BIN_EXE_runtime"));
+    let mut cmd = Command::new("/bin/true");
+    cmd.env_clear()
+        .env("HOME", r.root.join("home"))
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("WAYLAND_DISPLAY", "wayland-0");
+    let opts = rt_installer::SandboxOpts {
+        allow_network: true,
+        extra_ro_binds: vec![],
+    };
+    let wrapped = sb.wrap(cmd, &env, &opts);
+    let argv: Vec<String> = wrapped.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    assert!(argv.iter().any(|a| a == "--bind"), "not a real render: {argv:?}");
+    let mut seen = 0;
+    for (i, a) in argv.iter().enumerate() {
+        if a == "--" {
+            break;
+        }
+        if matches!(
+            a.as_str(),
+            "--bind" | "--ro-bind" | "--bind-try" | "--ro-bind-try" | "--dev-bind" | "--dev-bind-try"
+        ) {
+            seen += 1;
+            for p in [Path::new(&argv[i + 1]), Path::new(&argv[i + 2])] {
+                assert!(!sock.starts_with(p) && !p.starts_with(&xdg), "{a} {p:?}: {argv:?}");
+            }
+        }
+    }
+    assert!(seen >= 3, "{argv:?}");
+    let envs: Vec<_> = wrapped
+        .get_envs()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !envs.iter().any(|k| k == "XDG_RUNTIME_DIR" || k == "WAYLAND_DISPLAY"),
+        "{envs:?}"
+    );
+}

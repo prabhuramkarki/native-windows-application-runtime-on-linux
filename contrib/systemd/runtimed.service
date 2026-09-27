@@ -1,9 +1,19 @@
-# The runtime read-only API daemon (a user unit), started by runtimed.socket on the first connection. See
-# runtimed.socket for installing. It serves the socket until stopped (SIGTERM; exit 0).
+# The runtime API daemon (a user unit), started by runtimed.socket on the first connection. See runtimed.socket for
+# installing. It serves the socket until stopped (SIGTERM; exit 0).
+#
+# --write adds the mutating methods (run, install, remove, dependency install, permissions, display driver): each is
+# a job that runs the `runtime` binary next to runtimed with a validated argument list, so every guard of the CLI
+# (consent, the sandboxes, the app lock) applies. It needs the socket inside $XDG_RUNTIME_DIR (the socket unit's
+# %t/runtime/runtimed.sock is), which no sandboxed app can see. Drop --write for a read-only daemon. On stop, every
+# job is cancelled (SIGTERM, SIGKILL 5 s later) before the daemon exits.
+#
+# apps.run opens windows only if DISPLAY / WAYLAND_DISPLAY (and XAUTHORITY) are in the user manager's environment:
+# most desktop sessions import them; otherwise `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY
+# XAUTHORITY`. A job gets only an allowlist of the daemon's variables (see docs/API.md), never a client's.
 #
 # No sandboxing options, on purpose. The daemon's answers (doctor, sandbox.info, graphics.info) must equal what
 # `runtime` reports from a terminal, and it runs the same host probes (bwrap's probe, the systemd-run scope probe,
-# vulkaninfo, wine --version). It is read-only, runs as the user, and the hardening that matters is its own (0600
+# vulkaninfo, wine --version), and its jobs must behave exactly as `runtime` at a terminal. It runs as the user, and the hardening that matters is its own (0600
 # socket in a 0700 directory, peer uid check, caps and timeouts). Deliberately omitted:
 # - NoNewPrivileges=, and everything that implies it in a user unit (RestrictSUIDSGID=, LockPersonality=,
 #   RestrictRealtime=, RestrictAddressFamilies=, SystemCallFilter= and the other seccomp-based options): with
@@ -20,16 +30,26 @@
 # same value (`systemctl --user import-environment RUNTIME_DATA_DIR`, a file in ~/.config/environment.d/, or an
 # `Environment=` line in a drop-in), or the daemon serves a different store than `runtime`.
 [Unit]
-Description=runtime read-only API daemon
+Description=runtime API daemon
 Requires=runtimed.socket
 After=runtimed.socket
 
 [Service]
 Type=simple
-# Edit to where runtimed is installed. The `runtime` binary must sit in the same directory: sandbox.info names it
-# as the sandbox's launcher.
-ExecStart=%h/.cargo/bin/runtimed
-UMask=0077
+# Edit to where runtimed is installed. The `runtime` binary must sit in the same directory (and be the same version):
+# sandbox.info names it as the sandbox's launcher and every job runs it. With --write, `runtime` and its directory
+# must be writable only by their owner: with a umask of 002 (user-private groups, the Ubuntu default) cargo installs
+# them group-writable and runtimed refuses to start, saying so. Fix with:
+#   chmod g-w,o-w ~/.cargo/bin ~/.cargo/bin/runtime
+ExecStart=%h/.cargo/bin/runtimed --write
+# Stop: SIGTERM to runtimed alone, which cancels every job in order (SIGTERM to each job's process group, SIGKILL 5 s
+# later) and removes its socket last; anything still in the service's cgroup after TimeoutStopSec gets SIGKILL.
+# (The default, control-group, would SIGTERM the jobs at the same moment as the daemon, bypassing that order.)
+KillMode=mixed
+# The mode new files get. Jobs inherit it, so a `runtime install` through the daemon creates files as one from a
+# terminal with the common umask 022 would. The daemon's own socket (0600), its directory and the job directories
+# (0700) and its lock file (0600) are created with explicit modes and do not depend on it.
+UMask=0022
 
 [Install]
 Also=runtimed.socket
