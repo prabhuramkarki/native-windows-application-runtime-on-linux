@@ -10,7 +10,8 @@ use std::fmt::Write as _;
 
 /// The format revision this runtime reads and writes.
 pub const FORMAT: u32 = 1;
-/// Largest `wrun.toml`, in bytes.
+/// Largest `wrun.toml`, in bytes. Known v1 limit: every payload file takes one `[[files]]` entry (about 130
+/// bytes), so a portable package holds roughly 450 files; an app with more ships as an installer-kind package.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// Most requested dependencies.
 pub const MAX_DEPENDENCIES: usize = 16;

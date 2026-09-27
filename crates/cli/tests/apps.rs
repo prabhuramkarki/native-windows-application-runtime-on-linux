@@ -546,6 +546,26 @@ fn install_passes_exe_for_an_archive() {
 }
 
 #[test]
+fn install_of_a_wrun_package_is_refused_and_points_at_import() {
+    use std::io::Write;
+    let r = rig();
+    let wrun = r.inputs.join("app.wrun");
+    {
+        let mut w = zip::ZipWriter::new(fs::File::create(&wrun).unwrap());
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("wrun.toml", o).unwrap();
+        w.write_all(b"format = 1\n").unwrap();
+        w.start_file("payload/hello64.exe", o).unwrap();
+        w.write_all(&fs::read(fixture("hello64.exe")).unwrap()).unwrap();
+        w.finish().unwrap();
+    }
+    let err = assert_fails(&r.rt(&["install".as_ref(), wrun.as_os_str()]));
+    assert!(err.contains("this is a .wrun package: use `runtime import`"), "{err}");
+    assert!(r.app_dirs().is_empty());
+    assert_eq!(r.calls(), Vec::<String>::new(), "no environment was created");
+}
+
+#[test]
 fn install_errors_exit_1_leave_nothing_and_print_safe_text() {
     let r = rig();
     // not a Windows program, missing file, a directory, a hostile file name
