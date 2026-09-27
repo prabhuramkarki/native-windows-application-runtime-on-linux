@@ -105,7 +105,12 @@ fn peek_looks_like_installer(file: &Path) -> bool {
     }
 }
 
-fn print_installed(store: &Store, id: &AppId, executable: &str, warnings: &[String]) -> Result<(), CmdError> {
+pub(crate) fn print_installed(
+    store: &Store,
+    id: &AppId,
+    executable: &str,
+    warnings: &[String],
+) -> Result<(), CmdError> {
     let name = display_name(store, id)?;
     crate::emit(&format!(
         "Installed: {id}\nName:       {name}\nExecutable: {exe}\nRun it with: runtime run {id}\n",
@@ -120,7 +125,7 @@ fn print_installed(store: &Store, id: &AppId, executable: &str, warnings: &[Stri
 }
 
 /// Numbered candidates and the `--exe` hint; never a fake auto-pick.
-fn print_candidates(candidates: &[Candidate]) -> Result<(), CmdError> {
+pub(crate) fn print_candidates(candidates: &[Candidate]) -> Result<(), CmdError> {
     let mut out = String::from("Could not tell which installed file is the application. Candidates:\n");
     for (i, c) in candidates.iter().enumerate() {
         let name = c.name.as_deref().map(|n| format!(" ({})", safe(n))).unwrap_or_default();
