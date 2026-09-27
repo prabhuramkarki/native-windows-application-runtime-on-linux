@@ -2,7 +2,7 @@
 //! commands as the oracle, and a hostile fake daemon the CLI must survive without letting anything reach the
 //! terminal. Every run has a scratch environment (a scratch data directory and socket, never the user's).
 //!
-//! `runtime` is another crate's binary: it is taken from next to `runtimed` (`cargo test --workspace` builds
+//! `runtime` is another crate's binary: it is taken from next to `runtimed` (`cargo test --workspace --exclude runtime-gui` builds
 //! both; `cargo test -p runtime-daemon` alone does not, and then these tests fail saying so).
 use rt_core::{AppId, BackendInfo, Metadata, Store, WinPath};
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ fn runtime_bin() -> PathBuf {
     let p = Path::new(DAEMON).with_file_name("runtime");
     assert!(
         p.is_file(),
-        "{} is missing: build it first (`cargo build -p runtime-cli`, or run `cargo test --workspace`)",
+        "{} is missing: build it first (`cargo build -p runtime-cli`, or run `cargo test --workspace --exclude runtime-gui`)",
         p.display()
     );
     p

@@ -171,4 +171,42 @@ Task 1 first (the pins everything else builds on; stop there if crates cannot be
 
 ## As built
 
-(Filled in during implementation.)
+Commits on `phase-6c-gui`: Task 1 `bcbbf03`, Task 2 `f285342`, Task 3 `2e5e325`, Task 4 `ce93b1c`, Task 5 `7331bbc`,
+Task 6 (docs). Where the code departs from the plan above:
+
+- **Task 1.** The lock file gained 43 packages (plus `runtime-gui`) and changed none. `futures-channel` was not in
+  the lock before: it arrives with gio in the same change, so it adds no package of its own. With `default-members`
+  set, `cargo tree` needs `--workspace`. The widget test binary points HOME and every XDG directory at a tempdir,
+  sets `GSETTINGS_BACKEND=memory` and `GTK_A11Y=none`, and drops `DBUS_SESSION_BUS_ADDRESS` before GTK starts:
+  the first run read the host's GTK settings.
+- **Task 2.**
+  - Message names: the plan result is `Msg::PlanLoaded { id, plan }` (the intent is `Msg::Plan`);
+    `Msg::ConnectFailed(ConnError { socket, error })`; `Msg::Failed { what: Cmd, error }`.
+  - Added: `Msg::Dismiss`; `AppLoaded(Box<AppData>)`, whose probes fail one by one.
+  - Connection states: Io, Protocol, Rpc and other errors on connect map to `Unreachable`, with the reason as the
+    notice.
+  - A live job of any kind for the open app disables its other writes (`app_busy`).
+  - `not_found` while loading the open app closes its page.
+  - `jobs.list` is a write method, so it is asked only on a write daemon.
+- **Task 3.** The client-refused-unsent errors (`Unsupported`, `TooLarge`) keep the connection, like `Rpc`. A
+  follower stops on a final state with an empty poll: the daemon pages at 500 events, so a final state alone does not
+  mean every event has been read. An immediate empty poll on a live job waits 0.5 s. The rig gained
+  `Scratch::start(write, ..)` and `Scratch::plant` (over `rt_core::Store`).
+- **Task 4.**
+  - Scenarios (ii) and (v) plant the app with `Scratch::plant` instead of installing it through the real `runtime`.
+  - `ui::Ui::new(send, socket)` takes a command sink (the backend, or a recorder in tests); `ui::start(socket)` wires
+    a real backend.
+  - Each split pane has its own header bar, so a collapsed window gets a back button, and the page title (the app's
+    name) is drawn by the header: tested literally.
+  - The binary was run by hand under Xvfb against a scratch runtime dir, not against the user's own daemon.
+- **Task 5.**
+  - The view model gained display-ready page lines, permission rows (the raw grant path kept for revoke), a cap of
+    16 followed logs, and `LogBuffer::version` for incremental redraws.
+  - The consent dialog acts only while the model's plan has the digest it was built from.
+  - The install dialog's Install response is disabled until a file is chosen.
+  - Widget tests (canned model, recorded commands): the consent dialog, read-only page controls, the remove
+    confirmation, the install dialog defaults. With the real daemon: a followed job's output.
+- **Task 6.** README (GUI section; the core `--workspace` commands now `--exclude runtime-gui`, since `--workspace`
+  ignores `default-members`), SECURITY.md "The GUI client (Phase 6C)", `docs/GUI-CHECKLIST.md`, the roadmap row and
+  Open Decision 3.
+- **Not done:** the manual checklist on GNOME and KDE (the user runs it); the `gui` CI job's first hosted run.

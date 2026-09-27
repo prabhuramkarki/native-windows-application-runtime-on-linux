@@ -34,7 +34,7 @@ jobs:
       # RUNTIME_REQUIRE_BWRAP=1 turns a missing `bwrap` into a hard test failure instead of the default
       # loud-skip-and-pass, so the real-sandbox tests above are guaranteed to actually execute here.
       # `runtime-deps`' real-bwrap tests run the installer sandbox with the built `runtime` binary as its
-      # `sandbox-init` shim (target/debug/runtime); `cargo test --workspace` builds it (runtime-cli has integration
+      # `sandbox-init` shim (target/debug/runtime); `cargo test --workspace --exclude runtime-gui` builds it (runtime-cli has integration
       # tests), and those tests fail loudly when it is missing.
       - run: cargo test --workspace --exclude runtime-gui
         env:

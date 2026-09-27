@@ -227,7 +227,11 @@ pub fn alive(pid: i32) -> bool {
 /// The real `runtime` built next to `daemon`.
 pub fn real_runtime(daemon: &Path) -> PathBuf {
     let p = daemon.with_file_name("runtime");
-    assert!(p.is_file(), "{} is missing: run `cargo test --workspace`", p.display());
+    assert!(
+        p.is_file(),
+        "{} is missing: run `cargo build -p runtime-cli`",
+        p.display()
+    );
     p
 }
 
