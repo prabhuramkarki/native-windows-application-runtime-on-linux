@@ -262,6 +262,29 @@ pub struct PermissionsView {
     pub gpu: bool,
     pub filesystem: Vec<GrantView>,
     pub limits: LimitsView,
+    /// What the app's `.wrun` package requested (canonical EXPRs such as `network=allow`) that this profile does
+    /// not grant ([`requests_not_granted`]): shown to the user with the grant command, never applied. Empty for an
+    /// app that was not imported, and in `sandbox.info`'s profile. Additive in 0.2.1.
+    #[serde(default)]
+    pub requested: Vec<String>,
+}
+
+/// The requests of `requested` (EXPRs from `PackageMeta::requested_permissions`) that `p` does not satisfy, in
+/// order. Display only: nothing here grants anything. An EXPR outside the fixed set is never satisfied (metadata
+/// validation refuses such a record anyway).
+pub fn requests_not_granted(p: &Permissions, requested: &[String]) -> Vec<String> {
+    let granted = |expr: &str| match expr {
+        "network=allow" => p.network == Network::Allow,
+        "network=deny" => p.network == Network::Deny,
+        "display=on" => p.display,
+        "display=off" => !p.display,
+        "audio=on" => p.audio,
+        "audio=off" => !p.audio,
+        "gpu=on" => p.gpu,
+        "gpu=off" => !p.gpu,
+        _ => false,
+    };
+    requested.iter().filter(|r| !granted(r)).cloned().collect()
 }
 
 impl PermissionsView {
@@ -296,6 +319,7 @@ impl PermissionsView {
                 tasks_default: l.tasks == Tasks::Default,
                 explicit: l.explicit(),
             },
+            requested: vec![],
         }
     }
 }
