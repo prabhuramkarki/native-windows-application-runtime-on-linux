@@ -23,6 +23,16 @@
 //!    in that section (zip, PE or backend code) triggers the same best-effort cleanup from a drop guard; it can only
 //!    be logged (`tracing::error!`), not reported.
 //!
+//! **Package mode** (`runtime import` of a portable `.wrun`): [`InstallOpts::id`] is used unchanged (its
+//! `AlreadyExists` is [`InstallError::IdTaken`]: no retry, nothing of the existing app read, locked or removed);
+//! [`InstallOpts::subtree`] installs only that top-level directory of the archive, its name stripped;
+//! [`InstallOpts::digests`] must list every file of it (checked before `create`, together with "no special entries
+//! anywhere" and "no listed file missing") and each file is hashed while streaming (a mismatch fails the install
+//! and the cleanup removes the app); [`InstallOpts::expect_arch`] must equal the program's architecture (before
+//! `create`); [`InstallOpts::package`] is recorded in the metadata. Outside package mode, a zip whose first entry
+//! is `wrun.toml` is refused ([`InstallError::WrunPackage`]) so that a package's requests are never dropped
+//! silently by the plain archive path.
+//!
 //! **Not a sandbox.** Extraction runs while no Wine process is in the prefix (`prepare` stops the wineserver
 //! before it returns). There is no locking: two installs of the same name race on `Store::create`, which
 //! arbitrates (`mkdir` is atomic); the loser takes the next id.
@@ -31,9 +41,11 @@ use crate::text::{clean, quote};
 use crate::unzip::{self, Archive, Limits, Plan, ZipError};
 use crate::winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};
 use crate::{
-    AppEnv, AppId, BackendError, BackendInfo, CompatBackend, MetaError, Metadata, Store, StoreError, unique_id,
+    AppEnv, AppId, BackendError, BackendInfo, CompatBackend, MetaError, Metadata, PackageMeta, Store, StoreError,
+    unique_id,
 };
 use pe::{Arch, FileKind, InstallerKind, Kind, PeInfo, Subsystem};
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -44,13 +56,26 @@ pub const INPUT_CAP: u64 = 4 * 1024 * 1024 * 1024;
 /// How many times `create` is retried with a fresh id after `AlreadyExists`.
 const CREATE_ATTEMPTS: usize = 5;
 const MAX_NAME_BYTES: usize = 256;
+/// The first entry of every `.wrun` package.
+const WRUN_MANIFEST: &str = "wrun.toml";
 
 #[derive(Debug, Clone, Default)]
 pub struct InstallOpts {
     /// Display name; the app id is derived from it.
     pub name: Option<String>,
-    /// For archives: the program, as a path inside the archive.
+    /// For archives: the program, as a path inside the archive (inside [`InstallOpts::subtree`] when set).
     pub exe: Option<String>,
+    /// A fixed app id (package mode): used unchanged; `AlreadyExists` is [`InstallError::IdTaken`], never a retry.
+    pub id: Option<AppId>,
+    /// Archives only: install just this top-level directory, its name stripped (`payload` of a `.wrun`).
+    pub subtree: Option<String>,
+    /// Archives only: the sha256 of every file to install, keyed by its full `/`-joined archive path (the subtree
+    /// included). Every file must be listed and match; nothing listed may be missing; special entries are refused.
+    pub digests: Option<BTreeMap<String, [u8; 32]>>,
+    /// Recorded in the metadata (schema 4).
+    pub package: Option<PackageMeta>,
+    /// The program must have this architecture ([`InstallError::Mismatch`], before anything is created).
+    pub expect_arch: Option<Arch>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +111,17 @@ pub enum InstallError {
     UnsupportedArch(String),
     #[error("installer detected ({0}): installers arrive in Phase 3")]
     InstallerDetected(&'static str),
+    /// A `.wrun` handed to the plain archive path (W11).
+    #[error("this is a .wrun package: use `runtime import`")]
+    WrunPackage,
+    /// Package-mode options that the input cannot satisfy; fixed text.
+    #[error("the package cannot be installed: {0}")]
+    Package(&'static str),
+    /// The fixed id is taken; nothing of the existing app was read or changed.
+    #[error("an app with the id `{0}` already exists (nothing was changed; `runtime remove {0}` first to replace it)")]
+    IdTaken(AppId),
+    #[error("the program is {found}, but {expected} was expected")]
+    Mismatch { expected: String, found: String },
     #[error("the name is empty after removing control characters")]
     BadName,
     #[error("the file name cannot be used inside a Windows prefix: {0}")]
@@ -469,6 +505,11 @@ impl Payload {
 }
 
 fn prepare_exe(path: &Path, bytes: Vec<u8>, opts: &InstallOpts) -> Result<Prepared, InstallError> {
+    if opts.subtree.is_some() || opts.digests.is_some() {
+        return Err(InstallError::Package(
+            "a subtree and file digests apply to zip archives only",
+        ));
+    }
     let info = analyse(&bytes)?;
     let mut warnings = check_pe(&info)?;
     if opts.exe.is_some() {
@@ -496,8 +537,68 @@ fn prepare_exe(path: &Path, bytes: Vec<u8>, opts: &InstallOpts) -> Result<Prepar
     })
 }
 
+/// The part of `plan` below the top-level directory `top`, with that first component stripped.
+fn subtree_of(plan: Plan, top: &str) -> Plan {
+    let strip = |mut path: Vec<String>| (path.len() > 1 && path[0] == top).then(|| path.split_off(1));
+    Plan {
+        files: plan
+            .files
+            .into_iter()
+            .filter_map(|f| {
+                Some(unzip::PlannedFile {
+                    path: strip(f.path)?,
+                    ..f
+                })
+            })
+            .collect(),
+        // Stripping a common first component keeps parents before children.
+        dirs: plan.dirs.into_iter().filter_map(strip).collect(),
+        skipped: plan.skipped,
+    }
+}
+
+/// The key of `path` (below the subtree) in [`InstallOpts::digests`].
+fn digest_key(subtree: Option<&str>, path: &[String]) -> String {
+    match subtree {
+        Some(top) => format!("{top}/{}", path.join("/")),
+        None => path.join("/"),
+    }
+}
+
+/// Package mode's checks on the whole plan, before anything is created: no special entries anywhere, every file
+/// listed, and every listed file present (with unique planned paths, equal counts then mean equal sets).
+fn check_listed(plan: &Plan, opts: &InstallOpts, digests: &BTreeMap<String, [u8; 32]>) -> Result<(), InstallError> {
+    if plan.skipped > 0 {
+        return Err(InstallError::Package(
+            "it holds entries that are not regular files or directories (symlinks, devices, FIFOs, sockets)",
+        ));
+    }
+    for f in &plan.files {
+        if !digests.contains_key(&digest_key(opts.subtree.as_deref(), &f.path)) {
+            return Err(ZipError::Unlisted {
+                name: quote(&f.path.join("\\")),
+            }
+            .into());
+        }
+    }
+    if plan.files.len() != digests.len() {
+        return Err(InstallError::Package("a listed file is missing from the archive"));
+    }
+    Ok(())
+}
+
 fn prepare_zip(file: File, opts: &InstallOpts, limits: &Limits) -> Result<Prepared, InstallError> {
-    let (mut archive, plan) = unzip::open(file, limits)?;
+    let (mut archive, mut plan) = unzip::open(file, limits)?;
+    match &opts.subtree {
+        Some(top) => plan = subtree_of(plan, top),
+        None if archive.by_index_raw(0).is_ok_and(|e| e.name() == WRUN_MANIFEST) => {
+            return Err(InstallError::WrunPackage);
+        }
+        None => {}
+    }
+    if let Some(digests) = &opts.digests {
+        check_listed(&plan, opts, digests)?;
+    }
     let mut warnings = Vec::new();
     if plan.skipped > 0 {
         warnings.push(format!(
@@ -523,8 +624,9 @@ fn io_err(what: &'static str) -> impl FnOnce(io::Error) -> InstallError {
     move |source| InstallError::Io { what, source }
 }
 
-/// Copies the program or the archive below `drive_c/Program Files/<id>/`.
-fn place(env: &AppEnv, payload: Payload, limits: &Limits) -> Result<(), InstallError> {
+/// Copies the program or the archive below `drive_c/Program Files/<id>/`, verifying each archive file against
+/// `opts.digests` when given.
+fn place(env: &AppEnv, payload: Payload, limits: &Limits, opts: &InstallOpts) -> Result<(), InstallError> {
     let drive_c = env.drive_c();
     let dir = WinPath::parse(&format!("C:\\Program Files\\{}", env.id()))?;
     // `join_new` refuses a symlink at any existing component; the missing ones are then created (0755).
@@ -546,9 +648,16 @@ fn place(env: &AppEnv, payload: Payload, limits: &Limits) -> Result<(), InstallE
                 .map_err(io_err("cannot create the program file"))?;
             out.write_all(&bytes).map_err(io_err("cannot write the program file"))?;
         }
-        Payload::Zip { mut archive, plan, .. } => {
-            unzip::extract(&mut archive, &plan, &dest, limits)?;
-        }
+        Payload::Zip { mut archive, plan, .. } => match &opts.digests {
+            None => {
+                unzip::extract(&mut archive, &plan, &dest, limits)?;
+            }
+            Some(digests) => {
+                let top = opts.subtree.as_deref();
+                let digest = |path: &[String]| digests.get(&digest_key(top, path)).copied();
+                unzip::extract_verified(&mut archive, &plan, &dest, limits, &digest)?;
+            }
+        },
     }
     Ok(())
 }
@@ -636,6 +745,14 @@ pub(crate) fn install_with(
         payload,
     } = prepared;
     let dotnet = info.dotnet;
+    if let Some(expected) = opts.expect_arch
+        && expected != info.arch
+    {
+        return Err(InstallError::Mismatch {
+            expected: arch_label(expected),
+            found: arch_label(info.arch),
+        });
+    }
     // What the backend cannot run is refused here, before anything is created.
     backend.capabilities().check(backend.id(), info.arch, info.subsystem)?;
 
@@ -661,7 +778,7 @@ pub(crate) fn install_with(
     let exe_rel = payload.exe_components();
     let metadata_for = |id: &AppId| -> Result<(Metadata, WinPath), InstallError> {
         let exe = program_path(id, &exe_rel)?;
-        let md = Metadata::new(
+        let mut md = Metadata::new(
             id.clone(),
             name.clone(),
             version.clone(),
@@ -670,14 +787,18 @@ pub(crate) fn install_with(
             backend_info.clone(),
             subsystem,
         );
+        md.package = opts.package.clone();
         md.validate()?;
         Ok((md, exe))
     };
-    let mut id = (t.pick_id)(store, &base)?;
+    let mut id = match &opts.id {
+        Some(fixed) => fixed.clone(),
+        None => (t.pick_id)(store, &base)?,
+    };
 
-    // `create` is the arbiter. `AlreadyExists` means the directory belongs to someone else: pick again and NEVER
-    // remove anything. Cleanup below happens only for an id whose `create` returned `Ok`. The metadata for each
-    // candidate id is validated before its `create`, so an invalid one leaves nothing behind.
+    // `create` is the arbiter. `AlreadyExists` means the directory belongs to someone else: pick again (a fixed id:
+    // refuse) and NEVER remove anything. Cleanup below happens only for an id whose `create` returned `Ok`. The
+    // metadata for each candidate id is validated before its `create`, so an invalid one leaves nothing behind.
     let mut env = None;
     for _ in 0..CREATE_ATTEMPTS {
         metadata_for(&id)?;
@@ -686,6 +807,7 @@ pub(crate) fn install_with(
                 env = Some(created);
                 break;
             }
+            Err(StoreError::AlreadyExists) if opts.id.is_some() => return Err(InstallError::IdTaken(id)),
             Err(StoreError::AlreadyExists) => id = (t.pick_id)(store, &base)?,
             Err(e) => return Err(e.into()),
         }
@@ -703,7 +825,7 @@ pub(crate) fn install_with(
     let committed = (|| -> Result<WinPath, InstallError> {
         backend.prepare(&env)?;
         let (md, exe) = metadata_for(env.id())?;
-        place(&env, payload, &t.limits)?;
+        place(&env, payload, &t.limits, opts)?;
         // The program must now be a real file at the path metadata will name.
         let resolved = resolve_under(&env.drive_c(), &exe)?;
         if !fs::symlink_metadata(resolved).is_ok_and(|m| m.file_type().is_file()) {
