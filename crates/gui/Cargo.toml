@@ -1,0 +1,35 @@
+[package]
+name = "runtime-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+# gtk4 0.11 needs 1.92; every other crate keeps the workspace's 1.88.
+rust-version = "1.92"
+
+[lib]
+name = "rt_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "runtime-gui"
+path = "src/main.rs"
+
+[dependencies]
+runtime-daemon = { path = "../daemon" }
+runtime-api = { path = "../api" }
+runtime-core = { path = "../core" }
+# Exact pins: gtk-rs minor releases change APIs (docs/THIRD_PARTY.md). v4_12 / v1_5: the lowest levels that have
+# everything used (GtkFileDialog 4.10, AdwNavigationSplitView 1.4, AdwAlertDialog 1.5).
+gtk4 = { version = "=0.11.5", features = ["v4_12"] }
+libadwaita = { version = "=0.9.2", features = ["v1_5"] }
+# Already in the lock through gio: the worker-thread -> GTK main loop bridge.
+futures-channel = "=0.3.34"
+
+[dev-dependencies]
+tempfile.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+
+[[test]]
+name = "widgets"
+harness = false

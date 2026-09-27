@@ -1,6 +1,21 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Everything but `runtime-gui` (GTK): plain `cargo build`/`cargo test` at the root never needs GTK development files.
+# CI does not rely on this list (a crate missing from it would drop out silently): it runs `--workspace --exclude
+# runtime-gui`, and the `gui` job builds the GUI.
+default-members = [
+    "crates/api",
+    "crates/backend-wine",
+    "crates/cli",
+    "crates/core",
+    "crates/daemon",
+    "crates/deps",
+    "crates/desktop",
+    "crates/installer",
+    "crates/pe",
+    "crates/sandbox",
+]
 
 [workspace.package]
 version = "0.0.1"
