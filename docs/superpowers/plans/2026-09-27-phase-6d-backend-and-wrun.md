@@ -92,7 +92,7 @@
 ### Task 3: the `runtime-package` crate (format, reader, writer)
 
 **Files:**
-- Create: `crates/package/Cargo.toml` (`runtime-package`, lib `rt_package`; deps `runtime-core`, `runtime-pe`, `serde`, `toml`, `sha2`, `zip`, `thiserror` (workspace); dev `tempfile`), `crates/package/src/{lib.rs,manifest.rs,read.rs,write.rs}`, `crates/package/src/tests/{hostile.rs,mutate.rs,roundtrip.rs}`, `crates/package/tests/fixtures/` (built by the tests from the existing PE fixtures, not checked-in binaries)
+- Create: `crates/package/Cargo.toml` (`runtime-package`, lib `rt_package`; deps `runtime-core`, `runtime-pe`, `serde`, `toml`, `sha2`, `zip`, `thiserror` (workspace); dev `tempfile`), `crates/package/src/{lib.rs,manifest.rs,read.rs,write.rs}`, `crates/package/src/tests/{hostile.rs,mutate.rs,roundtrip.rs}`, ~~`crates/package/tests/fixtures/`~~ (none: see As built, Task 3)
 - Modify: `Cargo.toml` (`default-members` += `crates/package`), `crates/core/src/unzip.rs` (a public way to read one planned entry by name for the manifest, and `extract_verified`, see Interfaces), `Cargo.lock`
 
 **Interfaces:**
@@ -150,7 +150,7 @@
 ### Task 5: CLI `pack`, `inspect`, `unpack`, `import`; permissions show requests
 
 **Files:**
-- Create: `crates/cli/src/package.rs`, `crates/cli/tests/package.rs`
+- Create: `crates/cli/src/package.rs`, ~~`crates/cli/tests/package.rs`~~ `crates/cli/tests/apps/package.rs` (see As built, Task 5)
 - Modify: `crates/cli/src/main.rs` (four subcommands), `crates/cli/src/install.rs` (W11 check), `crates/cli/src/permissions.rs` (requested lines, `--json` `requested`), `crates/cli/Cargo.toml` (`runtime-package`), `crates/api/src/runtime.rs` + `types.rs` (`PermissionsView.requested`, additive)
 
 **Interfaces:**
@@ -259,6 +259,8 @@ approve with 1 Important). Both Important findings were fixed. No new third-part
   manifest.
 - `digests()` keys are full `payload/...` paths.
 - No checked-in fixtures: the tests build archives in memory.
+- W9 as built: the `icon` is checked only for being listed, a `.png` name and at most 1 MiB. Its content is not
+  validated as PNG, and `PackageMeta` does not record it. It is otherwise unused.
 - Review fix M5: three name-encoding tests (not UTF-8, UTF-8 bytes without the flag, the Info-ZIP 0x7075 field).
 - Known v1 limit (controller ruling): the 64 KiB manifest cap holds about 450 payload files. A test pins it (400
   pack, 600 fail), and larger apps ship as installer-kind packages.

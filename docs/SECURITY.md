@@ -435,8 +435,8 @@ bundled manifest, which also refuses placeholder-looking pins.
 - Real-Wine end-to-end tests (`e2e_real_wine_*` in `crates/deps`) check these outcomes against the local HTTPS test
   server: a tampered download installs nothing and leaves no cache file, a denied package is never requested, a
   second run downloads nothing, and removing the app leaves nothing of it. They have been run locally only (Wine
-  10.0 on Ubuntu 26.04). CI's `wine-e2e` job is written to run them but has NEVER run on a hosted runner and does not
-  gate anything (`continue-on-error`).
+  10.0 on Ubuntu 26.04). CI's `wine-e2e` job runs them; its one hosted run (commit `9cf1e27`, 2026-09-26) passed, including
+  the `e2e_real_wine` step, but it does not gate anything (`continue-on-error`).
 
 **Consent.** Packages whose licence is not permissive (`proprietary-redistributable`) need consent, per package and per
 version. The prompt shows the package id, version, licence LABEL, url, size and sha256; the consent record in
@@ -1356,7 +1356,7 @@ anything:
 | `installers` | `install_via_installer`, before it reads the file |
 | `dependency_packages` | `rt_deps::check_backend`, from `install_plan` and from `runtime deps --install` before the sandbox marker is written |
 | `dotnet` | `rt_core::run`, for an app with Wine Mono recorded |
-| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. `installers` and `dependency_packages` require it. |
+| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. That `installers` and `dependency_packages` require it is checked by the conformance check `capabilities` only; at run time a backend that breaks this fails closed later, when the sandbox builder finds no `WINEPREFIX`. |
 
 Wine declares all of them. The refusals are exercised by tests with `FakeBackend` and the null backend.
 

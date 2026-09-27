@@ -14,8 +14,10 @@ other crate depends on it: `runtime-core`, `-installer`, `-desktop`, `-deps`, `-
 **`runtime-core` (`rt_core`).** It owns app ids (`AppId`), the data directory, Windows path handling (`WinPath`,
 `resolve_under`), `metadata.json` (schema 4, validated on every read and write) and the `Store`. It also holds the
 portable-exe and zip install service (`install`, including the `.wrun` subtree mode), the run service (`run`) and
-the hardened zip planner (`unzip`). The `Launcher` is the one place a child process is started: it clears the
-environment, applies an allowlist and attaches the sandbox hook. The `CompatBackend` trait and its contract live
+the hardened zip planner (`unzip`). The `Launcher` is the one place a Windows program, a backend command or a Wine helper is started: it
+clears the environment, applies an allowlist and attaches the sandbox hook. (Other processes are started elsewhere:
+`runtimed`'s job runner starts `runtime`, the host probes start `vulkaninfo` and the like, and `runtime-desktop` runs
+`desktop-file-validate`.) The `CompatBackend` trait and its contract live
 here too (`backend`, with the conformance suite behind the `testing` feature). Core must not name Wine or depend
 on any other workspace crate except `runtime-pe`, and it never downloads. Every workspace crate except `runtime-pe`
 depends on it.
