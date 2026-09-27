@@ -187,6 +187,41 @@ fn a_32_bit_exe_is_accepted_and_recorded_as_x86() {
 }
 
 #[test]
+fn a_program_the_backend_cannot_run_is_refused_before_anything_is_created() {
+    use crate::backend::{Capabilities, Unsupported};
+    let only64 = Capabilities {
+        arches: &[Arch::X86_64],
+        ..FakeBackend::new().capabilities()
+    };
+    let f = fx_with(FakeBackend::new().with_capabilities(only64));
+    let e = f
+        .run(
+            &f.input("hello32.exe", &fixture("hello32.exe")),
+            &InstallOpts::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&e, InstallError::Unsupported(Unsupported::Arch { backend: "fake", arch }) if arch == "x86"),
+        "{e:?}"
+    );
+    f.assert_nothing_created("x86 on an x86-64-only backend");
+    // A console program on a GUI-only backend.
+    let gui_only = Capabilities {
+        subsystems: &[Subsystem::Gui],
+        ..FakeBackend::new().capabilities()
+    };
+    let f = fx_with(FakeBackend::new().with_capabilities(gui_only));
+    let e = f
+        .run(&f.input("hello64.exe", &hello64()), &InstallOpts::default())
+        .unwrap_err();
+    assert!(
+        matches!(&e, InstallError::Unsupported(Unsupported::Subsystem { .. })),
+        "{e:?}"
+    );
+    f.assert_nothing_created("console on a GUI-only backend");
+}
+
+#[test]
 fn installing_the_same_program_twice_gives_distinct_ids() {
     let f = fx();
     let path = f.input("hello64.exe", &prog());
@@ -577,6 +612,9 @@ impl Wrap {
 }
 
 impl CompatBackend for Wrap {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }

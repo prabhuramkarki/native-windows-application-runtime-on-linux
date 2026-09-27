@@ -51,7 +51,7 @@ pub fn run(
             exe_override: exe,
             runtime_exe: crate::runtime_exe(),
         };
-        return match rt_installer::install_via_installer(&store, &backend, launcher, file, opts)? {
+        return match rt_installer::install_via_installer(&store, &*backend, launcher, file, opts)? {
             rt_installer::InstallOutcome::Installed {
                 id,
                 executable,
@@ -72,7 +72,7 @@ pub fn run(
     if silent || network {
         warn("--silent/--network only apply to .msi/.exe installers; ignored for a portable exe or a zip archive");
     }
-    let outcome = rt_core::install(&store, &backend, file, &InstallOpts { name, exe })?;
+    let outcome = rt_core::install(&store, &*backend, file, &InstallOpts { name, exe })?;
     print_installed(&store, &outcome.id, &outcome.executable.to_string(), &outcome.warnings)?;
     crate::deps::print_hint(&store, &outcome.id);
     Ok(0)

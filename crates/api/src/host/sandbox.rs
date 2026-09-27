@@ -4,7 +4,7 @@
 //!
 //! Only throwaway probes are started (bwrap's own probe, the `systemd-run` scope probe); Wine is used only to describe
 //! the command when it is found (never started). The texts are raw: callers escape or clean them.
-use rt_core::{AppEnv, CompatBackend, Launcher, RunOpts, Store};
+use rt_core::{AppEnv, Launcher, RunOpts, Store};
 use rt_sandbox::{AppSandbox, Hardening, Host, Network, Permissions, RealHost, ScopeSupport, load, load_opt_raw};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -183,10 +183,11 @@ pub fn status(store: &Store, env: &AppEnv, runtime_exe: Option<&Path>) -> Result
     let shim = host.runtime_exe();
     let scopes = RealHost.scopes();
     let launcher = Launcher::new();
-    let p = rt_core::resolve_program(store, env.id(), backend_wine::BACKEND_ID).map_err(|e| e.to_string())?;
+    let p = rt_core::resolve_program(store, env.id(), crate::backends::DEFAULT).map_err(|e| e.to_string())?;
     // The command `run` builds (backend command with the app's real `dotnet`, settled, host environment rules);
     // without Wine, its shape.
-    let (wine, cmd, dll_dirs) = match backend_wine::WineBackend::discover_with(launcher.clone()) {
+    // Without Wine, the fallback shape is Wine's own (`wine`, `WINEPREFIX`, `app_home`): Decision B5.
+    let (wine, cmd, dll_dirs) = match crate::backends::select(crate::backends::DEFAULT, &launcher) {
         Ok(b) => {
             let cmd = b
                 .command(

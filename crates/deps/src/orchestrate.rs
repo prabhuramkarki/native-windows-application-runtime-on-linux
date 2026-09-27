@@ -177,6 +177,9 @@ pub enum DepsError {
     Recorded(String),
     #[error("cannot discard what the interrupted install left: {0}")]
     Discard(#[source] ArchiveError),
+    /// The app's backend cannot take dependency packages (checked before any lock, prompt or download).
+    #[error("{0}")]
+    Unsupported(#[from] rt_core::backend::Unsupported),
 }
 
 impl DepsError {
@@ -508,6 +511,15 @@ fn check_not_busy(env: &AppEnv) -> Result<(), DepsError> {
 pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsError> {
     if !has_install(&app.plan) {
         return Ok(execute(o, &app.plan, &Decisions::default(), &[]));
+    }
+    // Packages write DLL overrides and Wine configuration into the prefix: refused before any lock, prompt or
+    // download on a backend that cannot take them.
+    if !o.backend.capabilities().dependency_packages {
+        return Err(rt_core::Unsupported::Feature {
+            backend: o.backend.id(),
+            feature: "dependency packages",
+        }
+        .into());
     }
     let _lock = lock_app(o.env)?;
     check_not_busy(o.env)?;

@@ -6,6 +6,7 @@
 //! Everything read from an app's directory is untrusted, so every free-text field in [`types`] is cleaned at the
 //! boundary (control and format characters removed, length bounded) and ids are validated `AppId`s. Failures are
 //! an [`ApiError`] whose [`ErrorKind`] is stable (see [`error`]).
+pub mod backends;
 pub mod compat;
 pub mod error;
 pub mod host;

@@ -49,7 +49,10 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
     // An unknown id or a missing file is reported as that, not as a missing Wine: look for Wine only when the
     // target needs it.
     let found = rt_core::find_target(&store, target, Path::new("."))?;
-    let backend = crate::backend(&launcher)?;
+    let backend = match &found {
+        Target::Installed(id) => crate::backend_of(&store, &store.get(id)?, &launcher)?,
+        Target::File(_) => crate::backend(&launcher)?,
+    };
     // The app runs under a SHARED hold of its lock (module docs, "App lock"): refused while a dependency install,
     // a removal or a settings change holds it exclusively, and those refuse for as long as this run lives. No
     // missing-dependency hint here: it would read the whole executable on every start (`install` and `doctor`
@@ -63,13 +66,13 @@ pub fn run(target: &str, args: &[OsString], debug: bool, unsandboxed: bool) -> R
         eprintln!("warning: running WITHOUT a sandbox (--unsandboxed)");
         (None, false)
     } else {
-        let (sb, memory) = crate::sandbox::for_run(&store, &found, &backend)?;
+        let (sb, memory) = crate::sandbox::for_run(&store, &found, &*backend)?;
         (Some(sb), memory)
     };
     let sandboxed = sandbox.is_some();
     let started = rt_core::start(
         &store,
-        &backend,
+        &*backend,
         &launcher,
         target,
         args,

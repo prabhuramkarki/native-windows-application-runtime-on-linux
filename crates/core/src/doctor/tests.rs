@@ -320,6 +320,9 @@ fn a_missing_wine_fails_with_the_install_hint_and_hostile_text_is_escaped() {
 struct NoVersion(Option<&'static str>);
 
 impl CompatBackend for NoVersion {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        crate::fake::FAKE_CAPABILITIES
+    }
     fn id(&self) -> &'static str {
         "wine"
     }
@@ -415,7 +418,9 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
     assert_tame(&c.text);
-    assert!(c.text.chars().count() < 100, "{}", c.text.chars().count());
+    // 80 characters of version, then the fixed "; backend wine, interface 1".
+    assert!(c.text.chars().count() < 120, "{}", c.text.chars().count());
+    assert!(c.text.ends_with("; backend wine, interface 1"), "{}", c.text);
 }
 
 fn dev(api: (u32, u32)) -> crate::VulkanDevice {

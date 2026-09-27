@@ -7,8 +7,9 @@
 //! 2. the input is read (regular files only, at most 4 GiB) and classified by CONTENT with `pe::detect`. A PE
 //!    file is analysed with `pe::analyze`; an archive is planned and its program selected (see the `unzip` module);
 //!    MSI packages and unrecognised files are refused;
-//! 3. the program is refused when it is a kernel driver, a DLL, not x86/x86-64, or looks like an installer
-//!    (Phase 3). A .NET program only produces a warning;
+//! 3. the program is refused when it is a kernel driver, a DLL, not x86/x86-64, looks like an installer
+//!    (Phase 3), or its architecture or subsystem is outside the backend's capabilities. A .NET program only
+//!    produces a warning;
 //! 4. name (`--name`, else the version resource's `ProductName`, else the file stem; control characters removed,
 //!    at most 256 bytes) and id (`unique_id(AppId::slug(name))`); the metadata is built and VALIDATED (again for
 //!    every retried id, before its `create`);
@@ -25,6 +26,7 @@
 //! **Not a sandbox.** Extraction runs while no Wine process is in the prefix (`prepare` stops the wineserver
 //! before it returns). There is no locking: two installs of the same name race on `Store::create`, which
 //! arbitrates (`mkdir` is atomic); the loser takes the next id.
+use crate::backend::Unsupported;
 use crate::text::{clean, quote};
 use crate::unzip::{self, Archive, Limits, Plan, ZipError};
 use crate::winpath::{ResolveError, WinPath, WinPathError, join_new, resolve_under};
@@ -101,6 +103,9 @@ pub enum InstallError {
     Resolve(#[from] ResolveError),
     #[error("cannot place the program inside the prefix: {0}")]
     Path(#[from] WinPathError),
+    /// The backend's capabilities exclude the program (checked before anything is created).
+    #[error("{0}")]
+    Unsupported(#[from] Unsupported),
     /// The backend refused or failed; unchanged (a hardening refusal is an `Io` carrying a `HardenError`, see
     /// `backend_wine::harden_cause`).
     #[error("environment setup failed: {0}")]
@@ -631,6 +636,8 @@ pub(crate) fn install_with(
         payload,
     } = prepared;
     let dotnet = info.dotnet;
+    // What the backend cannot run is refused here, before anything is created.
+    backend.capabilities().check(backend.id(), info.arch, info.subsystem)?;
 
     // Everything that can be decided without touching the disk, decided (and validated) before `create`.
     let name = choose_name(opts.name.as_deref(), &info, &stem)?;

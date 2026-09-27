@@ -1190,6 +1190,9 @@ impl Settling {
 }
 
 impl CompatBackend for Settling {
+    fn capabilities(&self) -> rt_core::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         "settling"
     }

@@ -202,9 +202,23 @@ pub(crate) fn store() -> Result<Store, CmdError> {
     Ok(Store::new(rt_core::apps_dir()?)?)
 }
 
-/// The system Wine, with `launcher` for its helper processes (`run` spawns with the same launcher).
-pub(crate) fn backend(launcher: &Launcher) -> Result<backend_wine::WineBackend, CmdError> {
-    Ok(backend_wine::WineBackend::discover_with(launcher.clone())?)
+/// The backend of new installs (`rt_api::backends::DEFAULT`: the system Wine), with `launcher` for its helper
+/// processes (`run` spawns with the same launcher).
+pub(crate) fn backend(launcher: &Launcher) -> Result<Box<dyn rt_core::CompatBackend>, CmdError> {
+    Ok(rt_api::backends::select(rt_api::backends::DEFAULT, launcher)?)
+}
+
+/// The backend `env` was installed for (its recorded `backend.id`): an unknown one is refused by the registry,
+/// never replaced by Wine. Unreadable metadata falls back to the default; the command then reports the metadata.
+pub(crate) fn backend_of(
+    store: &Store,
+    env: &rt_core::AppEnv,
+    launcher: &Launcher,
+) -> Result<Box<dyn rt_core::CompatBackend>, CmdError> {
+    match store.read_metadata(env) {
+        Ok(md) => Ok(rt_api::backends::select(&md.backend.id, launcher)?),
+        Err(_) => backend(launcher),
+    }
 }
 
 /// This executable, for the installer sandbox's `sandbox-init` shim (`rt_installer::InstallerSandbox::new`). The
