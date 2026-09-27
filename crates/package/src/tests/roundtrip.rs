@@ -164,3 +164,27 @@ fn pack_refuses_inputs_over_the_readers_caps() {
         assert!(!out.exists());
     }
 }
+
+/// Known v1 limit: the 64 KiB `wrun.toml` holds one `[[files]]` entry (about 130 bytes) per payload file, so a
+/// portable package carries roughly 450 files. Apps with more files ship as installer-kind packages.
+#[test]
+fn the_manifest_cap_limits_a_portable_package_to_a_few_hundred_files() {
+    let t = tempfile::tempdir().unwrap();
+    let build = |n: usize| {
+        let dir = t.path().join(format!("src{n}"));
+        fs::create_dir_all(dir.join("payload/App/data")).unwrap();
+        fs::write(dir.join("wrun.toml"), INPUT.replace("icon = \"payload/app.png\"\n", "")).unwrap();
+        fs::write(dir.join("payload/App/app.exe"), b"MZ").unwrap();
+        for i in 0..n {
+            fs::write(dir.join(format!("payload/App/data/f{i:04}.dat")), i.to_le_bytes()).unwrap();
+        }
+        dir
+    };
+    let out = t.path().join("400.wrun");
+    pack(&build(400), &out).unwrap();
+    open(fs::File::open(&out).unwrap()).unwrap();
+    let out = t.path().join("600.wrun");
+    let e = pack(&build(600), &out).unwrap_err();
+    assert!(e.to_string().contains("too many files"), "{e}");
+    assert!(!out.exists());
+}
