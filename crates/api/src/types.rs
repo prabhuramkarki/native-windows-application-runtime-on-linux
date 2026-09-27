@@ -33,6 +33,9 @@ pub struct VersionInfo {
     pub api: String,
     pub runtime: String,
     pub protocol: String,
+    /// The daemon accepts the write methods (`runtimed --write`). Absent from a 0.1 daemon: read as `false`.
+    #[serde(default)]
+    pub write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,20 +593,25 @@ pub struct PlanEntryView {
     pub action: PlanAction,
     pub consent: ConsentView,
     pub blocked_reason: Option<String>,
+    /// The bundled manifest's sha256 of the package (`None`: not in the manifest).
+    pub sha256: Option<String>,
+    /// For an entry whose `consent` is `needed`: exactly the text a consent prompt shows, one cleaned line each.
+    pub consent_text: Option<Vec<String>>,
 }
 
 /// `runtime deps <app>` without `--install`: dependencies first; `unsatisfied` are needed capabilities no bundled
-/// package provides.
+/// package provides. `digest` is [`crate::jobs::plan_digest`] of this plan: what `deps.install` must send back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DepsPlanView {
     pub entries: Vec<PlanEntryView>,
     pub unsatisfied: Vec<String>,
     pub warnings: Vec<String>,
+    pub digest: String,
 }
 
 impl DepsPlanView {
-    pub(crate) fn from_plan(p: &rt_deps::AppPlan, manifest: &rt_deps::Manifest) -> DepsPlanView {
+    pub(crate) fn from_plan(id: &rt_core::AppId, p: &rt_deps::AppPlan, manifest: &rt_deps::Manifest) -> DepsPlanView {
         use rt_deps::{Action, ConsentState};
         DepsPlanView {
             entries: p
@@ -613,6 +621,16 @@ impl DepsPlanView {
                 .map(|e| PlanEntryView {
                     package: text(&e.package),
                     version: manifest.get(&e.package).map(|m| text(&m.version)),
+                    sha256: manifest.get(&e.package).map(|m| text(&m.sha256)),
+                    consent_text: manifest
+                        .get(&e.package)
+                        .filter(|_| e.consent == ConsentState::Needed)
+                        .map(|m| {
+                            rt_deps::consent_text(m)
+                                .split('\n')
+                                .map(|l| clean_text(l, PATH_MAX))
+                                .collect()
+                        }),
                     action: match e.action {
                         Action::Install => PlanAction::Install,
                         Action::AlreadyInstalled => PlanAction::AlreadyInstalled,
@@ -631,6 +649,7 @@ impl DepsPlanView {
                 .collect(),
             unsatisfied: p.plan.unsatisfied.iter().map(|u| text(u)).collect(),
             warnings: p.warnings.iter().map(|w| long(w)).collect(),
+            digest: crate::jobs::plan_digest(id, p, manifest),
         }
     }
 }

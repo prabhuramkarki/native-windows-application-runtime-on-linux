@@ -54,6 +54,7 @@ impl Runtime {
             api: API_VERSION.to_owned(),
             runtime: env!("CARGO_PKG_VERSION").to_owned(),
             protocol: PROTOCOL.to_owned(),
+            write: false,
         }
     }
 
@@ -444,9 +445,10 @@ mod tests {
         assert_eq!(
             v,
             VersionInfo {
-                api: "0.1.0".into(),
+                api: "0.2.0".into(),
                 runtime: env!("CARGO_PKG_VERSION").into(),
-                protocol: "jsonrpc-2.0-ndjson".into()
+                protocol: "jsonrpc-2.0-ndjson".into(),
+                write: false
             }
         );
     }
@@ -502,13 +504,29 @@ mod tests {
             ErrorKind::InvalidArgument,
             ErrorKind::Unavailable,
             ErrorKind::Internal,
+            ErrorKind::ReadOnly,
+            ErrorKind::ConsentMismatch,
+            ErrorKind::Busy,
+            ErrorKind::AppBusy,
         ] {
             let j = round_trip(ApiError::new(k, "m"));
             assert!(matches!(
                 j["kind"].as_str(),
-                Some("not_found" | "invalid_argument" | "unavailable" | "internal")
+                Some(
+                    "not_found"
+                        | "invalid_argument"
+                        | "unavailable"
+                        | "internal"
+                        | "read_only"
+                        | "consent_mismatch"
+                        | "busy"
+                        | "app_busy"
+                )
             ));
         }
+        // A 0.1 daemon's version has no `write`: read as a read-only daemon.
+        let old: VersionInfo = serde_json::from_str(r#"{"api":"0.1.0","runtime":"0","protocol":"p"}"#).unwrap();
+        assert!(!old.write);
     }
 
     #[test]
@@ -655,6 +673,28 @@ mod tests {
         for id in ["h1", "plain", "g"] {
             walk(&serde_json::to_value(rt.deps_plan(id).unwrap()).unwrap(), id);
         }
+        // `consentText` and `sha256` come from the manifest: a hostile one (the bundled one is validated).
+        let mut m = rt_deps::Manifest::bundled().clone();
+        let p = m.packages.iter_mut().find(|p| p.requires_consent).unwrap();
+        (p.licence, p.url, p.sha256, p.version) = (HOSTILE.into(), HOSTILE.into(), HOSTILE.into(), HOSTILE.into());
+        let plan = rt_deps::AppPlan {
+            facts: rt_deps::Facts {
+                imports: vec![],
+                extra_capabilities: vec![],
+            },
+            plan: rt_deps::Plan {
+                entries: vec![rt_deps::PlanEntry {
+                    package: p.id.clone(),
+                    action: rt_deps::Action::Install,
+                    consent: rt_deps::ConsentState::Needed,
+                }],
+                unsatisfied: vec![],
+            },
+            warnings: vec![],
+        };
+        let v = DepsPlanView::from_plan(&AppId::parse("h1").unwrap(), &plan, &m);
+        assert!(v.entries[0].consent_text.is_some());
+        walk(&serde_json::to_value(v).unwrap(), "hostile manifest");
         // doctor and sandbox_info probe the host (Wine, bwrap, systemd-run): their guard runs in the CLI's rig
         // (`crates/cli/tests/apps.rs`, `api_*`), in a child process with the rig's environment.
         for e in [
