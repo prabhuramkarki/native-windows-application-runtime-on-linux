@@ -8,7 +8,9 @@
 //! `"$@"` are the arguments verbatim (no shell ever parses them). Scripts can check the child's environment with
 //! `/usr/bin/env >&2` (stderr goes to the log file), and exit codes with `exit N`. Like a real backend it sets
 //! `WINEPREFIX` on the command, so tests can prove that the launcher re-applies backend variables.
+use crate::backend::Capabilities;
 use crate::{AppEnv, AppId, BackendError, CompatBackend, RunOpts};
+use pe::{Arch, Subsystem};
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
@@ -40,8 +42,18 @@ pub struct FakeBackend {
     script: String,
     fail_prepare: bool,
     dll_dirs: Vec<PathBuf>,
+    capabilities: Capabilities,
     calls: Mutex<Vec<Call>>,
 }
+
+/// [`FakeBackend`]'s default capabilities: both architectures and subsystems, every feature.
+pub const FAKE_CAPABILITIES: Capabilities = Capabilities {
+    arches: &[Arch::X86, Arch::X86_64],
+    subsystems: &[Subsystem::Gui, Subsystem::Console],
+    dotnet: true,
+    installers: true,
+    dependency_packages: true,
+};
 
 impl Default for FakeBackend {
     fn default() -> Self {
@@ -61,6 +73,7 @@ impl FakeBackend {
             script: script.to_owned(),
             fail_prepare: false,
             dll_dirs: Vec::new(),
+            capabilities: FAKE_CAPABILITIES,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -73,6 +86,12 @@ impl FakeBackend {
 
     pub fn with_dll_dirs(mut self, dirs: Vec<PathBuf>) -> FakeBackend {
         self.dll_dirs = dirs;
+        self
+    }
+
+    /// Declares `capabilities` instead of [`FAKE_CAPABILITIES`] (the refusals by capability are tested with it).
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> FakeBackend {
+        self.capabilities = capabilities;
         self
     }
 
@@ -93,6 +112,10 @@ impl CompatBackend for FakeBackend {
 
     fn version(&self) -> Result<String, BackendError> {
         Ok("fake-1.0".into())
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
     fn prepare(&self, env: &AppEnv) -> Result<(), BackendError> {

@@ -346,7 +346,7 @@ which is cached for 30 s.
 {
   "checks": [
     {"area": "architecture", "status": "ok", "text": "host architecture: x86-64"},
-    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1)"},
+    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1); backend wine, interface 1"},
     {"area": "graphics", "status": "ok", "text": "Vulkan: 3 devices usable"}, ...
   ],
   "missingDependencies": 0, "notes": [], "subject": {"kind": "system"}, "verdict": "may_fail"

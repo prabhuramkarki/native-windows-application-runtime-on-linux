@@ -40,6 +40,7 @@
 //! ([`LaunchError::Sandbox`]).
 //!
 //! No locking: `run` can race a concurrent `remove` of the same app (last writer wins, as everywhere in the store).
+use crate::backend::Unsupported;
 use crate::text::quote;
 use crate::winpath::{ResolveError, WinPath, WinPathError, resolve_under};
 use crate::{
@@ -123,6 +124,13 @@ pub enum RunAppError {
     Install(#[from] InstallError),
     #[error("{0}")]
     Backend(#[from] BackendError),
+    /// The backend's capabilities exclude what this app needs (nothing was started).
+    #[error("app {id}: {source}")]
+    Unsupported {
+        id: AppId,
+        #[source]
+        source: Unsupported,
+    },
     #[error("{0}")]
     Launch(#[from] LaunchError),
     #[error("cannot wait for the program: {0}")]
@@ -263,6 +271,16 @@ fn launch(
         debug: opts.debug,
         dotnet: p.metadata.has_dependency(DOTNET_PACKAGE_ID),
     };
+    // Wine Mono is recorded but the backend cannot use it: a refusal, not a silent run without it.
+    if run_opts.dotnet && !backend.capabilities().dotnet {
+        return Err(RunAppError::Unsupported {
+            id: id.clone(),
+            source: Unsupported::Feature {
+                backend: backend.id(),
+                feature: "managed (.NET) programs with Wine Mono",
+            },
+        });
+    }
     let sink = if opts.debug {
         LogSink::Tee((env.terminal)())
     } else {

@@ -24,6 +24,8 @@
 //! experiment `e2e_debug_run_survives_a_lingering_wineserver` shows that the server ignores `SIGPIPE`, survives
 //! the end of the debug run and serves the next run. Nothing in this crate depends on that being true for
 //! other Wine versions; the e2e test is the tripwire.
+use rt_core::backend::Capabilities;
+use rt_core::pe::{Arch, Subsystem};
 use rt_core::{AppEnv, BackendError, CompatBackend, Detail, Launcher, RunOpts};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -339,6 +341,18 @@ impl CompatBackend for WineBackend {
             return Err(BackendError::failed("wine --version", &out.output));
         }
         parse_version(&out.output).ok_or_else(|| BackendError::failed("wine --version", &out.output))
+    }
+
+    /// 32- and 64-bit GUI and console programs (a `win64` prefix with WoW64); Wine Mono, the installer pipeline
+    /// and dependency packages all work on its prefix layout.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            arches: &[Arch::X86, Arch::X86_64],
+            subsystems: &[Subsystem::Gui, Subsystem::Console],
+            dotnet: true,
+            installers: true,
+            dependency_packages: true,
+        }
     }
 
     /// `wineboot -u` (deadline 120 s, `WINEDEBUG=-all`), then ALWAYS `wineserver -k` (also after a failure or

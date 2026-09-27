@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 /// The report for `facts` on this host: Wine is looked for (its discovery error, with the install hint, is a
 /// failing check), `vulkan` is the host's Vulkan (the caller's probe, cached as it sees fit).
 pub fn report(facts: &Facts, vulkan: &HostVulkan) -> Report {
-    // The error as text: what `doctor` shows for a Wine that could not be found.
-    let wine = backend_wine::WineBackend::discover_with(Launcher::new()).map_err(|e| e.to_string());
-    let wine_drivers = wine.as_ref().ok().and_then(|b| wine_drivers(b));
+    // The error as text: what `doctor` shows for a Wine that could not be found. Only `&dyn` is needed here; the
+    // Wine-specific parts of the report (the prefix audit, `check_app_home`) stay Wine's (Decision B5).
+    let wine = crate::backends::select(crate::backends::DEFAULT, &Launcher::new()).map_err(|e| e.to_string());
+    let wine_drivers = wine.as_ref().ok().and_then(|b| wine_drivers(&**b));
     let sandbox = crate::host::sandbox::doctor_state(facts.env.as_ref());
     let hardening = crate::host::sandbox::doctor_hardening();
     let limits = crate::host::sandbox::doctor_limits(facts.env.as_ref());
@@ -36,7 +37,7 @@ pub fn report(facts: &Facts, vulkan: &HostVulkan) -> Report {
         env: &|k| std::env::var_os(k),
         fs: &HostFs,
         backend: match &wine {
-            Ok(b) => Ok(b as &dyn CompatBackend),
+            Ok(b) => Ok(&**b as &dyn CompatBackend),
             Err(e) => Err(e.as_str()),
         },
         pe: match &facts.pe {

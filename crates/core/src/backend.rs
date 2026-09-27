@@ -12,12 +12,141 @@
 //! (secrets, `LD_PRELOAD`). Convert its error with [`BackendError::from_run`].
 //!
 //! POSIX only: the crate is Linux-first and uses `OsStrExt` for byte-level name checks.
+//!
+//! # The contract (version [`BACKEND_API_VERSION`])
+//!
+//! [`CompatBackend`] is the only execution seam. Backends are Rust types compiled into the workspace and chosen by
+//! id (`rt_api::backends::select`); there are no plugins (no `dlopen`, no `libloading`: a source scan and a
+//! `cargo deny` ban enforce it; `docs/SECURITY.md` says why). The contract, method by method:
+//!
+//! * `id`: a constant `[a-z0-9-]{1,32}` word, recorded as the app's `backend.id`.
+//! * `version`: spawns nothing outside `Launcher::run_helper`.
+//! * `capabilities`: constant ([`Capabilities`]). The platform refuses what they exclude before it creates
+//!   anything: `rt_core::install` (architecture, subsystem), `rt_installer::install_via_installer` (`installers`),
+//!   `rt_deps::install_plan` (`dependency_packages`), `rt_core::run` (`dotnet`, for an app with Wine Mono recorded).
+//! * `prepare`: creates the prefix so that `env.drive_c()` exists and is the guest's `C:`; idempotent; helpers
+//!   only through the backend's `Launcher`.
+//! * `command`: describes and never spawns; never calls `env_clear`; refuses an exe or cwd outside `env.drive_c()`
+//!   ([`BackendError::OutsideDriveC`], see [`inside_drive_c`]); passes `args` verbatim; sets only its own
+//!   variables (never `LD_PRELOAD`/`LD_LIBRARY_PATH`); the program is an absolute path.
+//! * `stop`: with nothing running, succeeds. `dll_dirs`: absolute. `settle`: keeps the program and arguments of
+//!   the command it wraps.
+//! * A backend never reads the app's `permissions.toml`, never decides sandboxing (the `Launcher` and
+//!   `rt_sandbox` do), never downloads, never writes outside `env.root()`.
+//!
+//! `rt_core::backend::conformance` checks what of this is observable; never spawning in `command` and the
+//! prohibitions are reviewed, not proven.
+//!
+//! **What the platform assumes of every backend** (audit of Phase 6D): the prefix layout (`drive_c` is `C:`; the
+//! install services copy programs below it and `resolve_under` maps metadata paths into it); the program
+//! command carries `WINEPREFIX = env.prefix()` when it is to run in the app sandbox (`rt_sandbox` derives the app
+//! from it and refuses a command without it: a backend that does not set it can run only `--unsandboxed`).
+//! Gated by a capability because they read or write Wine's own layout: the installer pipeline (`system.reg`,
+//! `user.reg`, `.lnk` files, `msiexec.exe` in `system32`: `installers`); dependency packages (DLL overrides and
+//! Wine configuration in `user.reg`, `reg.exe`, the `wineserver`-in-`/proc` busy check: `dependency_packages`);
+//! Wine Mono (`dotnet`).
+//!
+//! **Wine-specific, stays concrete** (Decision B5; a second backend brings its own): `doctor`'s Wine checks
+//! (`backend_wine::harden::audit_prefix`, `check_app_home`, Wine's driver modules), the Wine-shaped fallback
+//! command of `runtime sandbox` when Wine is missing (`rt_api::host::sandbox`), `backend_wine::harden_cause`,
+//! `runtime display` (Wine's graphics driver in `user.reg`), and the `wineserver` checks of `remove`,
+//! `uninstall` and `permissions --set` (they find no `wineserver` for another backend, so they refuse nothing).
 use crate::{AppEnv, RunError};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+/// The version of the contract above; bumped on any change a backend must react to. `runtime doctor` prints it.
+pub const BACKEND_API_VERSION: u32 = 1;
+
+/// What a backend can run and take (see the module docs for where each is enforced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Guest architectures it runs.
+    pub arches: &'static [pe::Arch],
+    /// Subsystems it runs.
+    pub subsystems: &'static [pe::Subsystem],
+    /// Honours [`RunOpts::dotnet`].
+    pub dotnet: bool,
+    /// Its prefix is what `rt_installer` reads (`drive_c`, `system.reg`/`user.reg`, `.lnk` files).
+    pub installers: bool,
+    /// `rt_deps` may install packages into its prefix (DLL overrides, Wine configuration).
+    pub dependency_packages: bool,
+}
+
+impl Capabilities {
+    /// `Ok` when `backend` (whose capabilities these are) runs programs of `arch` and `subsystem`.
+    pub fn check(&self, backend: &'static str, arch: pe::Arch, subsystem: pe::Subsystem) -> Result<(), Unsupported> {
+        if !self.arches.contains(&arch) {
+            return Err(Unsupported::Arch {
+                backend,
+                arch: format!("{arch:?}").to_lowercase(),
+            });
+        }
+        if !self.subsystems.contains(&subsystem) {
+            return Err(Unsupported::Subsystem {
+                backend,
+                subsystem: format!("{subsystem:?}").to_lowercase(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A refusal by capability: nothing was created.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Unsupported {
+    #[error("the {backend} backend does not run {arch} programs")]
+    Arch { backend: &'static str, arch: String },
+    #[error("the {backend} backend does not run programs of the {subsystem} subsystem")]
+    Subsystem { backend: &'static str, subsystem: String },
+    #[error("the {backend} backend does not support {feature}")]
+    Feature {
+        backend: &'static str,
+        feature: &'static str,
+    },
+}
+
+/// Whether [`inside_drive_c`] wants a regular file or a directory at the end of the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Want {
+    File,
+    Dir,
+}
+
+/// The containment check of `command`, for every backend: `p` is absolute, has no `..`, is component-wise below
+/// `env.drive_c()` (else [`BackendError::OutsideDriveC`]), has no symlink on the way (`drive_c` itself included)
+/// and is a regular file or a directory as `want` says (all by `lstat`; else `Failed` naming `what`). Returns the
+/// normalised path: `drive_c` plus the verified components.
+pub fn inside_drive_c(env: &AppEnv, p: &Path, what: &'static str, want: Want) -> Result<PathBuf, BackendError> {
+    let root = env.drive_c();
+    let outside = || BackendError::OutsideDriveC { what };
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(outside());
+    }
+    // `root` is absolute (`AppEnv` guarantees it), so a relative `p` fails here; whole components are compared.
+    let rel = p.strip_prefix(&root).map_err(|_| outside())?;
+    let io = |source| BackendError::Io { what, source };
+    let not = |text: &[u8]| BackendError::failed(what, text);
+    let mut cur = root.clone();
+    let mut meta = std::fs::symlink_metadata(&cur).map_err(io)?;
+    for comp in rel.components() {
+        if meta.file_type().is_symlink() {
+            return Err(not(b"the path goes through a symbolic link"));
+        }
+        cur.push(comp);
+        meta = std::fs::symlink_metadata(&cur).map_err(io)?;
+    }
+    // A final symlink is neither a regular file nor a directory by lstat, so `want` refuses it too.
+    let file_type = meta.file_type();
+    match want {
+        Want::File if !file_type.is_file() => Err(not(b"not a regular file")),
+        Want::Dir if !file_type.is_dir() => Err(not(b"not a directory")),
+        _ => Ok(cur),
+    }
+}
 
 /// The most text an error keeps from a child's output or any other untrusted source.
 pub const MAX_DETAIL_BYTES: usize = 4096;
@@ -110,10 +239,13 @@ pub struct RunOpts {
     pub dotnet: bool,
 }
 
+/// The execution seam; see the module docs for the contract every implementation keeps.
 pub trait CompatBackend: Send + Sync {
     fn id(&self) -> &'static str;
     /// The backend's version string (what `doctor` and metadata record).
     fn version(&self) -> Result<String, BackendError>;
+    /// What it can run and take. Constant; required (no default), so every backend states them.
+    fn capabilities(&self) -> Capabilities;
     /// Creates and hardens the prefix under `env.prefix()`. Idempotent; a failure may leave a partial prefix
     /// (the caller removes the whole environment). Helper processes go through `Launcher::run_helper`.
     fn prepare(&self, env: &AppEnv) -> Result<(), BackendError>;
@@ -335,6 +467,37 @@ mod tests {
         assert!(matches!(e, BackendError::Io { .. }));
         let e = BackendError::from_run("x", RunError::Capture(io::Error::from(io::ErrorKind::Other)));
         assert!(matches!(e, BackendError::Io { .. }));
+    }
+
+    #[test]
+    fn capabilities_check_each_arch_and_subsystem() {
+        use pe::{Arch, Subsystem};
+        let caps = Capabilities {
+            arches: &[Arch::X86_64],
+            subsystems: &[Subsystem::Gui, Subsystem::Console],
+            dotnet: false,
+            installers: false,
+            dependency_packages: false,
+        };
+        assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Gui), Ok(()));
+        assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Console), Ok(()));
+        for arch in [Arch::X86, Arch::Arm64, Arch::Arm64Ec, Arch::Other(0x1c2)] {
+            let e = caps.check("t", arch, Subsystem::Gui).unwrap_err();
+            assert!(matches!(e, Unsupported::Arch { backend: "t", .. }), "{e:?}");
+        }
+        assert_eq!(
+            caps.check("t", Arch::X86, Subsystem::Gui).unwrap_err().to_string(),
+            "the t backend does not run x86 programs"
+        );
+        for sub in [Subsystem::Native, Subsystem::Efi, Subsystem::Other(9)] {
+            let e = caps.check("t", Arch::X86_64, sub).unwrap_err();
+            assert!(matches!(e, Unsupported::Subsystem { backend: "t", .. }), "{e:?}");
+        }
+        // The architecture is checked first.
+        assert!(matches!(
+            caps.check("t", Arch::X86, Subsystem::Efi),
+            Err(Unsupported::Arch { .. })
+        ));
     }
 
     #[test]

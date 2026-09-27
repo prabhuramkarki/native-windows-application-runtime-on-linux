@@ -322,6 +322,26 @@ fn silent_on_an_unrecognised_installer_family_creates_nothing() {
 }
 
 #[test]
+fn a_backend_without_installer_support_is_refused_before_anything_is_created() {
+    let f = fx();
+    let path = f.input("hello-nsis.exe", &fixture("hello-nsis.exe"));
+    let backend = FakeBackend::new().with_capabilities(rt_core::backend::Capabilities {
+        installers: false,
+        ..FakeBackend::new().capabilities()
+    });
+    let err = install_via_installer_isolated(&f.store, &backend, launcher(), &path, opts()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            InstallerError::Unsupported(rt_core::backend::Unsupported::Feature { backend: "fake", .. })
+        ),
+        "{err}"
+    );
+    assert!(!f.apps().exists());
+    assert!(backend.calls().is_empty());
+}
+
+#[test]
 fn unrecognised_file_formats_are_refused_before_anything_is_created() {
     let f = fx();
     let backend = FakeBackend::new();
@@ -416,6 +436,9 @@ impl Wrap {
 }
 
 impl CompatBackend for Wrap {
+    fn capabilities(&self) -> rt_core::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }

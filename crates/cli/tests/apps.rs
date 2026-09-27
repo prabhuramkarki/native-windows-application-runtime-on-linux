@@ -887,6 +887,29 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
 }
 
 #[test]
+fn run_of_an_app_recorded_for_an_unknown_backend_is_refused_not_run_with_wine() {
+    let r = rig();
+    let id = r.install();
+    let md = r.apps().join(&id).join("metadata.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&md).unwrap()).unwrap();
+    for recorded in ["null", "\u{1b}[31mx"] {
+        v["backend"]["id"] = recorded.into();
+        fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
+        let err = assert_fails(&r.rt(&["run", "--unsandboxed", &id]));
+        assert!(
+            err.contains("unknown compatibility backend") && err.contains("known: wine"),
+            "{err}"
+        );
+        assert_tame(&err, "stderr");
+        assert!(!r.log.join("argv.bin").exists(), "Wine ran the app");
+    }
+    // The same app recorded for Wine runs (the registry selects Wine on the rig's fake).
+    v["backend"]["id"] = "wine".into();
+    fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_ok(&r.rt(&["run", "--unsandboxed", &id]));
+}
+
+#[test]
 fn run_of_an_unknown_id_or_a_missing_file_says_so_even_when_wine_is_missing() {
     let r = rig().no_wine();
     let err = assert_fails(&r.rt(&["run", "--unsandboxed", "nothing"]));

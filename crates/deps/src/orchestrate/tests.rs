@@ -339,6 +339,37 @@ fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable
 }
 
 #[test]
+fn a_backend_without_dependency_packages_is_refused_before_any_prompt_or_fetch() {
+    let r = three();
+    let (f, a) = (
+        FakeFetcher::default(),
+        Answers {
+            never: vec!["perm", "gated", "gdep"],
+            ..Answers::default()
+        },
+    );
+    let b = FakeBackend::new().with_capabilities(rt_core::backend::Capabilities {
+        dependency_packages: false,
+        ..FakeBackend::new().capabilities()
+    });
+    let before = r.md();
+    let e = run_with(&r, &r.plan(THREE), &f, &a, &b).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            DepsError::Unsupported(rt_core::backend::Unsupported::Feature { backend: "fake", .. })
+        ),
+        "{e:?}"
+    );
+    assert!(f.calls().is_empty() && a.asked().is_empty() && b.calls().is_empty());
+    assert_eq!(r.md().dependencies, before.dependencies);
+    assert!(!r.c("windows/system32/perm.dll").exists());
+    // Nothing to install: nothing to refuse.
+    let rep = run_with(&r, &r.plan(&[]), &f, &a, &b).unwrap();
+    assert!(rep.completed.is_empty() && rep.failed.is_empty(), "{rep:?}");
+}
+
+#[test]
 fn without_consent_a_gated_package_is_never_fetched_and_the_rest_still_installs() {
     let r = three();
     let (f, a) = (FakeFetcher::default(), Answers::default());

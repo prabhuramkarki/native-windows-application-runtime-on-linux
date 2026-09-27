@@ -148,6 +148,9 @@ pub enum InstallerError {
     SandboxRefused(String),
     #[error("the chosen --exe {0} is not a file inside this app's environment")]
     ExeOverrideNotAFile(String),
+    /// The backend's capabilities exclude the installer pipeline (checked before anything is read or created).
+    #[error("{0}")]
+    Unsupported(#[from] rt_core::backend::Unsupported),
     #[error("environment setup failed: {0}")]
     Backend(#[from] BackendError),
     #[error("cannot run the installer: {0}")]
@@ -190,6 +193,15 @@ pub fn install_via_installer(
     path: &Path,
     opts: InstallerOpts,
 ) -> Result<InstallOutcome, InstallerError> {
+    // The pipeline reads Wine's prefix layout (registry files, `.lnk`s, `msiexec.exe`): a backend without it is
+    // refused before anything is read or created.
+    if !backend.capabilities().installers {
+        return Err(rt_core::Unsupported::Feature {
+            backend: backend.id(),
+            feature: "installer programs (the installer pipeline)",
+        }
+        .into());
+    }
     // Stage 1+2: detect and analyze. Pure; nothing is created yet.
     let bytes = read_whole_file(path)?;
     let analyzed = analyze_installer(&bytes)?;

@@ -144,6 +144,9 @@ fn run_app(
     check_plan_digest(env.id(), &plan, manifest, plan_digest)?;
     check_yes(&plan.plan, yes)?;
     crate::sandbox::print_hardening_caveat();
+    // The app's own backend (an unknown recorded one is refused here, before anything is marked or fetched).
+    let launcher = Launcher::new();
+    let backend = rt_api::backends::select(&md.backend.id, &launcher)?;
     // An installer package gets a read-write prefix in the installer sandbox, and the helper launcher below is chosen
     // ONCE for every archive package of this run: mark the app first, so an archive package's `reg.exe` that runs
     // after an installer package in the same run is sandboxed too (fail closed: nothing installs without the mark).
@@ -156,10 +159,8 @@ fn run_app(
             )
         })?;
     }
-    let launcher = Launcher::new();
-    let backend = crate::backend(&launcher)?;
     // `reg.exe` of archive packages; installer packages replace it with the installer sandbox.
-    let launcher = crate::sandbox::helper_launcher(&env, &launcher, &backend)?;
+    let launcher = crate::sandbox::helper_launcher(&env, &launcher, &*backend)?;
     let cache = cache_dir()?;
     let stdin = io::stdin();
     let answers: Option<Box<dyn BufRead>> =
@@ -170,7 +171,7 @@ fn run_app(
         cache_dir: &cache,
         env: &env,
         store: &store,
-        backend: &backend,
+        backend: &*backend,
         launcher: &launcher,
         fetcher: &NetFetcher,
         consent: &consent,

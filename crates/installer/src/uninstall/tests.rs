@@ -283,6 +283,9 @@ struct MarkerProbe {
 }
 
 impl CompatBackend for MarkerProbe {
+    fn capabilities(&self) -> rt_core::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }

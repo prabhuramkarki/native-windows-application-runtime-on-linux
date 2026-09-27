@@ -354,6 +354,35 @@ fn dotnet_is_passed_to_the_backend_only_for_a_recorded_wine_mono() {
 }
 
 #[test]
+fn an_app_with_wine_mono_is_refused_on_a_backend_without_dotnet() {
+    let mut f = fx("exit 0");
+    f.backend = FakeBackend::new().with_capabilities(crate::backend::Capabilities {
+        dotnet: false,
+        ..FakeBackend::new().capabilities()
+    });
+    let env = f.app("app");
+    let mut md = f.store.read_metadata(&env).unwrap();
+    md.dependencies = vec![record("wine-mono")];
+    f.store.write_metadata(&env, &md).unwrap();
+    let e = f.go("app", &[]).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            RunAppError::Unsupported {
+                source: crate::backend::Unsupported::Feature { backend: "fake", .. },
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(f.commands().is_empty(), "not a silent run without Mono");
+    // Without Wine Mono recorded the same backend runs the app.
+    md.dependencies.clear();
+    f.store.write_metadata(&env, &md).unwrap();
+    assert_eq!(f.go("app", &[]).unwrap().exit_code, 0);
+}
+
+#[test]
 fn an_oversized_or_duplicated_record_list_is_refused_before_any_command() {
     // `Metadata::read` refuses both (it is never asked twice), so `dotnet` is never derived from them.
     for ids in [
@@ -854,6 +883,9 @@ struct FailingBackend {
 }
 
 impl CompatBackend for FailingBackend {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        self.inner.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.inner.id()
     }
@@ -988,6 +1020,9 @@ impl Sandbox for RecordingSandbox {
 struct SettlingBackend(FakeBackend);
 
 impl CompatBackend for SettlingBackend {
+    fn capabilities(&self) -> crate::backend::Capabilities {
+        self.0.capabilities()
+    }
     fn id(&self) -> &'static str {
         self.0.id()
     }
