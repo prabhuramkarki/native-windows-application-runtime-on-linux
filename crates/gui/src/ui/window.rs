@@ -28,7 +28,9 @@ pub struct Widgets {
     pub page: gtk::Box,
     pub page_nav: adw::NavigationPage,
     pub jobs_panel: gtk::Revealer,
-    pub jobs_box: gtk::Box,
+    pub jobs_list: gtk::ListBox,
+    /// The selected followed job's output (plain text).
+    pub job_log: gtk::TextView,
 }
 
 fn named<W: IsA<gtk::Widget>>(w: W, name: &str) -> W {
@@ -127,7 +129,14 @@ pub fn build() -> Widgets {
     side.append(&apps_scroll);
     side.append(&apps_empty);
     side.append(&apps_note);
-    let sidebar = adw::NavigationPage::builder().title("Apps").child(&side).build();
+    let btn_install = named(gtk::Button::with_label("Install…"), "btn-install");
+    btn_install.add_css_class("suggested-action");
+    let side_header = adw::HeaderBar::new();
+    side_header.pack_start(&btn_install);
+    let side_view = adw::ToolbarView::new();
+    side_view.add_top_bar(&side_header);
+    side_view.set_content(Some(&side));
+    let sidebar = adw::NavigationPage::builder().title("Apps").child(&side_view).build();
 
     // The content.
     let page = vbox();
@@ -136,10 +145,23 @@ pub fn build() -> Widgets {
     page.set_margin_start(18);
     page.set_margin_end(18);
     let clamp = adw::Clamp::builder().maximum_size(760).child(&page).build();
-    let page_nav = adw::NavigationPage::builder()
-        .title("App")
-        .child(&gtk::ScrolledWindow::builder().child(&clamp).build())
+    let btn_jobs = named(gtk::ToggleButton::with_label("Jobs"), "btn-jobs");
+    let menu = gtk4::gio::Menu::new();
+    menu.append(Some("Refresh"), Some("win.refresh"));
+    menu.append(Some("About"), Some("win.about"));
+    let menu_btn = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("Menu")
         .build();
+    // The page title (an app's name) is shown by the header: AdwWindowTitle, plain text.
+    let content_header = adw::HeaderBar::new();
+    content_header.pack_end(&menu_btn);
+    content_header.pack_end(&btn_jobs);
+    let content_view = adw::ToolbarView::new();
+    content_view.add_top_bar(&content_header);
+    content_view.set_content(Some(&gtk::ScrolledWindow::builder().child(&clamp).build()));
+    let page_nav = adw::NavigationPage::builder().title("App").child(&content_view).build();
     let split = adw::NavigationSplitView::builder()
         .sidebar(&sidebar)
         .content(&page_nav)
@@ -147,10 +169,31 @@ pub fn build() -> Widgets {
         .build();
 
     // The jobs panel.
-    let jobs_box = vbox();
+    let jobs_list = named(gtk::ListBox::new(), "jobs-list");
+    jobs_list.add_css_class("boxed-list");
+    let job_log = named(
+        gtk::TextView::builder()
+            .editable(false)
+            .cursor_visible(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build(),
+        "job-log",
+    );
+    let jobs_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     jobs_box.set_margin_start(12);
     jobs_box.set_margin_end(12);
+    jobs_box.set_margin_top(12);
     jobs_box.set_margin_bottom(12);
+    jobs_box.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&jobs_list)
+            .min_content_width(300)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build(),
+    );
+    jobs_box.append(&gtk::ScrolledWindow::builder().child(&job_log).hexpand(true).build());
+    jobs_box.set_height_request(220);
     let jobs_panel = named(
         gtk::Revealer::builder()
             .child(&jobs_box)
@@ -163,35 +206,25 @@ pub fn build() -> Widgets {
     main.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     main.append(&jobs_panel);
 
+    let with_header = |w: &adw::StatusPage| {
+        let v = adw::ToolbarView::new();
+        v.add_top_bar(&adw::HeaderBar::new());
+        v.set_content(Some(w));
+        v
+    };
     let stack = gtk::Stack::new();
-    stack.add_named(&connecting, Some("connecting"));
-    stack.add_named(&unreachable, Some("unreachable"));
-    stack.add_named(&refused, Some("refused"));
+    stack.add_named(&with_header(&connecting), Some("connecting"));
+    stack.add_named(&with_header(&unreachable), Some("unreachable"));
+    stack.add_named(&with_header(&refused), Some("refused"));
     stack.add_named(&main, Some("main"));
 
-    // Header and banners.
-    let btn_install = named(gtk::Button::with_label("Install…"), "btn-install");
-    btn_install.add_css_class("suggested-action");
-    let btn_jobs = named(gtk::ToggleButton::with_label("Jobs"), "btn-jobs");
-    let menu = gtk4::gio::Menu::new();
-    menu.append(Some("Refresh"), Some("win.refresh"));
-    menu.append(Some("About"), Some("win.about"));
-    let menu_btn = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .menu_model(&menu)
-        .tooltip_text("Menu")
-        .build();
-    let header = adw::HeaderBar::new();
-    header.pack_start(&btn_install);
-    header.pack_end(&menu_btn);
-    header.pack_end(&btn_jobs);
+    // Banners over everything; the status pages get a bare header (window controls).
     let banner_read_only = named(adw::Banner::new(READ_ONLY), "banner-read-only");
     banner_read_only.set_use_markup(false);
     let banner_notice = named(adw::Banner::new(""), "banner-notice");
     banner_notice.set_use_markup(false);
     banner_notice.set_button_label(Some("Dismiss"));
     let view = adw::ToolbarView::new();
-    view.add_top_bar(&header);
     view.add_top_bar(&banner_read_only);
     view.add_top_bar(&banner_notice);
     view.set_content(Some(&stack));
@@ -221,6 +254,7 @@ pub fn build() -> Widgets {
         page,
         page_nav,
         jobs_panel,
-        jobs_box,
+        jobs_list,
+        job_log,
     }
 }
