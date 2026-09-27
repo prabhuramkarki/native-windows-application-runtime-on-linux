@@ -154,17 +154,24 @@ regenerate with `cargo run -q -p runtime-cli -- compat > docs/COMPAT.md`).
 
 ## API and daemon (`runtimed`, `runtime rpc`)
 
-`runtimed` serves a typed, read-only API (apps, permissions, doctor, dependency plan, sandbox and graphics info,
-the compatibility matrix) as JSON-RPC 2.0 over an owner-only Unix socket (`$XDG_RUNTIME_DIR/runtime/runtimed.sock`,
-no network), for a GUI or scripts; systemd user units for socket activation are in `contrib/systemd/`.
+`runtimed` serves a typed API (apps, permissions, doctor, dependency plan, sandbox and graphics info, the
+compatibility matrix) as JSON-RPC 2.0 over an owner-only Unix socket (`$XDG_RUNTIME_DIR/runtime/runtimed.sock`, no
+network), for a GUI or scripts; systemd user units for socket activation are in `contrib/systemd/`. It is read-only
+unless started with `--write` (the unit does): then it also runs, installs and removes apps, installs dependencies
+(only with consent to the exact plan the client showed) and changes permissions and the display driver, each as a
+job that runs the `runtime` CLI next to it, whose output clients follow with `jobs.poll`. With `--write`, `runtime`
+and its directory must be writable only by you (after a umask-002 `cargo install`:
+`chmod g-w,o-w ~/.cargo/bin ~/.cargo/bin/runtime`; `runtimed` says so if needed).
 `runtime rpc <method> [json-params]` calls it and prints the result, `runtime daemon-status` says whether one
-answers. Every other command works without it. Methods, types, errors, versioning and setup:
+answers and in which mode. Every other command works without it. Methods, types, errors, versioning and setup:
 [docs/API.md](docs/API.md); what it exposes and to whom: [docs/SECURITY.md](docs/SECURITY.md).
 
 ```sh
-runtimed &
+runtimed --write &
 runtime daemon-status
 runtime rpc apps.get '{"id": "tool"}'
+runtime rpc permissions.set '{"id": "tool", "set": ["network=allow"]}'    # {"jobId": "..."}
+runtime rpc jobs.poll '{"jobId": "<id>", "afterSeq": 0, "waitMs": 10000}'
 ```
 
 ## Requirements
@@ -241,9 +248,11 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/deps`: the dependency engine: bundled manifest, resolver, verified HTTPS fetch, archive and installer
   package installers (Phase 4A).
 - `crates/api`: `rt_api`, the typed, sanitised, read-only API (`Runtime`: apps, permissions, doctor, dependency
-  plan, sandbox and graphics info, compatibility matrix) and the host-fact gathering the CLI shares (`rt_api::host`).
-- `crates/daemon`: `runtimed`, the read-only API as JSON-RPC 2.0 (NDJSON) over an owner-only Unix socket, with
-  systemd user units in `contrib/systemd/`, and its client (`rt_daemon::client`).
+  plan, sandbox and graphics info, compatibility matrix), the host-fact gathering the CLI shares (`rt_api::host`),
+  and `rt_api::jobs` (the write methods' validated job specs and argv, the dependency plan digest and consent check).
+- `crates/daemon`: `runtimed`, the API as JSON-RPC 2.0 (NDJSON) over an owner-only Unix socket (read-only, or with
+  `--write` the job table that runs `runtime` for every change), with systemd user units in `contrib/systemd/`, and
+  its client (`rt_daemon::client`).
 - `crates/cli`: the `runtime` binary, a thin front end over the above (it uses `rt_daemon` only for its client, in
   `runtime rpc` and `runtime daemon-status`).
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.
