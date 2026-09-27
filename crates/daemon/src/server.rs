@@ -33,11 +33,10 @@
 //!
 //! **Socket activation** ([`listener_from_env`]): `LISTEN_PID` must be this process (else the variables are not
 //! for us and are ignored), `LISTEN_FDS` must be exactly 1, and fd 3 must be a listening `AF_UNIX` stream socket.
-use crate::dispatch;
+use crate::dispatch::{self, Ctx};
 use crate::protocol::{
     BUSY, FrameError, INTERNAL, INVALID_REQUEST, Id, MAX_FRAME, Reply, TIMEOUT, parse_request, read_frame,
 };
-use rt_api::Runtime;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
@@ -413,15 +412,15 @@ fn send_by(s: &UnixStream, r: &Reply, until: Instant) -> io::Result<()> {
 /// Runs one request on its own thread and waits at most `timeout` for it: the reply (a [`TIMEOUT`] error when it
 /// took longer) and the thread, which the caller joins before it frees the connection's slot.
 fn run(
-    rt: &Arc<Runtime>,
+    ctx: &Arc<Ctx>,
     req: crate::protocol::Request,
     id: Id,
     timeout: Duration,
 ) -> (Reply, Option<thread::JoinHandle<()>>) {
     let (tx, rx) = mpsc::channel();
-    let rt = rt.clone();
+    let ctx = ctx.clone();
     let h = match thread::Builder::new().spawn(move || {
-        let _ = tx.send(dispatch::handle(&rt, req));
+        let _ = tx.send(dispatch::handle(&ctx, req));
     }) {
         Ok(h) => h,
         Err(_) => return (Reply::error(id, INTERNAL, "internal error"), None),
@@ -433,7 +432,8 @@ fn run(
     }
 }
 
-fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'static AtomicBool) {
+fn connection(s: UnixStream, ctx: Arc<Ctx>, cfg: Arc<ServerConfig>) {
+    let stop = ctx.stop;
     let send = |r: &Reply| send_by(&s, r, Instant::now() + cfg.idle_timeout);
     let mut r = BufReader::new(Deadline {
         s: &s,
@@ -464,9 +464,9 @@ fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'s
                 continue;
             }
         };
-        // A notification: nothing to run (every method only reads), nothing to say.
+        // A notification: never executed (a client that cannot learn a job's id must not start one), no reply.
         let Some(id) = req.id.clone() else { continue };
-        let (reply, handler) = run(&rt, req, id, cfg.request_timeout);
+        let (reply, handler) = run(&ctx, req, id, cfg.request_timeout);
         let timed_out = matches!(reply, Reply::Err { code: TIMEOUT, .. });
         let sent = send(&reply);
         if timed_out {
@@ -483,25 +483,16 @@ fn connection(s: UnixStream, rt: Arc<Runtime>, cfg: Arc<ServerConfig>, stop: &'s
     }
 }
 
-/// Serves `rt` until `stop` is set: on `listener` (inherited; never removed) or on a socket bound at `cfg.socket`
-/// (removed at the end).
-pub fn serve(
-    rt: Arc<Runtime>,
-    cfg: ServerConfig,
-    listener: Option<UnixListener>,
-    stop: &'static AtomicBool,
-) -> Result<(), ServeError> {
-    serve_as(rt, cfg, listener, stop, euid())
+/// Serves `ctx` until `ctx.stop` is set: on `listener` (inherited; never removed) or on a socket bound at
+/// `cfg.socket` (removed at the end). Stopping, in order: the listener closes; every live job is cancelled and the
+/// server waits up to its `term_grace` + 1 s for them to be reaped; the requests in flight get up to [`GRACE`]; the
+/// socket this server bound is removed last, so no job outlives the socket a client could still reach it by.
+pub fn serve(ctx: Arc<Ctx>, cfg: ServerConfig, listener: Option<UnixListener>) -> Result<(), ServeError> {
+    serve_as(ctx, cfg, listener, euid())
 }
 
 /// [`serve`], admitting only peers of uid `me` (tests pass another uid to see a refusal).
-fn serve_as(
-    rt: Arc<Runtime>,
-    cfg: ServerConfig,
-    listener: Option<UnixListener>,
-    stop: &'static AtomicBool,
-    me: u32,
-) -> Result<(), ServeError> {
+fn serve_as(ctx: Arc<Ctx>, cfg: ServerConfig, listener: Option<UnixListener>, me: u32) -> Result<(), ServeError> {
     let (listener, bound) = match listener {
         Some(l) => {
             log("serving the inherited socket");
@@ -513,8 +504,16 @@ fn serve_as(
             (l, Some(b))
         }
     };
-    let result = accept_loop(&listener, rt, Arc::new(cfg), stop, me);
+    let active = Arc::new(AtomicUsize::new(0));
+    let result = accept_loop(&listener, &ctx, Arc::new(cfg), &active, me);
     drop(listener);
+    if let Some(jobs) = &ctx.jobs {
+        jobs.shutdown(jobs.term_grace() + Duration::from_secs(1));
+    }
+    let until = Instant::now() + GRACE;
+    while active.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
     if let Some(b) = bound {
         b.remove();
     }
@@ -524,13 +523,13 @@ fn serve_as(
 
 fn accept_loop(
     listener: &UnixListener,
-    rt: Arc<Runtime>,
+    ctx: &Arc<Ctx>,
     cfg: Arc<ServerConfig>,
-    stop: &'static AtomicBool,
+    active: &Arc<AtomicUsize>,
     me: u32,
 ) -> Result<(), ServeError> {
     listener.set_nonblocking(true).map_err(io("cannot use the socket"))?;
-    let active = Arc::new(AtomicUsize::new(0));
+    let stop = ctx.stop;
     while !stop.load(Ordering::SeqCst) {
         let mut pfd = libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -574,19 +573,15 @@ fn accept_loop(
             }
             active.fetch_add(1, Ordering::SeqCst);
             let slot = Slot(active.clone());
-            let (rt, cfg) = (rt.clone(), cfg.clone());
+            let (ctx, cfg) = (ctx.clone(), cfg.clone());
             let spawned = thread::Builder::new().spawn(move || {
                 let _slot = slot;
-                connection(s, rt, cfg, stop);
+                connection(s, ctx, cfg);
             });
             if spawned.is_err() {
                 log("cannot start a connection thread");
             }
         }
-    }
-    let until = Instant::now() + GRACE;
-    while active.load(Ordering::SeqCst) > 0 && Instant::now() < until {
-        thread::sleep(Duration::from_millis(20));
     }
     Ok(())
 }
@@ -595,6 +590,7 @@ fn accept_loop(
 mod tests {
     use super::*;
     use crate::testutil::{plant, rt};
+    use rt_api::Runtime;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::symlink;
@@ -617,11 +613,27 @@ mod tests {
 
         /// A server that admits only uid `me`.
         fn start_as(dir: &Path, rt: Arc<Runtime>, tune: impl FnOnce(&mut ServerConfig), me: u32) -> Srv {
+            Srv::start_full(dir, rt, None, tune, me)
+        }
+
+        /// A write-mode server whose jobs are `jobs`.
+        fn start_rw(dir: &Path, rt: Arc<Runtime>, jobs: crate::jobs::Jobs) -> Srv {
+            Srv::start_full(dir, rt, Some(jobs), |_| {}, euid())
+        }
+
+        fn start_full(
+            dir: &Path,
+            rt: Arc<Runtime>,
+            jobs: Option<crate::jobs::Jobs>,
+            tune: impl FnOnce(&mut ServerConfig),
+            me: u32,
+        ) -> Srv {
             let sock = dir.join("run").join("runtimed.sock");
             let mut cfg = ServerConfig::new(sock.clone());
             tune(&mut cfg);
             let stop = flag();
-            let done = Some(thread::spawn(move || serve_as(rt, cfg, None, stop, me)));
+            let ctx = Arc::new(Ctx::new(rt, jobs, stop));
+            let done = Some(thread::spawn(move || serve_as(ctx, cfg, None, me)));
             let until = Instant::now() + Duration::from_secs(5);
             // Mode 0600 is set after bind+listen; a probe connection would take a slot for a moment.
             while fs::symlink_metadata(&sock).map(|m| m.mode() & 0o777).ok() != Some(0o600) {
@@ -710,6 +722,9 @@ mod tests {
             "graphics.info" => v(Ok(rt.graphics_info())),
             "sandbox.info" => v(rt.sandbox_info(id)),
             "deps.plan" => v(rt.deps_plan(id)),
+            // A read-only server: every write method is refused before its params are read.
+            m if crate::dispatch::WRITE_METHODS.contains(&m) => json!({ "error": {
+                "message": "this runtimed is read-only (start it with --write)", "kind": "read_only" } }),
             m => panic!("{m}"),
         }
     }
@@ -949,7 +964,15 @@ mod tests {
         assert!(!sock.exists());
         assert_eq!(mode(&d.path().join("run/s.lock")), 0o600);
         drop(first);
-        let (_l, _b) = bind_socket(&sock).unwrap();
+        // Another test thread may have forked (a job's child) while the lock fd was open: the child shares the
+        // locked file description until its exec closes it (CLOEXEC), so the lock can outlive `first` briefly.
+        let until = Instant::now() + Duration::from_secs(2);
+        let (_l, _b) = loop {
+            match bind_socket(&sock) {
+                Err(ServeError::AlreadyRunning(_)) if Instant::now() < until => thread::sleep(Duration::from_millis(5)),
+                r => break r.unwrap(),
+            }
+        };
         // A lock path that is a symlink is refused.
         let d2 = tempfile::tempdir().unwrap();
         let run = d2.path().join("run");
@@ -1165,7 +1188,7 @@ mod tests {
         let l = UnixListener::bind(&sock).unwrap();
         let stop = flag();
         let cfg = ServerConfig::new(d.path().join("unused/never.sock"));
-        let h = thread::spawn(move || serve(Arc::new(rt), cfg, Some(l), stop));
+        let h = thread::spawn(move || serve(Arc::new(Ctx::new(Arc::new(rt), None, stop)), cfg, Some(l)));
         let mut c = Conn::new(UnixStream::connect(&sock).unwrap());
         assert!(c.call("rpc.version", json!({}))["result"].is_object());
         stop.store(true, Ordering::SeqCst);
@@ -1226,5 +1249,126 @@ mod tests {
         let _c = UnixStream::connect(d.path().join("l.sock")).unwrap();
         got.set_nonblocking(true).unwrap();
         assert!(got.accept().is_ok());
+    }
+
+    // ------------------------------------------------------------------------------------------------ write mode
+
+    use crate::jobs::tests::{alive, fx};
+
+    fn started(v: &Value) -> String {
+        v["result"]["jobId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn a_long_poll_returns_when_the_job_prints_and_stop_ends_it_within_a_tick() {
+        let (d, rt) = rt();
+        let f = fx();
+        f.mode(Some("a"), "slow");
+        let mut srv = Srv::start_rw(d.path(), Arc::new(rt), f.jobs.clone());
+        let mut c = srv.conn();
+        let id = started(&c.call("apps.remove", json!({"id": "a"})));
+        f.wait_for(&id, "first");
+        let after = f.events(&id).last().unwrap().seq;
+        let t = Instant::now();
+        let v = c.call("jobs.poll", json!({"jobId": id, "afterSeq": after, "waitMs": 10000}));
+        assert_eq!(v["result"]["events"][0]["text"], "late", "{v}");
+        // "late" comes 400 ms after "first": the poll returned right after it, not at waitMs.
+        assert!(t.elapsed() < Duration::from_millis(900), "{:?}", t.elapsed());
+        // A poll waiting on a job that prints nothing more: the daemon stops, the poll is answered within a tick.
+        f.mode(Some("b"), "wait");
+        let id = started(&c.call("apps.remove", json!({"id": "b"})));
+        f.wait_for(&id, "ready");
+        let after = f.events(&id).last().unwrap().seq;
+        let mut w = srv.conn();
+        let line = json!({"jsonrpc": "2.0", "id": 7, "method": "jobs.poll",
+            "params": {"jobId": id, "afterSeq": after, "waitMs": 20000}})
+        .to_string();
+        w.send(format!("{line}\n").as_bytes()).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let waiter = thread::spawn(move || {
+            let v = w.recv();
+            (Instant::now(), v)
+        });
+        let stopped_at = Instant::now();
+        srv.stop.store(true, Ordering::SeqCst);
+        let (answered, v) = waiter.join().unwrap();
+        assert!(
+            answered.duration_since(stopped_at) < Duration::from_millis(250),
+            "{:?}",
+            answered - stopped_at
+        );
+        assert!(v.unwrap()["result"]["events"].as_array().unwrap().is_empty());
+        srv.stop();
+        assert_eq!(f.jobs.status(&id).unwrap().state, rt_api::jobs::JobState::Cancelled);
+    }
+
+    #[test]
+    fn nine_waiting_polls_leave_the_ninth_and_other_connections_answered() {
+        let (d, rt) = rt();
+        let f = fx();
+        f.mode(Some("a"), "wait");
+        let mut srv = Srv::start_rw(d.path(), Arc::new(rt), f.jobs.clone());
+        let id = started(&srv.conn().call("apps.remove", json!({"id": "a"})));
+        f.wait_for(&id, "ready");
+        let after = f.events(&id).last().unwrap().seq;
+        let poll = json!({"jobId": id, "afterSeq": after, "waitMs": 5000});
+        let mut conns: Vec<Conn> = (0..8).map(|_| srv.conn()).collect();
+        for (n, c) in conns.iter_mut().enumerate() {
+            let line = json!({"jsonrpc": "2.0", "id": n, "method": "jobs.poll", "params": poll}).to_string();
+            c.send(format!("{line}\n").as_bytes()).unwrap();
+        }
+        thread::sleep(Duration::from_millis(300));
+        let t = Instant::now();
+        let v = srv.conn().call("jobs.poll", poll.clone());
+        assert!(v["result"]["events"].as_array().unwrap().is_empty(), "{v}");
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "the ninth waited: {:?}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        assert_eq!(srv.conn().call("rpc.version", json!({}))["result"]["write"], true);
+        assert!(t.elapsed() < Duration::from_millis(200));
+        // The eight are still waiting, then all answer.
+        for mut c in conns {
+            assert!(c.recv().unwrap()["result"]["events"].as_array().unwrap().is_empty());
+        }
+        srv.stop();
+    }
+
+    #[test]
+    fn stopping_kills_every_job_before_the_socket_goes() {
+        let (d, rt) = rt();
+        let f = crate::jobs::tests::fx_with(|c| c.term_grace = Duration::from_millis(500));
+        f.mode(Some("a"), "sleep");
+        let mut srv = Srv::start_rw(d.path(), Arc::new(rt), f.jobs.clone());
+        let id = started(&srv.conn().call("apps.remove", json!({"id": "a"})));
+        f.wait_for(&id, "ready");
+        let pid: i32 = f.read("pid", "a").trim().parse().unwrap();
+        let sock = srv.sock.clone();
+        let watcher = thread::spawn(move || {
+            // While the job's process lives, the socket must still be there.
+            let until = Instant::now() + Duration::from_secs(10);
+            while alive(pid) && Instant::now() < until {
+                assert!(
+                    fs::symlink_metadata(&sock).is_ok(),
+                    "the socket went before the job died"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let took = srv.stop();
+        watcher.join().unwrap();
+        assert!(!alive(pid));
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        assert!(!srv.sock.exists());
+        let i = f.jobs.status(&id).unwrap();
+        assert_eq!((i.state, i.signal), (rt_api::jobs::JobState::Cancelled, Some(9)));
     }
 }

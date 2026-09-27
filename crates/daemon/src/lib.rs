@@ -1,11 +1,14 @@
 //! `runtimed`: the read-only [`rt_api::Runtime`] served as JSON-RPC 2.0 over an owner-only Unix socket.
 //! [`protocol`] is the wire format and its limits, [`dispatch`] the method table, [`server`] the socket, the
 //! peer check, the connection limits and shutdown, [`client`] the client that `runtime rpc` uses (it checks the
-//! socket before it sends and treats replies as untrusted).
+//! socket before it sends and treats replies as untrusted). [`jobs`] is the job table of a write-mode daemon: the
+//! `runtime` children that perform every mutation, their bounded output, cancel and shutdown.
 pub mod client;
 pub mod dispatch;
+pub mod jobs;
 pub mod protocol;
 pub mod server;
+pub mod write;
 
 #[cfg(test)]
 pub(crate) mod testutil {

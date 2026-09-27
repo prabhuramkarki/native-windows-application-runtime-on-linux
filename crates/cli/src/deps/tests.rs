@@ -341,6 +341,48 @@ fn a_bare_yes_is_a_usage_error() {
 }
 
 #[test]
+fn plan_digest_is_64_lowercase_hex_and_needs_install() {
+    let d = "0a".repeat(32);
+    let a = deps_args(&["deps", "app", "--install", "--plan-digest", &d]);
+    assert_eq!(a.plan_digest.as_deref(), Some(d.as_str()));
+    assert_eq!(deps_args(&["deps", "app", "--install"]).plan_digest, None);
+    let upper = d.to_uppercase();
+    let short = &d[1..];
+    let long = format!("{d}0");
+    let flag = format!("--plan-digest={d}");
+    for bad in [
+        &["deps", "app", "--plan-digest", &d][..],
+        &["deps", "app", "--install", "--plan-digest", &upper],
+        &["deps", "app", "--install", "--plan-digest", short],
+        &["deps", "app", "--install", "--plan-digest", &long],
+        &["deps", "app", "--install", "--plan-digest", "g".repeat(64).as_str()],
+        &["deps", "app", "--install", "--plan-digest"],
+        &["deps", "app", "--install", &flag, "--discard-interrupted", "x"],
+        &["deps", "list", &flag],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?} parsed");
+    }
+}
+
+#[test]
+fn the_plan_digest_guard_refuses_any_other_plan() {
+    let r = three();
+    let ap = r.plan(THREE);
+    let d = rt_api::jobs::plan_digest(r.env.id(), &ap, &r.manifest);
+    check_plan_digest(r.env.id(), &ap, &r.manifest, None).unwrap();
+    check_plan_digest(r.env.id(), &ap, &r.manifest, Some(&d)).unwrap();
+    let stale = "0".repeat(64);
+    let e = check_plan_digest(r.env.id(), &ap, &r.manifest, Some(&stale)).unwrap_err();
+    assert!(
+        e.contains("the dependency plan changed since it was shown") && e.contains("nothing was installed"),
+        "{e}"
+    );
+    let mut other = ap.clone();
+    other.plan.entries.pop();
+    assert!(check_plan_digest(r.env.id(), &other, &r.manifest, Some(&d)).is_err());
+}
+
+#[test]
 fn every_yes_must_name_a_gated_package_the_plan_installs() {
     let r = three();
     let ap = r.plan(THREE);

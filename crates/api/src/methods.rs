@@ -69,7 +69,7 @@ impl Runtime {
         let md = self.store.read_metadata(&env).map_err(unavailable)?;
         let manifest = rt_deps::Manifest::bundled();
         let plan = rt_deps::plan_for_app(&env, &md, manifest, &|min| host_verdict(&self.vulkan(), min));
-        Ok(DepsPlanView::from_plan(&plan, manifest))
+        Ok(DepsPlanView::from_plan(env.id(), &plan, manifest))
     }
 }
 
@@ -179,7 +179,7 @@ mod tests {
         let md = store.read_metadata(&env).unwrap();
         let m = rt_deps::Manifest::bundled();
         let want = rt_deps::plan_for_app(&env, &md, m, &|min| host_verdict(&gpu((1, 3)), min));
-        assert_eq!(v, DepsPlanView::from_plan(&want, m));
+        assert_eq!(v, DepsPlanView::from_plan(env.id(), &want, m));
         assert_eq!(v.entries.len(), 1);
         let e = &v.entries[0];
         assert_eq!(

@@ -1,4 +1,7 @@
-//! `runtimed [--socket PATH]`: serves the read-only runtime API in the foreground until SIGTERM or SIGINT (exit 0).
+//! `runtimed [--socket PATH] [--write]`: serves the runtime API in the foreground until SIGTERM or SIGINT (exit 0).
+//! Read-only by default; `--write` adds the mutating methods (jobs that run the sibling `runtime`), after the checks
+//! of `rt_daemon::write` (the socket inside `$XDG_RUNTIME_DIR`, the job directory, the `runtime` binary and its
+//! version). The startup log says `mode: write` or `mode: read-only`.
 //!
 //! The socket is the one systemd hands over (`LISTEN_PID`/`LISTEN_FDS`, see `rt_daemon::server`), else `--socket
 //! PATH`, else `$XDG_RUNTIME_DIR/runtime/runtimed.sock`. A handed-over socket that is not usable is an error, never
@@ -17,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const USAGE: &str = "usage: runtimed [--socket PATH]";
+const USAGE: &str = "usage: runtimed [--socket PATH] [--write]";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -50,10 +53,12 @@ fn main() {
 
 fn run() -> i32 {
     let mut socket = None;
+    let mut write = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
         match (a.to_str(), args.len()) {
             (Some("--socket"), 1..) if socket.is_none() => socket = args.next().map(PathBuf::from),
+            (Some("--write"), _) if !write => write = true,
             (Some("-h" | "--help"), _) => {
                 println!("{USAGE}");
                 return 0;
@@ -88,7 +93,7 @@ fn run() -> i32 {
     };
     // `/usr/bin/runtimed` -> `/usr/bin/runtime`; after an upgrade `current_exe` reads `runtimed (deleted)`, and the
     // sibling is still the installed `runtime`.
-    let shim = match std::env::current_exe() {
+    let shim_path = match std::env::current_exe() {
         Ok(me) => me.with_file_name("runtime"),
         Err(_) => {
             eprintln!("runtimed: cannot find its own executable");
@@ -96,14 +101,37 @@ fn run() -> i32 {
         }
     };
     let rt = match Runtime::open() {
-        Ok(rt) => rt.with_runtime_exe(shim),
+        Ok(rt) => rt.with_runtime_exe(shim_path.clone()),
         Err(e) => {
             eprintln!("runtimed: {}", e.message);
             return 1;
         }
     };
     on_stop_signals();
-    match server::serve(Arc::new(rt), ServerConfig::new(socket), inherited, &STOP) {
+    // `_dir` (this daemon's job directory and its lock) lives until `serve` has returned and every job is reaped.
+    let (jobs, _dir) = if write {
+        let at = match &inherited {
+            Some(l) => rt_daemon::write::listener_path(l),
+            None => Some(socket.clone()),
+        };
+        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        let runtime_exe = shim_path.clone();
+        match at
+            .ok_or_else(|| "--write: the inherited socket has no path".to_owned())
+            .and_then(|at| rt_daemon::write::prepare(&at, xdg.as_deref(), &runtime_exe))
+        {
+            Ok(p) => (Some(rt_daemon::jobs::Jobs::new(p.jobs)), Some(p.dir)),
+            Err(e) => {
+                eprintln!("runtimed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        (None, None)
+    };
+    eprintln!("runtimed: mode: {}", if write { "write" } else { "read-only" });
+    let ctx = Arc::new(rt_daemon::dispatch::Ctx::new(Arc::new(rt), jobs, &STOP));
+    match server::serve(ctx, ServerConfig::new(socket), inherited) {
         Ok(()) => 0,
         Err(e) => fail(&e),
     }
