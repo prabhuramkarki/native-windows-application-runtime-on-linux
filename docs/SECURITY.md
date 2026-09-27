@@ -1314,6 +1314,109 @@ the channel or keep the main loop busy without end.
 - **A narrow window** collapses to one pane; keyboard and screen-reader use are only checked by hand
   (docs/GUI-CHECKLIST.md). An accessibility pass is a follow-up.
 
+## Backends and `.wrun` packages (Phase 6D)
+
+### No plugins
+
+Every runtime process (the CLI, `runtimed`, the GUI) runs as the user with the user's full access. The sandbox is
+built by the runtime around the Windows program, not around the runtime itself. A dynamically loaded backend would
+therefore run in-process and unsandboxed, with access to every app's prefix, the daemon's write socket and a consent
+flow it could answer itself. A plugin API would also freeze an ABI (Rust has none) and invite "install this backend"
+instructions from strangers. So backends are Rust types compiled into the workspace, reviewed, built from the lock
+file and checked by `cargo deny`. `rt_api::backends::select` maps an app's recorded `backend.id` to one of them. An
+unknown id is refused with a cleaned message and is never run with Wine. The test doubles (`FakeBackend`, the
+conformance suite's null backend) are not in the registry and cannot reach a release build.
+
+Enforcement: `deny.toml` bans `libloading`, `libloading-mini`, `dlopen` and `dlopen2`, and a test in
+`crates/core/tests/conformance.rs` fails on `dlopen`, `dlsym`, `libloading` or `RTLD_` in any `crates/*/src` file.
+A legitimate future use needs a deliberate edit of that scan and an entry here. An out-of-process backend protocol
+could be considered after 1.0, with its own threat model.
+
+### The backend contract and capabilities
+
+The contract (module docs of `crates/core/src/backend.rs`, `BACKEND_API_VERSION = 1`) says that a backend:
+
+- describes a process and never spawns one in `command`;
+- keeps the program and its working directory inside `drive_c`. `rt_core::backend::inside_drive_c` refuses `..`
+  escapes, absolute paths outside, and every symbolic link on the way (in `drive_c` itself, an intermediate
+  directory or the final component) as `OutsideDriveC`;
+- passes arguments verbatim and sets no loader variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`);
+- never reads `permissions.toml`, never decides sandboxing, never downloads, never writes outside the app.
+
+The conformance suite runs the same named checks over Wine, the fake and a null backend. Deliberately broken
+backends each fail exactly one check, one of them a backend that follows a final symlink. What the suite cannot
+observe (a `command` that spawns, a backend that reads `permissions.toml`) is left to review.
+
+A backend declares its capabilities, and the platform refuses what they exclude before it creates or starts
+anything:
+
+| Capability | Where it is enforced |
+|---|---|
+| guest architecture and subsystem | `rt_core::install` (before `Store::create`); the installer pipeline, for the program it found; `rt_core::run`, for the recorded architecture |
+| `installers` | `install_via_installer`, before it reads the file |
+| `dependency_packages` | `rt_deps::check_backend`, from `install_plan` and from `runtime deps --install` before the sandbox marker is written |
+| `dotnet` | `rt_core::run`, for an app with Wine Mono recorded |
+| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. `installers` and `dependency_packages` require it. |
+
+Wine declares all of them. The refusals are exercised by tests with `FakeBackend` and the null backend.
+
+### `.wrun` packages: the threat model
+
+A `.wrun` is hostile input from someone the user may not know. Its format is in [WRUN.md](WRUN.md).
+
+- **Parsing.** It is read only through the hardened zip planner (`rt_core::unzip`, the production limits of
+  `install`) plus the package rules. The rules are: the first entry is `wrun.toml` (at most 64 KiB), everything else
+  below `payload/`, no `\`, canonical UTF-8 names, and link and special entries refused rather than skipped. The
+  manifest is strict TOML with unknown keys refused at every level. Every rule has a hostile test. A mutation harness
+  (2,000 archive mutants and 2,000 manifest mutants) shows no panic, error text of at most 4 KiB, and nothing written
+  outside the destination. Every string from a package reaches output only cleaned and bounded.
+- **Integrity.** `[[files]]` must equal exactly the payload files with their declared sizes, checked before anything is
+  written. Each file's sha256 is checked on the bytes as they are written. A mismatch or an unlisted file fails the
+  import, and the half-built app is removed. `inspect` and `unpack` verify the same way; `unpack` removes its
+  directory on any error.
+- **Requests only.** A package can request dependencies (ids of the bundled manifest) and the typed permissions
+  `network`, `display`, `audio` and `gpu`. It cannot ask for host directories or looser limits. Import writes no
+  `permissions.toml`, installs no dependency, sets no `--yes` and never starts the app. Requests are stored in the
+  app's metadata (`package`, schema 4) as fixed strings built from enums, never copied from the file. The sandbox never
+  reads them. `runtime permissions`, `permissions.get` and the GUI show each request the profile does not grant, as
+  "requested by the package (not granted)". `runtime deps` plans a requested dependency with "(requested by the
+  package)" behind the unchanged per-package consent. That suffix is display only: the consent prompt and the
+  6B plan digest are unchanged.
+- **Id collisions.** The manifest's id becomes the app id unchanged. An installed id is refused before anything is
+  written, and `Store::create`'s atomic `mkdir` refuses the race. Nothing of the existing app is read, locked or
+  changed, and no other id is tried.
+- **Code on import.** There are no scripts or hooks. An installer-kind package runs its one installer through the
+  unchanged installer sandbox, with `--silent` and `--network` only when the user passes them.
+- **Staging.** An installer-kind package's installer is extracted and verified into
+  `<data>/staging/import-<pid>-<nanos>/` (0700; the file `create_new`, 0600) and removed on every normal exit and
+  on errors. A signal skips that removal, so each import first removes the staging directories of imports whose
+  process is gone.
+- **Signatures.** v1 packages are unsigned, and `pack`, `inspect` and `import` say "unsigned: its origin is not
+  verified". The package digest (sha256 of the raw `wrun.toml`, which covers every file hash) is recorded and is
+  what a future signature will sign. `wrun.sig` is reserved and refused, so a signed package is never silently
+  treated as trusted by this version.
+- **`runtime install` of a `.wrun`** (a zip whose first entry is `wrun.toml`) is refused by `rt_core::install`
+  itself (so also by `run <file>` and the API), so a package's requests are never silently dropped.
+- **`apps.import`** is a write method (API 0.2.1). Its path is validated like `apps.install`'s and its argv is
+  `import [--silent] [--network] -- <path>`. The GUI sends it only to a daemon that speaks 0.2.1.
+
+### Known bounds
+
+- **Unsigned means unverified.** A `.wrun` from a stranger is as trustworthy as a `setup.exe` from a stranger.
+  Import cannot tell who made it; it can only refuse to grant anything.
+- **Social engineering through requests.** A package can request `network=allow` and its README can tell the user
+  to grant it. The grant is still the user's own command, and the request text is fixed wording.
+- **The recorded digest is not proof.** `package.digest` in `metadata.json` is what was imported; the `.wrun` is not
+  kept, so the digest is never re-verified and is as trustworthy as any other metadata field.
+- **A killed import can leave a half-built app** under the package's id (as a killed `install` can). A re-import is
+  then refused as "already installed" until `runtime remove <id>` clears it.
+- **Schema 4.** Every app this version creates or changes (an install, an import, `deps --install`) records
+  metadata schema 4, which an older runtime refuses. This is the existing schema policy.
+- **The manifest's `arch` for installer packages** is checked against the backend's capabilities but not against the
+  program the installer wrote; the metadata records the program's real architecture.
+- **Contract gaps.** Parts of the backend contract are reviewed, not proven (above). `runtime display` writes Wine's
+  own configuration and is not gated by a capability yet; that is to do with a second backend.
+
 ## Roadmap
 
 Phase 5B's layers are in place for the app sandbox (seccomp, Landlock, resource limits and their escape tests) and,
