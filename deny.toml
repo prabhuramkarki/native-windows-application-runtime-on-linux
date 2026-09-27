@@ -11,6 +11,15 @@ ignore = true
 
 [bans]
 multiple-versions = "warn"
+# No workspace code loads plugins or backends dynamically (Phase 6D, Decision B7; docs/SECURITY.md): backends are
+# compiled in. `crates/core/tests/conformance.rs` scans the sources for the same thing. (System libraries still load
+# their own modules: GTK/GLib in runtime-gui, glibc NSS.)
+deny = [
+    { crate = "libloading", reason = "no plugins: backends are compiled in" },
+    { crate = "libloading-mini", reason = "no plugins: backends are compiled in" },
+    { crate = "dlopen", reason = "no plugins: backends are compiled in" },
+    { crate = "dlopen2", reason = "no plugins: backends are compiled in" },
+]
 
 # target-lexicon (via system-deps -> cfg-expr) runs only in the gtk-rs `-sys` build scripts of `runtime-gui`; it is
 # never linked into a binary (`cargo tree --workspace -i target-lexicon -e normal` is empty). The LLVM exception only relaxes

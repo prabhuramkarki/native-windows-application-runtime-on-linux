@@ -103,6 +103,16 @@ pub struct AppPlan {
     pub warnings: Vec<String>,
 }
 
+/// Why a plan entry that [`AppPlan::is_requested`] is there, for front ends to show next to it.
+pub const REQUESTED_REASON: &str = "requested by the package";
+
+impl AppPlan {
+    /// Whether `package` is in the plan because the imported package requested it ([`REQUESTED_REASON`]).
+    pub fn is_requested(&self, package: &str) -> bool {
+        self.facts.requested.iter().any(|r| r == package)
+    }
+}
+
 pub struct Orchestrator<'a> {
     pub manifest: &'a Manifest,
     /// Passed to the fetcher, which creates and checks it.
@@ -177,6 +187,9 @@ pub enum DepsError {
     Recorded(String),
     #[error("cannot discard what the interrupted install left: {0}")]
     Discard(#[source] ArchiveError),
+    /// The app's backend cannot take dependency packages (checked before any lock, prompt or download).
+    #[error("{0}")]
+    Unsupported(#[from] rt_core::backend::Unsupported),
 }
 
 impl DepsError {
@@ -312,6 +325,15 @@ pub fn plan_for_pe(
         Err(why) => warnings.push(line(&format!(
             "cannot read the app's executable ({why}); the plan does not include what it imports"
         ))),
+    }
+    for id in md.package.iter().flat_map(|p| &p.requested_dependencies) {
+        if manifest.get(id).is_some() {
+            facts.requested.push(id.clone());
+        } else {
+            warnings.push(line(&format!(
+                "the package requested {id:?}, which is not an available dependency package; it is not planned"
+            )));
+        }
     }
     let mut plan = resolve(&facts, &state::installed_set(md), &[], manifest);
     block_for_vulkan(&mut plan, manifest, vulkan);
@@ -504,11 +526,27 @@ fn check_not_busy(env: &AppEnv) -> Result<(), DepsError> {
 
 // ------------------------------------------------------------------------------------------------ installing
 
+/// Packages write DLL overrides and Wine configuration into the prefix: a backend that cannot take them is refused
+/// before any lock, prompt or download. [`install_plan`] checks it; a front end calls it first too, before it
+/// prepares anything of its own for the install (the CLI's sandbox marker).
+pub fn check_backend(backend: &dyn CompatBackend) -> Result<(), DepsError> {
+    if backend.capabilities().dependency_packages {
+        Ok(())
+    } else {
+        Err(rt_core::Unsupported::Feature {
+            backend: backend.id(),
+            feature: "dependency packages",
+        }
+        .into())
+    }
+}
+
 /// Installs what `app`'s plan needs, behind consent (see the module docs). `Err` only for run-level refusals.
 pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsError> {
     if !has_install(&app.plan) {
         return Ok(execute(o, &app.plan, &Decisions::default(), &[]));
     }
+    check_backend(o.backend)?;
     let _lock = lock_app(o.env)?;
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;

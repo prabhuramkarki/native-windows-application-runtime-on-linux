@@ -1159,6 +1159,7 @@ dependencies = [
  "runtime-deps",
  "runtime-desktop",
  "runtime-installer",
+ "runtime-package",
  "runtime-pe",
  "runtime-sandbox",
  "serde",
@@ -1178,9 +1179,12 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "libc",
+ "runtime-core",
+ "runtime-installer",
  "runtime-pe",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1259,6 +1263,22 @@ dependencies = [
  "runtime-sandbox",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "runtime-package"
+version = "0.0.1"
+dependencies = [
+ "flate2",
+ "libc",
+ "runtime-core",
+ "runtime-pe",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "zip",
 ]
 
 [[package]]

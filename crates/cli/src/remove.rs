@@ -5,7 +5,7 @@
 //! refused before anything is looked at. `Store::remove` then refuses a symlink or non-directory at the app path.
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
-use rt_core::{AppId, CompatBackend, Launcher, StoreError};
+use rt_core::{AppId, Launcher, StoreError};
 
 pub fn run(arg: &str) -> Result<(), CmdError> {
     let id = AppId::parse(arg).map_err(|e| {
@@ -23,7 +23,7 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
     // package can be recorded into an app that is being deleted (or into a new app of the same id).
     let _deps_lock = crate::deps::lock_or_refuse(&env, false, "remove")?;
     // Wine is only needed to stop what is still running: without it the app is removed anyway.
-    match crate::backend(&Launcher::new()) {
+    match crate::backend_of(&store, &env, &Launcher::new()) {
         Ok(backend) => {
             if let Err(e) = backend.stop(&env) {
                 warn(&format!(

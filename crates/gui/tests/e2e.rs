@@ -162,6 +162,10 @@ fn a_read_only_daemon_gets_no_write_command() {
             path: "/in/setup.exe".into(),
             ..Default::default()
         }),
+        Msg::Install(InstallForm {
+            path: "/in/app.wrun".into(),
+            ..Default::default()
+        }),
         Msg::Permission(PermChange::Network(true)),
         Msg::ResetPermissions,
         Msg::InstallDeps,
@@ -291,4 +295,54 @@ fn the_real_runtime_installs_edits_plans_and_removes() {
     assert_eq!(state, JobState::Succeeded, "{lines:?}");
     g.until("the page to close", |_, m| m.page().is_none());
     g.until("the empty list", |_, m| m.visible_apps().is_empty());
+}
+
+/// Phase 6D: a `.wrun` chosen in the install form is imported through `apps.import` by the real `runtime` (fake
+/// Wine): the app has the manifest's id and its page shows the request, not granted.
+#[test]
+fn the_install_form_imports_a_package() {
+    let (s, env) = support::real(&runtimed());
+    let pkg = s.root.join("pkg");
+    std::fs::create_dir_all(pkg.join("payload")).unwrap();
+    std::fs::copy(fixture("hello64.exe"), pkg.join("payload/hello64.exe")).unwrap();
+    std::fs::write(
+        pkg.join("wrun.toml"),
+        "format = 1\nid = \"demo\"\nname = \"Demo\"\nversion = \"1.0\"\narch = \"x86_64\"\n\n[entry]\n\
+         kind = \"portable\"\nexe = \"payload/hello64.exe\"\n\n[permissions]\ngpu = \"off\"\n",
+    )
+    .unwrap();
+    let file = s.root.join("demo.wrun");
+    let o = std::process::Command::new(s.bin.join("runtime"))
+        .env("RUNTIME_DATA_DIR", &s.data)
+        .env("HOME", &s.home)
+        .arg("pack")
+        .arg(&pkg)
+        .arg("-o")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    let _d = s.daemon(&refs(&env));
+    let mut g = Gui::new(s.sock());
+    assert!(g.ready());
+    g.user(Msg::Install(InstallForm {
+        path: file.clone(),
+        name: "Not used".into(),
+        ..Default::default()
+    }));
+    assert!(
+        matches!(g.sent.last(), Some(Cmd::Import(p)) if p.path == file.to_str().unwrap()),
+        "{:?}",
+        g.sent
+    );
+    let (state, lines) = g.job_ends("the import");
+    assert_eq!(state, JobState::Succeeded, "{lines:?}");
+    assert!(lines.iter().any(|l| l == "Installed: demo"), "{lines:?}");
+    g.open("demo");
+    let requested = g.model.page_permissions().unwrap().unwrap().requested;
+    assert_eq!(
+        requested.as_deref(),
+        Some("Requested by the package (not granted): gpu=off")
+    );
+    assert_eq!(g.model.page().unwrap().title(), "Demo");
 }

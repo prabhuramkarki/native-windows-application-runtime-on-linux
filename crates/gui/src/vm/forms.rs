@@ -1,8 +1,8 @@
 //! The permission edit (spec D9) and install form (D10): expressions and params built only from typed choices,
 //! refused here with a message before anything is sent (the CLI's own checks stay the real guard).
 use rt_api::GrantView;
-use rt_daemon::client::InstallParams;
-use std::path::PathBuf;
+use rt_daemon::client::{ImportParams, InstallParams};
+use std::path::{Path, PathBuf};
 
 /// Longest install name, in bytes (`rt_api::jobs::NAME_MAX`).
 const NAME_MAX: usize = rt_api::jobs::NAME_MAX;
@@ -71,6 +71,21 @@ pub(crate) fn perm_expr(c: &PermChange, grants: &[GrantView]) -> Result<String, 
             }
             format!("fs-={p}")
         }
+    })
+}
+
+/// A `.wrun` package (by its extension, any case): the form imports it (`apps.import`) instead of installing it.
+/// A package under another name goes to `apps.install`, whose CLI refuses it by its content (W11).
+pub fn is_package(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wrun"))
+}
+
+/// `apps.import`'s params from the form: its name is not used (the package names the app).
+pub(crate) fn import_params(f: &InstallForm) -> Result<ImportParams, &'static str> {
+    Ok(ImportParams {
+        path: plain_path(&f.path)?.to_owned(),
+        silent: f.silent,
+        network: f.network,
     })
 }
 

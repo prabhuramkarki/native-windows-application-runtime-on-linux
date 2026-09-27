@@ -101,6 +101,7 @@ mod tests {
         let facts = Facts {
             imports: vec!["mscoree.dll".into()],
             extra_capabilities: vec![],
+            requested: vec![],
         };
         let plan = resolve(&facts, &InstalledSet::default(), &[], Manifest::bundled());
         let got: Vec<_> = plan
@@ -123,6 +124,7 @@ mod tests {
         let facts = Facts {
             imports: vec!["D3D12.dll".into()],
             extra_capabilities: vec![],
+            requested: vec![],
         };
         let plan = resolve(&facts, &InstalledSet::default(), &[], m);
         let ids: Vec<_> = plan.entries.iter().map(|e| e.package.as_str()).collect();

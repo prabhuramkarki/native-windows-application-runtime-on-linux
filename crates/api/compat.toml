@@ -8,8 +8,9 @@
 # (the test `compat_md_matches_records` fails until you do).
 
 # The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, a record without a `gpu` field is
-# not a graphics test) with the two test commands of the `wine-e2e` CI job. That job is configured but has not yet run on a hosted runner, so none of them
-# claims `ci:`. The five records below whose notes say "also under the default sandbox" were run again on 2026-09-26
+# not a graphics test) with the two test commands of the `wine-e2e` CI job. That job passed once on a hosted runner (commit 9cf1e27,
+# 2026-09-26, the last push), but its log was not read, so which tests ran there (rather than skipped) is not recorded and
+# none of them claims `ci:`. The five records below whose notes say "also under the default sandbox" were run again on 2026-09-26
 # after Phase 5B (the same commands, every sandboxed run through the seccomp filter, Landlock ABI 8 and the default
 # task-limit scope): all passed.
 
@@ -19,42 +20,42 @@ app = "hello64.exe (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "runtime install + run of a 64-bit console program: prints its greeting, exits 7 (e2e_mvp_loop_install_list_run_logs_doctor_remove); also under the default sandbox (Phase 5A). Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
+notes = "runtime install + run of a 64-bit console program: prints its greeting, exits 7 (e2e_mvp_loop_install_list_run_logs_doctor_remove); also under the default sandbox (Phase 5A). Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 [[record]]
 app = "hello32.exe (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "runtime run of a 32-bit (WoW64) console program: prints its greeting, exits 7; app recorded as x86; also under the default sandbox (Phase 5A). Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
+notes = "runtime run of a 32-bit (WoW64) console program: prints its greeting, exits 7; app recorded as x86; also under the default sandbox (Phase 5A). Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 [[record]]
 app = "fs64.exe (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "file probe: a second app does not see the first app's file (e2e_a_second_app_cannot_see_the_first_apps_files); no Z: drive (e2e_hardening_is_visible_from_inside_the_app); also with every run under the default sandbox (Phase 5A). Also in the wine-e2e CI job (not yet run on a hosted runner)."
+notes = "file probe: a second app does not see the first app's file (e2e_a_second_app_cannot_see_the_first_apps_files); no Z: drive (e2e_hardening_is_visible_from_inside_the_app); also with every run under the default sandbox (Phase 5A). Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 [[record]]
 app = "hello-nsis.exe (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "NSIS installer run silently: installs, .desktop entry, program auto-discovered and run (exit 7, also under the default sandbox); environment and .desktop entry removed by `runtime uninstall` (the NSIS uninstaller itself is not run). Also in the wine-e2e CI job (not yet run on a hosted runner)."
+notes = "NSIS installer run silently: installs, .desktop entry, program auto-discovered and run (exit 7, also under the default sandbox); environment and .desktop entry removed by `runtime uninstall` (the NSIS uninstaller itself is not run). Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 [[record]]
 app = "hello.msi (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "MSI installer run silently through msiexec: installs, .desktop entry, program run (exit 7, also under the default sandbox), recorded msiexec uninstall run by `runtime uninstall` without warnings. Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
+notes = "MSI installer run silently through msiexec: installs, .desktop entry, program run (exit 7, also under the default sandbox), recorded msiexec uninstall run by `runtime uninstall` without warnings. Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 [[record]]
 app = "exports64.dll in a zip/tar.gz package (fixture)"
 status = "works"
 wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
 evidence = "manual:2026-09-26"
-notes = "dependency archive install into system32, byte-identical, with a native,builtin DLL override set via reg.exe. Also run by the wine-e2e CI job (configured, not yet run on a hosted runner)."
+notes = "dependency archive install into system32, byte-identical, with a native,builtin DLL override set via reg.exe. Also in the wine-e2e CI job (a hosted run passed at 9cf1e27)."
 
 # Run by hand on 2026-09-26 (same Wine, a Wayland desktop session) with
 #   DXVK_FILTER_DEVICE_NAME=<device> cargo test -p runtime-deps --lib -- --ignored real_net_wine_d3d11 --test-threads=1 --nocapture

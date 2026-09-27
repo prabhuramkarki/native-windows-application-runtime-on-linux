@@ -438,6 +438,26 @@ fn the_install_dialog_starts_with_everything_off() {
     close(ui);
 }
 
+/// Phase 6D: what an imported app's package requested is one plain line (`HOSTILE` markup drawn literally), and an
+/// app that requested nothing has no such line.
+fn the_requested_permissions_line_is_literal_text() {
+    let (ui, _) = recorded();
+    opened(&ui, true, canned_plan());
+    assert!(
+        find(ui.window().upcast_ref(), "perm-requested").is_none(),
+        "nothing requested"
+    );
+    let mut data = app_data("game");
+    data.permissions.as_mut().unwrap().requested = vec![HOSTILE.into(), "gpu=on".into()];
+    ui.dispatch(Msg::AppLoaded(Box::new(data)));
+    let l = get(&ui, "perm-requested").downcast::<gtk::Label>().unwrap();
+    assert!(!l.uses_markup());
+    let want = format!("Requested by the package (not granted): {HOSTILE}, gpu=on");
+    assert_eq!((l.label().as_str(), l.text().as_str()), (want.as_str(), want.as_str()));
+    shot(ui.window(), "requested");
+    close(ui);
+}
+
 /// A fake `runtime` whose run prints three lines, one with an ESC sequence.
 const PRINTER: &str =
     "#!/bin/sh\n[ \"$1\" = --version ] && { echo \"runtime @V@\"; exit 0; }\nprintf 'one\\n\\033[31mtwo\\nthree\\n'\n";
@@ -787,6 +807,10 @@ fn main() {
         (
             "the_remove_dialog_and_about_show_daemon_text_literally",
             the_remove_dialog_and_about_show_daemon_text_literally,
+        ),
+        (
+            "the_requested_permissions_line_is_literal_text",
+            the_requested_permissions_line_is_literal_text,
         ),
     ];
     for (name, t) in tests {

@@ -546,6 +546,26 @@ fn install_passes_exe_for_an_archive() {
 }
 
 #[test]
+fn install_of_a_wrun_package_is_refused_and_points_at_import() {
+    use std::io::Write;
+    let r = rig();
+    let wrun = r.inputs.join("app.wrun");
+    {
+        let mut w = zip::ZipWriter::new(fs::File::create(&wrun).unwrap());
+        let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        w.start_file("wrun.toml", o).unwrap();
+        w.write_all(b"format = 1\n").unwrap();
+        w.start_file("payload/hello64.exe", o).unwrap();
+        w.write_all(&fs::read(fixture("hello64.exe")).unwrap()).unwrap();
+        w.finish().unwrap();
+    }
+    let err = assert_fails(&r.rt(&["install".as_ref(), wrun.as_os_str()]));
+    assert!(err.contains("this is a .wrun package: use `runtime import`"), "{err}");
+    assert!(r.app_dirs().is_empty());
+    assert_eq!(r.calls(), Vec::<String>::new(), "no environment was created");
+}
+
+#[test]
 fn install_errors_exit_1_leave_nothing_and_print_safe_text() {
     let r = rig();
     // not a Windows program, missing file, a directory, a hostile file name
@@ -884,6 +904,29 @@ fn run_without_wine_or_with_a_broken_app_is_an_error() {
     r2.plant("x", "X");
     let err = assert_fails(&r2.rt(&["run", "--unsandboxed", "x"]));
     assert!(err.contains("RUNTIME_WINE"), "{err}");
+}
+
+#[test]
+fn run_of_an_app_recorded_for_an_unknown_backend_is_refused_not_run_with_wine() {
+    let r = rig();
+    let id = r.install();
+    let md = r.apps().join(&id).join("metadata.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&md).unwrap()).unwrap();
+    for recorded in ["null", "\u{1b}[31mx"] {
+        v["backend"]["id"] = recorded.into();
+        fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
+        let err = assert_fails(&r.rt(&["run", "--unsandboxed", &id]));
+        assert!(
+            err.contains("unknown compatibility backend") && err.contains("known: wine"),
+            "{err}"
+        );
+        assert_tame(&err, "stderr");
+        assert!(!r.log.join("argv.bin").exists(), "Wine ran the app");
+    }
+    // The same app recorded for Wine runs (the registry selects Wine on the rig's fake).
+    v["backend"]["id"] = "wine".into();
+    fs::write(&md, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert_ok(&r.rt(&["run", "--unsandboxed", &id]));
 }
 
 #[test]
@@ -5086,3 +5129,8 @@ fn the_installer_sandbox_never_binds_the_daemons_socket() {
         "{envs:?}"
     );
 }
+
+// ================================================================ .wrun packages
+
+#[path = "apps/package.rs"]
+mod package;

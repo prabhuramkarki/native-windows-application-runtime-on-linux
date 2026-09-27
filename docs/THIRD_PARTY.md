@@ -1,5 +1,7 @@
 # Third-party inventory
 
+This project's own licence: `MIT OR Apache-2.0`, at your option (`LICENSE-MIT`, `LICENSE-APACHE`; `license.workspace = true` on every `runtime-*` crate). The crates below keep their own licences.
+
 ## Rust crates linked into the runtime
 
 | Crate | Licence | Used for | Notes |
@@ -85,4 +87,4 @@ has no single SPDX id (upstream's COPYING: GPL, LGPL and MIT X11 parts, MIT Visu
 MS-PL and MIT with zlib dependencies), so the manifest lists the families. It also ships `csc.exe`, used only by
 `tools/build-managed-fixture.sh` to build the test fixture in a scratch prefix.
 
-Rule: never copy Wine or ReactOS source into this project unless the project licence is chosen accordingly (open decision in the roadmap).
+Rule: never copy Wine or ReactOS source into this project. Both are copyleft (Wine LGPL-2.1-or-later, ReactOS mostly GPL-2.0), which cannot be mixed into the `MIT OR Apache-2.0` code (licence settled in Phase 6D); Wine is used only as a separate program on the host.

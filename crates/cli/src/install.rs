@@ -50,8 +50,10 @@ pub fn run(
             allow_network: network,
             exe_override: exe,
             runtime_exe: crate::runtime_exe(),
+            id: None,
+            package: None,
         };
-        return match rt_installer::install_via_installer(&store, &backend, launcher, file, opts)? {
+        return match rt_installer::install_via_installer(&store, &*backend, launcher, file, opts)? {
             rt_installer::InstallOutcome::Installed {
                 id,
                 executable,
@@ -72,7 +74,16 @@ pub fn run(
     if silent || network {
         warn("--silent/--network only apply to .msi/.exe installers; ignored for a portable exe or a zip archive");
     }
-    let outcome = rt_core::install(&store, &backend, file, &InstallOpts { name, exe })?;
+    let outcome = rt_core::install(
+        &store,
+        &*backend,
+        file,
+        &InstallOpts {
+            name,
+            exe,
+            ..InstallOpts::default()
+        },
+    )?;
     print_installed(&store, &outcome.id, &outcome.executable.to_string(), &outcome.warnings)?;
     crate::deps::print_hint(&store, &outcome.id);
     Ok(0)
@@ -94,7 +105,12 @@ fn peek_looks_like_installer(file: &Path) -> bool {
     }
 }
 
-fn print_installed(store: &Store, id: &AppId, executable: &str, warnings: &[String]) -> Result<(), CmdError> {
+pub(crate) fn print_installed(
+    store: &Store,
+    id: &AppId,
+    executable: &str,
+    warnings: &[String],
+) -> Result<(), CmdError> {
     let name = display_name(store, id)?;
     crate::emit(&format!(
         "Installed: {id}\nName:       {name}\nExecutable: {exe}\nRun it with: runtime run {id}\n",
@@ -109,7 +125,7 @@ fn print_installed(store: &Store, id: &AppId, executable: &str, warnings: &[Stri
 }
 
 /// Numbered candidates and the `--exe` hint; never a fake auto-pick.
-fn print_candidates(candidates: &[Candidate]) -> Result<(), CmdError> {
+pub(crate) fn print_candidates(candidates: &[Candidate]) -> Result<(), CmdError> {
     let mut out = String::from("Could not tell which installed file is the application. Candidates:\n");
     for (i, c) in candidates.iter().enumerate() {
         let name = c.name.as_deref().map(|n| format!(" ({})", safe(n))).unwrap_or_default();

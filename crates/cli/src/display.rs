@@ -48,7 +48,10 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     let Some(choice) = choice else {
         let driver =
             read_graphics_driver_from_prefix(&env).map_err(|e| format!("cannot read {}'s user.reg: {e}", env.id()))?;
-        let wl = match crate::backend(&launcher).ok().and_then(|b| has_winewayland(&b)) {
+        let wl = match crate::backend_of(&store, &env, &launcher)
+            .ok()
+            .and_then(|b| has_winewayland(&*b))
+        {
             Some(true) => "present",
             Some(false) => "not found",
             None => "not verified",
@@ -61,7 +64,7 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     };
     let want = GraphicsDriver::parse_choice(choice)
         .ok_or_else(|| format!("unknown driver {:?}: choose auto, x11 or wayland", shorten(choice, 40)))?;
-    let backend = crate::backend(&launcher)?;
+    let backend = crate::backend_of(&store, &env, &launcher)?;
     match want {
         GraphicsDriver::Wayland => {
             if wayland_socket(&env_var, &HostFs).is_none() {
@@ -71,7 +74,7 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
                         .into(),
                 );
             }
-            match has_winewayland(&backend) {
+            match has_winewayland(&*backend) {
                 Some(false) => {
                     return Err(
                         "not set: this Wine has no winewayland driver (Wine built without Wayland \
@@ -112,7 +115,7 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     // never meets a symlinked prefix or `user.reg`. A missing user.reg is fine.
     read_graphics_driver_from_prefix(&env)
         .map_err(|e| format!("not set: cannot use {}'s registry: {e}; nothing was changed", env.id()))?;
-    let helpers = crate::sandbox::helper_launcher(&env, &launcher, &backend)?;
-    set_graphics_driver(&env, &backend, &helpers, &want).map_err(|e| e.to_string())?;
+    let helpers = crate::sandbox::helper_launcher(&env, &launcher, &*backend)?;
+    set_graphics_driver(&env, &*backend, &helpers, &want).map_err(|e| e.to_string())?;
     crate::emit(&format!("graphics driver of {} set to {}\n", env.id(), want.as_str()))
 }

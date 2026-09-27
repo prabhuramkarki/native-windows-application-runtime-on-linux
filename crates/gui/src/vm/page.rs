@@ -34,6 +34,9 @@ pub struct PermRows {
     pub grants: Vec<GrantRow>,
     /// The resource limits, one line (shown, not edited).
     pub limits: String,
+    /// What the app's `.wrun` package requested that the profile does not grant, one line (cleaned); `None` when
+    /// nothing (an app that was not imported). Shown, never applied.
+    pub requested: Option<String>,
 }
 
 fn section<T>(r: &Result<T, ClientError>, lines: impl FnOnce(&T) -> Vec<Line>) -> Vec<Line> {
@@ -79,6 +82,13 @@ fn perm_rows(p: &PermissionsView) -> PermRows {
             })
             .collect(),
         limits: limits.join(", "),
+        // One `shown` over the whole line cleans every item in it.
+        requested: (!p.requested.is_empty()).then(|| {
+            shown(
+                &format!("Requested by the package (not granted): {}", p.requested.join(", ")),
+                MAX_SHOWN,
+            )
+        }),
     }
 }
 

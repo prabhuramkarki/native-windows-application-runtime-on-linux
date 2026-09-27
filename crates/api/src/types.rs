@@ -151,6 +151,9 @@ pub struct AppDetail {
     pub installer: Option<InstallerView>,
     pub dependencies: Vec<DependencyView>,
     pub prefix: PrefixState,
+    /// What the `.wrun` package this app was imported from requested (0.2.1, additive; absent from older daemons).
+    #[serde(default)]
+    pub package: Option<PackageView>,
 }
 
 impl AppDetail {
@@ -171,6 +174,30 @@ impl AppDetail {
             installer: m.installer.as_ref().map(InstallerView::from_meta),
             dependencies: m.dependencies.iter().map(DependencyView::from_record).collect(),
             prefix: PrefixState::probe(env),
+            package: m.package.as_ref().map(PackageView::from_meta),
+        }
+    }
+}
+
+/// `Metadata::package`: requests only, none of them granted by the import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageView {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
+    pub requested_dependencies: Vec<String>,
+    pub requested_permissions: Vec<String>,
+}
+
+impl PackageView {
+    fn from_meta(p: &rt_core::PackageMeta) -> PackageView {
+        PackageView {
+            id: text(&p.id),
+            version: text(&p.version),
+            digest: text(&p.digest),
+            requested_dependencies: p.requested_dependencies.iter().map(|d| text(d)).collect(),
+            requested_permissions: p.requested_permissions.iter().map(|e| text(e)).collect(),
         }
     }
 }
@@ -235,6 +262,29 @@ pub struct PermissionsView {
     pub gpu: bool,
     pub filesystem: Vec<GrantView>,
     pub limits: LimitsView,
+    /// What the app's `.wrun` package requested (canonical EXPRs such as `network=allow`) that this profile does
+    /// not grant ([`requests_not_granted`]): shown to the user with the grant command, never applied. Empty for an
+    /// app that was not imported, and in `sandbox.info`'s profile. Additive in 0.2.1.
+    #[serde(default)]
+    pub requested: Vec<String>,
+}
+
+/// The requests of `requested` (EXPRs from `PackageMeta::requested_permissions`) that `p` does not satisfy, in
+/// order. Display only: nothing here grants anything. An EXPR outside the fixed set is never satisfied (metadata
+/// validation refuses such a record anyway).
+pub fn requests_not_granted(p: &Permissions, requested: &[String]) -> Vec<String> {
+    let granted = |expr: &str| match expr {
+        "network=allow" => p.network == Network::Allow,
+        "network=deny" => p.network == Network::Deny,
+        "display=on" => p.display,
+        "display=off" => !p.display,
+        "audio=on" => p.audio,
+        "audio=off" => !p.audio,
+        "gpu=on" => p.gpu,
+        "gpu=off" => !p.gpu,
+        _ => false,
+    };
+    requested.iter().filter(|r| !granted(r)).cloned().collect()
 }
 
 impl PermissionsView {
@@ -269,6 +319,7 @@ impl PermissionsView {
                 tasks_default: l.tasks == Tasks::Default,
                 explicit: l.explicit(),
             },
+            requested: vec![],
         }
     }
 }

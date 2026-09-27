@@ -9,7 +9,7 @@
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -84,7 +84,7 @@
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -169,7 +169,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works (`runtime run` starts programs in it)
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -187,7 +187,7 @@ Result: Looks good.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -287,7 +287,7 @@ Result: Looks good.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -352,7 +352,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -401,7 +401,7 @@ Result: Looks good.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -502,7 +502,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -552,7 +552,7 @@ hint: 1 dependency missing: run `runtime deps runtime-fixture-2`
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -659,7 +659,7 @@ Audio
 
 Runtime
   [warn] managed (.NET) program: Wine Mono is not installed for this app; run `runtime deps runtime-fixture-3 --install`
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -713,7 +713,7 @@ Result: Application may fail to start.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -814,7 +814,7 @@ Audio
 
 Runtime
   [ok]   managed (.NET) program: Wine Mono 9.4.0 is recorded as installed for this app
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -868,7 +868,7 @@ Result: Looks good.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -969,7 +969,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -1018,7 +1018,7 @@ Result: Looks good.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -1115,7 +1115,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -1139,7 +1139,7 @@ Result: Application cannot run: fix the items marked [FAIL].
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -1222,7 +1222,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -1246,7 +1246,7 @@ Result: Application cannot run: fix the items marked [FAIL].
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -1329,7 +1329,7 @@ Audio
   [ok]   PulseAudio-compatible socket found ($XDG_RUNTIME_DIR/pulse/native)
 
 Runtime
-  [ok]   Wine: wine-10.0 (Fake 1)
+  [ok]   Wine: wine-10.0 (Fake 1); backend wine, interface 1
   [ok]   sandbox: bubblewrap works; this app's profile: network deny, display on, audio on, gpu on, 0 host directories
   [ok]   <SECCOMP>; <LANDLOCK>
   [ok]   limits: systemd-run --user available (cgroup controllers: cpu io memory pids)
@@ -1354,7 +1354,7 @@ Result: Application cannot run: fix the items marked [FAIL].
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",
@@ -1466,7 +1466,7 @@ Nothing to install.
     {
       "area": "runtime",
       "status": "ok",
-      "text": "Wine: wine-10.0 (Fake 1)"
+      "text": "Wine: wine-10.0 (Fake 1); backend wine, interface 1"
     },
     {
       "area": "runtime",

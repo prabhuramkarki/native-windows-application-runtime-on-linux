@@ -6,6 +6,7 @@ mod graphics;
 mod install;
 mod list;
 mod logs;
+mod package;
 mod permissions;
 mod remove;
 mod rpc;
@@ -63,6 +64,44 @@ enum Cmd {
         #[arg(long)]
         silent: bool,
         /// Installer only: allow it network access while it runs (default: no network at all, not even loopback)
+        #[arg(long)]
+        network: bool,
+    },
+    /// Build a `.wrun` package from DIR (`wrun.toml` without `[[files]]`, and `payload/`). Reproducible: the same
+    /// input gives the same bytes. Prints the package digest.
+    Pack {
+        dir: PathBuf,
+        /// The package to write (must not exist)
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+    },
+    /// Show what a `.wrun` package is and what it would request, after verifying every file in it. Installs, runs
+    /// and writes nothing.
+    Inspect {
+        file: PathBuf,
+        /// Machine-readable output: {id, name, version, arch, kind, entry, files, bytes, digest, signed, installed,
+        /// requests: {dependencies: [{id, consent}], permissions: [EXPR]}}
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extract a `.wrun` package (its `wrun.toml` and `payload/`), verifying every file. Runs nothing.
+    Unpack {
+        file: PathBuf,
+        /// The directory to create (must not exist; removed again on any error)
+        #[arg(short = 'o', long = "output")]
+        output: PathBuf,
+    },
+    /// Install a `.wrun` package as the app its manifest names (needs Wine). An app with that id already installed
+    /// is refused and left alone. The package can only REQUEST: its dependencies and permissions are recorded and
+    /// shown with the commands that grant them (`runtime deps <app> --install`, `runtime permissions <app>
+    /// --set=...`); nothing is granted, downloaded or run. An import that was killed can leave a half-built app
+    /// under the package's id: `runtime remove <app>` clears it, then import again.
+    Import {
+        file: PathBuf,
+        /// Installer packages only: run the installer non-interactively (as `install --silent`)
+        #[arg(long)]
+        silent: bool,
+        /// Installer packages only: allow the installer network access while it runs (as `install --network`)
         #[arg(long)]
         network: bool,
     },
@@ -141,7 +180,8 @@ enum Cmd {
         #[arg(long)]
         reset: bool,
         /// Machine-readable output: {network, display, audio, gpu, filesystem: [{path, access}], limits: {memory_mb,
-        /// cpu_percent, tasks, tasks_default}}
+        /// cpu_percent, tasks, tasks_default}, requested: [EXPR]} (`requested`: what an imported package asked for
+        /// and this profile does not grant; never applied)
         #[arg(long)]
         json: bool,
     },
@@ -202,9 +242,23 @@ pub(crate) fn store() -> Result<Store, CmdError> {
     Ok(Store::new(rt_core::apps_dir()?)?)
 }
 
-/// The system Wine, with `launcher` for its helper processes (`run` spawns with the same launcher).
-pub(crate) fn backend(launcher: &Launcher) -> Result<backend_wine::WineBackend, CmdError> {
-    Ok(backend_wine::WineBackend::discover_with(launcher.clone())?)
+/// The backend of new installs (`rt_api::backends::DEFAULT`: the system Wine), with `launcher` for its helper
+/// processes (`run` spawns with the same launcher).
+pub(crate) fn backend(launcher: &Launcher) -> Result<Box<dyn rt_core::CompatBackend>, CmdError> {
+    Ok(rt_api::backends::select(rt_api::backends::DEFAULT, launcher)?)
+}
+
+/// The backend `env` was installed for (its recorded `backend.id`): an unknown one is refused by the registry,
+/// never replaced by Wine. Unreadable metadata falls back to the default; the command then reports the metadata.
+pub(crate) fn backend_of(
+    store: &Store,
+    env: &rt_core::AppEnv,
+    launcher: &Launcher,
+) -> Result<Box<dyn rt_core::CompatBackend>, CmdError> {
+    match store.read_metadata(env) {
+        Ok(md) => Ok(rt_api::backends::select(&md.backend.id, launcher)?),
+        Err(_) => backend(launcher),
+    }
 }
 
 /// This executable, for the installer sandbox's `sandbox-init` shim (`rt_installer::InstallerSandbox::new`). The
@@ -291,6 +345,10 @@ fn main() -> ExitCode {
             silent,
             network,
         } => install::run(&file, name, exe, silent, network),
+        Cmd::Pack { dir, output } => package::pack(&dir, &output),
+        Cmd::Inspect { file, json } => package::inspect(&file, json),
+        Cmd::Unpack { file, output } => package::unpack(&file, &output),
+        Cmd::Import { file, silent, network } => package::import(&file, silent, network),
         Cmd::Run {
             target,
             debug,
@@ -382,6 +440,17 @@ mod daemon_argv {
                 };
                 assert_eq!((&file, &n, &e, si, ne), (path, name, exe, *silent, *network));
             }
+            JobSpec::Import { path, silent, network } => {
+                let Cmd::Import {
+                    file,
+                    silent: si,
+                    network: ne,
+                } = cmd
+                else {
+                    panic!("{spec:?}: not import")
+                };
+                assert_eq!((&file, si, ne), (path, *silent, *network));
+            }
             JobSpec::Remove { app } => {
                 let Cmd::Remove { app: a } = cmd else {
                     panic!("{spec:?}: not remove")
@@ -470,6 +539,18 @@ mod daemon_argv {
                 network,
             });
         }
+        for (path, silent, network) in [
+            ("/-x/My App.wrun", false, false),
+            ("/--silent", true, false),
+            ("/-n/--network", false, true),
+            ("/a.wrun", true, true),
+        ] {
+            specs.push(JobSpec::Import {
+                path: path.into(),
+                silent,
+                network,
+            });
+        }
         for driver in [Driver::Auto, Driver::X11, Driver::Wayland] {
             specs.push(JobSpec::DisplaySet { app: id("a"), driver });
         }
@@ -489,7 +570,7 @@ mod daemon_argv {
         let mut kinds: Vec<_> = specs.iter().map(|s| format!("{:?}", s.kind())).collect();
         kinds.sort();
         kinds.dedup();
-        assert_eq!(kinds.len(), 7, "one sample per variant at least: {kinds:?}");
+        assert_eq!(kinds.len(), 8, "one sample per variant at least: {kinds:?}");
         specs.iter().for_each(check);
     }
 }

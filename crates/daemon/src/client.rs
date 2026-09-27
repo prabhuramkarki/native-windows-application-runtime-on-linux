@@ -91,6 +91,15 @@ pub struct InstallParams {
     pub network: bool,
 }
 
+/// `apps.import`'s params (API 0.2.1): a `.wrun` package. `silent`/`network` apply to installer packages only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportParams {
+    pub path: String,
+    pub silent: bool,
+    pub network: bool,
+}
+
 /// The deadline of a `jobs.poll` call: its wait plus 15 s, never under [`TIMEOUT`].
 pub fn poll_timeout(wait_ms: u32) -> Duration {
     (Duration::from_millis(wait_ms.into()) + Duration::from_secs(15)).max(TIMEOUT)
@@ -212,6 +221,11 @@ impl Client {
     pub fn install(&mut self, p: &InstallParams) -> Result<JobStarted, ClientError> {
         let params = serde_json::to_value(p).map_err(|_| ClientError::Protocol("unserialisable params"))?;
         self.typed("apps.install", params)
+    }
+    /// `apps.import` (API 0.2.1; an older daemon answers -32601).
+    pub fn import(&mut self, p: &ImportParams) -> Result<JobStarted, ClientError> {
+        let params = serde_json::to_value(p).map_err(|_| ClientError::Protocol("unserialisable params"))?;
+        self.typed("apps.import", params)
     }
     pub fn remove(&mut self, id: &str) -> Result<JobStarted, ClientError> {
         self.typed("apps.remove", json!({ "id": id }))
@@ -549,6 +563,15 @@ mod tests {
                 JobKind::Install,
                 "install\0--name=--network\0--\0/in/setup.exe\0",
             ),
+            (
+                c.import(&ImportParams {
+                    path: "/in/pkg.wrun".into(),
+                    network: true,
+                    ..Default::default()
+                }),
+                JobKind::Import,
+                "import\0--network\0--\0/in/pkg.wrun\0",
+            ),
             (c.remove("a2"), JobKind::Remove, "remove\0--\0a2\0"),
             (
                 c.permissions_set("a3", &["gpu=off".into()]),
@@ -595,7 +618,7 @@ mod tests {
         // poll, list, cancel
         let ev = c.job_poll(&id, 0, 0).unwrap();
         assert_eq!(ev.events[0].text, "queued");
-        assert_eq!(c.jobs().unwrap().len(), 7);
+        assert_eq!(c.jobs().unwrap().len(), 8);
         f.mode(Some("a6"), "wait");
         let id = c.remove("a6").unwrap().job_id;
         f.wait_for(&id, "ready");

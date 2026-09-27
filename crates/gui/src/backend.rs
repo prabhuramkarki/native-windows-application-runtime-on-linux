@@ -209,6 +209,7 @@ fn request(c: &mut Client, cmd: &Cmd) -> Result<Msg, ClientError> {
         Cmd::Run(id) => started(c.run_app(id, &[])),
         Cmd::Remove(id) => started(c.remove(id)),
         Cmd::Install(p) => started(c.install(p)),
+        Cmd::Import(p) => started(c.import(p)),
         Cmd::DepsInstall { id, digest, consent } => started(c.deps_install(id, digest, consent)),
         Cmd::PermSet { id, set } => started(c.permissions_set(id, set)),
         Cmd::PermReset(id) => started(c.permissions_reset(id)),

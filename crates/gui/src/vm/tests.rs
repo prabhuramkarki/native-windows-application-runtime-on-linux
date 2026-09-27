@@ -254,6 +254,10 @@ fn write_intents() -> Vec<Msg> {
             path: "/in/setup.exe".into(),
             ..Default::default()
         }),
+        Msg::Install(InstallForm {
+            path: "/in/app.wrun".into(),
+            ..Default::default()
+        }),
         Msg::Permission(PermChange::Network(true)),
         Msg::ResetPermissions,
         Msg::Cancel("j1".into()),
@@ -818,6 +822,104 @@ fn the_install_form_is_checked_before_sending() {
         assert!(m.notice().is_some(), "{what}");
     }
     assert_eq!(send(&mut m, "/in/setup.exe".into(), &"n".repeat(256)).len(), 1);
+}
+
+#[test]
+fn a_wrun_is_imported_with_name_and_exe_dropped() {
+    let mut m = ready(true);
+    m.update(Msg::Connected(version(true, "0.2.1")));
+    for path in ["/in/app.wrun", "/in/-x/App.WRUN"] {
+        assert!(forms::is_package(Path::new(path)), "{path}");
+        assert_eq!(
+            m.update(Msg::Install(InstallForm {
+                path: path.into(),
+                name: "Ignored <b>name</b>".into(),
+                silent: true,
+                network: false,
+            })),
+            vec![Cmd::Import(ImportParams {
+                path: path.into(),
+                silent: true,
+                network: false,
+            })],
+            "one import, the name dropped"
+        );
+    }
+    for path in ["/in/app.wrun.exe", "/in/wrun", "/in/app.zip"] {
+        assert!(!forms::is_package(Path::new(path)), "{path}");
+    }
+    // The path is checked as an installer's.
+    for path in ["in/app.wrun", "/in/\u{202e}nurw.wrun", "/in/a\nb.wrun"] {
+        m.update(Msg::Dismiss);
+        let form = InstallForm {
+            path: path.into(),
+            ..Default::default()
+        };
+        assert!(m.update(Msg::Install(form)).is_empty(), "{path:?}");
+        assert!(m.notice().is_some(), "{path:?}");
+    }
+    // A failed import is named in the notice.
+    let what = Cmd::Import(ImportParams {
+        path: "/in/app.wrun".into(),
+        ..Default::default()
+    });
+    m.update(Msg::Failed {
+        what,
+        error: rpc("invalid_argument"),
+    });
+    assert!(m.notice().unwrap().starts_with("Import: "), "{:?}", m.notice());
+}
+
+#[test]
+fn a_daemon_without_apps_import_is_not_sent_a_package() {
+    for api in ["0.2.0", "0.2"] {
+        let mut m = ready(true);
+        m.update(Msg::Connected(version(true, api)));
+        let form = InstallForm {
+            path: "/in/app.wrun".into(),
+            ..Default::default()
+        };
+        assert!(m.update(Msg::Install(form)).is_empty(), "{api}");
+        assert_eq!(m.notice(), Some(NO_IMPORT), "{api}");
+    }
+    let mut m = ready(true);
+    m.update(Msg::Connected(version(true, "0.3.0")));
+    let form = InstallForm {
+        path: "/in/app.wrun".into(),
+        ..Default::default()
+    };
+    assert_eq!(m.update(Msg::Install(form)).len(), 1, "a newer daemon has it");
+}
+
+#[test]
+fn a_read_only_daemon_refuses_an_import_with_the_reason() {
+    let mut m = ready(false);
+    m.update(Msg::Connected(version(false, "0.2.1")));
+    let form = InstallForm {
+        path: "/in/app.wrun".into(),
+        ..Default::default()
+    };
+    assert!(m.update(Msg::Install(form)).is_empty());
+    assert_eq!(m.notice(), Some(READ_ONLY));
+}
+
+#[test]
+fn requested_permissions_are_one_cleaned_line() {
+    let mut m = ready(true);
+    assert_eq!(m.page_permissions().unwrap().unwrap().requested, None, "not imported");
+    let mut p = perms(&[]);
+    p.requested = vec!["network=allow".into(), "<b>x</b>\u{1b}[31m\u{202e}".into()];
+    m.update(Msg::AppLoaded(Box::new(AppData {
+        detail: detail("game"),
+        permissions: Ok(p),
+        doctor: Err(rpc("unavailable")),
+        graphics: Err(rpc("unavailable")),
+        sandbox: Err(rpc("unavailable")),
+    })));
+    assert_eq!(
+        m.page_permissions().unwrap().unwrap().requested.as_deref(),
+        Some("Requested by the package (not granted): network=allow, <b>x</b>[31m")
+    );
 }
 
 // ------------------------------------------------------------------------------------------------ shown

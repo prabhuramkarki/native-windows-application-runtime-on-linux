@@ -9,7 +9,7 @@
 //! has nothing to run here and falls back to plain environment removal, same as `runtime remove`.
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
-use rt_core::{AppId, CompatBackend, Launcher, StoreError};
+use rt_core::{AppId, Launcher, StoreError};
 use rt_installer::SandboxOpts;
 
 pub fn run(arg: &str) -> Result<(), CmdError> {
@@ -30,7 +30,7 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
     let launcher = Launcher::new();
     // Wine is only needed to run the recorded uninstaller and to stop what is still running: without it the app
     // is removed anyway, same fallback `remove.rs` already uses.
-    let backend = crate::backend(&launcher);
+    let backend = crate::backend_of(&store, &env, &launcher);
     // Stop, then refuse while anything still runs (a sandboxed app's wineserver survives `wineserver -k`, see
     // `refuse_if_running`): before the uninstaller, so a refusal has run nothing.
     if let Ok(b) = &backend
@@ -56,7 +56,7 @@ pub fn run(arg: &str) -> Result<(), CmdError> {
                 {
                     crate::sandbox::print_hardening_caveat();
                 }
-                let outcome = rt_installer::uninstall(&backend, &launcher, &env, &md, opts, &crate::runtime_exe());
+                let outcome = rt_installer::uninstall(&*backend, &launcher, &env, &md, opts, &crate::runtime_exe());
                 match outcome.uninstaller_succeeded {
                     None => {} // a documented limit: no uninstall command was recorded for this app
                     Some(true) => {}

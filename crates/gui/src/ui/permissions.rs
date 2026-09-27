@@ -94,6 +94,12 @@ pub fn group(ui: &Rc<Ui>, m: &Model) -> Option<adw::PreferencesGroup> {
     ui.page_control(&reset, Action::EditPermissions);
     buttons.append(&reset);
     g.add(&text::row("Limits", &p.limits));
+    if let Some(r) = &p.requested {
+        let l = text::label(r);
+        l.set_widget_name("perm-requested");
+        l.add_css_class("dim-label");
+        g.add(&l);
+    }
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     outer.append(&buttons);
     // A group takes rows; the buttons go under it.
