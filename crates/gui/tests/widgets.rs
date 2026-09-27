@@ -654,6 +654,42 @@ fn the_remove_dialog_and_about_show_daemon_text_literally() {
     close(ui);
 }
 
+/// A fake `runtime` whose run prints 20 bursts, apart: well over the 8 job-output messages that may be in flight.
+const BURSTS: &str = "#!/bin/sh\n[ \"$1\" = --version ] && { echo \"runtime @V@\"; exit 0; }\nfor i in $(seq 1 20); do echo \"burst $i\"; sleep 0.05; done\n";
+
+/// The credits between the followers and the UI are handed back: a job with more poll answers than may be in flight
+/// still runs to its end (without the release the follower would wait for good after 8).
+fn a_long_chatty_job_runs_to_its_end() {
+    let script = BURSTS.replace("@V@", env!("CARGO_PKG_VERSION"));
+    let s = Scratch::new(&runtimed(), Err(&script));
+    s.plant("game", "Game");
+    let _d = s.daemon(&[]);
+    let ui = gui(&s);
+    let list = get(&ui, "apps-list");
+    iterate_until(WAIT, "the app list", || rows(&list).len() == 1);
+    list.downcast_ref::<gtk::ListBox>()
+        .unwrap()
+        .row_at_index(0)
+        .unwrap()
+        .emit_activate();
+    iterate_until(WAIT, "Run", || get(&ui, "btn-run").is_sensitive());
+    click(&ui, "btn-run");
+    iterate_until(WAIT, "the job's end", || {
+        let m = ui.model();
+        m.logs()
+            .next()
+            .and_then(|(_, l)| l.job())
+            .is_some_and(|j| rt_gui::vm::is_final(j.state))
+    });
+    let m = ui.model();
+    let (_, log) = m.logs().next().unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    let bursts = lines.iter().filter(|l| l.starts_with("burst ")).count();
+    assert_eq!(bursts, 20, "{lines:?}");
+    drop(m);
+    close(ui);
+}
+
 /// Points HOME and every XDG directory at `dir` and keeps GTK off the user's session bus and settings, before GTK
 /// starts: the tests never read or write the user's own configuration.
 fn isolate(dir: &std::path::Path) {
@@ -739,6 +775,7 @@ fn main() {
             a_followed_jobs_output_is_shown_in_order,
         ),
         ("a_cancelled_consent_is_forgotten", a_cancelled_consent_is_forgotten),
+        ("a_long_chatty_job_runs_to_its_end", a_long_chatty_job_runs_to_its_end),
         (
             "a_new_plan_closes_an_open_consent_dialog",
             a_new_plan_closes_an_open_consent_dialog,

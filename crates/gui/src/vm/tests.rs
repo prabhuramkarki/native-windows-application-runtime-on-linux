@@ -1020,3 +1020,28 @@ fn a_local_refusal_is_a_notice() {
     assert!(m.update(Msg::Refused("that file is not a local file")).is_empty());
     assert_eq!(m.notice(), Some("that file is not a local file"));
 }
+
+#[test]
+fn a_refused_install_closes_the_models_dialog_and_forgets_its_choices() {
+    let mut m = planned(true, plan());
+    m.update(Msg::ConsentOpened);
+    m.update(Msg::Accept("a".into(), true));
+    // The app became busy while the dialog was open: Install is refused.
+    m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Running)]));
+    assert!(m.update(Msg::InstallDeps).is_empty());
+    assert!(!m.consent_open());
+    assert_eq!(m.consent().unwrap().accepted_count(), 0);
+}
+
+#[test]
+fn another_jobs_start_does_not_free_a_pending_app() {
+    let mut m = ready(true);
+    assert_eq!(m.update(Msg::Run), vec![Cmd::Run("game".into())]);
+    // An install (no app) starts and the job list arrives before game's own start.
+    m.update(Msg::JobStarted {
+        what: Cmd::Install(InstallParams::default()),
+        job_id: "other".into(),
+    });
+    m.update(Msg::JobList(vec![]));
+    assert!(m.update(Msg::Run).is_empty(), "game is still pending");
+}

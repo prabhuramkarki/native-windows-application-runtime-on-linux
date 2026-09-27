@@ -324,15 +324,8 @@ impl Model {
     pub fn update(&mut self, msg: Msg) -> Vec<Cmd> {
         let cmds = self.step(msg);
         // A second click before the job shows up in the list must not send a second command.
-        for c in &cmds {
-            if let Cmd::Run(id)
-            | Cmd::Remove(id)
-            | Cmd::PermReset(id)
-            | Cmd::PermSet { id, .. }
-            | Cmd::DepsInstall { id, .. } = c
-            {
-                self.pending = Some((id.clone(), false));
-            }
+        for id in cmds.iter().filter_map(write_target) {
+            self.pending = Some((id.to_owned(), false));
         }
         cmds
     }
@@ -379,13 +372,18 @@ impl Model {
             }
             Msg::Refused(why) => self.refuse(why),
             Msg::InstallDeps => {
-                if let Err(why) = self.can(Action::InstallDeps) {
+                // Any answer closes the model's dialog; a refused one also forgets its choices.
+                let was_open = std::mem::take(&mut self.consent_open);
+                let refused = self
+                    .can(Action::InstallDeps)
+                    .err()
+                    .or_else(|| (!was_open).then_some("review the plan in the Install dependencies dialog first"));
+                if let Some(why) = refused {
+                    if let Some(p) = &mut self.plan {
+                        p.reset();
+                    }
                     return self.refuse(why);
                 }
-                if !self.consent_open {
-                    return self.refuse("review the plan in the Install dependencies dialog first");
-                }
-                self.consent_open = false;
                 // The plan is dropped once sent: a second install needs a fresh plan.
                 let (id, digest, consent) = self.plan.take().expect("can() checked the plan").into_install();
                 vec![Cmd::DepsInstall { id, digest, consent }]
@@ -462,8 +460,11 @@ impl Model {
                 }
                 vec![]
             }
-            Msg::JobStarted { job_id, .. } => {
-                if let Some((_, started)) = &mut self.pending {
+            Msg::JobStarted { what, job_id } => {
+                // Only the pending app's own job counts (not an unrelated install's).
+                if let Some((app, started)) = &mut self.pending
+                    && write_target(&what) == Some(app.as_str())
+                {
                     *started = true;
                 }
                 self.logs.push((job_id.clone(), LogBuffer::default()));
@@ -502,10 +503,7 @@ impl Model {
             }
             Msg::Failed { what, error } => {
                 let kind = error.api_error().map(|e| e.kind);
-                if matches!(
-                    what,
-                    Cmd::Run(_) | Cmd::Remove(_) | Cmd::PermReset(_) | Cmd::PermSet { .. } | Cmd::DepsInstall { .. }
-                ) {
+                if write_target(&what).is_some() {
                     self.pending = None;
                 }
                 match what {
@@ -673,6 +671,16 @@ impl Model {
 }
 
 const APP_BUSY: &str = "A job for this app is still running; try again when it ends.";
+
+/// The app a write command changes (the commands that make an app busy).
+fn write_target(c: &Cmd) -> Option<&str> {
+    match c {
+        Cmd::Run(id) | Cmd::Remove(id) | Cmd::PermReset(id) | Cmd::PermSet { id, .. } | Cmd::DepsInstall { id, .. } => {
+            Some(id)
+        }
+        _ => None,
+    }
+}
 
 /// `major.minor` of an API version is at least the given one (an unreadable version is not).
 fn api_at_least(api: &str, major: u64, minor: u64) -> bool {
