@@ -21,7 +21,9 @@
 //! only ever reach the job's own group. (The daemon never ignores SIGCHLD, which would auto-reap.)
 //!
 //! **Cancel.** SIGTERM to the group, SIGKILL `term_grace` later if the leader has not exited; once the leader of a
-//! cancelled job has exited, SIGKILL to what is left of its group (still before the reap). A job is `cancelled` only
+//! cancelled job has exited, what is left of its group has the rest of that grace, then SIGKILL (the job ends when
+//! the group is empty or after that SIGKILL, still before the reap). A cancel that finds the leader already exited
+//! sends the rest of the group SIGTERM, then SIGKILL `term_grace` later. A job is `cancelled` only
 //! when the cancel stopped it (before it started, or through that SIGTERM, ending other than with exit 0); a job that
 //! exited 0 `succeeded`, and one that ended on its own before the cancel reached it keeps its own result. **Limits.**
 //! `max_running` live jobs, one live job per app, finished jobs kept `keep_finished` and `keep_for` (evicted on every
@@ -143,6 +145,8 @@ struct Data {
     leader_exited: bool,
     cancel_requested: bool,
     term_at: Option<Instant>,
+    /// When what is left of a cancelled job's group (its leader gone) gets SIGKILL, if anything is left then.
+    kill_group_at: Option<Instant>,
     killed: bool,
     readers_open: u8,
     /// The final state event was pushed: later output (a grandchild's) is drained and dropped.
@@ -269,19 +273,22 @@ impl Shared {
         }
     }
 
-    fn cancel_locked(d: &mut Data) {
+    /// Asks a live job to stop. While its leader runs: SIGTERM to the group (the supervisor sends SIGKILL
+    /// `term_grace` later). Once the leader has exited (noticed by the supervisor or not: `waitid(WNOWAIT)` looks,
+    /// reaping nothing), its result stands; what is left of the group gets SIGTERM now and SIGKILL `term_grace` later.
+    fn cancel_locked(&self, d: &mut Data) {
         if !live(d.state) || d.cancel_requested {
             return;
         }
         d.cancel_requested = true;
-        if d.pid.is_some() && !d.leader_exited {
+        let Some(pid) = d.pid else { return };
+        if !d.leader_exited && !leader_exited(pid) {
             Self::signal(d, libc::SIGTERM);
             d.term_at = Some(Instant::now());
-        } else if d.pid.is_some() && !d.killed {
-            // The leader exited but is not reaped yet (its zombie keeps the group id ours): what is left of the
-            // group (a process still holding the output) is killed.
-            Self::signal(d, libc::SIGKILL);
-            d.killed = true;
+        } else if d.kill_group_at.is_none() {
+            // The leader's zombie still keeps the group id ours (it is reaped under this lock, later).
+            Self::signal(d, libc::SIGTERM);
+            d.kill_group_at = Some(Instant::now() + self.cfg.term_grace);
         }
     }
 
@@ -378,6 +385,7 @@ impl Jobs {
                     leader_exited: false,
                     cancel_requested: false,
                     term_at: None,
+                    kill_group_at: None,
                     killed: false,
                     readers_open: 0,
                     closed: false,
@@ -452,7 +460,7 @@ impl Jobs {
     pub fn cancel(&self, id: &str) -> Result<JobInfo, ApiError> {
         let job = self.s.find(id)?;
         let mut d = lock(&job.data);
-        Shared::cancel_locked(&mut d);
+        self.s.cancel_locked(&mut d);
         Ok(job.info(&d))
     }
 
@@ -481,7 +489,7 @@ impl Jobs {
             t.jobs.clone()
         };
         for j in &jobs {
-            Shared::cancel_locked(&mut lock(&j.data));
+            self.s.cancel_locked(&mut lock(&j.data));
         }
         let until = Instant::now() + within;
         for j in &jobs {
@@ -531,7 +539,7 @@ fn supervise(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>) {
         return;
     }
     run_child(s, job, argv, &cwd);
-    let _ = std::fs::remove_dir_all(&cwd);
+    crate::write::remove_logged(&cwd);
 }
 
 fn run_child(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>, cwd: &Path) {
@@ -582,7 +590,7 @@ fn run_child(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>, cwd: &Path) {
         if d.cancel_requested {
             // Cancelled while queued: it never gets to run for long.
             d.cancel_requested = false;
-            Shared::cancel_locked(&mut d);
+            s.cancel_locked(&mut d);
         }
     }
     let pipes: [(Option<Box<dyn Read + Send>>, EventKind); 2] = [
@@ -617,19 +625,29 @@ fn run_child(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>, cwd: &Path) {
     }
     let mut d = lock(&job.data);
     d.leader_exited = true;
-    if d.cancel_requested && !d.killed {
-        // Cancelled and the leader is gone: what is left of the group (a member that ignores SIGTERM) is killed
-        // now, while the leader's zombie still keeps the group id ours.
-        Shared::signal(&mut d, libc::SIGKILL);
-        d.killed = true;
+    if d.cancel_requested && d.kill_group_at.is_none() {
+        // Cancelled and the leader is gone: what is left of the group (it got the same SIGTERM) has the same grace,
+        // then SIGKILL, while the leader's zombie still keeps the group id ours.
+        d.kill_group_at = Some(d.term_at.unwrap_or_else(Instant::now) + s.cfg.term_grace);
     }
-    let until = Instant::now() + DRAIN;
-    while d.readers_open > 0 {
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+    // Drain the pipes (up to DRAIN), and while a cancel's SIGKILL is pending, wait for the group to empty or for it.
+    let mut until = Instant::now() + DRAIN;
+    loop {
+        let now = Instant::now();
+        if let Some(at) = d.kill_group_at {
+            if d.killed || !group_alive(pid) {
+                d.kill_group_at = None;
+            } else if now >= at {
+                Shared::signal(&mut d, libc::SIGKILL);
+                d.killed = true;
+                d.kill_group_at = None;
+                until = until.max(now + Duration::from_millis(200));
+            }
+        }
+        if d.kill_group_at.is_none() && (d.readers_open == 0 || now >= until) {
             break;
         }
-        d = job.cv.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+        d = job.cv.wait_timeout(d, CHILD_TICK).unwrap_or_else(|e| e.into_inner()).0;
     }
     if d.readers_open > 0 {
         s.push(
@@ -653,6 +671,25 @@ fn run_child(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>, cwd: &Path) {
         (None, None)
     };
     s.finish(job, &mut d, code, sig);
+}
+
+/// Whether a process other than a zombie is in process group `pgid` (`/proc`; unreadable entries are skipped).
+fn group_alive(pgid: libc::pid_t) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten().any(|e| {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // `pid (comm) state ppid pgrp ...`: comm may hold anything, so parse after its last `)`.
+        let mut f = stat.rsplit_once(')').map_or("", |(_, r)| r).split_whitespace();
+        let (state, _ppid, pgrp) = (f.next(), f.next(), f.next());
+        state != Some("Z") && pgrp.and_then(|g| g.parse::<libc::pid_t>().ok()) == Some(pgid)
+    })
 }
 
 /// Whether the leader exited, leaving it unreaped (`WNOWAIT`). An error (no such child) counts as exited.
@@ -751,8 +788,16 @@ fn unavailable(what: &str) -> ApiError {
     ApiError::new(ErrorKind::Unavailable, what)
 }
 
+/// A path in a refusal: cleaned, and cut to 320 bytes (`...` marks a cut) so the message (at most 512 bytes, see
+/// `ApiError::new`) always keeps what to do.
 fn shown(p: &Path) -> String {
-    rt_core::clean_text(&p.to_string_lossy(), 512)
+    let full = rt_core::clean_text(&p.to_string_lossy(), 4096);
+    let cut = rt_core::clean_text(&full, 320);
+    if cut.len() < full.len() {
+        format!("{cut}...")
+    } else {
+        cut
+    }
 }
 
 /// Why a file or directory that decides what the daemon runs is unsafe to trust, with what to do; `None`: safe.
@@ -766,7 +811,7 @@ fn unsafe_mode(p: &Path, m: &std::fs::Metadata, euid: u32) -> Option<String> {
     }
     if m.mode() & 0o022 != 0 {
         return Some(format!(
-            "{path} is writable by its group or others (mode {:o}); run: chmod g-w,o-w {path}",
+            "writable by its group or others (mode {:o}): run: chmod g-w,o-w {path}",
             m.mode() & 0o7777
         ));
     }

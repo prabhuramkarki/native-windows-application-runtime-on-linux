@@ -473,17 +473,7 @@ mod tests {
     #[test]
     fn every_error_kind_is_documented() {
         let doc = include_str!("../../../docs/API.md");
-        // Every kind the daemon can send (`ErrorKind` is non_exhaustive to this crate: a new one is added here).
-        for k in [
-            ErrorKind::NotFound,
-            ErrorKind::InvalidArgument,
-            ErrorKind::Unavailable,
-            ErrorKind::ReadOnly,
-            ErrorKind::ConsentMismatch,
-            ErrorKind::Busy,
-            ErrorKind::AppBusy,
-            ErrorKind::Internal,
-        ] {
+        for &k in ErrorKind::ALL {
             let name = serde_json::to_value(k).unwrap();
             let name = name.as_str().unwrap();
             assert!(

@@ -108,7 +108,8 @@ fn run() -> i32 {
         }
     };
     on_stop_signals();
-    let jobs = if write {
+    // `_dir` (this daemon's job directory and its lock) lives until `serve` has returned and every job is reaped.
+    let (jobs, _dir) = if write {
         let at = match &inherited {
             Some(l) => rt_daemon::write::listener_path(l),
             None => Some(socket.clone()),
@@ -119,14 +120,14 @@ fn run() -> i32 {
             .ok_or_else(|| "--write: the inherited socket has no path".to_owned())
             .and_then(|at| rt_daemon::write::prepare(&at, xdg.as_deref(), &runtime_exe))
         {
-            Ok(cfg) => Some(rt_daemon::jobs::Jobs::new(cfg)),
+            Ok(p) => (Some(rt_daemon::jobs::Jobs::new(p.jobs)), Some(p.dir)),
             Err(e) => {
                 eprintln!("runtimed: {e}");
                 return 1;
             }
         }
     } else {
-        None
+        (None, None)
     };
     eprintln!("runtimed: mode: {}", if write { "write" } else { "read-only" });
     let ctx = Arc::new(rt_daemon::dispatch::Ctx::new(Arc::new(rt), jobs, &STOP));

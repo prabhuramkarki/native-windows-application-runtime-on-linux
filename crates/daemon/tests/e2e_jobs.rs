@@ -29,6 +29,7 @@ for a in "$@"; do last="$a"; done
 key=$(printf %s "$last" | tr -c 'a-z0-9.-' _)
 printf '%s\0' "$@" > "$F/argv.$key"
 echo $$ > "$F/pid.$key"
+pwd > "$F/cwd.$key"
 case "$(cat "$F/mode.$key" 2>/dev/null)" in
   wait) echo ready; sleep 60 ;;
   pdeath) trap 'echo term > "$F/pdeath.$key"; exit 0' TERM; echo ready; while :; do sleep 0.05; done ;;
@@ -340,6 +341,54 @@ fn a_killed_daemon_takes_its_jobs_with_it() {
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The final review's I1, through the real binaries: a second `runtimed --write` on the same socket (refused by the
+/// socket lock) and a third on another socket must leave a running daemon's live job directory alone.
+#[test]
+fn a_second_write_daemon_leaves_a_running_daemons_job_directories_alone() {
+    let s = Scratch::new(Err(&fake_runtime()));
+    let _a = s.daemon(&[]);
+    let mut c = s.client();
+    s.mode("a", "wait");
+    let id = c.remove("a").unwrap().job_id;
+    wait_for_event(&mut c, &id, "ready");
+    let cwd = PathBuf::from(s.fake("cwd", "a").trim());
+    assert!(cwd.is_dir() && cwd.ends_with(&id), "{cwd:?}");
+    fs::write(cwd.join("partial"), b"a running job's file").unwrap();
+    // Same socket: it gets as far as its --write checks, then the socket lock refuses it.
+    let o = s.cmd(&[]).args(["--write", "--socket"]).arg(s.sock()).output().unwrap();
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    assert!(String::from_utf8_lossy(&o.stderr).contains("already serving"), "{o:?}");
+    assert!(
+        cwd.join("partial").exists(),
+        "the refused daemon removed a live job's directory"
+    );
+    // Another socket inside XDG_RUNTIME_DIR: a second write daemon, legal; it starts and stops.
+    let other = s.xdg.join("other.sock");
+    let mut b = Daemon(
+        s.cmd(&[])
+            .args(["--write", "--socket"])
+            .arg(&other)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while !other.exists() {
+        assert!(Instant::now() < until, "the second daemon did not come up");
+        thread::sleep(Duration::from_millis(10));
+    }
+    b.signal(libc::SIGTERM);
+    assert!(b.wait(Duration::from_secs(10)).success());
+    assert!(
+        cwd.join("partial").exists(),
+        "another daemon removed a live job's directory"
+    );
+    assert_eq!(c.job_status(&id).unwrap().state, JobState::Running);
+    c.job_cancel(&id).unwrap();
+    follow(&mut c, &id);
+    assert!(!cwd.exists(), "the job's own directory is removed after it ended");
 }
 
 // ------------------------------------------------------------------------------------------------ B: real runtime

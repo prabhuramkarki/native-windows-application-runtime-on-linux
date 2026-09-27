@@ -6,9 +6,12 @@
 //!   the path and refuses any `..`.
 //!   `$XDG_RUNTIME_DIR` itself must be a 0700 directory of this user and not `/` (what systemd makes
 //!   `/run/user/<uid>`), or "inside" would mean nothing.
-//! * `$XDG_RUNTIME_DIR/runtime/job-cwd` exists as a 0700 directory of ours (spec D8), created if missing; each job
-//!   runs in a fresh subdirectory of it. Leftover job directories of an earlier daemon (32-hex names) are removed;
-//!   anything else there is left alone.
+//! * `$XDG_RUNTIME_DIR/runtime/job-cwd` exists as a 0700 directory of ours (spec D8), created if missing. Each
+//!   daemon takes a directory of its own in it, `d-<32 hex>/`, guarded by an exclusive `flock` on `d-<32 hex>.lock`
+//!   held for the daemon's life ([`DaemonDir`]); each job runs in a fresh subdirectory of that. At startup a daemon
+//!   removes only the `d-*` directories whose lock it can take (their daemon is gone): never a live daemon's, whether
+//!   that daemon serves the same socket (and this one is about to be refused by the socket lock) or another one.
+//!   Anything else there is left alone.
 //! * The sibling `runtime` passes `check_runtime_exe` and `runtime --version` prints this daemon's own version
 //!   within [`VERSION_TIMEOUT`] (its output read on a thread against the same deadline, at most 4 KiB) (spec D10).
 //!   The CLI's `--plan-digest` check still guards consent if the binary is replaced later.
@@ -23,8 +26,149 @@ use std::time::{Duration, Instant};
 /// How long `runtime --version` may take.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What `--write` needs: the job configuration, and this daemon's own job directory (keep it for the daemon's life;
+/// dropping it releases the lock and removes the directory).
+#[derive(Debug)]
+pub struct Prepared {
+    pub jobs: JobsConfig,
+    pub dir: DaemonDir,
+}
+
+/// This daemon's job directory and the `flock` that marks it live. Dropped: the directory is removed.
+#[derive(Debug)]
+pub struct DaemonDir {
+    path: PathBuf,
+    lock_path: PathBuf,
+    _lock: fs::File,
+}
+
+impl Drop for DaemonDir {
+    fn drop(&mut self) {
+        remove_logged(&self.path);
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// `remove_dir_all` (it never follows a symlink), saying so on stderr when it fails (the disk space stays used).
+pub(crate) fn remove_logged(p: &Path) {
+    if let Err(e) = fs::remove_dir_all(p)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("runtimed: cannot remove the job directory {}: {e}", shown(p));
+    }
+}
+
+/// Opens (creating if `create`) and `flock`s `p` without blocking: `Ok(None)` when another process holds it.
+fn try_lock(p: &Path, create: bool) -> std::io::Result<Option<fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(p)?;
+    // SAFETY: `flock` on an fd we own; no memory is passed.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(f));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}
+
+fn random_hex() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    let mut got = 0;
+    while got < b.len() {
+        // SAFETY: the pointer and length name the unfilled tail of `b`.
+        let r = unsafe { libc::getrandom(b[got..].as_mut_ptr().cast(), b.len() - got, 0) };
+        if r > 0 {
+            got += r as usize;
+        } else if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return Err("--write: getrandom failed".into());
+        }
+    }
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Takes a fresh `d-<hex>` directory in `job_cwd`, locked. The lock file is created and locked first, and still
+/// being the file at its path is checked after the lock (a cleaner of another daemon may have removed an unlocked
+/// one in between); only then the directory is created, so a `d-*` directory without its lock file is never live.
+fn take_daemon_dir(job_cwd: &Path) -> Result<DaemonDir, String> {
+    for _ in 0..8 {
+        let name = format!("d-{}", random_hex()?);
+        let lock_path = job_cwd.join(format!("{name}.lock"));
+        let lock = match try_lock(&lock_path, true) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("--write: cannot create {}: {e}", shown(&lock_path))),
+        };
+        let held = lock.metadata().ok();
+        let there = fs::symlink_metadata(&lock_path).ok();
+        if held
+            .zip(there)
+            .is_none_or(|(h, t)| h.ino() != t.ino() || h.dev() != t.dev())
+        {
+            continue;
+        }
+        let path = job_cwd.join(&name);
+        if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&path) {
+            let _ = fs::remove_file(&lock_path);
+            return Err(format!("--write: cannot create {}: {e}", shown(&path)));
+        }
+        return Ok(DaemonDir {
+            path,
+            lock_path,
+            _lock: lock,
+        });
+    }
+    Err("--write: cannot take a job directory".into())
+}
+
+/// Removes the job directories of daemons that are gone: `d-<32 hex>` whose lock can be taken (or has no lock
+/// file), and lock files whose lock can be taken. Held locks and anything else are left alone.
+fn remove_dead_daemon_dirs(job_cwd: &Path) {
+    let is_hex = |n: &str| n.len() == 32 && n.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let Ok(entries) = fs::read_dir(job_cwd) else { return };
+    for e in entries.flatten() {
+        let Some(name) = e.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(id) = name.strip_prefix("d-") else { continue };
+        let (id, is_lock) = match id.strip_suffix(".lock") {
+            Some(id) => (id, true),
+            None => (id, false),
+        };
+        // `DirEntry::file_type` does not follow a symlink.
+        let Ok(ft) = e.file_type() else { continue };
+        if !is_hex(id) || (is_lock && !ft.is_file()) || (!is_lock && !ft.is_dir()) {
+            continue;
+        }
+        let lock_path = job_cwd.join(format!("d-{id}.lock"));
+        let dir = job_cwd.join(format!("d-{id}"));
+        match try_lock(&lock_path, false) {
+            // Its daemon is gone: the directory first, the lock file last (while held).
+            Ok(Some(_held)) => {
+                remove_logged(&dir);
+                let _ = fs::remove_file(&lock_path);
+            }
+            // No lock file: never live (a daemon creates and locks it before the directory).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !is_lock => remove_logged(&dir),
+            _ => {}
+        }
+    }
+}
+
 /// The job configuration for a write-mode daemon on `socket`, or why it may not have one (a message for stderr).
-pub fn prepare(socket: &Path, xdg: Option<&Path>, runtime_exe: &Path) -> Result<JobsConfig, String> {
+pub fn prepare(socket: &Path, xdg: Option<&Path>, runtime_exe: &Path) -> Result<Prepared, String> {
     prepare_with(socket, xdg, runtime_exe, VERSION_TIMEOUT)
 }
 
@@ -41,7 +185,7 @@ pub(crate) fn prepare_with(
     xdg: Option<&Path>,
     runtime_exe: &Path,
     version_timeout: Duration,
-) -> Result<JobsConfig, String> {
+) -> Result<Prepared, String> {
     let xdg = xdg
         .filter(|p| p.is_absolute())
         .ok_or("--write needs XDG_RUNTIME_DIR (an absolute path)")?;
@@ -65,7 +209,7 @@ pub(crate) fn prepare_with(
     let cwd = dir.join("job-cwd");
     private_dir(&cwd)?;
     check_job_cwd(&cwd, euid()).map_err(|e| format!("--write: {}", e.message))?;
-    remove_stale_job_dirs(&cwd);
+    remove_dead_daemon_dirs(&cwd);
     check_runtime_exe(runtime_exe, euid()).map_err(|e| format!("--write: {}", e.message))?;
     let want = format!("runtime {}", env!("CARGO_PKG_VERSION"));
     let got = version_of(runtime_exe, &cwd, version_timeout)?;
@@ -77,7 +221,11 @@ pub(crate) fn prepare_with(
             env!("CARGO_PKG_VERSION")
         ));
     }
-    Ok(JobsConfig::new(runtime_exe.to_owned(), cwd))
+    let dir = take_daemon_dir(&cwd)?;
+    Ok(Prepared {
+        jobs: JobsConfig::new(runtime_exe.to_owned(), dir.path.clone()),
+        dir,
+    })
 }
 
 /// Whether `p` resolves to a path at or below `root` (canonical): `..` is refused outright, symlinks in the part
@@ -117,21 +265,6 @@ fn private_dir(d: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// Removes the job directories an earlier daemon left (named by a job id: 32 lowercase hex); nothing else.
-fn remove_stale_job_dirs(cwd: &Path) {
-    let Ok(entries) = fs::read_dir(cwd) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let ours = name
-            .to_str()
-            .is_some_and(|n| n.len() == 32 && n.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-        // `DirEntry::file_type` does not follow a symlink; `remove_dir_all` never follows one either.
-        if ours && e.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = fs::remove_dir_all(e.path());
-        }
-    }
 }
 
 /// `exe --version`'s first line, with the job environment. Everything is bounded by `timeout`: the output is read
@@ -212,7 +345,7 @@ mod tests {
         format!("echo 'runtime {}'", env!("CARGO_PKG_VERSION"))
     }
 
-    fn prep(w: &W, sock: &Path) -> Result<JobsConfig, String> {
+    fn prep(w: &W, sock: &Path) -> Result<Prepared, String> {
         prepare_with(sock, Some(&w.xdg), &w.exe, Duration::from_millis(500))
     }
 
@@ -224,8 +357,13 @@ mod tests {
             w.xdg.join("other/deeper/s.sock"),
             w.xdg.join("s.sock"),
         ] {
-            let cfg = prep(&w, &sock).unwrap_or_else(|e| panic!("{sock:?}: {e}"));
-            assert_eq!(cfg.cwd, w.xdg.join("runtime/job-cwd"));
+            let p = prep(&w, &sock).unwrap_or_else(|e| panic!("{sock:?}: {e}"));
+            let cfg = &p.jobs;
+            // This daemon's own job directory under the shared one: `d-<32 hex>`, 0700.
+            assert_eq!(cfg.cwd.parent().unwrap(), w.xdg.join("runtime/job-cwd"));
+            let name = cfg.cwd.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("d-") && name.len() == 34, "{name}");
+            assert_eq!(fs::symlink_metadata(&cfg.cwd).unwrap().mode() & 0o7777, 0o700);
             assert_eq!(cfg.runtime_exe, w.exe);
             assert_eq!(cfg.max_running, 4);
         }
@@ -301,19 +439,20 @@ mod tests {
         fs::set_permissions(w.xdg.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(w.xdg.join("runtime/job-cwd")).unwrap();
         fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o700)).unwrap();
-        // Anything that is not an old job directory is left alone and blocks nothing; old job directories go.
+        // Anything that is not a daemon's job directory is left alone and blocks nothing.
         fs::write(w.xdg.join("runtime/job-cwd/notepad"), b"planted").unwrap();
-        let stale = w.xdg.join(format!("runtime/job-cwd/{}", "ab".repeat(16)));
-        fs::create_dir(&stale).unwrap();
-        fs::write(stale.join("core"), b"x").unwrap();
+        let odd = w.xdg.join(format!("runtime/job-cwd/{}", "ab".repeat(16)));
+        fs::create_dir(&odd).unwrap();
         prep(&w, &w.xdg.join("s.sock")).unwrap();
-        assert!(!stale.exists() && w.xdg.join("runtime/job-cwd/notepad").exists());
+        assert!(odd.exists() && w.xdg.join("runtime/job-cwd/notepad").exists());
         fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o750)).unwrap();
         assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("0700"));
         // XDG_RUNTIME_DIR itself: ours and 0700, never `/`.
         fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&w.xdg, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("XDG_RUNTIME_DIR"));
+        let like = "to be a 0700 directory of this user (like /run/user/<uid>)";
+        let e = prep(&w, &w.xdg.join("s.sock")).unwrap_err();
+        assert!(e.contains(like), "{e}");
         let e = prepare_with(
             Path::new("/s.sock"),
             Some(Path::new("/")),
@@ -321,7 +460,44 @@ mod tests {
             Duration::from_millis(500),
         )
         .unwrap_err();
-        assert!(e.contains("0700 directory of this user"), "{e}");
+        assert!(e.contains(like), "{e}");
+    }
+
+    /// The final review's I1: a second `runtimed --write` (the same socket, refused later by the socket lock, or
+    /// another socket) must never remove a running daemon's job directories; only a dead daemon's go.
+    #[test]
+    fn two_write_daemons_never_remove_each_others_job_directories() {
+        let w = w(&ours());
+        let a = prep(&w, &w.xdg.join("runtime/runtimed.sock")).unwrap();
+        let live = a.jobs.cwd.join("0".repeat(32));
+        fs::create_dir(&live).unwrap();
+        fs::write(live.join("setup.log"), b"a running job's file").unwrap();
+        let b = prep(&w, &w.xdg.join("runtime/runtimed.sock")).unwrap();
+        let c = prep(&w, &w.xdg.join("other.sock")).unwrap();
+        assert!(
+            live.join("setup.log").exists(),
+            "a second daemon removed a live job's directory"
+        );
+        assert!(b.jobs.cwd != a.jobs.cwd && c.jobs.cwd != a.jobs.cwd && b.jobs.cwd != c.jobs.cwd);
+        drop(b);
+        drop(c);
+        assert!(live.exists());
+        // A dead daemon's directory (its lock free, or its lock file gone) is removed with what is in it.
+        let job_cwd = w.xdg.join("runtime/job-cwd");
+        let dead = job_cwd.join(format!("d-{}", "1".repeat(32)));
+        fs::create_dir_all(dead.join("2".repeat(32))).unwrap();
+        fs::write(job_cwd.join(format!("d-{}.lock", "1".repeat(32))), b"").unwrap();
+        let orphan = job_cwd.join(format!("d-{}", "3".repeat(32)));
+        fs::create_dir(&orphan).unwrap();
+        let d = prep(&w, &w.xdg.join("s.sock")).unwrap();
+        assert!(!dead.exists() && !job_cwd.join(format!("d-{}.lock", "1".repeat(32))).exists());
+        assert!(!orphan.exists());
+        assert!(live.exists(), "a's lock is still held");
+        // A daemon's own directory goes when it stops.
+        let a_dir = a.jobs.cwd.clone();
+        drop(a);
+        assert!(!a_dir.exists());
+        drop(d);
     }
 
     #[test]
