@@ -552,8 +552,8 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
   `deps.plan`'s `digest`, `sha256` and `consentText`. A 0.2 client reading a 0.1 daemon's `deps.plan` gets an
   empty `digest`, and the bundled client refuses `deps_install` with it before sending.
 - **0.2.1 is additive**: the `apps.import` method and its job kind `import`, `apps.get`'s `package` and
-  `permissions.get`'s `requested`. A 0.2.0 daemon answers `apps.import` `-32601`; the GUI offers a `.wrun` only to a
-  0.2.1 daemon.
+  `permissions.get`'s `requested`. A 0.2.0 daemon answers `apps.import` `-32601`; the GUI does not send a `.wrun` to a
+  daemon older than 0.2.1 (it says why).
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
