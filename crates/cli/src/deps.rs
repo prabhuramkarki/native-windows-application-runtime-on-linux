@@ -42,28 +42,28 @@ const MAX_ANSWER: u64 = 256;
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct DepsArgs {
     #[command(subcommand)]
-    sub: Option<DepsSub>,
+    pub(crate) sub: Option<DepsSub>,
     /// An app id from `runtime list` (an app named `list` or `cache` is shadowed by those subcommands)
     #[arg(required = true)]
-    app: Option<String>,
+    pub(crate) app: Option<String>,
     /// Download and install what the plan lists (consent-gated packages ask first, or need --yes)
     #[arg(long)]
-    install: bool,
+    pub(crate) install: bool,
     /// Consent to one consent-gated package of the plan without a prompt (its licence text is still printed).
     /// Repeat for each package; it always takes a package name.
     #[arg(long, value_name = "PKG", requires = "install")]
-    yes: Vec<String>,
+    pub(crate) yes: Vec<String>,
     /// For clients that showed the plan to the user (runtimed): the plan's digest as they showed it; refuses,
     /// installing nothing, when the plan differs
     #[arg(long, value_name = "HEX", requires = "install", value_parser = parse_digest)]
-    plan_digest: Option<String>,
+    pub(crate) plan_digest: Option<String>,
     /// Undo what an interrupted (killed) install of PKG left in the prefix, so it can be installed again
     #[arg(long, value_name = "PKG", conflicts_with = "install")]
-    discard_interrupted: Option<String>,
+    pub(crate) discard_interrupted: Option<String>,
 }
 
 #[derive(Subcommand)]
-enum DepsSub {
+pub(crate) enum DepsSub {
     /// Show the bundled package manifest
     List,
     /// Show the download cache

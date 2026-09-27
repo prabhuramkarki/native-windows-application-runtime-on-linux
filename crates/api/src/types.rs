@@ -607,6 +607,8 @@ pub struct DepsPlanView {
     pub entries: Vec<PlanEntryView>,
     pub unsatisfied: Vec<String>,
     pub warnings: Vec<String>,
+    /// Empty only when read from a 0.1 daemon, which has no `deps.install`.
+    #[serde(default)]
     pub digest: String,
 }
 
