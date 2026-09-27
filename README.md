@@ -174,6 +174,25 @@ runtime rpc permissions.set '{"id": "tool", "set": ["network=allow"]}'    # {"jo
 runtime rpc jobs.poll '{"jobId": "<id>", "afterSeq": 0, "waitMs": 10000}'
 ```
 
+## GUI (`runtime-gui`)
+
+`runtime-gui` is a GTK 4 + libadwaita desktop client of `runtimed`. It lists your apps (with search), runs and stops
+them, installs a program from a file, removes an app, and plans and installs an app's dependencies. Every package that
+needs consent is shown with its version, sha256 and full terms, and has its own unchecked box. It also changes
+permissions and follows each job's output. It talks only to `runtimed` (it never runs `runtime` itself and never
+starts a daemon), so changes need a `runtimed --write` (the systemd unit passes it). With a read-only daemon every
+change control is disabled with the reason; with no daemon it shows how to start one. `--socket PATH` picks another
+socket (and opens its own window: a plain second launch only raises the first).
+
+Building it needs the GTK >= 4.12 and libadwaita >= 1.5 development files (`apt install libgtk-4-dev
+libadwaita-1-dev`) and Rust 1.92 or newer. It is not a default workspace member: plain `cargo build` never needs GTK.
+
+```sh
+cargo build -p runtime-gui && target/debug/runtime-gui
+```
+
+Manual checks on GNOME and KDE: [docs/GUI-CHECKLIST.md](docs/GUI-CHECKLIST.md).
+
 ## Requirements
 
 - Linux on x86-64 with **Wine 10** (`wine64` or `wine`, and `wineserver`; on Debian/Ubuntu `apt install wine`).
@@ -185,7 +204,7 @@ runtime rpc jobs.poll '{"jobId": "<id>", "afterSeq": 0, "waitMs": 10000}'
   `RUNTIME_WINESERVER=/abs/path/to/wineserver` (a wrong value is an error, not a fallback).
   `RUNTIME_VULKAN_LOADER=present|absent` overrides the Vulkan loader lookup (used by the tests; any other
   value, or unset, means the real lookup).
-- Stable Rust 1.88 or newer to build (`cargo build`).
+- Stable Rust 1.88 or newer to build (`cargo build`); 1.92 and the GTK/libadwaita development files for `runtime-gui`.
 - mingw-w64 (`apt install mingw-w64`) only to build the test fixtures, never to use the program.
 
 ## Where things live
@@ -199,7 +218,8 @@ the app's `C:`), `runtime/home/` (the program's `HOME`, so Wine does not hand it
 
 ```sh
 tools/build-fixtures.sh                 # test .exe/.dll files into tests/fixtures/build (mingw-w64)
-cargo test --workspace                  # unit, hostile-input and hermetic CLI tests; no Wine needed
+cargo test --workspace --exclude runtime-gui
+                                        # unit, hostile-input and hermetic CLI tests; no Wine needed
 RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-backend-wine -p runtime-cli -- --ignored --skip real_net_ --test-threads=1
                                         # real-Wine end-to-end tests and the sandbox escape suite (minutes; Wine 10, bwrap, fixtures)
 DXVK_FILTER_DEVICE_NAME=<device> cargo test -p runtime-cli --test e2e_sandbox -- --ignored real_net_wine_d3d11 --nocapture
@@ -212,8 +232,16 @@ cargo test -p runtime-deps --lib -- --ignored real_net_wine_d3d11 --test-threads
                                         # D3D11 render through DXVK on real Wine (internet, Vulkan device, display)
 RUNTIME_SAMPLES=dir1:dir2 cargo test -p runtime-pe -- --ignored --nocapture
                                         # PE oracle: compares every PE under those dirs with file(1)
-cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check && cargo clippy --workspace --exclude runtime-gui --all-targets -- -D warnings
+cargo clippy -p runtime-gui --all-targets -- -D warnings            # the GUI (needs GTK development files)
+cargo build -p runtime-daemon -p runtime-cli && RUNTIME_REQUIRE_DISPLAY=1 xvfb-run -a cargo test -p runtime-gui
+                                        # view model, backend e2e against the real runtimed, widget smoke tests
 ```
+
+`--workspace` includes `runtime-gui` (it ignores `default-members`), so the core commands exclude it.
+The GUI's widget tests run on a display (`xvfb-run`). Without one they skip loudly, unless
+`RUNTIME_REQUIRE_DISPLAY=1` is set, which makes them fail. `RUNTIME_GUI_SHOTS=1` saves screenshots to
+`target/gui-smoke/`. The GUI tests start their own `runtimed` in scratch directories, never yours.
 
 The Wine tests use temporary data directories, stop and kill their `wineserver` on exit, and never run
 `gui64.exe` (a modal message box; run it by hand to look at a window). Run them with `--test-threads=1`.
@@ -253,6 +281,8 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 - `crates/daemon`: `runtimed`, the API as JSON-RPC 2.0 (NDJSON) over an owner-only Unix socket (read-only, or with
   `--write` the job table that runs `runtime` for every change), with systemd user units in `contrib/systemd/`, and
   its client (`rt_daemon::client`).
+- `crates/gui`: `runtime-gui`, the GTK 4 + libadwaita client of `runtimed`. It has a toolkit-free view model
+  (`vm`), a backend (`backend`: request thread and job followers) and the widgets (`ui`). It is not a default member.
 - `crates/cli`: the `runtime` binary, a thin front end over the above (it uses `rt_daemon` only for its client, in
   `runtime rpc` and `runtime daemon-status`).
 - `tools/`: fixture build script and fixture sources. `docs/`: security model, third-party inventory, plans.

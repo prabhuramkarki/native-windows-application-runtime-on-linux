@@ -8,207 +8,29 @@
 //! * C (`#[ignore]`, real Wine and bwrap): a sandboxed `apps.run` of `hello64.exe` whose output arrives as events.
 //!
 //! Every run has its own scratch HOME, data dir and `XDG_RUNTIME_DIR` (never the user's).
+mod support;
+
 use rt_api::jobs::{EventKind, JobEvent, JobInfo, JobState};
 use rt_daemon::client::{Client, InstallParams};
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{Daemon, Scratch, alive, fake_runtime, fixture, refs};
 
 const DAEMON: &str = env!("CARGO_BIN_EXE_runtimed");
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The fake `runtime` of A: answers `--version`, else records its argv (NUL separated) and pid keyed by its last
-/// argument, then acts on `$RUNTIME_DATA_DIR/fake/mode.<key>` (default: print one line).
-const FAKE_RUNTIME: &str = r#"#!/bin/sh
-[ "$1" = --version ] && { echo "runtime @VERSION@"; exit 0; }
-F="$RUNTIME_DATA_DIR/fake"
-for a in "$@"; do last="$a"; done
-key=$(printf %s "$last" | tr -c 'a-z0-9.-' _)
-printf '%s\0' "$@" > "$F/argv.$key"
-echo $$ > "$F/pid.$key"
-pwd > "$F/cwd.$key"
-case "$(cat "$F/mode.$key" 2>/dev/null)" in
-  wait) echo ready; sleep 60 ;;
-  pdeath) trap 'echo term > "$F/pdeath.$key"; exit 0' TERM; echo ready; while :; do sleep 0.05; done ;;
-  *) echo done ;;
-esac
-"#;
-
-/// The CLI rig's fake Wine (`crates/cli/tests/apps.rs`), trimmed: `wineboot` makes a minimal prefix, anything else
-/// is "the app", which prints a line.
-const FAKE_WINE: &str = r#"#!/bin/sh
-case "$1" in
-  --version) echo 'wine-10.0 (Fake 1)' ;;
-  wineboot)
-    P="$WINEPREFIX"
-    mkdir -p "$P/dosdevices" "$P/drive_c/Program Files" "$P/drive_c/users/tester/AppData/Roaming/Microsoft/Windows" "$P/drive_c/windows"
-    ln -s ../drive_c "$P/dosdevices/c:"
-    : > "$P/system.reg" ;;
-  *reg.exe)
-    case "$2" in
-      add) printf 'WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\Drivers] 1\n"Graphics"="%s"\n\n' "$7" > "$WINEPREFIX/user.reg" ;;
-      delete) rm -f "$WINEPREFIX/user.reg" ;;
-    esac ;;
-  *) echo "app-stdout" ;;
-esac
-"#;
-
-fn fixture(name: &str) -> PathBuf {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/build")
-        .join(name);
-    assert!(p.exists(), "missing fixture {name}: run tools/build-fixtures.sh");
-    p
+fn scratch(runtime: Result<&Path, &str>) -> Scratch {
+    Scratch::new(Path::new(DAEMON), runtime)
 }
 
-/// Writes (or copies) an executable, then waits until it can be executed: another test thread may have forked while
-/// it was open for writing, and that child holds the write fd until its exec (ETXTBSY meanwhile).
-fn install_exe(dst: &Path, from: Result<&Path, &str>) {
-    match from {
-        Ok(src) => {
-            fs::copy(src, dst).unwrap();
-        }
-        Err(body) => fs::write(dst, body).unwrap(),
-    }
-    fs::set_permissions(dst, fs::Permissions::from_mode(0o755)).unwrap();
-    for _ in 0..500 {
-        match Command::new(dst)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => thread::sleep(Duration::from_millis(4)),
-            _ => break,
-        }
-    }
+fn real_runtime() -> PathBuf {
+    support::real_runtime(Path::new(DAEMON))
 }
 
-struct Scratch {
-    _t: tempfile::TempDir,
-    root: PathBuf,
-    bin: PathBuf,
-    xdg: PathBuf,
-    data: PathBuf,
-    home: PathBuf,
-}
-
-impl Scratch {
-    /// `runtime`: `Err(script)` for a fake, `Ok(path)` to copy a real binary.
-    fn new(runtime: Result<&Path, &str>) -> Scratch {
-        let t = tempfile::tempdir().unwrap();
-        let root = t.path().canonicalize().unwrap();
-        let (bin, xdg, data, home) = (root.join("bin"), root.join("xdg"), root.join("data"), root.join("home"));
-        for d in [&bin, &xdg, &data.join("fake"), &home] {
-            fs::create_dir_all(d).unwrap();
-        }
-        fs::set_permissions(&xdg, fs::Permissions::from_mode(0o700)).unwrap();
-        // A umask of 002 would leave it group-writable, which `runtimed --write` refuses (with a chmod hint).
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-        install_exe(&bin.join("runtimed"), Ok(Path::new(DAEMON)));
-        install_exe(&bin.join("runtime"), runtime);
-        Scratch {
-            _t: t,
-            root,
-            bin,
-            xdg,
-            data,
-            home,
-        }
-    }
-
-    fn sock(&self) -> PathBuf {
-        self.xdg.join("runtime/runtimed.sock")
-    }
-
-    fn cmd(&self, extra: &[(&str, &Path)]) -> Command {
-        let mut c = Command::new(self.bin.join("runtimed"));
-        c.env_clear()
-            .env("HOME", &self.home)
-            .env("PATH", format!("{}:/usr/bin:/bin", self.root.join("fakes").display()))
-            .env("RUNTIME_DATA_DIR", &self.data)
-            .env("XDG_RUNTIME_DIR", &self.xdg)
-            .env("SECRET", "hunter2")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null());
-        for (k, v) in extra {
-            c.env(k, v);
-        }
-        c
-    }
-
-    /// `runtimed --write` on the default-style socket, up and serving; its stderr goes to `daemon.log`.
-    fn daemon(&self, extra: &[(&str, &Path)]) -> Daemon {
-        let log = fs::File::create(self.root.join("daemon.log")).unwrap();
-        let child = self
-            .cmd(extra)
-            .args(["--write", "--socket"])
-            .arg(self.sock())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        let mut d = Daemon(child);
-        let until = Instant::now() + Duration::from_secs(10);
-        while fs::symlink_metadata(self.sock()).map(|m| m.mode() & 0o777).ok() != Some(0o600) {
-            if let Some(st) = d.0.try_wait().unwrap() {
-                panic!("runtimed exited early ({st}): {}", self.log());
-            }
-            assert!(Instant::now() < until, "no socket: {}", self.log());
-            thread::sleep(Duration::from_millis(10));
-        }
-        d
-    }
-
-    fn log(&self) -> String {
-        fs::read_to_string(self.root.join("daemon.log")).unwrap_or_default()
-    }
-
-    fn client(&self) -> Client {
-        Client::connect(&self.sock()).unwrap()
-    }
-
-    fn fake(&self, what: &str, key: &str) -> String {
-        fs::read_to_string(self.data.join(format!("fake/{what}.{key}"))).unwrap_or_default()
-    }
-
-    fn mode(&self, key: &str, m: &str) {
-        fs::write(self.data.join(format!("fake/mode.{key}")), m).unwrap();
-    }
-}
-
-struct Daemon(Child);
-
-impl Daemon {
-    fn signal(&self, sig: i32) {
-        // SAFETY: a signal to our own child, not reaped yet.
-        unsafe { libc::kill(self.0.id() as libc::pid_t, sig) };
-    }
-
-    fn wait(&mut self, within: Duration) -> std::process::ExitStatus {
-        let until = Instant::now() + within;
-        loop {
-            if let Some(st) = self.0.try_wait().unwrap() {
-                return st;
-            }
-            assert!(Instant::now() < until, "runtimed did not exit");
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn alive(pid: i32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-        && !fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "))
+fn real() -> (Scratch, Vec<(&'static str, PathBuf)>) {
+    support::real(Path::new(DAEMON))
 }
 
 /// Follows job `id` to its end: its final info and every event.
@@ -240,15 +62,11 @@ fn wait_for_event(c: &mut Client, id: &str, text: &str) {
     }
 }
 
-fn fake_runtime() -> String {
-    FAKE_RUNTIME.replace("@VERSION@", VERSION)
-}
-
 // ------------------------------------------------------------------------------------------------ A: fake runtime
 
 #[test]
 fn write_mode_refuses_a_socket_outside_xdg_runtime_dir_or_another_runtime_version() {
-    let s = Scratch::new(Err(&fake_runtime()));
+    let s = scratch(Err(&fake_runtime()));
     let o = s
         .cmd(&[])
         .args(["--write", "--socket"])
@@ -260,7 +78,7 @@ fn write_mode_refuses_a_socket_outside_xdg_runtime_dir_or_another_runtime_versio
         String::from_utf8_lossy(&o.stderr).contains("inside XDG_RUNTIME_DIR"),
         "{o:?}"
     );
-    let other = Scratch::new(Err("#!/bin/sh\necho 'runtime 0.0.0-other'\n"));
+    let other = scratch(Err("#!/bin/sh\necho 'runtime 0.0.0-other'\n"));
     let o = other
         .cmd(&[])
         .args(["--write", "--socket"])
@@ -274,7 +92,7 @@ fn write_mode_refuses_a_socket_outside_xdg_runtime_dir_or_another_runtime_versio
 
 #[test]
 fn jobs_run_the_sibling_runtime_with_the_exact_argv_and_die_with_the_daemon() {
-    let s = Scratch::new(Err(&fake_runtime()));
+    let s = scratch(Err(&fake_runtime()));
     let mut d = s.daemon(&[]);
     assert!(s.log().contains("mode: write"), "{}", s.log());
     let mut c = s.client();
@@ -319,7 +137,7 @@ fn jobs_run_the_sibling_runtime_with_the_exact_argv_and_die_with_the_daemon() {
 
 #[test]
 fn a_killed_daemon_takes_its_jobs_with_it() {
-    let s = Scratch::new(Err(&fake_runtime()));
+    let s = scratch(Err(&fake_runtime()));
     let mut d = s.daemon(&[]);
     let mut c = s.client();
     s.mode("p", "pdeath");
@@ -347,7 +165,7 @@ fn a_killed_daemon_takes_its_jobs_with_it() {
 /// socket lock) and a third on another socket must leave a running daemon's live job directory alone.
 #[test]
 fn a_second_write_daemon_leaves_a_running_daemons_job_directories_alone() {
-    let s = Scratch::new(Err(&fake_runtime()));
+    let s = scratch(Err(&fake_runtime()));
     let _a = s.daemon(&[]);
     let mut c = s.client();
     s.mode("a", "wait");
@@ -392,31 +210,6 @@ fn a_second_write_daemon_leaves_a_running_daemons_job_directories_alone() {
 }
 
 // ------------------------------------------------------------------------------------------------ B: real runtime
-
-fn real_runtime() -> PathBuf {
-    let p = Path::new(DAEMON).with_file_name("runtime");
-    assert!(p.is_file(), "{} is missing: run `cargo test --workspace`", p.display());
-    p
-}
-
-/// A scratch with the real `runtime`, a fake Wine and a fake vulkaninfo on PATH.
-fn real() -> (Scratch, Vec<(&'static str, PathBuf)>) {
-    let s = Scratch::new(Ok(&real_runtime()));
-    let fakes = s.root.join("fakes");
-    fs::create_dir(&fakes).unwrap();
-    install_exe(&fakes.join("wine"), Err(FAKE_WINE));
-    install_exe(&fakes.join("wineserver"), Err("#!/bin/sh\nexit 0\n"));
-    let env = vec![
-        ("RUNTIME_WINE", fakes.join("wine")),
-        ("RUNTIME_WINESERVER", fakes.join("wineserver")),
-        ("RUNTIME_VULKAN_LOADER", PathBuf::from("present")),
-    ];
-    (s, env)
-}
-
-fn refs<'a>(env: &'a [(&'static str, PathBuf)]) -> Vec<(&'static str, &'a Path)> {
-    env.iter().map(|(k, v)| (*k, v.as_path())).collect()
-}
 
 #[test]
 fn the_real_runtime_as_jobs_install_permissions_display_deps_run_remove() {
@@ -573,7 +366,7 @@ fn a_real_sandboxed_run_streams_its_output() {
         eprintln!("SKIPPED: no bwrap");
         return;
     }
-    let s = Scratch::new(Ok(&real_runtime()));
+    let s = scratch(Ok(&real_runtime()));
     let _d = s.daemon(&[]);
     let mut c = s.client();
     let exe = s.root.join("hello64.exe");
