@@ -37,18 +37,18 @@ case "$mode" in
 esac
 "#;
 
-struct Fx {
+pub(crate) struct Fx {
     _t: tempfile::TempDir,
-    root: PathBuf,
-    fake: PathBuf,
-    cwd: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) fake: PathBuf,
+    pub(crate) cwd: PathBuf,
     clock: Arc<AtomicU64>,
-    jobs: Jobs,
+    pub(crate) jobs: Jobs,
 }
 
 const T0: u64 = 1_800_000_000_000;
 
-fn write_script(path: &Path, body: &str) {
+pub(crate) fn write_script(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     // Another test thread may have forked while the file was open for writing (ETXTBSY until its exec).
@@ -60,11 +60,11 @@ fn write_script(path: &Path, body: &str) {
     }
 }
 
-fn fx() -> Fx {
+pub(crate) fn fx() -> Fx {
     fx_with(|_| {})
 }
 
-fn fx_with(tweak: impl FnOnce(&mut JobsConfig)) -> Fx {
+pub(crate) fn fx_with(tweak: impl FnOnce(&mut JobsConfig)) -> Fx {
     let t = tempfile::tempdir().unwrap();
     let root = t.path().canonicalize().unwrap();
     let (data, bin, cwd) = (root.join("data"), root.join("bin"), root.join("cwd"));
@@ -113,12 +113,16 @@ fn app(id: &str) -> AppId {
     AppId::parse(id).unwrap()
 }
 
-fn remove(id: &str) -> JobSpec {
+pub(crate) fn remove(id: &str) -> JobSpec {
     JobSpec::Remove { app: app(id) }
 }
 
 impl Fx {
-    fn mode(&self, key: Option<&str>, m: &str) {
+    pub(crate) fn start_job(&self, app_id: &str) -> String {
+        self.start(remove(app_id))
+    }
+
+    pub(crate) fn mode(&self, key: Option<&str>, m: &str) {
         let f = match key {
             Some(k) => self.fake.join(format!("mode.{k}")),
             None => self.fake.join("mode"),
@@ -131,7 +135,7 @@ impl Fx {
     }
 
     /// Every retained event after `after`, polling without waiting.
-    fn events_after(&self, id: &str, mut after: u64) -> Vec<JobEvent> {
+    pub(crate) fn events_after(&self, id: &str, mut after: u64) -> Vec<JobEvent> {
         let mut all = vec![];
         loop {
             let e = self
@@ -146,11 +150,11 @@ impl Fx {
         }
     }
 
-    fn events(&self, id: &str) -> Vec<JobEvent> {
+    pub(crate) fn events(&self, id: &str) -> Vec<JobEvent> {
         self.events_after(id, 0)
     }
 
-    fn wait_end(&self, id: &str) -> JobInfo {
+    pub(crate) fn wait_end(&self, id: &str) -> JobInfo {
         let until = Instant::now() + Duration::from_secs(20);
         loop {
             let i = self.jobs.status(id).unwrap();
@@ -163,7 +167,7 @@ impl Fx {
     }
 
     /// Waits for a `stdout` event with `text`.
-    fn wait_for(&self, id: &str, text: &str) {
+    pub(crate) fn wait_for(&self, id: &str, text: &str) {
         let until = Instant::now() + Duration::from_secs(10);
         while !self.events(id).iter().any(|e| e.text == text) {
             assert!(Instant::now() < until, "no {text:?} from {id}: {:?}", self.events(id));
@@ -171,7 +175,7 @@ impl Fx {
         }
     }
 
-    fn read(&self, what: &str, key: &str) -> String {
+    pub(crate) fn read(&self, what: &str, key: &str) -> String {
         fs::read_to_string(self.fake.join(format!("{what}.{key}"))).unwrap_or_default()
     }
 }
@@ -187,7 +191,7 @@ fn clean(s: &str) -> bool {
     !s.chars().any(|c| c.is_control() || rt_core::is_format(c))
 }
 
-fn alive(pid: i32) -> bool {
+pub(crate) fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the pid exists; nothing is delivered.
     unsafe { libc::kill(pid, 0) == 0 }
 }

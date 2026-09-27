@@ -113,6 +113,17 @@ control or format characters) and bounded, but it may change between versions.
 | `graphics.info` | none | `GraphicsView` |
 | `sandbox.info` | `{"id"}` | `SandboxView` |
 | `deps.plan` | `{"id"}` | `DepsPlanView` |
+| `apps.run` | `{"id", "args"?}` | `JobStarted` (write mode) |
+| `apps.install` | `{"path", "name"?, "exe"?, "silent"?, "network"?}` | `JobStarted` (write mode) |
+| `apps.remove` | `{"id"}` | `JobStarted` (write mode) |
+| `deps.install` | `{"id", "planDigest", "consent"}` | `JobStarted` (write mode) |
+| `permissions.set` | `{"id", "set"}` | `JobStarted` (write mode) |
+| `permissions.reset` | `{"id"}` | `JobStarted` (write mode) |
+| `display.set` | `{"id", "driver"}` | `JobStarted` (write mode) |
+| `jobs.poll` | `{"jobId", "afterSeq", "waitMs"?}` | `JobEvents` (write mode) |
+| `jobs.status` | `{"jobId"}` | `JobInfo` (write mode) |
+| `jobs.cancel` | `{"jobId"}` | `JobInfo` (write mode) |
+| `jobs.list` | none | `JobList` (write mode) |
 
 Conventions:
 
@@ -299,6 +310,50 @@ What `runtime deps <app>` would install. It does not use the network and changes
 {"entries": [], "unsatisfied": [],
  "warnings": ["cannot read the app's executable (not a Windows program or a zip archive (unrecognised format)); the plan does not include what it imports"]}
 ```
+
+### `apps.run`
+
+Runs an installed app in its sandbox as a job (`runtime run <id> -- <args>`). Write mode only.
+
+### `apps.install`
+
+Installs a program or installer as a job (`runtime install`). Write mode only.
+
+### `apps.remove`
+
+Removes an app as a job (`runtime remove`). Write mode only.
+
+### `deps.install`
+
+Installs the app's dependency plan as a job, given the `digest` of the plan `deps.plan` showed and the exact `{package, version, sha256}` of each consent-gated package the user accepted. Write mode only.
+
+### `permissions.set`
+
+Changes permissions with `runtime permissions --set` expressions, as a job. Write mode only.
+
+### `permissions.reset`
+
+Returns an app's permissions to the default, as a job. Write mode only.
+
+### `display.set`
+
+Sets an app's Wine graphics driver (`auto`, `x11`, `wayland`), as a job. Write mode only.
+
+### `jobs.poll`
+
+A job's events after `afterSeq`, waiting up to `waitMs` (at most 25000) for one. Write mode only.
+
+### `jobs.status`
+
+A job's state. Write mode only.
+
+### `jobs.cancel`
+
+Stops a job (SIGTERM to its process group, SIGKILL 5 s later). Write mode only.
+
+### `jobs.list`
+
+Every job the daemon knows: live ones first, then finished ones, newest first. Write mode only.
 
 ## Versioning and compatibility
 
