@@ -2,7 +2,8 @@
 //! a [`JobSpec`]'s argv, and this module owns those processes.
 //!
 //! **Spawn.** On the job's own supervisor thread (so `PR_SET_PDEATHSIG`, which fires when the spawning THREAD exits,
-//! fires only if the daemon dies): no shell, `env_clear()` plus [`child_env`], cwd the checked empty job directory,
+//! fires only if the daemon dies): no shell, `env_clear()` plus [`child_env`], cwd a fresh empty directory of the
+//! job's own under the checked job directory (removed after the reap),
 //! stdin `/dev/null`, stdout/stderr piped, `process_group(0)` (pgid = the child's pid), and a `pre_exec` that sets
 //! `PR_SET_PDEATHSIG = SIGTERM` and `_exit(127)`s if the daemon already died. Every daemon fd is `CLOEXEC`.
 //!
@@ -19,7 +20,10 @@
 //! under the job's lock while the leader is unreaped, and the supervisor reaps under the same lock. So a signal can
 //! only ever reach the job's own group. (The daemon never ignores SIGCHLD, which would auto-reap.)
 //!
-//! **Cancel.** SIGTERM to the group, SIGKILL `term_grace` later if the leader has not exited. **Limits.**
+//! **Cancel.** SIGTERM to the group, SIGKILL `term_grace` later if the leader has not exited; once the leader of a
+//! cancelled job has exited, SIGKILL to what is left of its group (still before the reap). A job is `cancelled` only
+//! when the cancel stopped it (before it started, or through that SIGTERM, ending other than with exit 0); a job that
+//! exited 0 `succeeded`, and one that ended on its own before the cancel reached it keeps its own result. **Limits.**
 //! `max_running` live jobs, one live job per app, finished jobs kept `keep_finished` and `keep_for` (evicted on every
 //! start, poll, status, cancel and list). Ids are 128 bits from `getrandom(2)`, held only in memory.
 //!
@@ -30,7 +34,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -144,6 +148,7 @@ struct Data {
     /// The final state event was pushed: later output (a grandchild's) is drained and dropped.
     closed: bool,
     /// Every signal sent to the group (the tests' pid-reuse guard).
+    #[cfg(test)]
     signals: Vec<i32>,
 }
 
@@ -229,11 +234,15 @@ impl Shared {
     }
 
     /// The job ended: records how, frees its slots, wakes every poll.
+    /// `cancelled` only when the cancel stopped it: before it started, or by the SIGTERM sent while it ran and not
+    /// ended with exit 0. A job that exited 0 (it finished, or handled SIGTERM cleanly) succeeded; one that ended on
+    /// its own before the cancel reached it keeps its own result.
     fn finish(&self, job: &Job, d: &mut Data, exit_code: Option<i32>, signal: Option<i32>) {
-        let (state, word) = if d.cancel_requested {
-            (JobState::Cancelled, "cancelled")
-        } else if exit_code == Some(0) {
+        let stopped = d.cancel_requested && (d.started_at.is_none() || d.term_at.is_some());
+        let (state, word) = if exit_code == Some(0) {
             (JobState::Succeeded, "succeeded")
+        } else if stopped {
+            (JobState::Cancelled, "cancelled")
         } else {
             (JobState::Failed, "failed")
         };
@@ -255,6 +264,7 @@ impl Shared {
         if let Some(pid) = d.pid {
             // SAFETY: `pid` is our unreaped child (its zombie at worst), so `-pid` is still its own group.
             unsafe { libc::kill(-pid, sig) };
+            #[cfg(test)]
             d.signals.push(sig);
         }
     }
@@ -267,6 +277,11 @@ impl Shared {
         if d.pid.is_some() && !d.leader_exited {
             Self::signal(d, libc::SIGTERM);
             d.term_at = Some(Instant::now());
+        } else if d.pid.is_some() && !d.killed {
+            // The leader exited but is not reaped yet (its zombie keeps the group id ours): what is left of the
+            // group (a process still holding the output) is killed.
+            Self::signal(d, libc::SIGKILL);
+            d.killed = true;
         }
     }
 
@@ -366,6 +381,7 @@ impl Jobs {
                     killed: false,
                     readers_open: 0,
                     closed: false,
+                    #[cfg(test)]
                     signals: vec![],
                 }),
                 cv: Condvar::new(),
@@ -399,7 +415,7 @@ impl Jobs {
         let until = Instant::now() + wait;
         let mut d = lock(&job.data);
         loop {
-            let ready = d.next_seq > after + 1 || !live(d.state);
+            let ready = d.next_seq.saturating_sub(1) > after || !live(d.state);
             let left = until.saturating_duration_since(Instant::now());
             if ready || left.is_zero() || stop.load(Ordering::SeqCst) {
                 break;
@@ -500,13 +516,32 @@ fn supervise(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>) {
             return;
         }
     }
+    // The job's own fresh, empty directory (spec D8), removed after the reap: whatever lands in the shared job
+    // directory (a core dump) never reaches a job, and never blocks one.
+    let cwd = s.cfg.cwd.join(&job.id);
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&cwd) {
+        let mut d = lock(&job.data);
+        s.push(
+            job,
+            &mut d,
+            EventKind::Stderr,
+            clean(&format!("cannot create the job's directory: {e}")),
+        );
+        s.finish(job, &mut d, None, None);
+        return;
+    }
+    run_child(s, job, argv, &cwd);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+fn run_child(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>, cwd: &Path) {
     // SAFETY: getpid has no preconditions.
     let daemon = unsafe { libc::getpid() };
     let mut cmd = Command::new(&s.cfg.runtime_exe);
     cmd.args(&argv)
         .env_clear()
         .envs(child_env(&*s.cfg.env))
-        .current_dir(&s.cfg.cwd)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -582,6 +617,12 @@ fn supervise(s: &Arc<Shared>, job: &Arc<Job>, argv: Vec<OsString>) {
     }
     let mut d = lock(&job.data);
     d.leader_exited = true;
+    if d.cancel_requested && !d.killed {
+        // Cancelled and the leader is gone: what is left of the group (a member that ignores SIGTERM) is killed
+        // now, while the leader's zombie still keeps the group id ours.
+        Shared::signal(&mut d, libc::SIGKILL);
+        d.killed = true;
+    }
     let until = Instant::now() + DRAIN;
     while d.readers_open > 0 {
         let left = until.saturating_duration_since(Instant::now());
@@ -706,31 +747,72 @@ pub fn child_env(get: &dyn Fn() -> Vec<(OsString, OsString)>) -> Vec<(OsString, 
 }
 
 fn unavailable(what: &str) -> ApiError {
+    // Up to the message bound (512): a path and a remedy fit.
     ApiError::new(ErrorKind::Unavailable, what)
 }
 
-/// The `runtime` binary (spec D10): a regular file (a symlink is refused, not followed), owned by `euid` or root,
-/// writable by nobody else.
-pub fn check_runtime_exe(p: &Path, euid: u32) -> Result<(), ApiError> {
-    let m = std::fs::symlink_metadata(p).map_err(|_| unavailable("the runtime binary next to runtimed is missing"))?;
-    if !m.file_type().is_file() || (m.uid() != euid && m.uid() != 0) || m.mode() & 0o022 != 0 {
-        return Err(unavailable(
-            "the runtime binary next to runtimed is not a regular file owned by this user or root and writable only by \
-             its owner",
+fn shown(p: &Path) -> String {
+    rt_core::clean_text(&p.to_string_lossy(), 512)
+}
+
+/// Why a file or directory that decides what the daemon runs is unsafe to trust, with what to do; `None`: safe.
+fn unsafe_mode(p: &Path, m: &std::fs::Metadata, euid: u32) -> Option<String> {
+    let path = shown(p);
+    if m.uid() != euid && m.uid() != 0 {
+        return Some(format!(
+            "{path} belongs to uid {}, not to this user (uid {euid}) or root",
+            m.uid()
         ));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Some(format!(
+            "{path} is writable by its group or others (mode {:o}); run: chmod g-w,o-w {path}",
+            m.mode() & 0o7777
+        ));
+    }
+    None
+}
+
+/// The `runtime` binary (spec D10): a regular file (a symlink is refused, not followed), owned by `euid` or root,
+/// writable by nobody else, in a directory that is also owned by `euid` or root and writable by nobody else (whoever
+/// may write the directory may rename another file into place). Each refusal says what is wrong and what to do.
+pub fn check_runtime_exe(p: &Path, euid: u32) -> Result<(), ApiError> {
+    let path = shown(p);
+    let m = std::fs::symlink_metadata(p).map_err(|e| {
+        unavailable(&format!(
+            "{path} is missing or unreadable ({e}): the runtime binary must sit next to runtimed"
+        ))
+    })?;
+    if m.file_type().is_symlink() {
+        return Err(unavailable(&format!(
+            "{path} is a symlink: install the real runtime and runtimed files side by side and start that runtimed"
+        )));
+    }
+    if !m.file_type().is_file() {
+        return Err(unavailable(&format!("{path} is not a regular file")));
+    }
+    if let Some(why) = unsafe_mode(p, &m, euid) {
+        return Err(unavailable(&why));
+    }
+    let dir = p.parent().unwrap_or(Path::new("/"));
+    let dm = std::fs::metadata(dir).map_err(|e| unavailable(&format!("cannot inspect {}: {e}", shown(dir))))?;
+    if let Some(why) = unsafe_mode(dir, &dm, euid) {
+        return Err(unavailable(&why));
     }
     Ok(())
 }
 
-/// The job cwd (spec D8): a directory (not a symlink) owned by `euid`, mode 0700, empty.
+/// The shared job directory (spec D8): a directory (not a symlink) owned by `euid`, mode 0700. Each job runs in a
+/// fresh subdirectory of its own, so other entries here are ignored.
 pub fn check_job_cwd(p: &Path, euid: u32) -> Result<(), ApiError> {
-    let bad = || unavailable("the job directory is not an empty 0700 directory of this user");
+    let bad = || {
+        unavailable(&format!(
+            "the job directory {} is not a 0700 directory of this user",
+            shown(p)
+        ))
+    };
     let m = std::fs::symlink_metadata(p).map_err(|_| bad())?;
     if !m.file_type().is_dir() || m.uid() != euid || m.permissions().mode() & 0o7777 != 0o700 {
-        return Err(bad());
-    }
-    let mut entries = std::fs::read_dir(p).map_err(|_| bad())?;
-    if entries.next().is_some() {
         return Err(bad());
     }
     Ok(())

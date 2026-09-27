@@ -37,9 +37,19 @@ After=runtimed.socket
 [Service]
 Type=simple
 # Edit to where runtimed is installed. The `runtime` binary must sit in the same directory (and be the same version):
-# sandbox.info names it as the sandbox's launcher and every job runs it.
+# sandbox.info names it as the sandbox's launcher and every job runs it. With --write, `runtime` and its directory
+# must be writable only by their owner: with a umask of 002 (user-private groups, the Ubuntu default) cargo installs
+# them group-writable and runtimed refuses to start, saying so. Fix with:
+#   chmod g-w,o-w ~/.cargo/bin ~/.cargo/bin/runtime
 ExecStart=%h/.cargo/bin/runtimed --write
-UMask=0077
+# Stop: SIGTERM to runtimed alone, which cancels every job in order (SIGTERM to each job's process group, SIGKILL 5 s
+# later) and removes its socket last; anything still in the service's cgroup after TimeoutStopSec gets SIGKILL.
+# (The default, control-group, would SIGTERM the jobs at the same moment as the daemon, bypassing that order.)
+KillMode=mixed
+# The mode new files get. Jobs inherit it, so a `runtime install` through the daemon creates files as one from a
+# terminal with the common umask 022 would. The daemon's own socket (0600), its directory and the job directories
+# (0700) and its lock file (0600) are created with explicit modes and do not depend on it.
+UMask=0022
 
 [Install]
 Also=runtimed.socket

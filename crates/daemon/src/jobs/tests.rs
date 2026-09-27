@@ -34,6 +34,8 @@ case "$mode" in
   child) sleep 60 & echo $! > "$F/grandchild.$key"; echo ready; wait ;;
   slow) echo first; sleep 0.4; echo late ;;
   orphan) (sleep 2; echo late) & echo ready ;;
+  stubborn) (trap '' TERM; exec sleep 60) & echo $! > "$F/grandchild.$key"; echo ready; wait ;;
+  graceful) trap 'echo bye; exit 0' TERM; echo ready; while :; do sleep 0.05; done ;;
 esac
 "#;
 
@@ -73,6 +75,7 @@ pub(crate) fn fx_with(tweak: impl FnOnce(&mut JobsConfig)) -> Fx {
         fs::create_dir_all(d).unwrap();
     }
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     write_script(&bin.join("runtime"), FAKE);
     let env: Vec<(OsString, OsString)> = [
         ("PATH", "/usr/bin:/bin".into()),
@@ -228,7 +231,9 @@ fn a_job_runs_runtime_with_the_argv_an_allowlisted_env_the_empty_cwd_no_stdin_an
         );
     }
     assert!(env.contains("RUNTIME_DATA_DIR=") && env.contains("LANG=C"), "{env}");
-    assert_eq!(f.read("cwd", "notepad").trim(), f.cwd.to_str().unwrap());
+    // Its own fresh directory under the job cwd, removed when it ended.
+    let own = f.cwd.join(&id);
+    assert_eq!(f.read("cwd", "notepad").trim(), own.to_str().unwrap());
     assert_eq!(f.read("stdin", "notepad").trim(), "eof");
     let (pgid, pid) = (f.read("pgid", "notepad"), f.read("pid", "notepad"));
     assert_eq!(pgid.trim(), pid.trim(), "the child leads its own group");
@@ -243,7 +248,7 @@ fn a_job_runs_runtime_with_the_argv_an_allowlisted_env_the_empty_cwd_no_stdin_an
         (1..=ev.len() as u64).collect::<Vec<_>>()
     );
     assert!(ev.iter().all(|e| e.ts == T0));
-    // The job cwd is still empty: nothing the child did landed there.
+    assert!(!own.exists());
     assert_eq!(fs::read_dir(&f.cwd).unwrap().count(), 0);
 }
 
@@ -449,7 +454,8 @@ fn cancel_kills_the_whole_group() {
         assert!(Instant::now() < until, "the grandchild survived");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM]);
+    // SIGTERM, then (the leader gone) SIGKILL for whatever is left of the group.
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM, libc::SIGKILL]);
 }
 
 #[test]
@@ -578,23 +584,39 @@ fn the_runtime_binary_must_be_a_regular_file_only_we_can_write() {
             "{what}"
         );
     }
+    let shown = exe.to_str().unwrap().to_owned();
+    let msg = |p: &Path, uid| check_runtime_exe(p, uid).unwrap_err().message;
+    assert!(msg(&link, euid()).contains("is a symlink"), "{}", msg(&link, euid()));
+    assert!(msg(&f.root.join("bin"), euid()).contains("not a regular file"));
+    assert!(msg(&f.root.join("none"), euid()).contains("missing"));
     for mode in [0o775, 0o757] {
         fs::set_permissions(&exe, fs::Permissions::from_mode(mode)).unwrap();
-        assert!(check_runtime_exe(&exe, euid()).is_err(), "{mode:o}");
+        let m = msg(&exe, euid());
+        assert!(
+            m.contains(&format!("run: chmod g-w,o-w {shown}")) && m.contains(&format!("{mode:o}")),
+            "{mode:o}: {m}"
+        );
     }
+    // Its directory too: whoever may write there may swap the file.
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(f.root.join("bin"), fs::Permissions::from_mode(0o775)).unwrap();
+    let m = msg(&exe, euid());
     assert!(
-        check_runtime_exe(&exe, euid() + 1).is_err() || euid() + 1 == 0,
-        "another owner"
+        m.contains(&format!("run: chmod g-w,o-w {}", f.root.join("bin").display())),
+        "{m}"
     );
-    // start refuses before any job exists
+    fs::set_permissions(f.root.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(msg(&exe, euid() + 1).contains("belongs to uid"), "another owner");
+    // start refuses before any job exists, and says what to do
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o775)).unwrap();
-    assert_eq!(f.jobs.start(remove("a")).unwrap_err().kind, ErrorKind::Unavailable);
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable);
+    assert!(e.message.contains("chmod g-w,o-w"), "{}", e.message);
     assert!(f.jobs.list().is_empty());
 }
 
 #[test]
-fn the_job_cwd_must_be_our_own_empty_0700_directory() {
+fn the_job_cwd_must_be_our_own_0700_directory_and_a_stray_file_blocks_nothing() {
     let f = fx();
     check_job_cwd(&f.cwd, euid()).unwrap();
     let link = f.root.join("cwdlink");
@@ -602,16 +624,16 @@ fn the_job_cwd_must_be_our_own_empty_0700_directory() {
     assert!(check_job_cwd(&link, euid()).is_err(), "symlink");
     assert!(check_job_cwd(&f.cwd, euid() + 1).is_err(), "owner");
     fs::set_permissions(&f.cwd, fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(check_job_cwd(&f.cwd, euid()).is_err(), "0755");
+    let m = check_job_cwd(&f.cwd, euid()).unwrap_err().message;
+    assert!(m.contains(f.cwd.to_str().unwrap()), "{m}");
     fs::set_permissions(&f.cwd, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(f.cwd.join("x.exe"), b"MZ").unwrap();
-    assert_eq!(
-        check_job_cwd(&f.cwd, euid()).unwrap_err().kind,
-        ErrorKind::Unavailable,
-        "not empty"
-    );
-    assert_eq!(f.jobs.start(remove("a")).unwrap_err().kind, ErrorKind::Unavailable);
-    assert!(f.jobs.list().is_empty());
+    // A stray file (a core dump, say) is in no job's own directory: jobs still start, and see none of it.
+    fs::write(f.cwd.join("a"), b"MZ").unwrap();
+    check_job_cwd(&f.cwd, euid()).unwrap();
+    let id = f.start(remove("a"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    assert_eq!(f.read("cwd", "a").trim(), f.cwd.join(&id).to_str().unwrap());
+    assert!(f.cwd.join("a").exists(), "not ours to remove");
 }
 
 #[test]
@@ -672,4 +694,65 @@ fn the_final_state_event_is_the_last_even_when_a_grandchild_holds_the_output() {
     let note = &ev[ev.len() - 2];
     assert_eq!(note.kind, EventKind::Stderr);
     assert!(note.text.contains("still holds its output"), "{ev:?}");
+}
+
+#[test]
+fn cancel_kills_what_is_left_of_the_group_after_the_leader_exits() {
+    let f = fx();
+    f.mode(Some("a"), "stubborn");
+    let id = f.start(remove("a"));
+    f.wait_for(&id, "ready");
+    let gc: i32 = f.read("grandchild", "a").trim().parse().unwrap();
+    f.jobs.cancel(&id).unwrap();
+    let i = f.wait_end(&id);
+    assert_eq!((i.state, i.signal), (JobState::Cancelled, Some(libc::SIGTERM)));
+    let until = Instant::now() + Duration::from_secs(1);
+    while alive(gc) {
+        assert!(
+            Instant::now() < until,
+            "a group member that ignores SIGTERM survived the cancel"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGTERM, libc::SIGKILL]);
+}
+
+#[test]
+fn a_job_that_finished_is_not_reported_cancelled() {
+    let f = fx();
+    // It handles SIGTERM and exits 0: the work it did stands.
+    f.mode(Some("a"), "graceful");
+    let id = f.start(remove("a"));
+    f.wait_for(&id, "ready");
+    f.jobs.cancel(&id).unwrap();
+    let i = f.wait_end(&id);
+    assert_eq!((i.state, i.exit_code), (JobState::Succeeded, Some(0)));
+    // The leader already exited 0; a cancel during the drain kills the process holding the output, and the job
+    // still succeeded.
+    f.mode(Some("b"), "orphan");
+    let id = f.start(remove("b"));
+    f.wait_for(&id, "ready");
+    std::thread::sleep(Duration::from_millis(300));
+    f.jobs.cancel(&id).unwrap();
+    let t = Instant::now();
+    let i = f.wait_end(&id);
+    assert_eq!((i.state, i.exit_code), (JobState::Succeeded, Some(0)));
+    assert!(
+        t.elapsed() < Duration::from_millis(900),
+        "the drain was not cut short: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(f.jobs.signals_sent(&id), [libc::SIGKILL]);
+}
+
+#[test]
+fn a_poll_after_the_largest_seq_is_empty_not_a_panic() {
+    let f = fx();
+    let id = f.start(remove("a"));
+    f.wait_end(&id);
+    let e = f
+        .jobs
+        .poll(&id, u64::MAX, Duration::from_millis(50), &AtomicBool::new(false))
+        .unwrap();
+    assert!(e.events.is_empty() && e.dropped == 0 && e.next_seq == u64::MAX);
 }

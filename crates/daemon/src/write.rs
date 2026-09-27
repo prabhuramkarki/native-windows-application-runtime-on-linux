@@ -4,12 +4,17 @@
 //!   directory and no grant may name it, so no sandboxed program can reach a write-capable socket. A `--socket` in
 //!   any other directory could sit inside one a grant exposes. The check resolves symlinks in the existing part of
 //!   the path and refuses any `..`.
-//! * `$XDG_RUNTIME_DIR/runtime/job-cwd` exists as an empty 0700 directory of ours (spec D8), created if missing.
-//! * The sibling `runtime` passes `check_runtime_exe` and `runtime --version` (bounded) prints this daemon's own
-//!   version (spec D10). The CLI's `--plan-digest` check still guards consent if the binary is replaced later.
+//!   `$XDG_RUNTIME_DIR` itself must be a 0700 directory of this user and not `/` (what systemd makes
+//!   `/run/user/<uid>`), or "inside" would mean nothing.
+//! * `$XDG_RUNTIME_DIR/runtime/job-cwd` exists as a 0700 directory of ours (spec D8), created if missing; each job
+//!   runs in a fresh subdirectory of it. Leftover job directories of an earlier daemon (32-hex names) are removed;
+//!   anything else there is left alone.
+//! * The sibling `runtime` passes `check_runtime_exe` and `runtime --version` prints this daemon's own version
+//!   within [`VERSION_TIMEOUT`] (its output read on a thread against the same deadline, at most 4 KiB) (spec D10).
+//!   The CLI's `--plan-digest` check still guards consent if the binary is replaced later.
 use crate::jobs::{JobsConfig, check_job_cwd, check_runtime_exe, child_env};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +46,13 @@ pub(crate) fn prepare_with(
         .filter(|p| p.is_absolute())
         .ok_or("--write needs XDG_RUNTIME_DIR (an absolute path)")?;
     let root = fs::canonicalize(xdg).map_err(|e| format!("--write: cannot resolve XDG_RUNTIME_DIR: {e}"))?;
+    let m = fs::metadata(&root).map_err(|e| format!("--write: cannot inspect XDG_RUNTIME_DIR: {e}"))?;
+    if root == Path::new("/") || !m.is_dir() || m.uid() != euid() || m.mode() & 0o077 != 0 {
+        return Err(format!(
+            "--write needs XDG_RUNTIME_DIR ({}) to be a 0700 directory of this user (like /run/user/<uid>)",
+            shown(&root)
+        ));
+    }
     if !inside(socket, &root) {
         return Err(format!(
             "--write needs the socket inside XDG_RUNTIME_DIR ({}), which no sandbox can see; {} is not",
@@ -52,8 +64,9 @@ pub(crate) fn prepare_with(
     private_dir(&dir)?;
     let cwd = dir.join("job-cwd");
     private_dir(&cwd)?;
-    check_job_cwd(&cwd, euid()).map_err(|e| format!("--write: {} ({})", e.message, shown(&cwd)))?;
-    check_runtime_exe(runtime_exe, euid()).map_err(|e| format!("--write: {} ({})", e.message, shown(runtime_exe)))?;
+    check_job_cwd(&cwd, euid()).map_err(|e| format!("--write: {}", e.message))?;
+    remove_stale_job_dirs(&cwd);
+    check_runtime_exe(runtime_exe, euid()).map_err(|e| format!("--write: {}", e.message))?;
     let want = format!("runtime {}", env!("CARGO_PKG_VERSION"));
     let got = version_of(runtime_exe, &cwd, version_timeout)?;
     if got != want {
@@ -106,7 +119,24 @@ fn private_dir(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `exe --version`'s first line, with the job environment, within `timeout` (killed after it).
+/// Removes the job directories an earlier daemon left (named by a job id: 32 lowercase hex); nothing else.
+fn remove_stale_job_dirs(cwd: &Path) {
+    let Ok(entries) = fs::read_dir(cwd) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let ours = name
+            .to_str()
+            .is_some_and(|n| n.len() == 32 && n.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        // `DirEntry::file_type` does not follow a symlink; `remove_dir_all` never follows one either.
+        if ours && e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// `exe --version`'s first line, with the job environment. Everything is bounded by `timeout`: the output is read
+/// on a thread (at most 4 KiB, up to the first newline), so a process it leaves holding stdout cannot hang startup;
+/// a child still running at the deadline is killed.
 fn version_of(exe: &Path, cwd: &Path, timeout: Duration) -> Result<String, String> {
     let fail = |why: String| format!("--write: cannot check {}'s version: {why}", shown(exe));
     let mut child = Command::new(exe)
@@ -120,22 +150,29 @@ fn version_of(exe: &Path, cwd: &Path, timeout: Duration) -> Result<String, Strin
         .spawn()
         .map_err(|e| fail(e.to_string()))?;
     let until = Instant::now() + timeout;
+    let no_answer = || fail(format!("no answer within {} s", timeout.as_secs_f32()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(out) = child.stdout.take() {
+        // Left blocked (and leaked) only if something keeps the pipe open past the deadline: startup fails then.
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(out.take(4096)).read_line(&mut line);
+            let _ = tx.send(line);
+        });
+    }
+    let line = rx.recv_timeout(until.saturating_duration_since(Instant::now()));
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            Ok(Some(_)) if line.is_ok() => break,
+            Ok(None) if Instant::now() < until && line.is_ok() => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(fail(format!("no answer within {} s", timeout.as_secs_f32())));
+                return Err(no_answer());
             }
         }
     }
-    let mut out = String::new();
-    if let Some(o) = child.stdout.take() {
-        let _ = o.take(4096).read_to_string(&mut out);
-    }
-    Ok(out.lines().next().unwrap_or("").trim().to_owned())
+    Ok(line.unwrap_or_default().trim().to_owned())
 }
 
 /// The path an inherited listener is bound to (`None`: unnamed or abstract, which `--write` refuses).
@@ -162,6 +199,7 @@ mod tests {
         fs::create_dir(&xdg).unwrap();
         fs::set_permissions(&xdg, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(root.join("bin")).unwrap();
+        fs::set_permissions(root.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
         let exe = root.join("bin/runtime");
         write_script(
             &exe,
@@ -242,8 +280,16 @@ mod tests {
         let e = prep(&w, &w.xdg.join("s.sock")).unwrap_err();
         assert!(e.contains("no answer") && t.elapsed() < Duration::from_secs(3), "{e}");
         let w = self::w(&ours());
-        fs::set_permissions(&w.exe, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("runtime binary"));
+        fs::set_permissions(&w.exe, fs::Permissions::from_mode(0o775)).unwrap();
+        let e = prep(&w, &w.xdg.join("s.sock")).unwrap_err();
+        assert!(e.contains(&format!("run: chmod g-w,o-w {}", w.exe.display())), "{e}");
+        // A process left holding stdout (with or without a first line) cannot hang startup.
+        let w = self::w(&format!("sleep 10 & {}", ours()));
+        prep(&w, &w.xdg.join("s.sock")).unwrap();
+        let w = self::w("sleep 10 &");
+        let t = Instant::now();
+        let e = prep(&w, &w.xdg.join("s.sock")).unwrap_err();
+        assert!(e.contains("no answer") && t.elapsed() < Duration::from_secs(3), "{e}");
     }
 
     #[test]
@@ -255,8 +301,27 @@ mod tests {
         fs::set_permissions(w.xdg.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(w.xdg.join("runtime/job-cwd")).unwrap();
         fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Anything that is not an old job directory is left alone and blocks nothing; old job directories go.
         fs::write(w.xdg.join("runtime/job-cwd/notepad"), b"planted").unwrap();
-        assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("job directory"));
+        let stale = w.xdg.join(format!("runtime/job-cwd/{}", "ab".repeat(16)));
+        fs::create_dir(&stale).unwrap();
+        fs::write(stale.join("core"), b"x").unwrap();
+        prep(&w, &w.xdg.join("s.sock")).unwrap();
+        assert!(!stale.exists() && w.xdg.join("runtime/job-cwd/notepad").exists());
+        fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("0700"));
+        // XDG_RUNTIME_DIR itself: ours and 0700, never `/`.
+        fs::set_permissions(w.xdg.join("runtime/job-cwd"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&w.xdg, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prep(&w, &w.xdg.join("s.sock")).unwrap_err().contains("XDG_RUNTIME_DIR"));
+        let e = prepare_with(
+            Path::new("/s.sock"),
+            Some(Path::new("/")),
+            &w.exe,
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        assert!(e.contains("0700 directory of this user"), "{e}");
     }
 
     #[test]

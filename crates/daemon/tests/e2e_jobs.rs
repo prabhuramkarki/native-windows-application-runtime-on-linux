@@ -105,6 +105,8 @@ impl Scratch {
             fs::create_dir_all(d).unwrap();
         }
         fs::set_permissions(&xdg, fs::Permissions::from_mode(0o700)).unwrap();
+        // A umask of 002 would leave it group-writable, which `runtimed --write` refuses (with a chmod hint).
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         install_exe(&bin.join("runtimed"), Ok(Path::new(DAEMON)));
         install_exe(&bin.join("runtime"), runtime);
         Scratch {
