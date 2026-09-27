@@ -31,6 +31,9 @@ fn file_dialog() -> gtk::FileDialog {
         .build()
 }
 
+/// A chosen file or folder with no local path (a remote gvfs location).
+pub const NOT_LOCAL: &str = "That is not a local file or folder (copy it to this computer first).";
+
 pub fn open(ui: &Rc<Ui>) {
     let d = adw::AlertDialog::builder().heading("Install a program").build();
     d.set_heading_use_markup(false);
@@ -61,16 +64,25 @@ pub fn open(ui: &Rc<Ui>) {
     d.set_default_response(Some("cancel"));
     d.set_close_response("cancel");
     let win = ui.w.window.clone();
-    let (p, dd) = (path.clone(), d.clone());
+    let (p, dd, weak) = (path.clone(), d.clone(), Rc::downgrade(ui));
     choose.connect_clicked(move |_| {
         let (p, dd, chosen, win) = (p.clone(), dd.clone(), chosen.clone(), win.clone());
+        let weak = weak.clone();
         glib::spawn_future_local(async move {
-            if let Ok(file) = file_dialog().open_future(Some(&win)).await
-                && let Some(f) = file.path()
-            {
-                chosen.set_label(&shown(&f.to_string_lossy(), MAX_SHOWN));
-                *p.borrow_mut() = Some(f);
-                dd.set_response_enabled("install", true);
+            let Ok(file) = file_dialog().open_future(Some(&win)).await else {
+                return;
+            };
+            match file.path() {
+                Some(f) => {
+                    chosen.set_label(&shown(&f.to_string_lossy(), MAX_SHOWN));
+                    *p.borrow_mut() = Some(f);
+                    dd.set_response_enabled("install", true);
+                }
+                None => {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.dispatch(Msg::Refused(NOT_LOCAL));
+                    }
+                }
             }
         });
     });

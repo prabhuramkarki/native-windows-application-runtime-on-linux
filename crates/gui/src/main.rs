@@ -22,18 +22,24 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> Result<Option<PathBuf
 }
 
 fn main() -> glib::ExitCode {
-    let socket = match parse_args(std::env::args_os().skip(1)) {
-        // No --socket and no runtime dir: an empty path, which the backend reports as "no runtime directory".
-        Ok(s) => s
-            .or_else(|| rt_daemon::client::default_socket_path().ok())
-            .unwrap_or_default(),
+    let given = match parse_args(std::env::args_os().skip(1)) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("runtime-gui: {e}");
             return glib::ExitCode::from(2);
         }
     };
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    // The window's UI lives as long as the application (a second launch only raises it).
+    // A window for another socket is its own instance: a unique application would only raise the first one.
+    let flags = match given {
+        Some(_) => gtk4::gio::ApplicationFlags::NON_UNIQUE,
+        None => gtk4::gio::ApplicationFlags::empty(),
+    };
+    // No --socket and no runtime dir: an empty path, which the backend reports as "no runtime directory".
+    let socket = given
+        .or_else(|| rt_daemon::client::default_socket_path().ok())
+        .unwrap_or_default();
+    let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
+    // The window's UI lives as long as the application (a second plain launch only raises it).
     let held: RefCell<Option<Rc<rt_gui::ui::Ui>>> = RefCell::default();
     app.connect_activate(move |app| {
         if let Some(w) = app.active_window() {

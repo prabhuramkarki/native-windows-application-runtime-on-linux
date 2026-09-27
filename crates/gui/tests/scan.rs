@@ -1,10 +1,35 @@
-//! Spec D4: the GUI talks only to `runtimed`. No file under `src` names the in-process API, starts a process or
-//! links the CLI; the view model and the backend import no toolkit.
+//! Spec D4: the GUI talks only to `runtimed`. No file under `src` names the in-process API, starts a process (std,
+//! GLib or GIO), launches a URI or another app, opens a network socket, uses the daemon's server side, or links the
+//! CLI; the view model and the backend import no toolkit.
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Anywhere under `src`.
-const NEVER: &[&str] = &["Runtime::", "rt_api::Runtime", "process::Command", "runtime_cli"];
+const NEVER: &[&str] = &[
+    "Runtime::",
+    "rt_api::Runtime",
+    "runtime_cli",
+    // Processes: std, and GLib/GIO's own spawning.
+    "process::Command",
+    "Command::new",
+    "os::unix::process",
+    "Subprocess",
+    "spawn_async",
+    "spawn_sync",
+    "spawn_command_line",
+    "spawn_check",
+    // Handing a URI or file to another app.
+    "UriLauncher",
+    "FileLauncher",
+    "launch_default_for_uri",
+    "AppInfo",
+    "show_uri",
+    // Network sockets.
+    "std::net",
+    "SocketClient",
+];
+/// The only parts of `rt_daemon` the GUI may name: the client and the protocol constants.
+const DAEMON_ALLOWED: &[&str] = &["client", "protocol"];
 /// Under `src/vm` and in `src/backend.rs` (whole words: `gio` must not match "region").
 const NO_TOOLKIT: &[&str] = &["gtk4", "libadwaita", "adw", "glib", "gio", "gdk4", "gsk4"];
 
@@ -40,6 +65,13 @@ fn violations(src: &Path) -> Vec<String> {
                 .filter(|n| text.contains(*n))
                 .map(|n| format!("{}: {n}", rel.display())),
         );
+        for (i, _) in text.match_indices("rt_daemon::") {
+            let rest = &text[i + "rt_daemon::".len()..];
+            if !DAEMON_ALLOWED.iter().any(|a| rest.starts_with(a)) {
+                let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                found.push(format!("{}: rt_daemon::{name}", rel.display()));
+            }
+        }
         if rel.starts_with("vm") || rel == Path::new("backend.rs") {
             found.extend(
                 NO_TOOLKIT
@@ -63,13 +95,25 @@ fn the_scanner_finds_what_it_looks_for() {
     )
     .unwrap();
     fs::write(d.path().join("ui.rs"), "use gtk4::glib; rt_api::Runtime::new();\n").unwrap();
+    fs::write(
+        d.path().join("more.rs"),
+        "gio::Subprocess::newv(); glib::spawn_async(); gtk::UriLauncher::new(); std::net::TcpStream; \
+         rt_daemon::server::serve(); rt_daemon::client::Client; glib::spawn_future_local(f);\n",
+    )
+    .unwrap();
     let mut v = violations(d.path());
     v.sort();
     assert_eq!(
         v,
         [
+            "backend.rs: Command::new",
             "backend.rs: adw",
             "backend.rs: process::Command",
+            "more.rs: Subprocess",
+            "more.rs: UriLauncher",
+            "more.rs: rt_daemon::server",
+            "more.rs: spawn_async",
+            "more.rs: std::net",
             "ui.rs: Runtime::",
             "ui.rs: rt_api::Runtime",
             "vm/mod.rs: glib",

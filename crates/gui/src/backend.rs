@@ -284,9 +284,70 @@ fn follow_one(sh: &Shared, id: &str) {
     }
 }
 
+/// Back-pressure between job followers and a slower consumer: at most `max` messages in flight. A follower calls
+/// [`Credits::acquire`] before handing over a message (it waits, so it stops polling the daemon), the consumer calls
+/// [`Credits::release`] once it has handled one.
+pub struct Credits {
+    n: Mutex<usize>,
+    cv: std::sync::Condvar,
+    max: usize,
+}
+
+impl Credits {
+    pub fn new(max: usize) -> Credits {
+        Credits {
+            n: Mutex::new(0),
+            cv: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    /// Waits for room (checking `gone` every 100 ms: a consumer that went away never releases).
+    pub fn acquire(&self, gone: impl Fn() -> bool) {
+        let mut n = self.n.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= self.max && !gone() {
+            n = self
+                .cv
+                .wait_timeout(n, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *n += 1;
+    }
+
+    pub fn release(&self) {
+        let mut n = self.n.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.cv.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credits_hold_a_producer_until_the_consumer_catches_up() {
+        let c = Arc::new(Credits::new(2));
+        c.acquire(|| false);
+        c.acquire(|| false);
+        let (tx, rx) = mpsc::channel();
+        let c2 = c.clone();
+        thread::spawn(move || {
+            c2.acquire(|| false);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a third got through"
+        );
+        c.release();
+        rx.recv_timeout(Duration::from_secs(5)).expect("released");
+        // A consumer that is gone never blocks a producer for long.
+        let t = Instant::now();
+        c.acquire(|| true);
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
 
     #[test]
     fn a_fifth_follow_waits_until_one_of_four_ends() {

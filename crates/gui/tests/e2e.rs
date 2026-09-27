@@ -269,6 +269,7 @@ fn the_real_runtime_installs_edits_plans_and_removes() {
     g.user(Msg::Plan);
     g.until("the plan", |_, m| m.consent().is_some());
     assert!(g.model.consent().unwrap().nothing_to_install());
+    g.user(Msg::ConsentOpened);
     g.user(Msg::InstallDeps);
     let (state, lines) = g.job_ends("the deps install");
     assert_eq!(state, JobState::Succeeded, "{lines:?}");

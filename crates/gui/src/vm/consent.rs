@@ -166,6 +166,13 @@ impl ConsentState {
         }
     }
 
+    /// Every choice back to not accepted.
+    pub(crate) fn reset(&mut self) {
+        for c in &mut self.choices {
+            c.accepted = false;
+        }
+    }
+
     /// The digest and the accepted entries, exactly as the plan gave them.
     pub(crate) fn into_install(self) -> (String, String, Vec<ConsentItem>) {
         let consent = self

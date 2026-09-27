@@ -209,4 +209,19 @@ Task 6 (docs). Where the code departs from the plan above:
 - **Task 6.** README (GUI section; the core `--workspace` commands now `--exclude runtime-gui`, since `--workspace`
   ignores `default-members`), SECURITY.md "The GUI client (Phase 6C)", `docs/GUI-CHECKLIST.md`, the roadmap row and
   Open Decision 3.
-- **Not done:** the manual checklist on GNOME and KDE (the user runs it); the `gui` CI job's first hosted run.
+- **Review fixes** (`.superpowers/sdd/2026-09-27-phase-6c/review.md`):
+  - C1: consent choices reset when the dialog opens and when it closes without Install; Accept and InstallDeps
+    only while the dialog is open.
+  - M2: a new plan answer closes an open dialog with a notice.
+  - I1: logs capped at 1 MiB as well; the log view is append-only; job output is credit-limited (8 in flight) and
+    handled in batches.
+  - M3: a pending write blocks a second click until its job is listed.
+  - M4: `--socket` makes the app non-unique.
+  - M5: a notice for a non-local file.
+  - M1: a broader source scan with an `rt_daemon` allow-list.
+  - M6: remove dialog and About markup tests.
+  - M7: `close()` really drains.
+  - M8: checklist step 5.
+  - M9: splitting the client into its own crate is left as a follow-up.
+- **Not done:** the manual checklist on GNOME and KDE (the user runs it); the `gui` CI job's first hosted run, which
+  must be watched before merging.

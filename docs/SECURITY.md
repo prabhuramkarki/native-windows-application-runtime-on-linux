@@ -1255,15 +1255,17 @@ Every package that needs consent is shown with:
 - its own **unchecked** box, "I accept the terms above for <package> <version>".
 
 There is no "accept all" control. Cancel is the default and the close response. The Install button counts what was
-accepted, for example "Install (1 of 2 accepted)".
+accepted, for example "Install (1 of 2 accepted)". Every choice is reset to not accepted whenever the dialog opens and
+whenever it closes without Install (Cancel, Escape): a box ticked in a dialog that was cancelled never counts later.
+Choices can only be accepted, and the plan only installed, while the dialog is open.
 
 The view model sends `deps.install` with the plan's digest exactly as `deps.plan` returned it. The consent items are
 the raw `{package, version, sha256}` of entries the user accepted one at a time; nothing else can become a consent
 item. An entry can never be accepted when it lacks its version, sha256 or terms, is listed twice, or would be shown
 differently from what is sent (cleaning changed it). The plan is dropped once it is sent. `consent_mismatch` shows
 "The dependency plan changed since it was shown. Review it again." and fetches a fresh plan, which starts
-unaccepted; nothing is re-sent. An open dialog acts only while the model still holds the plan it shows (the same
-digest). The daemon and then the CLI re-check all of this regardless.
+unaccepted; nothing is re-sent. A new plan answer while the dialog is open closes the dialog with "The dependency
+plan changed while it was shown. Review it again." (its choices start over). The daemon and then the CLI re-check all of this regardless.
 
 ### Text and markup
 
@@ -1287,9 +1289,15 @@ header. The consent test checks that terms containing `<b>`, `&` and an ESC sequ
 
 ### Memory bounds
 
-Each followed job's log keeps at most 5,000 lines: the oldest go first, behind one "[earlier lines dropped]" line.
-Lines the daemon dropped are noted too. At most 16 followed logs are kept; the oldest ended one goes first. The jobs
-panel lists at most 30 jobs.
+Each followed job's log keeps at most 5,000 lines and 1 MiB: the oldest go first, behind one "[earlier lines
+dropped]" line. Lines the daemon dropped are noted too. At most 16 followed logs are kept (so at most about 16 MiB of
+log text); the oldest ended one goes first. The jobs panel lists at most 30 jobs. The log view only appends new
+lines and deletes dropped ones, so each update costs what it adds.
+
+Job output crosses to the UI with back-pressure: a follower may have at most 8 unhandled messages in flight. It waits
+before handing over a ninth, and so stops polling the daemon, whose own per-job bounds (2,000 events, 512 KiB) then
+apply. The UI handles everything waiting in one main-loop turn and renders once. A chatty job therefore cannot grow
+the channel or keep the main loop busy without end.
 
 ### Known bounds
 
@@ -1300,6 +1308,8 @@ panel lists at most 30 jobs.
   not be readable by the CLI; the job's log says so. The view model refuses a folder grant path that is relative,
   not UTF-8, contains `:`, or has a control or format character. The CLI's grant rules (no home, no `~/.ssh`, …)
   remain the real guard.
+- **One window per socket.** A plain second launch raises the first window (`GApplication` uniqueness). A launch with
+  `--socket` is a separate instance, so a window for another socket always opens.
 - **GTK's own session-bus use** (accessibility, portals, `GApplication` uniqueness) is GTK's, not this project's.
 - **A narrow window** collapses to one pane; keyboard and screen-reader use are only checked by hand
   (docs/GUI-CHECKLIST.md). An accessibility pass is a follow-up.

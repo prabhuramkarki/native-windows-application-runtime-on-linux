@@ -123,6 +123,13 @@ fn plan() -> DepsPlanView {
     }
 }
 
+/// [`planned`] with the consent dialog open.
+fn opened_plan(write: bool, p: DepsPlanView) -> Model {
+    let mut m = planned(write, p);
+    m.update(Msg::ConsentOpened);
+    m
+}
+
 fn planned(write: bool, p: DepsPlanView) -> Model {
     let mut m = ready(write);
     assert_eq!(m.update(Msg::Plan), vec![Cmd::Plan("game".into())]);
@@ -416,11 +423,22 @@ fn stop_needs_a_live_run_job_of_this_app() {
     assert!(m.can(Action::Remove).is_err());
 }
 
+/// The last write's job started and ended: the app is free again.
+fn free(m: &mut Model) {
+    m.update(Msg::JobStarted {
+        what: Cmd::Run("game".into()),
+        job_id: "done".into(),
+    });
+    m.update(Msg::JobList(vec![]));
+}
+
 #[test]
 fn write_intents_send_their_command() {
     let mut m = ready(true);
     assert_eq!(m.update(Msg::Run), vec![Cmd::Run("game".into())]);
+    free(&mut m);
     assert_eq!(m.update(Msg::Remove), vec![Cmd::Remove("game".into())]);
+    free(&mut m);
     assert_eq!(m.update(Msg::ResetPermissions), vec![Cmd::PermReset("game".into())]);
     assert_eq!(m.update(Msg::Cancel("j9".into())), vec![Cmd::Cancel("j9".into())]);
     assert_eq!(
@@ -541,7 +559,7 @@ fn errors_are_fixed_sentences_or_the_cleaned_message() {
 
 #[test]
 fn nothing_is_accepted_until_each_entry_is() {
-    let mut m = planned(true, plan());
+    let mut m = opened_plan(true, plan());
     let c = m.consent().unwrap();
     assert_eq!(c.choices().len(), 2, "one choice per needed entry");
     assert!(c.choices().iter().all(|c| !c.accepted() && c.unacceptable().is_none()));
@@ -569,7 +587,7 @@ fn nothing_is_accepted_until_each_entry_is() {
 
 #[test]
 fn install_deps_sends_the_digest_verbatim_and_exactly_the_accepted_entries_once() {
-    let mut m = planned(true, plan());
+    let mut m = opened_plan(true, plan());
     m.update(Msg::Accept("a".into(), true));
     let a = &plan().entries[0];
     assert_eq!(
@@ -591,7 +609,7 @@ fn install_deps_sends_the_digest_verbatim_and_exactly_the_accepted_entries_once(
     );
     assert!(m.can(Action::InstallDeps).is_err());
     // Nothing accepted: the digest alone (the daemon installs only what needs no consent).
-    let mut m = planned(true, plan());
+    let mut m = opened_plan(true, plan());
     assert_eq!(
         m.update(Msg::InstallDeps),
         vec![Cmd::DepsInstall {
@@ -618,7 +636,7 @@ fn entries_that_cannot_be_shown_whole_can_never_be_accepted() {
     let mut bad_sum = entry("g", ConsentView::Needed, Some(&["t"]));
     bad_sum.sha256 = Some(format!("{:0>63}\u{200b}", 1));
     p.entries.extend([bad, twin1, twin2, empty_text, bad_name, bad_sum]);
-    let mut m = planned(true, p);
+    let mut m = opened_plan(true, p);
     for pkg in ["a", "b", "c", "d", "e", "f\u{7}", "g"] {
         m.update(Msg::Accept(pkg.into(), true));
     }
@@ -638,14 +656,14 @@ fn entries_that_cannot_be_shown_whole_can_never_be_accepted() {
 fn a_plan_without_a_digest_cannot_be_installed() {
     let mut p = plan();
     p.digest.clear();
-    let mut m = planned(true, p);
+    let mut m = opened_plan(true, p);
     assert!(m.can(Action::InstallDeps).unwrap_err().contains("API 0.1"));
     assert!(m.update(Msg::InstallDeps).is_empty());
 }
 
 #[test]
 fn a_changed_plan_is_planned_again_and_nothing_is_resent() {
-    let mut m = planned(true, plan());
+    let mut m = opened_plan(true, plan());
     m.update(Msg::Accept("a".into(), true));
     let sent = m.update(Msg::InstallDeps).remove(0);
     let again = m.update(Msg::Failed {
@@ -671,7 +689,7 @@ fn a_plan_for_another_app_is_not_kept() {
     });
     assert!(m.consent().is_none());
     // Opening another app drops the plan.
-    let mut m = planned(true, plan());
+    let mut m = opened_plan(true, plan());
     m.update(Msg::Open("other".into()));
     assert!(m.consent().is_none());
 }
@@ -684,7 +702,7 @@ fn a_hostile_plan_is_cleaned_for_display() {
         "unsatisfied": ["cap\u{200b}"], "warnings": ["w\0"], "digest": DIGEST
     }))
     .unwrap();
-    let m = planned(true, p);
+    let m = opened_plan(true, p);
     let c = m.consent().unwrap();
     assert!(c.choices().is_empty());
     let e = &c.entries()[0];
@@ -697,7 +715,9 @@ fn a_hostile_plan_is_cleaned_for_display() {
 // ------------------------------------------------------------------------------------------------ permissions
 
 fn perm(m: &mut Model, c: PermChange) -> Vec<Cmd> {
-    m.update(Msg::Permission(c))
+    let cmds = m.update(Msg::Permission(c));
+    free(m);
+    cmds
 }
 
 fn set(e: &str) -> Vec<Cmd> {
@@ -888,4 +908,115 @@ fn the_page_is_shown_as_cleaned_lines() {
     assert_eq!(m.page_status().as_deref(), Some("Not running"));
     m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Running)]));
     assert_eq!(m.page_status().as_deref(), Some("Running (job j1)"));
+}
+
+// ------------------------------------------------------------------------------------------------ review fixes
+
+#[test]
+fn consent_is_reset_whenever_the_dialog_opens_or_closes_without_install() {
+    let mut m = planned(true, plan());
+    // No dialog open: nothing can be accepted or installed.
+    m.update(Msg::Accept("a".into(), true));
+    assert_eq!(m.consent().unwrap().accepted_count(), 0);
+    assert!(m.update(Msg::InstallDeps).is_empty());
+    // Tick, cancel, reopen: nothing accepted, nothing sent.
+    m.update(Msg::ConsentOpened);
+    m.update(Msg::Accept("a".into(), true));
+    assert_eq!(m.consent().unwrap().accepted_count(), 1);
+    m.update(Msg::ConsentClosed);
+    assert_eq!(m.consent().unwrap().accepted_count(), 0);
+    m.update(Msg::ConsentOpened);
+    assert_eq!(m.consent().unwrap().install_label(), "Install (0 of 2 accepted)");
+    match &m.update(Msg::InstallDeps)[..] {
+        [Cmd::DepsInstall { consent, .. }] => assert!(consent.is_empty()),
+        c => panic!("{c:?}"),
+    }
+    // A tick then a reopen (without a close in between) also starts over.
+    let mut m = planned(true, plan());
+    m.update(Msg::ConsentOpened);
+    m.update(Msg::Accept("a".into(), true));
+    m.update(Msg::ConsentOpened);
+    assert_eq!(m.consent().unwrap().accepted_count(), 0);
+}
+
+#[test]
+fn a_plan_answer_while_the_dialog_is_open_closes_it() {
+    for digest in [
+        DIGEST,
+        "cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34",
+    ] {
+        let mut m = planned(true, plan());
+        m.update(Msg::ConsentOpened);
+        m.update(Msg::Accept("a".into(), true));
+        assert!(m.consent_open());
+        let mut p = plan();
+        p.digest = digest.into();
+        m.update(Msg::PlanLoaded {
+            id: "game".into(),
+            plan: p,
+        });
+        assert!(!m.consent_open(), "{digest}");
+        assert_eq!(m.notice(), Some(PLAN_REPLACED));
+        assert_eq!(m.consent().unwrap().accepted_count(), 0);
+        assert!(
+            m.update(Msg::InstallDeps).is_empty(),
+            "the replaced dialog cannot install"
+        );
+    }
+}
+
+#[test]
+fn a_second_click_before_the_job_is_known_sends_nothing() {
+    let mut m = ready(true);
+    assert_eq!(m.update(Msg::Run), vec![Cmd::Run("game".into())]);
+    assert!(m.update(Msg::Run).is_empty());
+    assert!(m.update(Msg::Remove).is_empty());
+    assert!(m.update(Msg::Permission(PermChange::Gpu(true))).is_empty());
+    assert!(m.can(Action::Run).is_err());
+    // Started, and the job list shows it: still busy (now through the list).
+    m.update(Msg::JobStarted {
+        what: Cmd::Run("game".into()),
+        job_id: "j1".into(),
+    });
+    m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Running)]));
+    assert!(m.can(Action::Run).is_err());
+    m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Succeeded)]));
+    assert_eq!(m.can(Action::Run), Ok(()));
+    // A refused command frees the app at once.
+    m.update(Msg::Remove);
+    m.update(Msg::Failed {
+        what: Cmd::Remove("game".into()),
+        error: rpc("busy"),
+    });
+    assert_eq!(m.can(Action::Remove), Ok(()));
+}
+
+#[test]
+fn a_log_is_bounded_in_bytes_and_reads_what_is_new() {
+    let mut m = ready(true);
+    m.update(Msg::JobStarted {
+        what: Cmd::Run("game".into()),
+        job_id: "j1".into(),
+    });
+    let line = "x".repeat(4000);
+    let lines: Vec<&str> = (0..400).map(|_| line.as_str()).collect();
+    m.update(Msg::JobEvents(events("j1", JobState::Running, 1, &lines, 0)));
+    let log = m.log("j1").unwrap();
+    assert!(log.bytes() <= LOG_BYTES, "{}", log.bytes());
+    assert!(log.lines().next() == Some(EARLIER_DROPPED));
+    assert_eq!(log.len(), log.lines().count());
+    // Incremental reads: what came after a version, or None once it was dropped.
+    let v = log.version();
+    m.update(Msg::JobEvents(events("j1", JobState::Running, 401, &["a", "b"], 0)));
+    let log = m.log("j1").unwrap();
+    assert_eq!(log.since(v).unwrap().collect::<Vec<_>>(), ["a", "b"]);
+    assert!(log.since(0).is_none(), "the first lines are gone");
+    assert_eq!(log.since(log.version()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_local_refusal_is_a_notice() {
+    let mut m = ready(true);
+    assert!(m.update(Msg::Refused("that file is not a local file")).is_empty());
+    assert_eq!(m.notice(), Some("that file is not a local file"));
 }
