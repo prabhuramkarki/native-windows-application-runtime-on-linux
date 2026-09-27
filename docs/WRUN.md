@@ -109,7 +109,7 @@ permission or a `scripts` key are refused, not ignored.
 | `version` | Required. 1 to 64 characters of `0-9 A-Z a-z . + ~ -`. |
 | `arch` | Required. `"x86"` or `"x86_64"`. For a portable package it must equal the program's PE architecture. |
 | `dependencies` | Optional. At most 16 unique ids of the bundled dependency manifest (`runtime deps list`); an unknown id is refused by `inspect` and `import`. |
-| `icon` | Optional. A listed `.png` payload file of at most 1 MiB. It is validated and recorded only; menu entries keep using the program's own icon. |
+| `icon` | Optional. A listed payload file whose name ends in `.png`, at most 1 MiB. Only that is checked: the PNG content is not validated, the icon is not recorded in the app's metadata, and nothing uses it yet (menu entries use the program's own icon). |
 | `[entry] kind` | Required. `"portable"` or `"installer"`. |
 | `[entry] exe` | Portable: the program, a listed payload file. |
 | `[entry] installer` | Installer: the installer (`.msi` or a recognised installer `.exe`), which must be the only payload file. |

@@ -6,9 +6,10 @@ front end, a local daemon and a GTK desktop client.
 ## Status
 
 **Phases 0 to 6 of the [roadmap](docs/superpowers/plans/2026-09-21-runtime-master-roadmap.md) are implemented, as
-scoped by their plans. This is not a 1.0 release.** The crates are at version 0.0.1 and nothing has been pushed or
-published. Left out on purpose, and recorded in the roadmap: portal "ask" flows (5C, deferred), desktop notifications,
-nightly compatibility runs in CI, package signing, and any backend other than Wine.
+scoped by their plans. This is not a 1.0 release.** The crates are at version 0.0.1 and none is published to crates.io.
+`main` was last pushed to GitHub at the Phase 4D merge (`9cf1e27`); Phases 4F to 6D are local only. Left out on purpose, and recorded in the roadmap: portal "ask" flows (5C, deferred), desktop notifications,
+clipboard and drag-and-drop through Wine's Wayland support, nightly compatibility runs in CI, package signing, and any
+backend other than Wine.
 
 What works, and is tested: install of portable `.exe` and `.zip` programs and of `.msi`/NSIS/Inno/InstallShield/WiX
 installers (the installers run sandboxed); `runtime run` in a per-app bubblewrap sandbox with seccomp, Landlock and
@@ -26,8 +27,9 @@ The v1.0 exit criteria that are still open:
 - **At least 25 matrix apps tested with statuses** (roadmap, Phase 6 exit). The matrix has no real application yet.
 - **Install, launch and uninstall from the GUI on GNOME and KDE.** The manual [GUI checklist](docs/GUI-CHECKLIST.md)
   has not been run on either desktop.
-- **CI on a hosted runner.** The `gui` job and the `wine-e2e` job have never run on a hosted runner; every result so
-  far is from local runs.
+- **Green CI on a hosted runner.** The one hosted run (on `9cf1e27`) passed `wine-e2e` and `deny`, but the `test` job
+  FAILED at `cargo test --workspace`, and the cause has not been investigated yet. The `gui` job has never run on a
+  hosted runner. Every compatibility record is from local runs.
 - **A semver-stable API.** The daemon API is at 0.2.1 and may still change.
 
 ## Sandbox
@@ -304,7 +306,7 @@ directory probe for the isolation tests), `gui{32,64}.exe`, `exports{32,64}.dll`
 
 - `crates/pe`: hardened parser for untrusted PE files (Phase 1).
 - `crates/core`: app ids, data dir, Windows path handling, metadata and store, install/run services,
-  `doctor`, the `CompatBackend` trait and the `Launcher` (the one place child processes are started).
+  `doctor`, the `CompatBackend` trait and the `Launcher` (the one place a Windows program, backend or helper command is started).
 - `crates/backend-wine`: the system-Wine backend: discovery, prefix creation and hardening.
 - `crates/package`: `rt_package`, the `.wrun` v1 reader and reproducible writer (Phase 6D).
 - `crates/installer`, `crates/desktop`: installer pipeline and sandbox (Phase 3), desktop entries.
