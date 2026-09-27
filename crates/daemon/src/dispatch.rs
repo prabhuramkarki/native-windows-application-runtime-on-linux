@@ -41,6 +41,7 @@ use std::time::Duration;
 pub const WRITE_METHODS: &[&str] = &[
     "apps.run",
     "apps.install",
+    "apps.import",
     "apps.remove",
     "deps.install",
     "permissions.set",
@@ -66,6 +67,7 @@ pub const METHODS: &[&str] = &[
     "deps.plan",
     "apps.run",
     "apps.install",
+    "apps.import",
     "apps.remove",
     "deps.install",
     "permissions.set",
@@ -552,6 +554,7 @@ mod tests {
             ("apps.remove", json!({"id": "a", "force": true})),
             ("apps.run", json!({"id": "a", "unsandboxed": true})),
             ("apps.install", json!([1])),
+            ("apps.import", json!({"path": "/p.wrun", "name": "x"})),
             ("display.set", json!({"id": "a", "driver": "vnc"})),
             ("deps.install", json!({"id": "a", "planDigest": "x"})),
             (
@@ -571,6 +574,8 @@ mod tests {
             ("apps.remove", json!({"id": "-rf"})),
             ("apps.run", json!({"id": "x.exe"})),
             ("apps.install", json!({"path": "setup.exe"})),
+            ("apps.import", json!({"path": "-x.wrun"})),
+            ("apps.import", json!({"path": "/a/../p.wrun"})),
             ("permissions.set", json!({"id": "a", "set": ["a\nb"]})),
             ("deps.install", json!({"id": "a", "planDigest": "x", "consent": []})),
         ] {
@@ -588,6 +593,26 @@ mod tests {
             &req("jobs.poll", Some(json!({"jobId": "x", "afterSeq": 0, "waitMs": 25000}))),
         );
         assert_eq!(v["error"]["data"]["kind"], "not_found");
+    }
+
+    #[test]
+    fn apps_import_is_a_write_method_with_its_exact_argv() {
+        let (_d, _rt, c) = ro();
+        let v = call_line(&c, &req("apps.import", Some(json!({"path": "/p.wrun"}))));
+        assert_eq!((code(&v), v["error"]["data"]["kind"].as_str()), (-32000, Some(RO_KIND)));
+        let (_d, _rt, f, c) = rw();
+        let v = call_line(
+            &c,
+            &req("apps.import", Some(json!({"path": "/in/-x.wrun", "silent": true}))),
+        );
+        let id = v["result"]["jobId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_owned();
+        let info = f.wait_end(&id);
+        assert_eq!((info.kind, info.app), (rt_api::jobs::JobKind::Import, None));
+        let argv = std::fs::read(f.fake.join("argv._in_-x.wrun")).unwrap();
+        assert_eq!(argv, b"import\0--silent\0--\0/in/-x.wrun\0");
     }
 
     #[test]

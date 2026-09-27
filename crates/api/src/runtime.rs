@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(
             v,
             VersionInfo {
-                api: "0.2.0".into(),
+                api: "0.2.1".into(),
                 runtime: env!("CARGO_PKG_VERSION").into(),
                 protocol: "jsonrpc-2.0-ndjson".into(),
                 write: false

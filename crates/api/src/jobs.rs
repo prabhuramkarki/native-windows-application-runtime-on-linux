@@ -44,6 +44,8 @@ pub const MAX_CONSENT: usize = 64;
 pub enum JobKind {
     Run,
     Install,
+    /// `apps.import` (0.2.1): a `.wrun` package.
+    Import,
     Remove,
     DepsInstall,
     PermissionsSet,
@@ -89,7 +91,7 @@ pub enum EventKind {
 pub struct JobInfo {
     pub job_id: String,
     pub kind: JobKind,
-    /// The app the job acts on; `None` for an install (the CLI derives the id).
+    /// The app the job acts on; `None` for an install or an import (the CLI derives the id).
     pub app: Option<String>,
     pub state: JobState,
     pub exit_code: Option<i32>,
@@ -197,6 +199,13 @@ pub enum JobSpec {
         silent: bool,
         network: bool,
     },
+    /// A `.wrun` package: no name or exe (the manifest has them); `silent`/`network` are the user's, for installer
+    /// packages only (the CLI refuses them on a portable one).
+    Import {
+        path: PathBuf,
+        silent: bool,
+        network: bool,
+    },
     Remove {
         app: AppId,
     },
@@ -256,6 +265,16 @@ struct InstallParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportParams {
+    path: String,
+    #[serde(default)]
+    silent: bool,
+    #[serde(default)]
+    network: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdParams {
     id: String,
@@ -306,6 +325,14 @@ impl JobSpec {
                     network: p.network,
                 }
             }
+            "apps.import" => {
+                let p: ImportParams = shape(params)?;
+                JobSpec::Import {
+                    path: installer_path(&p.path)?,
+                    silent: p.silent,
+                    network: p.network,
+                }
+            }
             "apps.remove" => JobSpec::Remove {
                 app: app_id(&shape::<IdParams>(params)?.id)?,
             },
@@ -342,6 +369,7 @@ impl JobSpec {
         match self {
             JobSpec::Run { .. } => JobKind::Run,
             JobSpec::Install { .. } => JobKind::Install,
+            JobSpec::Import { .. } => JobKind::Import,
             JobSpec::Remove { .. } => JobKind::Remove,
             JobSpec::DepsInstall { .. } => JobKind::DepsInstall,
             JobSpec::PermissionsSet { .. } => JobKind::PermissionsSet,
@@ -350,10 +378,10 @@ impl JobSpec {
         }
     }
 
-    /// The app the job acts on; `None` for an install.
+    /// The app the job acts on; `None` for an install or an import.
     pub fn app(&self) -> Option<&AppId> {
         match self {
-            JobSpec::Install { .. } => None,
+            JobSpec::Install { .. } | JobSpec::Import { .. } => None,
             JobSpec::Run { app, .. }
             | JobSpec::Remove { app }
             | JobSpec::DepsInstall { app, .. }
@@ -384,6 +412,16 @@ impl JobSpec {
                 v.push("install".into());
                 v.extend(name.iter().map(|n| flag("name", n)));
                 v.extend(exe.iter().map(|e| flag("exe", e)));
+                if *silent {
+                    v.push("--silent".into());
+                }
+                if *network {
+                    v.push("--network".into());
+                }
+                v.extend(["--".into(), path.into()]);
+            }
+            JobSpec::Import { path, silent, network } => {
+                v.push("import".into());
                 if *silent {
                     v.push("--silent".into());
                 }
@@ -446,7 +484,7 @@ fn value(what: &str, s: String, max: usize) -> Result<String, ApiError> {
     Ok(s)
 }
 
-/// An installer file: absolute, no `.`/`..` component, no trailing `/`, nothing invisible, at most 4,096 bytes.
+/// An installer or package file: absolute, no `.`/`..` component, no trailing `/`, nothing invisible, at most 4,096 bytes.
 /// Whether it exists and what it is are the CLI's to judge.
 fn installer_path(s: &str) -> Result<PathBuf, ApiError> {
     if s.len() > VALUE_MAX {
@@ -668,11 +706,13 @@ mod tests {
             "/a\u{1b}[31m",
             long.as_str(),
         ] {
-            assert_eq!(
-                kind_of(spec("apps.install", json!({ "path": bad }))),
-                Some(ErrorKind::InvalidArgument),
-                "{bad:?}"
-            );
+            for m in ["apps.install", "apps.import"] {
+                assert_eq!(
+                    kind_of(spec(m, json!({ "path": bad }))),
+                    Some(ErrorKind::InvalidArgument),
+                    "{m} {bad:?}"
+                );
+            }
         }
         assert_eq!(long.len(), 4097);
         let max = format!("/{}", "p".repeat(VALUE_MAX - 1));
@@ -687,6 +727,14 @@ mod tests {
                 JobSpec::Install { path, .. } => assert_eq!(path, PathBuf::from(ok)),
                 other => panic!("{other:?}"),
             }
+            assert_eq!(
+                spec("apps.import", json!({ "path": ok })).unwrap(),
+                JobSpec::Import {
+                    path: PathBuf::from(ok),
+                    silent: false,
+                    network: false
+                }
+            );
         }
     }
 
@@ -796,6 +844,11 @@ mod tests {
             ("apps.install", json!({"path": "/a", "silent": "yes"})),
             ("apps.install", json!({"path": "/a", "env": {}})),
             ("apps.install", json!({"name": "x"})),
+            ("apps.import", json!({"path": "/a.wrun", "name": "x"})),
+            ("apps.import", json!({"path": "/a.wrun", "exe": "x"})),
+            ("apps.import", json!({"path": "/a.wrun", "yes": true})),
+            ("apps.import", json!({"path": "/a.wrun", "network": "yes"})),
+            ("apps.import", json!({"silent": true})),
             ("apps.remove", json!({"id": "a", "force": true})),
             ("permissions.set", json!({"id": "a"})),
             ("permissions.set", json!({"id": "a", "set": "network=allow"})),
@@ -885,6 +938,24 @@ mod tests {
                 JobKind::Install,
             ),
             (
+                JobSpec::Import {
+                    path: "/-x/My App.wrun".into(),
+                    silent: false,
+                    network: false,
+                },
+                vec!["import", "--", "/-x/My App.wrun"],
+                JobKind::Import,
+            ),
+            (
+                JobSpec::Import {
+                    path: "/p.wrun".into(),
+                    silent: true,
+                    network: true,
+                },
+                vec!["import", "--silent", "--network", "--", "/p.wrun"],
+                JobKind::Import,
+            ),
+            (
                 JobSpec::Remove { app: id() },
                 vec!["remove", "--", "notepad"],
                 JobKind::Remove,
@@ -932,7 +1003,10 @@ mod tests {
             assert_eq!(argv(&s), want, "{s:?}");
             assert_eq!(s.kind(), kind);
             let app = s.app().map(AppId::as_str);
-            assert_eq!(app, (kind != JobKind::Install).then_some("notepad"));
+            assert_eq!(
+                app,
+                (!matches!(kind, JobKind::Install | JobKind::Import)).then_some("notepad")
+            );
         }
     }
 
@@ -1282,6 +1356,7 @@ mod tests {
         for (k, s) in [
             (JobKind::Run, "run"),
             (JobKind::Install, "install"),
+            (JobKind::Import, "import"),
             (JobKind::Remove, "remove"),
             (JobKind::DepsInstall, "depsInstall"),
             (JobKind::PermissionsSet, "permissionsSet"),
