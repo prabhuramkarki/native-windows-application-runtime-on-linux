@@ -28,14 +28,15 @@ jobs:
           components: rustfmt, clippy
       - run: tools/build-fixtures.sh
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `runtime-gui` needs GTK 4 development files; the `gui` job below builds, lints and tests it.
+      - run: cargo clippy --workspace --exclude runtime-gui --all-targets -- -D warnings
       # Plain `cargo test` skips the `#[ignore]`d real-Wine tests; the `wine-e2e` job runs them.
       # RUNTIME_REQUIRE_BWRAP=1 turns a missing `bwrap` into a hard test failure instead of the default
       # loud-skip-and-pass, so the real-sandbox tests above are guaranteed to actually execute here.
       # `runtime-deps`' real-bwrap tests run the installer sandbox with the built `runtime` binary as its
       # `sandbox-init` shim (target/debug/runtime); `cargo test --workspace` builds it (runtime-cli has integration
       # tests), and those tests fail loudly when it is missing.
-      - run: cargo test --workspace
+      - run: cargo test --workspace --exclude runtime-gui
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
@@ -106,6 +107,31 @@ jobs:
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
           RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE: "1"
+  # The GUI client (`runtime-gui`, GTK 4 + libadwaita): ubuntu-latest (24.04) has GTK 4.14 and libadwaita 1.5, the
+  # crate's minimum (features v4_12 / v1_5). Its e2e tests drive the real `runtimed` and `runtime` (built first) with
+  # the fixtures; the widget tests run under Xvfb, and RUNTIME_REQUIRE_DISPLAY=1 makes a missing display a failure
+  # instead of a loud skip. Screenshots (RUNTIME_GUI_SHOTS) are uploaded for a look, never asserted on.
+  gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev xvfb mingw-w64 nsis msitools wixl bubblewrap desktop-file-utils
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: tools/build-fixtures.sh
+      - run: cargo clippy -p runtime-gui --all-targets -- -D warnings
+      - run: cargo build -p runtime-daemon -p runtime-cli
+      - run: xvfb-run -a cargo test -p runtime-gui
+        env:
+          RUNTIME_REQUIRE_DISPLAY: "1"
+          RUNTIME_GUI_SHOTS: "1"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-smoke
+          path: target/gui-smoke/
+          if-no-files-found: ignore
   deny:
     runs-on: ubuntu-latest
     steps:
