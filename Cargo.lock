@@ -1263,6 +1263,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-package"
+version = "0.0.1"
+dependencies = [
+ "flate2",
+ "libc",
+ "runtime-core",
+ "runtime-pe",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "zip",
+]
+
+[[package]]
 name = "runtime-pe"
 version = "0.0.1"
 dependencies = [

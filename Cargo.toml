@@ -13,6 +13,7 @@ default-members = [
     "crates/deps",
     "crates/desktop",
     "crates/installer",
+    "crates/package",
     "crates/pe",
     "crates/sandbox",
 ]
