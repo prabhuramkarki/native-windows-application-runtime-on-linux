@@ -365,3 +365,53 @@ fn e2e_a_planted_reg_exe_cannot_escape_the_helper_sandbox_after_a_sandboxed_inst
     rig.rt_env(&["uninstall", &id], &xdg_env).expect_ok();
     rig.finish();
 }
+
+/// Phase 6D: an installer-kind `.wrun` runs its installer through the unchanged pipeline (real Wine, real bwrap),
+/// under the package's fixed id, records the package, grants nothing and leaves no staged installer.
+#[test]
+#[ignore = "needs Wine, bwrap and msitools-built fixtures; run with --ignored --test-threads=1"]
+fn e2e_import_of_an_installer_package() {
+    if !support::bwrap_works("e2e_import_of_an_installer_package") {
+        return;
+    }
+    let rig = Rig::new();
+    let xdg = rig.xdg_data_home();
+    let xdg_env = [("XDG_DATA_HOME", xdg.to_str().unwrap())];
+    let dir = rig.data().parent().unwrap().join("pkg");
+    std::fs::create_dir_all(dir.join("payload")).unwrap();
+    std::fs::copy(fixture("hello.msi"), dir.join("payload/hello.msi")).unwrap();
+    std::fs::write(
+        dir.join("wrun.toml"),
+        "format = 1\nid = \"hello-pkg\"\nname = \"Hello\"\nversion = \"1\"\narch = \"x86_64\"\n\n[entry]\n\
+         kind = \"installer\"\ninstaller = \"payload/hello.msi\"\n\n[permissions]\nnetwork = \"allow\"\n",
+    )
+    .unwrap();
+    let wrun = dir.with_extension("wrun");
+    rig.rt(&["pack", dir.to_str().unwrap(), "-o", wrun.to_str().unwrap()])
+        .expect_ok();
+
+    let ran = rig.rt_env(&["import", wrun.to_str().unwrap(), "--silent"], &xdg_env);
+    ran.expect_ok();
+    assert_eq!(installed_id(&ran), "hello-pkg");
+    assert!(
+        ran.out()
+            .contains("  runtime permissions hello-pkg --set=network=allow\n"),
+        "{}",
+        ran.report()
+    );
+    let app = rig.apps().join("hello-pkg");
+    assert!(!app.join("permissions.toml").exists(), "import granted something");
+    let md: serde_json::Value = serde_json::from_slice(&std::fs::read(app.join("metadata.json")).unwrap()).unwrap();
+    assert_eq!(md["package"]["requestedPermissions"][0], "network=allow", "{md}");
+    let staging = rig.data().join("staging");
+    assert_eq!(
+        std::fs::read_dir(&staging).unwrap().count(),
+        0,
+        "the staged installer is removed"
+    );
+
+    let ran = rig.rt(&["run", "hello-pkg"]);
+    assert!(ran.out().contains(HELLO), "hello64 stdout: {}", ran.report());
+    rig.rt_env(&["remove", "hello-pkg"], &xdg_env).expect_ok();
+    rig.finish();
+}
