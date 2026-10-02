@@ -1207,11 +1207,14 @@ must not exist, and why it does not:
   fill them; that is the user hurting themselves. `apps.run` holds a running slot for as long as the app runs.
 - **A `runtime` started at a terminal is invisible to the job table.** The app lock and the running-app refusals of
   the CLI are the real guard between the two, as between two terminals.
-- **The version is checked before every job** (Phase 6E; at startup too). Before each spawn the daemon checks the
-  `runtime` file's owner, mode and directory, then runs `runtime --version` (the job environment, the job directory,
-  5 s, its own process group, read on the calling thread with `poll(2)` and killed as a group at the deadline, so a
-  probe leaves no thread or process behind). Another version is refused with `runtime_mismatch` (restart `runtimed`)
-  and nothing is spawned; a probe that fails is `unavailable`. A same-version replacement (a reinstall) is accepted:
+- **The version is checked before every job** (Phase 6E; at startup too). Before each spawn (and after the cheap
+  busy/stopping checks) the daemon checks the `runtime` file's owner, mode and directory, then runs `runtime
+  --version`: the job environment, the job directory, 5 s, at most 4 KiB read on the calling thread with `poll(2)`,
+  in a process group of its own. That group gets SIGKILL when the leader exits (or at the deadline), before the
+  leader is reaped, so the probe leaves no thread behind and nothing in its group outlives it (a process that left
+  the group with `setsid` is the binary's own doing). Another version is refused with `runtime_mismatch` (restart
+  `runtimed`) and nothing is spawned; a probe that fails (no line in time, no output, a non-zero exit) is
+  `unavailable`. A same-version replacement (a reinstall) is accepted:
   the owner, mode and directory checks are the trust guard, and the version check is against protocol skew. The
   consent path is also re-checked by the CLI itself.
 - **Check-then-exec.** The binary is checked by path, then executed by path. The per-job version probe narrows the

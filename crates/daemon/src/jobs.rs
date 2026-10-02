@@ -322,6 +322,25 @@ impl Shared {
         }
     }
 
+    /// Whether a job for `app` may start now: the daemon is not stopping, no live job for `app`, a free slot.
+    fn admit(&self, t: &mut Table, app: &Option<String>) -> Result<(), ApiError> {
+        if t.shutting_down {
+            return Err(ApiError::new(ErrorKind::Unavailable, "the daemon is stopping"));
+        }
+        self.evict(t);
+        let running: Vec<&Arc<Job>> = t.jobs.iter().filter(|j| live(lock(&j.data).state)).collect();
+        if app.is_some() && running.iter().any(|j| j.app == *app) {
+            return Err(ApiError::new(ErrorKind::AppBusy, "a job for this app is still running"));
+        }
+        if running.len() >= self.cfg.max_running {
+            return Err(ApiError::new(
+                ErrorKind::Busy,
+                format!("{} jobs are already running; try again later", self.cfg.max_running),
+            ));
+        }
+        Ok(())
+    }
+
     fn find(&self, id: &str) -> Result<Arc<Job>, ApiError> {
         let mut t = lock(&self.table);
         self.evict(&mut t);
@@ -353,6 +372,10 @@ impl Jobs {
         let euid = unsafe { libc::geteuid() };
         check_runtime_exe(&s.cfg.runtime_exe, euid)?;
         check_job_cwd(&s.cfg.cwd, euid)?;
+        let app = spec.app().map(|a| a.as_str().to_owned());
+        // A cheap refusal first, so a stopping or full daemon never spawns the probe; the authoritative check is
+        // repeated under the lock below.
+        s.admit(&mut lock(&s.table), &app)?;
         // Outside the table lock: a slow binary never stalls polls.
         check_runtime_version(
             &s.cfg.runtime_exe,
@@ -360,23 +383,9 @@ impl Jobs {
             &child_env(&*s.cfg.env),
             s.cfg.version_timeout,
         )?;
-        let app = spec.app().map(|a| a.as_str().to_owned());
         let job = {
             let mut t = lock(&s.table);
-            if t.shutting_down {
-                return Err(ApiError::new(ErrorKind::Unavailable, "the daemon is stopping"));
-            }
-            s.evict(&mut t);
-            let running: Vec<&Arc<Job>> = t.jobs.iter().filter(|j| live(lock(&j.data).state)).collect();
-            if app.is_some() && running.iter().any(|j| j.app == app) {
-                return Err(ApiError::new(ErrorKind::AppBusy, "a job for this app is still running"));
-            }
-            if running.len() >= s.cfg.max_running {
-                return Err(ApiError::new(
-                    ErrorKind::Busy,
-                    format!("{} jobs are already running; try again later", s.cfg.max_running),
-                ));
-            }
+            s.admit(&mut t, &app)?;
             let now = s.now_ms();
             let job = Arc::new(Job {
                 id: new_id()?,
@@ -867,8 +876,9 @@ pub(crate) fn wanted_version() -> String {
 /// `exe --version`'s first line (trimmed, non-empty), run with exactly `env`, in `cwd`, in a process group of its
 /// own. Everything is bounded by `timeout` and happens on the calling thread: stdout is read with `poll(2)` (at most
 /// 4 KiB, up to the first newline) until the deadline, then dropped, so a process the probe leaves holding the pipe
-/// cannot hang the caller; at the deadline the probe's whole group is killed (while its leader is unreaped, so the
-/// group id is still its own) and the leader reaped. `Err`: why there is no answer.
+/// cannot hang the caller. The probe's whole group is killed when its leader has exited (or at the deadline), before
+/// the leader is reaped, so nothing it started outlives it. A non-zero exit is a failure. `Err`: why there is no
+/// answer.
 pub(crate) fn runtime_version(
     exe: &Path,
     cwd: &Path,
@@ -923,24 +933,29 @@ pub(crate) fn runtime_version(
             }
         };
     }
-    let kill = |child: &mut std::process::Child| {
-        // SAFETY: `child` is not reaped yet (only `try_wait` reaps, and it saw it running or was not called), so its
-        // pid is still its own group's id.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = child.wait();
-        Err(no_answer(timeout))
+    // Every signal goes to the probe's group while its leader is unreaped (`leader_exited` looks with WNOWAIT), so
+    // the group id is still its own; the leader is reaped only after. On success too: nothing it started outlives it.
+    let pid = child.id() as libc::pid_t;
+    let reap = |child: &mut std::process::Child| {
+        // SAFETY: `pid` is our unreaped child (exited or not), so `-pid` is its own group.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        child.wait()
     };
     if line.is_none() {
-        return kill(&mut child);
+        let _ = reap(&mut child);
+        return Err(no_answer(timeout));
     }
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < until => std::thread::sleep(CHILD_TICK),
-            Ok(None) => return kill(&mut child),
-            // Not our child any more (cannot happen): nothing is signalled.
-            Err(e) => return Err(e.to_string()),
+    while !leader_exited(pid) {
+        if Instant::now() >= until {
+            let _ = reap(&mut child);
+            return Err(no_answer(timeout));
         }
+        std::thread::sleep(CHILD_TICK);
+    }
+    match reap(&mut child) {
+        Ok(st) if st.success() => {}
+        Ok(st) => return Err(format!("it ended with {st} after printing its version")),
+        Err(e) => return Err(e.to_string()),
     }
     let line = String::from_utf8_lossy(&line.unwrap_or_default()).trim().to_owned();
     if line.is_empty() {

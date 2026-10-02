@@ -950,3 +950,75 @@ fn a_hanging_version_probe_is_unavailable_and_leaves_no_thread_or_process() {
     }
     assert!(f.jobs.list().is_empty());
 }
+
+#[test]
+fn a_probe_that_floods_trickles_fails_or_leaves_a_child_is_bounded_and_cleaned_up() {
+    let f = fx_with(|c| c.version_timeout = Duration::from_millis(500));
+    // A newline-free flood: the first 4 KiB is the "line"; another version, and a bounded message.
+    version_is(&f, "head -c 10000 /dev/zero | tr '\\0' x");
+    let t = Instant::now();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::RuntimeMismatch, "{e:?}");
+    assert!(
+        e.message.len() <= 512 && t.elapsed() < Duration::from_secs(3),
+        "{}",
+        e.message
+    );
+    // One byte at a time, no newline, past the deadline: no answer, close to the timeout.
+    version_is(&f, "while :; do printf r; sleep 0.05; done");
+    let t = Instant::now();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("no answer"), "{}", e.message);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    // The right line, one byte at a time within the deadline: accepted.
+    let line = format!("runtime {}", env!("CARGO_PKG_VERSION"));
+    let slow: String = line.chars().map(|c| format!("printf '{c}'; sleep 0.01; ")).collect();
+    version_is(&f, &format!("{slow}echo"));
+    let id = f.start(remove("a"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    // The right line, then a failing exit: refused.
+    version_is(&f, &format!("{}; exit 3", ours()));
+    let e = f.jobs.start(remove("b")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("exit status: 3"), "{}", e.message);
+    // The right line, with a child left behind that does not hold stdout: accepted, and the child is gone.
+    version_is(
+        &f,
+        &format!("sleep 30 >/dev/null & echo $! > \"$F/left-pid\"; {}", ours()),
+    );
+    let id = f.start(remove("b"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    let left: i32 = fs::read_to_string(f.fake.join("left-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while alive(left) {
+        assert!(Instant::now() < until, "the probe's child {left} outlived it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_full_or_stopping_daemon_refuses_without_running_the_probe() {
+    let f = fx_with(|c| c.max_running = 1);
+    version_is(&f, &format!("echo x >> \"$F/probes\"; {}", ours()));
+    let probes = || {
+        fs::read_to_string(f.fake.join("probes"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    f.mode(Some("a"), "wait");
+    let id = f.start(remove("a"));
+    f.wait_for(&id, "ready");
+    assert_eq!(probes(), 1);
+    assert_eq!(f.jobs.start(remove("a")).unwrap_err().kind, ErrorKind::AppBusy);
+    assert_eq!(f.jobs.start(remove("b")).unwrap_err().kind, ErrorKind::Busy);
+    assert_eq!(probes(), 1, "a refused start ran the probe");
+    f.jobs.shutdown(Duration::from_secs(5));
+    assert_eq!(f.jobs.start(remove("b")).unwrap_err().kind, ErrorKind::Unavailable);
+    assert_eq!(probes(), 1);
+}
