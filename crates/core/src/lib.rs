@@ -39,9 +39,9 @@ pub use id::{AppId, IdError};
 pub use install::{INPUT_CAP, Input, InstallError, InstallOpts, InstallOutcome, install, read_input};
 pub use launch::{Finished, LaunchError, Launcher, LogSink, Running, Sandbox};
 pub use meta::{
-    BackendInfo, ConsentRecord, DOTNET_PACKAGE_ID, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES, MAX_FIELD_LEN,
-    MAX_NAME_LEN, MAX_REQUESTED_DEPENDENCIES, MIN_SCHEMA_VERSION, MetaError, Metadata, PackageMeta,
-    REQUESTABLE_PERMISSIONS, SCHEMA_VERSION,
+    ArchiveRecord, BackendInfo, ConsentRecord, DOTNET_PACKAGE_ID, DependencyRecord, InstallerMeta, MAX_DEPENDENCIES,
+    MAX_FIELD_LEN, MAX_NAME_LEN, MAX_RECORDED, MAX_REQUESTED_DEPENDENCIES, MIN_SCHEMA_VERSION, MetaError, Metadata,
+    PackageMeta, REQUESTABLE_PERMISSIONS, RecordedFile, RecordedOverride, SCHEMA_VERSION,
 };
 /// The PE model the backend contract speaks ([`Capabilities`]), for backends that do not depend on it directly.
 pub use pe;

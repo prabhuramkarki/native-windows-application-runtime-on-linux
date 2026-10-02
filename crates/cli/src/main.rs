@@ -472,6 +472,24 @@ mod daemon_argv {
                     ),
                     (Some(app.as_str()), true, yes, Some(plan_digest.as_str()), None)
                 );
+                assert!(a.remove.is_empty(), "{spec:?}");
+            }
+            JobSpec::DepsRemove { app, packages } => {
+                let Cmd::Deps(a) = cmd else {
+                    panic!("{spec:?}: not deps")
+                };
+                assert!(a.sub.is_none(), "{spec:?}: routed to a subcommand");
+                assert_eq!(
+                    (
+                        a.app.as_deref(),
+                        &a.remove,
+                        a.install,
+                        a.yes.len(),
+                        a.plan_digest,
+                        a.discard_interrupted
+                    ),
+                    (Some(app.as_str()), packages, false, 0, None, None)
+                );
             }
             JobSpec::PermissionsSet { app, set } => {
                 let Cmd::Permissions {
@@ -567,10 +585,19 @@ mod daemon_argv {
                 yes,
             });
         }
+        // Package ids cannot look like options (the API refuses them), but `list`/`cache` as the app still must not
+        // become subcommands.
+        for (app, packages) in [
+            ("notepad", strings(&["dxvk"])),
+            ("list", strings(&["vkd3d-proton", "dxvk"])),
+            ("cache", strings(&["a.b_c-d"])),
+        ] {
+            specs.push(JobSpec::DepsRemove { app: id(app), packages });
+        }
         let mut kinds: Vec<_> = specs.iter().map(|s| format!("{:?}", s.kind())).collect();
         kinds.sort();
         kinds.dedup();
-        assert_eq!(kinds.len(), 8, "one sample per variant at least: {kinds:?}");
+        assert_eq!(kinds.len(), 9, "one sample per variant at least: {kinds:?}");
         specs.iter().for_each(check);
     }
 }

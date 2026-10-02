@@ -831,3 +831,70 @@ fn doctor_notes_each_installer_already_in_the_prefix_and_nothing_else() {
     assert!(notes[0].contains("did not set its DLL overrides"));
     assert!(!notes[1].contains('\u{1b}'), "unsanitised: {:?}", notes[1]);
 }
+
+// ------------------------------------------------------------------------------------------------ --remove (6F)
+
+#[test]
+fn remove_parses_repeated_and_conflicts_with_install_and_discard() {
+    let a = deps_args(&["deps", "app", "--remove", "dxvk", "--remove", "vkd3d-proton"]);
+    assert_eq!(a.remove, strings(&["dxvk", "vkd3d-proton"]));
+    assert!(!a.install);
+    let a = deps_args(&["deps", "--remove=a", "--remove=b", "--", "game"]);
+    assert_eq!(
+        (a.remove.clone(), a.app.as_deref()),
+        (strings(&["a", "b"]), Some("game"))
+    );
+    for bad in [
+        &["deps", "app", "--remove", "dxvk", "--install"][..],
+        &["deps", "app", "--install", "--remove", "dxvk"],
+        &["deps", "app", "--remove", "dxvk", "--discard-interrupted", "dxvk"],
+        &["deps", "app", "--remove"],
+        &["deps", "app", "--remove", "-x"],
+        &["deps", "app", "--remove", "A"],
+        &["deps", "app", "--remove", "a b"],
+        &["deps", "app", "--remove", "dxvk", "--yes", "vc"],
+        &["deps", "list", "--remove", "dxvk"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?} parsed");
+    }
+}
+
+#[test]
+fn a_package_named_twice_is_a_usage_error() {
+    assert_eq!(duplicate_remove(&strings(&["a", "b"])), None);
+    assert_eq!(duplicate_remove(&strings(&["a", "b", "a"])).as_deref(), Some("a"));
+}
+
+#[test]
+fn the_remove_report_is_formatted_and_any_problem_is_exit_1() {
+    let clean = rt_deps::RemoveReport {
+        removed: strings(&["vkd3d-proton", "dxvk"]),
+        ..rt_deps::RemoveReport::default()
+    };
+    assert_eq!(
+        format_remove_report(&clean),
+        ("removed vkd3d-proton\nremoved dxvk\n".into(), 0)
+    );
+    let messy = rt_deps::RemoveReport {
+        removed: strings(&["dxvk"]),
+        left: vec![(
+            "dxvk".into(),
+            "windows/system32/d3d11.dll: changed since it was installed".into(),
+        )],
+        failed: vec![("x".into(), "boom\u{1b}[31m".into())],
+        skipped: vec![("y".into(), "not attempted: an earlier package failed".into())],
+    };
+    let (text, code) = format_remove_report(&messy);
+    assert_eq!(code, 1);
+    assert_eq!(
+        text,
+        "removed dxvk\nleft dxvk: windows/system32/d3d11.dll: changed since it was installed\nfailed x: \
+         boom\\u{1b}[31m\nskipped y: not attempted: an earlier package failed\n"
+    );
+    let only_left = rt_deps::RemoveReport {
+        removed: strings(&["dxvk"]),
+        left: messy.left.clone(),
+        ..rt_deps::RemoveReport::default()
+    };
+    assert_eq!(format_remove_report(&only_left).1, 1);
+}

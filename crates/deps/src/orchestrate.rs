@@ -30,8 +30,23 @@
 //!    them. What a denied package itself NEEDS still installs (spec §4: only the denied package and its dependents
 //!    are blocked).
 //! 5. Packages install in plan order: busy re-check, the installer marker check again (right before the download),
-//!    fetch, install, then record (read, `state::record`, atomic
-//!    write) after EACH success. The first failure stops the run; the rest are skipped.
+//!    for an archive package its DLL overrides' current values (a value the runtime could not restore refuses it
+//!    before the download), fetch, install, then record (read, `state::record`, atomic write) after EACH success.
+//!    An archive package's record says exactly what it wrote ([`install_archive::record_of`], hashed from disk);
+//!    if it cannot be recorded, what it wrote is undone again. The first failure stops the run; the rest are
+//!    skipped.
+//!
+//! **Removal** ([`remove_packages`], Phase 6F):
+//! 1. [`check_backend`], then the exclusive app lock, then no `wineserver` for the prefix, then the metadata is
+//!    read under the lock;
+//! 2. every pre-check, before anything changes ([`DepsError::CannotRemove`]): each id recorded; not an installer
+//!    package (that would run a vendor uninstaller); recorded with an install record (schema 5); and no recorded
+//!    package outside the set needs one inside it (by the bundled manifest's `requires`; a recorded package the
+//!    manifest does not know refuses, since its needs are unknown);
+//! 3. dependents first: a package is removed before every package of the set it requires;
+//! 4. per package: the busy check again, then [`install_archive::remove_archive`] (verifying; what changed is left
+//!    and reported), then the metadata: the record is deleted, or, after a hard failure, shrunk to what failed. Any
+//!    failure fails the package and stops the run; the rest are skipped with their records unchanged.
 //!
 //! Library code prints nothing; every report string is one line, bounded, with control and format characters
 //! escaped (callers still print through their sanitiser).
@@ -200,6 +215,9 @@ pub enum DepsError {
     /// The app's backend cannot take dependency packages (checked before any lock, prompt or download).
     #[error("{0}")]
     Unsupported(#[from] rt_core::backend::Unsupported),
+    /// [`remove_packages`] refused before changing anything (fixed text with validated, clipped ids).
+    #[error("{0}")]
+    CannotRemove(String),
 }
 
 impl DepsError {
@@ -721,6 +739,15 @@ fn install_one(
     }
     // Before the download (saves it) and again right before installing: an app may start while it downloads.
     not_busy_now(o)?;
+    // An archive package's overrides as they are before it is installed, under the lock with the prefix idle (so
+    // `user.reg` is current and stays so until the install sets them), and before anything is downloaded: a value
+    // the runtime could not restore on removal refuses the package here (Decision R5).
+    let previous = match &pkg.install {
+        manifest::Install::Archive { dll_overrides, .. } if pkg.kind == Kind::Archive => {
+            crate::wine_config::read_dll_overrides(o.env, dll_overrides)?
+        }
+        _ => Vec::new(),
+    };
     // Under the lock, the prefix idle: an installer whose marker is there already has nothing to do (Ruling 15).
     if pkg.kind == Kind::Installer
         && install_installer::marker_already_present(pkg, o.env).map_err(|e| {
@@ -735,9 +762,29 @@ fn install_one(
         .map_err(|e| format!("download failed: {e}"))?;
     not_busy_now(o)?;
     let warnings = match pkg.kind {
-        Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
-            .map(|_| Vec::new())
-            .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?,
+        Kind::Archive => {
+            let done =
+                install_archive::install_archive_with_previous(pkg, &file, o.env, o.backend, o.launcher, &previous)
+                    .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?;
+            // Recorded from disk right after the install, under the lock (Decision R2). An archive package never
+            // stays in the prefix without its record: if either step fails, what this call wrote is undone (R12).
+            let recorded = install_archive::record_of(&done, &previous, o.env)
+                .map_err(|e| e.to_string())
+                .and_then(|rec| record(o, pkg, consent, Some(rec)));
+            return match recorded {
+                Ok(()) => Ok(Some(Vec::new())),
+                Err(e) => Err(
+                    match install_archive::undo_install(&done, &previous, &pkg.id, o.env, o.backend, o.launcher) {
+                        Ok(()) => {
+                            format!("not installed: it could not be recorded ({e}); what it wrote was removed again")
+                        }
+                        Err(u) => format!(
+                            "not installed: it could not be recorded ({e}); removing what it wrote also failed: {u}"
+                        ),
+                    },
+                ),
+            };
+        }
         Kind::Installer => {
             match install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher, o.runtime_exe) {
                 Ok(done) => {
@@ -753,7 +800,7 @@ fn install_one(
             }
         }
     };
-    record(o, pkg, consent).map_err(|e| {
+    record(o, pkg, consent, None).map_err(|e| {
         format!(
             "installed but not recorded ({e}); the runtime does not count it as installed, and installing it \
              again may be refused: recreate the environment if that happens"
@@ -776,7 +823,13 @@ fn not_busy_now(o: &Orchestrator) -> Result<(), String> {
 }
 
 /// Records `pkg` in the app's metadata: read, edit, atomic write. Only called after the installer returned `Ok`.
-fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Result<(), String> {
+/// `archive`: what an archive package's install wrote ([`install_archive::record_of`]); `None` for an installer.
+fn record(
+    o: &Orchestrator,
+    pkg: &Package,
+    consent: Option<ConsentRecord>,
+    archive: Option<rt_core::ArchiveRecord>,
+) -> Result<(), String> {
     let mut md = o.store.read_metadata(o.env).map_err(|e| e.to_string())?;
     state::record(
         &mut md,
@@ -786,6 +839,7 @@ fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Re
             sha256: pkg.sha256.clone(),
             installed_at: (o.now)(),
             consent,
+            archive,
         },
     )
     .map_err(|e| e.to_string())?;
@@ -826,6 +880,182 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::Marker(_)
         | E::DllOverride(_) => format!("{}; {VENDOR_PARTIAL}", line(&e.to_string())),
     }
+}
+
+// ------------------------------------------------------------------------------------------------ removal
+
+/// What [`remove_packages`] did, per package id, in removal order. Reasons are bounded single lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveReport {
+    /// Packages whose record is gone (possibly with `left` items).
+    pub removed: Vec<String>,
+    /// `(package, "<item>: <why>")`: what changed since the install and was left in place.
+    pub left: Vec<(String, String)>,
+    pub failed: Vec<(String, String)>,
+    /// Not attempted after a failure; their records are unchanged.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Removes the recorded archive packages `ids` from the app (see the module docs, "Removal"). `Err` only for
+/// run-level refusals, all decided before anything changed; package failures are in the report.
+pub fn remove_packages(
+    store: &Store,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    manifest: &Manifest,
+    ids: &[String],
+) -> Result<RemoveReport, DepsError> {
+    check_backend(backend)?;
+    let _lock = lock_app(env)?;
+    check_not_busy(env)?;
+    let md = store.read_metadata(env).map_err(DepsError::Metadata)?;
+    let order = removal_order(env, &md, manifest, ids)?;
+    let mut report = RemoveReport::default();
+    for id in order {
+        if !report.failed.is_empty() {
+            report
+                .skipped
+                .push((id, "not attempted: an earlier package failed".into()));
+            continue;
+        }
+        if let Err(why) = remove_one(store, env, backend, launcher, &id, &mut report) {
+            report.failed.push((id, line(&why)));
+        }
+    }
+    Ok(report)
+}
+
+/// The pre-checks of [`remove_packages`] (R3, R4, R8) and the removal order: dependents first.
+fn removal_order(env: &AppEnv, md: &Metadata, manifest: &Manifest, ids: &[String]) -> Result<Vec<String>, DepsError> {
+    let refuse = |s: String| Err(DepsError::CannotRemove(line(&s)));
+    let app = env.id();
+    if ids.is_empty() {
+        return refuse("no package to remove".into());
+    }
+    let mut set: Vec<&str> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !manifest::valid_id(id) {
+            return refuse(format!("{:?} is not a package id", manifest::clip(id)));
+        }
+        if set.contains(&id.as_str()) {
+            return refuse(format!("`{id}` is named twice"));
+        }
+        set.push(id);
+        let Some(rec) = md.dependency(id) else {
+            return refuse(format!("`{id}` is not installed in {app} (see `runtime deps {app}`)"));
+        };
+        if manifest.get(id).is_some_and(|p| p.kind == Kind::Installer) {
+            return refuse(format!(
+                "`{id}` is an installer package: the runtime cannot remove it (that would run the vendor's \
+                 uninstaller); recreate the environment to drop it"
+            ));
+        }
+        let Some(archive) = &rec.archive else {
+            return refuse(format!(
+                "`{id}` was installed by an older runtime that did not record what it wrote, so it cannot be \
+                 removed safely; recreate the environment (`runtime remove {app}`, then install the app again) to \
+                 drop it"
+            ));
+        };
+        // The record's meaning, checked for EVERY package before any is removed (R9; the metadata crate checked its
+        // shape only).
+        if let Err(e) = install_archive::check_archive_record(archive) {
+            return refuse(format!(
+                "`{id}`'s install record is not usable ({e}); nothing was removed: recreate the environment to drop it"
+            ));
+        }
+    }
+    let requires = |id: &str| manifest.get(id).map(|p| p.requires.as_slice());
+    for other in md.dependencies.iter().filter(|d| !set.contains(&d.id.as_str())) {
+        let x = manifest::clip(&other.id);
+        match requires(&other.id) {
+            None => return refuse(format!("cannot tell whether `{x}` needs `{}`", set[0])),
+            Some(reqs) => {
+                if let Some(b) = set.iter().find(|b| reqs.iter().any(|r| r == *b)) {
+                    return refuse(format!(
+                        "`{x}` needs `{b}`; remove both: `runtime deps {app} --remove {x} --remove {b}`"
+                    ));
+                }
+            }
+        }
+    }
+    // Dependents first: repeatedly take the first package that nothing still pending in the set requires.
+    let mut pending = set;
+    let mut order = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let needed = |c: &str| {
+            pending
+                .iter()
+                .any(|p| requires(p).is_some_and(|r| r.iter().any(|x| x == c)))
+        };
+        let next = pending.iter().position(|c| !needed(c)).unwrap_or(0);
+        order.push(pending.remove(next).to_owned());
+    }
+    Ok(order)
+}
+
+/// Removes one package and updates its record; `Err` is the report reason (then the run stops).
+fn remove_one(
+    store: &Store,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    id: &str,
+    report: &mut RemoveReport,
+) -> Result<(), String> {
+    match wineservers_for(&env.prefix()) {
+        Ok(pids) if pids.is_empty() => {}
+        Ok(_) => {
+            return Err(
+                "not removed: a Wine program is now running in this app's prefix; close the app first, \
+                        then try again"
+                    .into(),
+            );
+        }
+        Err(e) => return Err(format!("not removed: cannot check for running Wine programs: {e}")),
+    }
+    let mut md = store.read_metadata(env).map_err(|e| e.to_string())?;
+    let rec = md
+        .dependency(id)
+        .and_then(|d| d.archive.clone())
+        .ok_or("its record changed during the run; nothing was removed")?;
+    let out = install_archive::remove_archive(&rec, id, env, backend, launcher).map_err(|e| e.to_string())?;
+    report.left.extend(
+        out.left
+            .iter()
+            .map(|(item, why)| (id.to_owned(), line(&format!("{item}: {why}")))),
+    );
+    let empty = out.remaining == rt_core::ArchiveRecord::default();
+    if out.failed.is_empty() {
+        state::forget(&mut md, id);
+    } else if !empty && let Some(d) = md.dependencies.iter_mut().find(|d| d.id == id) {
+        d.archive = Some(out.remaining.clone());
+    }
+    // Otherwise only the journal could not be deleted: the record stays as it was (fail closed), so a retry runs
+    // the whole removal again and deletes the journal then.
+    if out.failed.is_empty() || !empty {
+        store.write_metadata(env, &md).map_err(|e| {
+            format!(
+                "what was undone could not be recorded ({e}); removing it again finishes it, reporting what was \
+                 already undone as left"
+            )
+        })?;
+    }
+    if !out.failed.is_empty() {
+        let shown: Vec<String> = out
+            .failed
+            .iter()
+            .take(5)
+            .map(|(item, e)| format!("{item}: {e}"))
+            .collect();
+        return Err(format!(
+            "removal failed ({}); what failed stays recorded, so removing it again retries only that",
+            shown.join("; ")
+        ));
+    }
+    report.removed.push(id.to_owned());
+    Ok(())
 }
 
 /// [`install_archive::discard_interrupted`] behind the run guards, for the CLI to offer after a journal error:

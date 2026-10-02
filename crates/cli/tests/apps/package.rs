@@ -260,7 +260,7 @@ fn import_creates_the_app_records_the_requests_and_grants_nothing() {
     let exe = app.join("prefix/drive_c/Program Files/demo/App/hello64.exe");
     assert_eq!(fs::read(exe).unwrap(), hello());
     let md: serde_json::Value = serde_json::from_slice(&fs::read(app.join("metadata.json")).unwrap()).unwrap();
-    assert_eq!(md["schemaVersion"], 4);
+    assert_eq!(md["schemaVersion"], 5);
     assert_eq!(md["name"], "Demo App");
     let p = &md["package"];
     assert_eq!((&p["id"], &p["version"]), (&"demo".into(), &"1.0.0".into()));

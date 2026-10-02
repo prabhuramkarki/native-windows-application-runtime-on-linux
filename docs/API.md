@@ -4,7 +4,7 @@
 or a script asks it what the CLI would print, as typed JSON. By default it is **read-only**. Started with `--write`,
 it also runs, installs, imports and removes apps, installs dependencies and changes permissions and the display driver: each
 such change is a **job** that runs the `runtime` CLI next to `runtimed`, whose output clients follow by long-polling
-([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.2**.
+([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.3**.
 
 The CLI does not need the daemon. Every `runtime` command works on its own, except the two that exist to talk to it:
 `runtime rpc` and `runtime daemon-status`.
@@ -133,6 +133,7 @@ sandboxes, the app lock, the refusals while an app is running, the grant rules. 
 - `apps.import`: `runtime import [--silent] [--network] -- <path>`;
 - `apps.remove`: `runtime remove -- <id>`;
 - `deps.install`: `runtime deps --install --plan-digest=<hex> [--yes=<pkg>]... -- <id>`;
+- `deps.remove`: `runtime deps --remove=<pkg>... -- <id>` (0.2.3);
 - `permissions.set`: `runtime permissions --set=<expr>... -- <id>`;
 - `permissions.reset`: `runtime permissions --reset -- <id>`;
 - `display.set`: `runtime display -- <id> <driver>`.
@@ -162,7 +163,7 @@ Stop when `job.state` is `succeeded`, `failed` or `cancelled`: the last event is
   output is not shown, and the job ends.
 
 A job's `JobInfo` is `{jobId, kind, app, state, exitCode, signal, createdAt, startedAt, endedAt, dropped}`: `kind` is
-`run`, `install`, `import`, `remove`, `depsInstall`, `permissionsSet`, `permissionsReset` or `displaySet`; `app` is
+`run`, `install`, `import`, `remove`, `depsInstall`, `depsRemove` (0.2.3), `permissionsSet`, `permissionsReset` or `displaySet`; `app` is
 `null` for an install or an import (the CLI derives the id: read it from the `Installed: <id>` line or `apps.list`);
 times are Unix ms;
 `exitCode` and `signal` are `null` until known.
@@ -211,6 +212,7 @@ There is no "yes to all" and no consent that is not a concrete package, version 
 | program args of `apps.run` | 64, each 4,096 bytes, 64 KiB in all, no NUL | `invalid_argument` |
 | expressions of `permissions.set` | 1-32, each 4,096 bytes | `invalid_argument` |
 | consent items of `deps.install` | 64 | `invalid_argument` |
+| packages of `deps.remove` | 1-16 unique package ids | `invalid_argument` |
 
 Waiting polls take at most 8 of the 32 connection slots. Job ids exist only in the daemon's memory: a restarted
 daemon knows none. Jobs die with the daemon: on SIGTERM it cancels every job and waits for them before it removes its
@@ -235,6 +237,7 @@ socket; if it is killed outright, each job's `runtime` gets SIGTERM from the ker
 | `apps.import` | `{"path", "silent"?, "network"?}` | `JobStarted` (write mode) |
 | `apps.remove` | `{"id"}` | `JobStarted` (write mode) |
 | `deps.install` | `{"id", "planDigest", "consent"}` | `JobStarted` (write mode) |
+| `deps.remove` | `{"id", "packages"}` | `JobStarted` (write mode) |
 | `permissions.set` | `{"id", "set"}` | `JobStarted` (write mode) |
 | `permissions.reset` | `{"id"}` | `JobStarted` (write mode) |
 | `display.set` | `{"id", "driver"}` | `JobStarted` (write mode) |
@@ -261,7 +264,7 @@ The API version (semver), the runtime's crate version, the protocol name, and wh
 methods (`runtimed --write`). A 0.1 daemon has no `write`: treat it as `false`.
 
 ```json
-{"api": "0.2.2", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
+{"api": "0.2.3", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
 ```
 
 ### `apps.list`
@@ -500,6 +503,21 @@ d=$(runtime rpc deps.plan '{"id": "game"}' | jq -r .digest)
 runtime rpc deps.install "{\"id\": \"game\", \"planDigest\": \"$d\", \"consent\": []}"
 ```
 
+### `deps.remove`
+
+Params: `{"id", "packages": ["vkd3d-proton", "dxvk"]}` (0.2.3): 1 to 16 unique package ids (the manifest's id
+grammar, `[a-z0-9][a-z0-9._-]{0,63}`; anything else is `invalid_argument`, no job is started). Removes recorded archive
+packages, as `runtime deps <id> --remove <pkg>...`: under the app lock, each file's hash and each DLL override is
+checked against what the install recorded; what changed since the install is left in place and reported (a `stdout`
+event `left <pkg>: <item>: <why>`), and the job then ends `failed` (exit 1). The daemon does not check that the
+packages are installed: the CLI decides that under the lock, and refuses, changing nothing, an unknown or
+non-recorded package, an installer package (`vcrun2022`, `wine-mono`), a package installed before metadata schema 5,
+or a package another recorded package needs unless both are named. The job's events carry the refusal.
+
+```sh
+runtime rpc deps.remove '{"id": "game", "packages": ["dxvk"]}'
+```
+
 ### `permissions.set`
 
 Params: `{"id", "set": ["network=allow", "fs+=/home/me/Games:rw", ...]}` (1-32 of `runtime permissions --set`'s
@@ -543,7 +561,7 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 
 ## Versioning and compatibility
 
-- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.2**. Until 1.0:
+- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.3**. Until 1.0:
   - a **breaking** change bumps the **minor** version: a method removed or renamed, a param changed, a result
     member removed or retyped, an enum value removed;
   - an **additive** change bumps the **patch** version: a new method, a new result member, a new enum value, a new
@@ -572,6 +590,8 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 - **0.2.2 is additive**: the `data.kind` `runtime_mismatch`, and the `Unknown` fallback on every result enum (a
   client-side change: the wire is unchanged). An older client reads `runtime_mismatch` as `ErrorKind::Unknown` and
   shows the message.
+- **0.2.3 is additive**: the `deps.remove` method and its job kind `depsRemove`. A 0.2.2 daemon answers `deps.remove`
+  `-32601`; an older client reads the job kind as `Unknown`.
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
@@ -680,7 +700,7 @@ edge is used by these two commands alone.
 ```sh
 sock=$XDG_RUNTIME_DIR/runtime/runtimed.sock
 printf '%s\n' '{"jsonrpc":"2.0","method":"rpc.version","id":1}' | socat - UNIX-CONNECT:$sock
-# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.2","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
+# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.3","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
 printf '%s\n' '{"jsonrpc":"2.0","method":"apps.get","params":{"id":"nope"},"id":"a"}' | nc -U -N $sock
 # {"error":{"code":-32000,"data":{"kind":"not_found"},"message":"no app named nope is installed"},"id":"a","jsonrpc":"2.0"}
 ```
@@ -725,7 +745,7 @@ line of at most 16 MiB, be JSON-RPC 2.0, carry the call's id (or `null` on an er
   them on a terminal.
 - Typed helpers exist for every method: `version`, `apps`, `app`, `permissions`, `compat`, `doctor_system`,
   `doctor_app`, `graphics_info`, `sandbox_info`, `deps_plan`; and for write mode `run_app`, `install`
-  (`InstallParams`), `remove`, `deps_install`, `permissions_set`, `permissions_reset`, `display_set`, `job_poll`
+  (`InstallParams`), `remove`, `deps_install`, `deps_remove`, `permissions_set`, `permissions_reset`, `display_set`, `job_poll`
   (its deadline is `waitMs` + 15 s, never under 40 s), `job_status`, `job_cancel`, `jobs`.
 - Strings in results (event texts included) are returned as the daemon sent them. Clean or escape them before you
   show them.

@@ -243,6 +243,11 @@ impl Client {
             json!({ "id": id, "planDigest": digest, "consent": consent }),
         )
     }
+    /// `deps.remove` (API 0.2.3): removes the recorded archive packages `packages` (1 to 16 ids) from app `id`. An
+    /// older daemon answers -32601 (unknown method).
+    pub fn deps_remove(&mut self, id: &str, packages: &[String]) -> Result<JobStarted, ClientError> {
+        self.typed("deps.remove", json!({ "id": id, "packages": packages }))
+    }
     pub fn permissions_set(&mut self, id: &str, set: &[String]) -> Result<JobStarted, ClientError> {
         self.typed("permissions.set", json!({ "id": id, "set": set }))
     }
@@ -588,6 +593,11 @@ mod tests {
                 JobKind::DisplaySet,
                 "display\0--\0a5\0wayland\0",
             ),
+            (
+                c.deps_remove("a6", &["vkd3d-proton".into(), "dxvk".into()]),
+                JobKind::DepsRemove,
+                "deps\0--remove=vkd3d-proton\0--remove=dxvk\0--\0a6\0",
+            ),
         ];
         for (r, kind, argv) in starts {
             let id = r.unwrap().job_id;
@@ -618,7 +628,7 @@ mod tests {
         // poll, list, cancel
         let ev = c.job_poll(&id, 0, 0).unwrap();
         assert_eq!(ev.events[0].text, "queued");
-        assert_eq!(c.jobs().unwrap().len(), 8);
+        assert_eq!(c.jobs().unwrap().len(), 9);
         f.mode(Some("a6"), "wait");
         let id = c.remove("a6").unwrap().job_id;
         f.wait_for(&id, "ready");

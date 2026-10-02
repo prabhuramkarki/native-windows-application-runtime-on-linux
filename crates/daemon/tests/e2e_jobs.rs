@@ -114,6 +114,13 @@ fn jobs_run_the_sibling_runtime_with_the_exact_argv_and_die_with_the_daemon() {
     assert_eq!((info.state, info.exit_code), (JobState::Succeeded, Some(0)), "{ev:?}");
     assert_eq!(s.fake("argv", "notepad"), "remove\0--\0notepad\0");
     assert!(ev.iter().any(|e| e.kind == EventKind::Stdout && e.text == "done"));
+    // deps.remove (0.2.3): its argv, exactly; an option-looking package never reaches a child.
+    let e = c.deps_remove("dr", &["-x".into()]).unwrap_err();
+    assert_eq!(e.api_error().unwrap().kind, rt_api::ErrorKind::InvalidArgument);
+    let id = c.deps_remove("dr", &["dxvk".into()]).unwrap().job_id;
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!(info.state, JobState::Succeeded, "{ev:?}");
+    assert_eq!(s.fake("argv", "dr"), "deps\0--remove=dxvk\0--\0dr\0");
     // Cancel.
     s.mode("a", "wait");
     let id = c.remove("a").unwrap().job_id;

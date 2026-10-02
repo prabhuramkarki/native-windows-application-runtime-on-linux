@@ -319,6 +319,7 @@ fn record(id: &str) -> crate::DependencyRecord {
         sha256: "0".repeat(64),
         installed_at: 1_800_000_000,
         consent: None,
+        archive: None,
     }
 }
 

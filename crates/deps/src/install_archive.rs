@@ -56,13 +56,16 @@
 //!
 //! * if the retry SUCCEEDS but selects less than the killed run wrote (the selection comes from the manifest's
 //!   `extract`, which can change while the archive stays pinned), the listed files it did not write again are
-//!   still recorded in `files` (and listed replaced ones in `replaced`), so [`remove_archive`] removes them too.
+//!   still recorded in `files` (and listed replaced ones in `replaced`), so [`record_of`] records them and
+//!   [`remove_archive`] removes them too.
 //!
 //! The `F`/`D`/`R` entries are facts about the prefix, not about an archive. A journal written for a DIFFERENT
 //! archive of the package (another sha256) is still [`ArchiveError::Journal`] for [`install_archive`]: the way out
-//! is [`discard_interrupted`], which undoes exactly what the journal lists and deletes it. Calling
-//! [`remove_archive`] with an empty record instead would delete the journal and make the next install back up the
-//! killed run's files as originals, so it refuses (with [`ArchiveError::Journal`]) while a journal exists.
+//! is [`discard_interrupted`], which undoes exactly what the journal lists and deletes it. Calling `undo_install`
+//! with an empty result instead would delete the journal and make the next install back up the killed run's files
+//! as originals, so it refuses (with [`ArchiveError::Journal`]) while a journal exists. [`remove_archive`] has no
+//! such case: it only ever gets the record of a package the app records, and a recorded package is never installed
+//! again (upgrades are refused), so its journal is that install's own.
 //!
 //! The journal is read defensively (regular file only, `O_NOFOLLOW`, at most 4 MiB and 16384 entries, UTF-8, a
 //! header naming a valid sha256, strict `F `/`D `/`R ` lines whose paths pass the same rules as a recorded
@@ -70,11 +73,12 @@
 //! newline is dropped, because it was being appended when the process died and the step it announced had not
 //! started; before appending to such a journal, the torn tail is cut off (`ftruncate`), so reading and appending
 //! agree. A torn HEADER cannot come from a crash (the journal is created atomically) and is an error. The journal
-//! stays after a successful install (the caller may die before recording it) and is deleted by a successful
-//! [`remove_archive`] and by a fully rolled-back install (which also removes what the killed attempt left).
+//! stays after a successful install (the caller may die before recording it) and is deleted by a
+//! [`remove_archive`] without hard failures and by a fully rolled-back install (which also removes what the killed
+//! attempt left).
 //!
 //! **Failure.** On any error [`install_archive`] undoes exactly what the call did (overrides deleted newest
-//! first, new files deleted, replaced files restored, created directories removed when empty) and returns the
+//! first, or put back to their previous values with [`install_archive_with_previous`], new files deleted, replaced files restored, created directories removed when empty) and returns the
 //! ORIGINAL error; if undoing fails too, the result is [`ArchiveError::Rollback`] carrying both. A process that is
 //! KILLED mid-install cannot roll back: earlier files, backups and the journal stay, and the next install (or its
 //! rollback) takes them over (see the journal). The caller records a package in the app's state only after
@@ -85,16 +89,23 @@
 //! written by Wine's own `reg.exe` in the prefix, run through the backend:
 //! `reg add HKCU\Software\Wine\DllOverrides /v <name> /d native,builtin /f`, wrapped by
 //! [`CompatBackend::settle`] (so `wineserver` has flushed `user.reg` before the call returns) and run by
-//! [`Launcher::run_helper`] with a deadline; a non-zero exit is [`ArchiveError::Registry`]. Removal runs
-//! `reg delete ... /v <name> /f`; if that fails, `reg query ... /v <name>` decides whether the value is already
+//! [`Launcher::run_helper`] with a deadline; a non-zero exit is [`ArchiveError::Registry`]. Removal puts a recorded
+//! previous value back with `reg add ... /v <name> /d <previous> /f`, or runs `reg delete ... /v <name> /f` when the
+//! override did not exist before; if a delete fails, `reg query ... /v <name>` decides whether the value is already
 //! gone (then it is not an error, so removal can be retried). Verified on real Wine 10.0 by the ignored test
 //! `e2e_real_wine_zip_and_tar_gz_with_a_dll_override`: `reg.exe` exists in a fresh prefix, the value is in
 //! `user.reg` once the settled command returns, and `reg delete` removes it. The `user.reg` writer the ruling
 //! also allowed was therefore not needed.
 //!
-//! **Recording.** [`ArchiveInstalled`] is (de)serialisable so the caller can persist it; [`remove_archive`]
-//! re-validates every recorded path and name (and the list sizes) before touching anything, since a recorded
-//! state file is not trusted either.
+//! **Recording (metadata schema 5).** [`ArchiveInstalled`] is what one call did; it is not persisted. What is
+//! persisted is [`rt_core::ArchiveRecord`], built by [`record_of`] right after the install under the app lock: each
+//! file with the sha256 of its bytes as hashed from disk, whether it replaced a file, the created directories, and
+//! each override with its value before the install (read by `wine_config::read_dll_overrides` before the download;
+//! a value the runtime could not restore refuses the install). [`remove_archive`] takes that record, re-validates
+//! every path, name and previous value (the list sizes too) before touching anything, since `metadata.json` is not
+//! trusted either, and then verifies each entry against the prefix: what changed since the install is left in
+//! place and reported, never deleted. If the record cannot be written, the orchestrator undoes the install with
+//! `undo_install` (the unverified undo of the current call), so an archive package never stays unrecorded.
 //!
 //! **Not covered** (as for `rt_core::unzip` and `winpath`): a process that can write inside `drive_c` WHILE this
 //! runs could swap a checked directory for a symlink. Callers install only while no Windows program runs in the
@@ -119,6 +130,8 @@ use std::time::Duration;
 pub const BACKUP_DIR: &str = "deps-backup";
 /// Where Wine reads per-DLL load order.
 pub const OVERRIDES_KEY: &str = r"HKCU\Software\Wine\DllOverrides";
+/// The value an archive install gives each of its DLL overrides.
+pub const INSTALLED_OVERRIDE: &str = "native,builtin";
 /// Deadline of one `reg.exe` run (including the settle wait for `wineserver`).
 const REG_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most entries in a zip, and most recorded files or directories in an [`ArchiveInstalled`].
@@ -135,7 +148,8 @@ const MAX_JOURNAL_ENTRIES: usize = 4 * MAX_ENTRIES;
 /// Most rollback failures quoted in an error.
 const MAX_REPORTED: usize = 5;
 
-/// What one [`install_archive`] call put into the prefix: exactly what [`remove_archive`] takes away again. Paths
+/// What one [`install_archive`] call put into the prefix: what [`record_of`] records and `undo_install` takes away
+/// again. Paths
 /// are relative to `drive_c`, with the real on-disk spelling of existing components.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,10 +206,26 @@ pub fn install_archive(
     backend: &dyn CompatBackend,
     launcher: &Launcher,
 ) -> Result<ArchiveInstalled, ArchiveError> {
+    install_archive_with_previous(pkg, file, env, backend, launcher, &[])
+}
+
+/// [`install_archive`] knowing each override's value before the install (`wine_config::read_dll_overrides`): a
+/// rollback puts those values back instead of deleting the overrides (as `undo_install` does, Decision R14). A
+/// previous value the runtime could not restore is refused before anything is written.
+pub fn install_archive_with_previous(
+    pkg: &Package,
+    file: &Path,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    previous: &[(String, Option<String>)],
+) -> Result<ArchiveInstalled, ArchiveError> {
     let (format, extract, overrides) = check_package(pkg)?;
     check_overrides(overrides, Some(&pkg.provides))?;
+    check_previous(previous)?;
     let src = open_archive(file, pkg.size)?;
     let mut ledger = Ledger::new(env, &pkg.id);
+    ledger.previous = previous.to_vec();
     ledger.sha256.clone_from(&pkg.sha256);
     ledger.adopt()?;
     let result = (|| {
@@ -216,7 +246,7 @@ pub fn install_archive(
         Ok(()) => {
             // The selection comes from the manifest, not the archive: a retry may select less than the killed run
             // wrote. Whatever it did not write again stays ours (the file on disk is the killed run's copy, the
-            // backup the original), so it is recorded and `remove_archive` takes it away too.
+            // backup the original), so it is recorded and removal takes it away too.
             for f in &ledger.adopted {
                 if !ledger.done.files.contains(f) {
                     ledger.done.files.push(f.clone());
@@ -288,12 +318,91 @@ pub fn discard_interrupted(pkg_id: &str, env: &AppEnv) -> Result<DiscardReport, 
     }
 }
 
-/// Removes what `installed` records for package `pkg_id`: deletes the overrides, deletes exactly the recorded new
-/// files, restores replaced originals from the backup directory (then deletes the backups) and removes the
-/// recorded directories that are empty. Files and directories already gone are fine, so it can be retried. The
-/// record is validated first; on failures the first one is returned after everything else was attempted.
-pub fn remove_archive(
+/// The persisted record of `done` (Decision R2): each file hashed from disk as it is NOW (reached with no symlink in
+/// any component, opened `O_NOFOLLOW`, a regular file only), each override paired with its value before the install
+/// from `previous` (`read_dll_overrides`, read before the download). The caller holds the app lock and no
+/// `wineserver` serves the prefix, so the files are exactly what the install left, including those adopted from a
+/// killed earlier attempt. `Err`: a file gone, unreadable or not a regular file, more than [`rt_core::MAX_RECORDED`]
+/// files, directories or overrides, a path that is not UTF-8, or an override without a previous entry.
+pub fn record_of(
+    done: &ArchiveInstalled,
+    previous: &[(String, Option<String>)],
+    env: &AppEnv,
+) -> Result<rt_core::ArchiveRecord, ArchiveError> {
+    let cap = rt_core::MAX_RECORDED;
+    if done.files.len() > cap || done.created_dirs.len() > cap || done.overrides.len() > cap {
+        return Err(ArchiveError::BadPackage(format!(
+            "the install wrote more than {cap} files, directories or overrides: too many to record"
+        )));
+    }
+    let text = |p: &Path| {
+        p.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| ArchiveError::Destination(format!("{:?} is not UTF-8", clip(&p.to_string_lossy()))))
+    };
+    let ledger = Ledger::new(env, "");
+    let mut files = Vec::with_capacity(done.files.len());
+    for rel in &done.files {
+        let sha256 = match ledger.hash(rel)? {
+            Hashed::File(h) => h,
+            Hashed::Gone => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is gone right after the install",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
+            Hashed::Oversized => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is larger than an install writes",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
+            Hashed::NotRegular => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is not a regular file",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
+        };
+        files.push(rt_core::RecordedFile {
+            path: text(rel)?,
+            sha256,
+            replaced: done.replaced.contains(rel),
+        });
+    }
+    let created_dirs = done.created_dirs.iter().map(|d| text(d)).collect::<Result<_, _>>()?;
+    let overrides = done
+        .overrides
+        .iter()
+        .map(|name| match previous.iter().find(|(n, _)| n == name) {
+            Some((_, prev)) => Ok(rt_core::RecordedOverride {
+                name: name.clone(),
+                previous: prev.clone(),
+            }),
+            None => Err(ArchiveError::BadOverrideName(format!(
+                "{}: its previous value was not read",
+                clip(name)
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(rt_core::ArchiveRecord {
+        files,
+        created_dirs,
+        overrides,
+    })
+}
+
+/// Undoes what the CURRENT [`install_archive`] call `installed` (Decision R11): puts each override back to its value
+/// in `previous` (as read before the download), deleting those that had none (R14), deletes the
+/// new files, restores replaced originals from the backup directory (then deletes the backups), removes the created
+/// directories that are empty, and deletes the journal. Nothing is verified: this is the same undo `install_archive`
+/// runs on its own errors, for the one case where its result could not be recorded (R12), in the same locked run
+/// with no gap in which anyone else could write. Only the orchestrator's `install_one` calls it. A persisted record
+/// is removed by the verifying `remove_archive` instead. On failures the first one is returned after everything else
+/// was attempted.
+pub(crate) fn undo_install(
     installed: &ArchiveInstalled,
+    previous: &[(String, Option<String>)],
     pkg_id: &str,
     env: &AppEnv,
     backend: &dyn CompatBackend,
@@ -306,7 +415,9 @@ pub fn remove_archive(
         )));
     }
     check_record(installed)?;
+    check_previous(previous)?;
     let mut ledger = Ledger::new(env, pkg_id);
+    ledger.previous = previous.to_vec();
     if installed.files.is_empty() && fs::symlink_metadata(ledger.journal_path()).is_ok() {
         return Err(ArchiveError::Journal(format!(
             "package {pkg_id:?} has an interrupted install; an empty record would drop its journal and leak it: use \
@@ -316,11 +427,208 @@ pub fn remove_archive(
     ledger.done = installed.clone();
     // A record may list directories in any order: children first.
     ledger.done.created_dirs.sort_by_key(|d| d.components().count());
+    // Newest first: an override that had a value before the install gets it back (R14), one that had none is
+    // deleted.
     let mut failures = ledger.undo_overrides(env, backend, launcher);
     failures.extend(ledger.undo_files());
     match failures.into_iter().next() {
         Some(first) => Err(first),
         None => ledger.drop_journal(),
+    }
+}
+
+/// Why an unchanged-looking item was left in place ([`RemoveOutcome::left`]).
+const CHANGED: &str = "changed since it was installed";
+const NOT_FOLLOWED: &str = "not a regular file, or reached through a symbolic link: left in place, not followed";
+
+/// What [`remove_archive`] did with one package's record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// `removed <path>`, `restored <path>`, `override <name> restored` or `override <name> deleted`, in the order
+    /// done.
+    pub done: Vec<String>,
+    /// `(item, why)`: what changed since the install and was left in place (Decision R6): a file whose hash
+    /// differs, a path that is not a regular file or goes through a symlink, an override whose value is not
+    /// [`INSTALLED_OVERRIDE`]. Such items are no longer the runtime's: they are not in `remaining`.
+    pub left: Vec<(String, String)>,
+    /// `(item, error)`: hard failures (an I/O error, `reg.exe` failing or timing out; Decision R7). A failure to
+    /// delete the journal is reported as item `journal`, with nothing in `remaining` for it: the caller then keeps
+    /// the whole record (fail closed), and a retry deletes the journal.
+    pub failed: Vec<(String, String)>,
+    /// Exactly the record entries whose step failed: what a retry has to work on. Empty when nothing failed.
+    pub remaining: rt_core::ArchiveRecord,
+}
+
+/// Removes what `rec` records for package `pkg_id`, verifying each entry against the prefix first (spec 4.3):
+/// 1. the id and the whole record are validated (paths through the Windows name rules inside `drive_c`, override
+///    names, previous values in the restorable charset); `Err` means nothing was touched;
+/// 2. overrides, newest first: `user.reg` is read once; an override whose value is exactly [`INSTALLED_OVERRIDE`]
+///    gets its previous value back (`reg add ... /d <previous> /f`) or is deleted when it had none, each argument
+///    one argv element, through `launcher`; any other value, or none, is left;
+/// 3. files, newest first: reached with no symlink in any component, opened `O_NOFOLLOW`, `fstat`ed to be a
+///    regular file and hashed. Equal to the record: deleted (a new file) or replaced by its backup (a replaced
+///    one). Different: left, and a replaced file's backup is kept. Already gone: removed, or for a replaced file
+///    its original is restored. A symlink, a directory or a special file is left, never followed;
+/// 4. created directories, children first, removed only when empty;
+/// 5. when nothing failed, the journal is deleted (and empty backup directories pruned).
+///
+/// Nothing that is not in the record is deleted or changed; nothing is listed or walked.
+pub fn remove_archive(
+    rec: &rt_core::ArchiveRecord,
+    pkg_id: &str,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+) -> Result<RemoveOutcome, ArchiveError> {
+    if !manifest::valid_id(pkg_id) {
+        return Err(ArchiveError::BadPackage(format!(
+            "invalid package id {:?}",
+            clip(pkg_id)
+        )));
+    }
+    check_archive_record(rec)?;
+    let ledger = Ledger::new(env, pkg_id);
+    let mut out = RemoveOutcome::default();
+    let fail = |out: &mut RemoveOutcome, item: String, e: &dyn std::fmt::Display| {
+        out.failed.push((item, clip(&e.to_string())));
+    };
+
+    let names: Vec<String> = rec.overrides.iter().map(|o| o.name.clone()).collect();
+    let mut failed_overrides = HashSet::new();
+    match crate::wine_config::dll_overrides_equal(env, &names, INSTALLED_OVERRIDE) {
+        Err(e) => {
+            for o in &rec.overrides {
+                fail(&mut out, format!("override {}", o.name), &e);
+                failed_overrides.insert(o.name.as_str());
+            }
+        }
+        Ok(states) => {
+            for (o, state) in rec.overrides.iter().zip(states).rev() {
+                let item = format!("override {}", o.name);
+                match state {
+                    Some(true) => {
+                        let (undone, verb) = match &o.previous {
+                            Some(v) => (restore_override(&o.name, v, env, backend, launcher), "restored"),
+                            None => (delete_override(&o.name, env, backend, launcher, None), "deleted"),
+                        };
+                        match undone {
+                            Ok(()) => out.done.push(format!("{item} {verb}")),
+                            Err(e) => {
+                                fail(&mut out, item, &e);
+                                failed_overrides.insert(o.name.as_str());
+                            }
+                        }
+                    }
+                    Some(false) => out.left.push((item, CHANGED.into())),
+                    None => out.left.push((item, "already removed".into())),
+                }
+            }
+        }
+    }
+    out.remaining.overrides = rec
+        .overrides
+        .iter()
+        .filter(|o| failed_overrides.contains(o.name.as_str()))
+        .cloned()
+        .collect();
+
+    for f in rec.files.iter().rev() {
+        let rel = Path::new(&f.path);
+        let path = clip(&f.path);
+        // A replaced file that is left keeps its backup, and the report says where it is (only while it is there).
+        let kept = |why: &str| match f.replaced && ledger.backup_exists(rel) {
+            true => format!("{why}; its original is kept at {BACKUP_DIR}/{pkg_id}/c/{path}"),
+            false => why.to_owned(),
+        };
+        let step = match ledger.hash(rel) {
+            Ok(Hashed::NotRegular) => {
+                out.left.push((path.clone(), kept(NOT_FOLLOWED)));
+                continue;
+            }
+            Ok(Hashed::Oversized) => {
+                out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
+            Ok(Hashed::File(h)) if h != f.sha256 => {
+                out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
+            // Unchanged, but its original is gone: there is nothing to put back, so it stays as installed, and
+            // keeping it in the record would fail every retry (review I1, as R15): left, and out of the record.
+            Ok(Hashed::File(_)) if f.replaced && !ledger.backup_exists(rel) => {
+                out.left
+                    .push((path.clone(), "its original backup is missing: left as installed".into()));
+                ledger.prune_backup_dirs(rel);
+                continue;
+            }
+            // Gone together with its backup: nothing to restore, and keeping it would fail every retry (Ruling
+            // 6F-2): left, and out of the record.
+            Ok(Hashed::Gone) if f.replaced && !ledger.backup_exists(rel) => {
+                out.left.push((path.clone(), "missing, nothing to restore".into()));
+                ledger.prune_backup_dirs(rel);
+                continue;
+            }
+            // Unchanged, or already gone: a replaced file gets its original back either way.
+            Ok(Hashed::File(_) | Hashed::Gone) if f.replaced => ledger.restore(rel).map(|()| "restored"),
+            Ok(Hashed::File(_)) => ledger.remove_file(rel).map(|()| "removed"),
+            Ok(Hashed::Gone) => Ok("removed"),
+            Err(e) => Err(e),
+        };
+        match step {
+            Ok(verb) => out.done.push(format!("{verb} {path}")),
+            Err(e) => {
+                fail(&mut out, path, &e);
+                out.remaining.files.insert(0, f.clone());
+            }
+        }
+    }
+
+    let mut dirs: Vec<&String> = rec.created_dirs.iter().collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(Path::new(d).components().count()));
+    for d in dirs {
+        match ledger.remove_created_dir(Path::new(d)) {
+            Ok(true) => {}
+            Ok(false) => out
+                .left
+                .push((clip(d), NOT_FOLLOWED.replace("a regular file", "a directory"))),
+            Err(e) => {
+                fail(&mut out, clip(d), &e);
+                out.remaining.created_dirs.push(d.clone());
+            }
+        }
+    }
+    // Keep the record's order (parents first) for a retry.
+    out.remaining
+        .created_dirs
+        .sort_by_key(|d| rec.created_dirs.iter().position(|r| r == d));
+
+    if out.failed.is_empty()
+        && let Err(e) = ledger.drop_journal()
+    {
+        fail(&mut out, "journal".into(), &e);
+    }
+    Ok(out)
+}
+
+/// Puts DLL override `name` back to `value` (a restorable previous value): `reg add ... /v <name> /d <value> /f`.
+fn restore_override(
+    name: &str,
+    value: &str,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+) -> Result<(), ArchiveError> {
+    let (ok, detail) = reg(
+        &["add", OVERRIDES_KEY, "/v", name, "/d", value, "/f"],
+        env,
+        backend,
+        launcher,
+        None,
+    )?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ArchiveError::Registry(format!("reg add {name}: {detail}")))
     }
 }
 
@@ -375,6 +683,20 @@ fn valid_override(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Every previous override value is one the runtime can restore (Decision R5).
+fn check_previous(previous: &[(String, Option<String>)]) -> Result<(), ArchiveError> {
+    let bad = |v: &Option<String>| {
+        v.as_deref()
+            .is_some_and(|v| !crate::wine_config::restorable_override(v))
+    };
+    if previous.iter().any(|(_, v)| bad(v)) {
+        return Err(ArchiveError::BadPackage(
+            "a previous override value is not one the runtime can restore".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Every name valid and unique; with `provides`, every name also in it.
 pub(crate) fn check_overrides(names: &[String], provides: Option<&[String]>) -> Result<(), ArchiveError> {
     if names.len() > MAX_LIST_LEN {
@@ -392,7 +714,7 @@ pub(crate) fn check_overrides(names: &[String], provides: Option<&[String]>) -> 
     Ok(())
 }
 
-/// A recorded install is re-validated before [`remove_archive`] acts on it.
+/// An install result is re-validated before `undo_install` acts on it.
 fn check_record(r: &ArchiveInstalled) -> Result<(), ArchiveError> {
     let bad = |why: String| ArchiveError::BadPackage(format!("recorded install: {why}"));
     if r.files.len() > MAX_ENTRIES || r.created_dirs.len() > MAX_ENTRIES || r.replaced.len() > r.files.len() {
@@ -408,6 +730,35 @@ fn check_record(r: &ArchiveInstalled) -> Result<(), ArchiveError> {
         )));
     }
     check_overrides(&r.overrides, None).map_err(|e| bad(e.to_string()))
+}
+
+/// A persisted record is re-validated before [`remove_archive`] acts on it (the metadata crate checked its shape
+/// only): every path passes the Windows name rules inside `drive_c`, every sha256 is well-formed, override names are
+/// valid and unique, and previous values are restorable. The error never quotes a previous value.
+pub(crate) fn check_archive_record(r: &rt_core::ArchiveRecord) -> Result<(), ArchiveError> {
+    let bad = |why: String| ArchiveError::BadPackage(format!("recorded install: {why}"));
+    let cap = rt_core::MAX_RECORDED;
+    if r.files.len() > cap || r.created_dirs.len() > cap || r.overrides.len() > cap {
+        return Err(bad("too many entries".into()));
+    }
+    for p in r.files.iter().map(|f| &f.path).chain(&r.created_dirs) {
+        win_path(Path::new(p)).map_err(|_| bad(format!("unsafe path {:?}", clip(p))))?;
+    }
+    if r.files.iter().any(|f| !manifest::valid_sha256(&f.sha256)) {
+        return Err(bad("a file's sha256 is not 64 lowercase hex digits".into()));
+    }
+    let names: Vec<String> = r.overrides.iter().map(|o| o.name.clone()).collect();
+    check_overrides(&names, None).map_err(|e| bad(e.to_string()))?;
+    if r.overrides.iter().any(|o| {
+        o.previous
+            .as_deref()
+            .is_some_and(|v| !crate::wine_config::restorable_override(v))
+    }) {
+        return Err(bad(
+            "a previous override value is not one the runtime can restore".into()
+        ));
+    }
+    Ok(())
 }
 
 /// A `drive_c`-relative path as a [`WinPath`]: plain UTF-8 components only, then the full Windows name rules.
@@ -704,6 +1055,8 @@ struct Ledger {
     adopted: Vec<PathBuf>,
     /// Files the killed attempt listed as replaced whose backup still exists: restored on rollback.
     adopted_replaced: Vec<PathBuf>,
+    /// Each override's value before the install: what undoing it puts back (`None`, or not listed: deleted).
+    previous: Vec<(String, Option<String>)>,
 }
 
 /// Appends one journal line and makes it durable before the step it announces.
@@ -801,6 +1154,7 @@ impl Ledger {
             prior_files: HashSet::new(),
             adopted: Vec::new(),
             adopted_replaced: Vec::new(),
+            previous: Vec::new(),
         }
     }
 
@@ -957,8 +1311,14 @@ impl Ledger {
         let dest = dir.join(rel.file_name().unwrap_or_default());
         atomic_write(&dest, &mut open_nofollow(&target)?, None, 0o644)?;
         fs::remove_file(&target)?;
-        // Prune empty backup directories up to and including `deps-backup`.
+        self.prune_backup_dirs(rel);
+        Ok(())
+    }
+
+    /// Prunes the empty backup directories above the backup of `rel`, up to and including `deps-backup`.
+    fn prune_backup_dirs(&self, rel: &Path) {
         let top = self.app_root.join(BACKUP_DIR);
+        let target = self.app_root.join(&self.backups).join(rel);
         let mut dir = target.parent();
         while let Some(d) = dir
             && d.starts_with(&top)
@@ -966,7 +1326,6 @@ impl Ledger {
         {
             dir = d.parent();
         }
-        Ok(())
     }
 
     /// The host path of `rel` under `drive_c` through real directories only (no symlinks); `None` if it is gone.
@@ -986,6 +1345,32 @@ impl Ledger {
         }
     }
 
+    /// Whether anything (even a symlink, which `restore` then refuses) is at the backup of `rel`. An error other
+    /// than "not found" counts as present, so `restore` reports it.
+    fn backup_exists(&self, rel: &Path) -> bool {
+        !matches!(
+            fs::symlink_metadata(self.app_root.join(&self.backups).join(rel)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        )
+    }
+
+    /// Removes the recorded directory `rel` if it is empty. `Ok(false)`: it is not a directory, or the path goes
+    /// through a symlink (left, never followed); gone or not empty is `Ok(true)` (nothing to do).
+    fn remove_created_dir(&self, rel: &Path) -> Result<bool, ArchiveError> {
+        let path = match resolve_under(&self.drive_c, &win_path(rel)?) {
+            Ok(p) => p,
+            Err(ResolveError::NotFound) => return Ok(true),
+            Err(ResolveError::Symlink | ResolveError::SpecialFile | ResolveError::NotADirectory) => return Ok(false),
+            Err(e) => return Err(resolve_err(rel, e)),
+        };
+        match fs::remove_dir(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) || e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn remove_dir(&self, rel: &Path) -> Result<(), ArchiveError> {
         let Some(p) = self.resolve(rel)? else {
             return Ok(());
@@ -996,11 +1381,25 @@ impl Ledger {
         }
     }
 
-    /// Deletes the overrides in `done`, newest first, continuing past failures.
+    /// Undoes the overrides in `done`, newest first, continuing past failures: one with a value in `previous`
+    /// gets it back, any other is deleted.
     fn undo_overrides(&self, env: &AppEnv, backend: &dyn CompatBackend, launcher: &Launcher) -> Vec<ArchiveError> {
-        let deleted = self.done.overrides.iter().rev();
-        deleted
-            .filter_map(|name| delete_override(name, env, backend, launcher, None).err())
+        self.done
+            .overrides
+            .iter()
+            .rev()
+            .filter_map(|name| {
+                match self
+                    .previous
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .and_then(|(_, v)| v.as_deref())
+                {
+                    Some(v) => restore_override(name, v, env, backend, launcher),
+                    None => delete_override(name, env, backend, launcher, None),
+                }
+                .err()
+            })
             .collect()
     }
 
@@ -1034,6 +1433,67 @@ impl Ledger {
             note(self.remove_dir(rel));
         }
         failures
+    }
+}
+
+/// What [`Ledger::hash`] found at a recorded path.
+#[derive(Debug, PartialEq, Eq)]
+enum Hashed {
+    /// A regular file, with the lowercase hex sha256 of its bytes.
+    File(String),
+    /// Nothing there.
+    Gone,
+    /// A regular file larger than any install writes ([`MAX_EXPANDED`]): changed, and not read.
+    Oversized,
+    /// A symlink in any component, a directory, a special file, or a component that is not a directory: never
+    /// followed and never read.
+    NotRegular,
+}
+
+impl Ledger {
+    /// Hashes the file at `rel` under `drive_c`: reached with no symlink in any component, opened `O_NOFOLLOW` (and
+    /// `O_NONBLOCK`, so a FIFO swapped in cannot hang the open), checked with `fstat` to be a regular file, then read
+    /// to the end.
+    fn hash(&self, rel: &Path) -> Result<Hashed, ArchiveError> {
+        use sha2::{Digest, Sha256};
+        let path = match resolve_under(&self.drive_c, &win_path(rel)?) {
+            Ok(p) => p,
+            Err(ResolveError::NotFound) => return Ok(Hashed::Gone),
+            Err(ResolveError::Symlink | ResolveError::SpecialFile | ResolveError::NotADirectory) => {
+                return Ok(Hashed::NotRegular);
+            }
+            Err(e) => return Err(resolve_err(rel, e)),
+        };
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Hashed::Gone),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Hashed::NotRegular),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Ok(Hashed::NotRegular);
+        }
+        // An install never writes more than this, so a bigger file has changed; reading it (a huge sparse file)
+        // would only hold the app lock for nothing.
+        if meta.len() > MAX_EXPANDED {
+            return Ok(Hashed::Oversized);
+        }
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Hashed::File(crate::fetch::hex(&hasher.finalize())))
     }
 }
 
@@ -1101,7 +1561,7 @@ pub(crate) fn reg(
     Ok((out.status.success(), clip(&detail)))
 }
 
-/// Sets `name` to `native,builtin`; `sandbox` as for [`reg`].
+/// Sets `name` to [`INSTALLED_OVERRIDE`]; `sandbox` as for [`reg`].
 pub(crate) fn set_override(
     name: &str,
     env: &AppEnv,
@@ -1110,7 +1570,7 @@ pub(crate) fn set_override(
     sandbox: Option<&InstallerSandbox>,
 ) -> Result<(), ArchiveError> {
     let (ok, detail) = reg(
-        &["add", OVERRIDES_KEY, "/v", name, "/d", "native,builtin", "/f"],
+        &["add", OVERRIDES_KEY, "/v", name, "/d", INSTALLED_OVERRIDE, "/f"],
         env,
         backend,
         launcher,

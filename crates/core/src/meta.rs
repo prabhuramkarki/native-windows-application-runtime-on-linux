@@ -22,13 +22,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The schema version this crate writes.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 /// The oldest schema version this crate still reads, so `MIN_SCHEMA_VERSION..=SCHEMA_VERSION` is accepted. Each
 /// version only added a `#[serde(default)]` field: schema 1 (Phase 2) had no `installer` (added in 2), and neither
 /// 1 nor 2 has `dependencies` (added in 3), and no version before 4 has `package` (added in 4). So no field-by-field
 /// migration code exists: `installer: None`, `dependencies: []` and `package: None` for an older file already ARE its
-/// correct v4 reading. Frozen v1/v2 bytes in the tests guard it. An older runtime refuses a v4 file (schema policy).
+/// correct v4 reading. Schema 5 (Phase 6F) adds `DependencyRecord::archive`, also `#[serde(default)]`: a schema 1-4
+/// record reads as `archive: None`, which IS its correct v5 reading (an archive package installed then recorded
+/// nothing it wrote, so it is not removable). Frozen v1/v2/v4 bytes in the tests guard it. An older runtime refuses a
+/// file of a newer schema (schema policy); only `rt_deps::state::record` bumps a file's schema.
 pub const MIN_SCHEMA_VERSION: u32 = 1;
+/// Most files, created directories or overrides one [`ArchiveRecord`] may hold (each list on its own).
+pub const MAX_RECORDED: usize = 64;
+/// Longest recorded previous value of a DLL override, in bytes.
+const MAX_PREVIOUS_LEN: usize = 32;
 /// Most [`DependencyRecord`]s one app may record. The bundled manifest has about a dozen packages; the cap keeps a
 /// hostile file's validation cheap and a full list of realistic records well inside [`MAX_FILE_BYTES`].
 pub const MAX_DEPENDENCIES: usize = 128;
@@ -90,6 +97,9 @@ pub enum MetaError {
     /// The field's content is not quoted: it is untrusted.
     #[error("field `package.{0}` is not valid")]
     BadPackage(&'static str),
+    /// Fixed text only: the record's content is untrusted and never quoted.
+    #[error("dependency record `archive`: {0}")]
+    BadArchiveRecord(&'static str),
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }
@@ -134,6 +144,88 @@ pub struct DependencyRecord {
     pub installed_at: u64,
     /// `Some` when the package needed consent and it was given.
     pub consent: Option<ConsentRecord>,
+    /// What the install wrote (schema 5; archive packages only). `None`: an installer package, or an archive
+    /// package installed before schema 5 (not removable). Not written when `None`, so rewriting an older file
+    /// leaves its bytes as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveRecord>,
+}
+
+/// Exactly what an archive package's install wrote into the prefix (schema 5), as `rt_deps` hashed it from disk
+/// under the app lock right after the install. Only its SHAPE is checked here; `rt_deps` re-validates its meaning
+/// (paths inside `drive_c` under the Windows name rules, override names, previous values) before acting on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArchiveRecord {
+    /// Every file the install wrote, in the order written.
+    pub files: Vec<RecordedFile>,
+    /// Directories the install created, `/`-separated and relative to `drive_c`, parents first.
+    pub created_dirs: Vec<String>,
+    /// DLL overrides the install set, in the order set.
+    pub overrides: Vec<RecordedOverride>,
+}
+
+/// One file an archive install wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordedFile {
+    /// `/`-separated, relative to `drive_c`.
+    pub path: String,
+    /// Lowercase hex SHA-256 of the file's bytes right after the install.
+    pub sha256: String,
+    /// The install replaced a file that existed; its original is in the package's backup directory.
+    pub replaced: bool,
+}
+
+/// One DLL override an archive install set, with the value it had before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordedOverride {
+    pub name: String,
+    /// `None`: the override did not exist before the install.
+    pub previous: Option<String>,
+}
+
+impl ArchiveRecord {
+    /// Shape only (see the type docs). Errors are fixed text.
+    fn validate(&self) -> Result<(), MetaError> {
+        let bad = |why| Err(MetaError::BadArchiveRecord(why));
+        if self.files.len() > MAX_RECORDED || self.created_dirs.len() > MAX_RECORDED {
+            return bad("too many files or directories");
+        }
+        if self.overrides.len() > MAX_RECORDED {
+            return bad("too many overrides");
+        }
+        let paths = self.files.iter().map(|f| &f.path).chain(&self.created_dirs);
+        if paths.clone().any(|p| p.len() > MAX_FIELD_LEN) {
+            return bad("a path is too long");
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !paths.into_iter().all(|p| seen.insert(p.as_str())) {
+            return bad("a path is recorded twice");
+        }
+        for f in &self.files {
+            sha256_hex("dependencies.archive.files.sha256", &f.sha256)?;
+        }
+        let name_ok = |n: &str| {
+            (1..=32).contains(&n.len())
+                && n.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        };
+        let mut names = std::collections::HashSet::new();
+        for o in &self.overrides {
+            if !name_ok(&o.name) {
+                return bad("an override name is not valid");
+            }
+            if !names.insert(o.name.as_str()) {
+                return bad("an override is recorded twice");
+            }
+            if o.previous.as_ref().is_some_and(|p| p.len() > MAX_PREVIOUS_LEN) {
+                return bad("a previous override value is too long");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Consent given for one package version.
@@ -407,6 +499,9 @@ impl Metadata {
             if !seen.insert(d.id.as_str()) {
                 return Err(MetaError::DuplicateDependency);
             }
+            if let Some(a) = &d.archive {
+                a.validate()?;
+            }
         }
         if let Some(p) = &self.package {
             p.validate(&self.id)?;
@@ -560,8 +655,8 @@ mod tests {
         m.write_atomic(&path).unwrap();
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
-        // New saves write schema 4 (the literal, not the constant, so a bump has to touch this test).
-        for key in ["\"schemaVersion\": 4", "\"created\"", "\"backend\"", "\"executable\""] {
+        // New saves write schema 5 (the literal, not the constant, so a bump has to touch this test).
+        for key in ["\"schemaVersion\": 5", "\"created\"", "\"backend\"", "\"executable\""] {
             assert!(text.contains(key), "{key} missing in {text}");
         }
         let mut none_version = m.clone();
@@ -616,25 +711,25 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_accepts_1_to_4_and_rejects_everything_else() {
-        for v in [0u64, 5, 99, u64::MAX] {
+    fn schema_version_accepts_1_to_5_and_rejects_everything_else() {
+        for v in [0u64, 6, 99, u64::MAX] {
             let err = Metadata::parse(&with("schemaVersion", Some(serde_json::json!(v)))).unwrap_err();
             assert!(matches!(err, MetaError::SchemaVersion(n) if n == v), "{v}: {err:?}");
         }
         // Both ends of the supported range parse (the sample's own shape already carries `installer: None`).
-        for v in [1u64, 2, 3, 4] {
+        for v in [1u64, 2, 3, 4, 5] {
             let bytes = with("schemaVersion", Some(serde_json::json!(v)));
             Metadata::parse(&bytes).unwrap_or_else(|e| panic!("schemaVersion {v} should parse: {e}"));
         }
         // An unknown future version with a shape we do not know is still reported as the version.
-        let err = Metadata::parse(br#"{"schemaVersion":5,"totally":"different"}"#).unwrap_err();
-        assert!(matches!(err, MetaError::SchemaVersion(5)), "{err:?}");
-        for bad in [0u32, 5] {
+        let err = Metadata::parse(br#"{"schemaVersion":6,"totally":"different"}"#).unwrap_err();
+        assert!(matches!(err, MetaError::SchemaVersion(6)), "{err:?}");
+        for bad in [0u32, 6] {
             let mut m = sample("app");
             m.schema_version = bad;
             assert!(matches!(m.validate(), Err(MetaError::SchemaVersion(n)) if n == u64::from(bad)));
         }
-        for good in [1, 2, 3, 4] {
+        for good in [1, 2, 3, 4, 5] {
             let mut m = sample("app");
             m.schema_version = good;
             m.validate().unwrap();
@@ -1215,6 +1310,7 @@ mod tests {
                 given_at: 1_799_999_999,
                 licence_text_sha256: HASH_B.into(),
             }),
+            archive: None,
         }
     }
 
@@ -1256,7 +1352,7 @@ mod tests {
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
         for key in [
-            "\"schemaVersion\": 4",
+            "\"schemaVersion\": 5",
             "\"dependencies\"",
             "\"installedAt\"",
             "\"givenAt\"",
@@ -1442,7 +1538,7 @@ mod tests {
         assert_eq!(Metadata::read(&path).unwrap(), m);
         let text = fs::read_to_string(&path).unwrap();
         for key in [
-            "\"schemaVersion\": 4",
+            "\"schemaVersion\": 5",
             "\"package\"",
             "\"requestedDependencies\"",
             "\"requestedPermissions\"",
@@ -1520,5 +1616,223 @@ mod tests {
             ..package("app")
         });
         m.validate().unwrap();
+    }
+
+    // ---------------------------------------------------------------- Phase 6F Task 1: schema v5, archive record
+
+    /// FROZEN: the exact bytes `Metadata::write_atomic` wrote at commit 088595a (schema 4, before 6F) for
+    /// `sample("my-app")` with a dxvk record (no consent) and a vcrun2022 record (with consent). Produced by running
+    /// that revision's code. Never edit.
+    const FROZEN_V4: &str = r#"{
+  "schemaVersion": 4,
+  "id": "my-app",
+  "name": "Sample App",
+  "version": "1.2.3",
+  "architecture": "x86_64",
+  "executable": "C:\\Program Files\\Sample\\app.exe",
+  "environment": "default",
+  "backend": {
+    "id": "wine",
+    "version": "wine-10.0"
+  },
+  "subsystem": "gui",
+  "created": 1700000000,
+  "installer": null,
+  "dependencies": [
+    {
+      "id": "dxvk",
+      "version": "2.4",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "installedAt": 1800000000,
+      "consent": null
+    },
+    {
+      "id": "vcrun2022",
+      "version": "14.40.33810",
+      "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "installedAt": 1800000001,
+      "consent": {
+        "givenAt": 1799999999,
+        "licenceTextSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
+    }
+  ],
+  "package": null
+}"#;
+
+    #[test]
+    fn frozen_v4_bytes_read_with_no_archive_record_and_write_back_unchanged() {
+        assert!(!FROZEN_V4.contains("archive"));
+        let m = parse_both_ways(FROZEN_V4);
+        assert_eq!(m.schema_version, 4);
+        assert_eq!(m.dependencies.len(), 2);
+        assert!(m.dependencies.iter().all(|d| d.archive.is_none()));
+        // Only `state::record` bumps the schema: a plain rewrite keeps the file as it was, byte for byte.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        m.write_atomic(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), FROZEN_V4);
+    }
+
+    fn dxvk_archive() -> ArchiveRecord {
+        let dlls = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"];
+        ArchiveRecord {
+            files: dlls
+                .iter()
+                .enumerate()
+                .map(|(i, d)| RecordedFile {
+                    path: format!("windows/system32/{d}.dll"),
+                    sha256: if i % 2 == 0 { HASH_A } else { HASH_B }.into(),
+                    replaced: i != 4,
+                })
+                .collect(),
+            created_dirs: vec![],
+            overrides: dlls
+                .iter()
+                .map(|d| RecordedOverride {
+                    name: (*d).into(),
+                    previous: (*d == "d3d11").then(|| "builtin".into()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn v5_round_trip_preserves_an_archive_record_in_camel_case() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("metadata.json");
+        let mut m = sample("app");
+        let mut d = dep("dxvk");
+        d.consent = None;
+        d.archive = Some(dxvk_archive());
+        m.dependencies = vec![d, dep("vcrun2022")];
+        m.write_atomic(&path).unwrap();
+        assert_eq!(Metadata::read(&path).unwrap(), m);
+        let text = fs::read_to_string(&path).unwrap();
+        for key in [
+            "\"schemaVersion\": 5",
+            "\"archive\"",
+            "\"createdDirs\"",
+            "\"replaced\": true",
+            "\"previous\": \"builtin\"",
+            "\"previous\": null",
+        ] {
+            assert!(text.contains(key), "{key} missing in {text}");
+        }
+    }
+
+    #[test]
+    fn the_archive_record_is_bounded_on_write_and_read_without_quoting() {
+        type Set = fn(&mut ArchiveRecord);
+        let bad: Vec<(&str, Set)> = vec![
+            ("65 files", |a| {
+                a.files = (0..=MAX_RECORDED)
+                    .map(|i| RecordedFile {
+                        path: format!("f{i}"),
+                        sha256: HASH_A.into(),
+                        replaced: false,
+                    })
+                    .collect()
+            }),
+            ("65 overrides", |a| {
+                a.overrides = (0..=MAX_RECORDED)
+                    .map(|i| RecordedOverride {
+                        name: format!("o{i}"),
+                        previous: None,
+                    })
+                    .collect()
+            }),
+            ("65 directories", |a| {
+                a.created_dirs = (0..=MAX_RECORDED).map(|i| format!("d{i}")).collect()
+            }),
+            ("sha256", |a| a.files[0].sha256 = "ABC".into()),
+            ("duplicate path", |a| a.files[1].path = a.files[0].path.clone()),
+            ("duplicate directory", |a| {
+                a.created_dirs = vec!["\u{1b}x".into(), "\u{1b}x".into()]
+            }),
+            ("duplicate override", |a| {
+                a.overrides[1].name = a.overrides[0].name.clone()
+            }),
+            ("uppercase override", |a| a.overrides[0].name = "D3D11".into()),
+            ("override charset", |a| a.overrides[0].name = "a;b".into()),
+            ("empty override", |a| a.overrides[0].name = String::new()),
+            ("long override", |a| a.overrides[0].name = "a".repeat(33)),
+            ("long previous", |a| a.overrides[0].previous = Some("a".repeat(33))),
+            ("long path", |a| a.files[0].path = "\u{1b}".repeat(MAX_FIELD_LEN + 1)),
+            ("long directory", |a| {
+                a.created_dirs = vec!["\u{1b}".repeat(MAX_FIELD_LEN + 1)]
+            }),
+        ];
+        for (what, set) in bad {
+            let mut m = sample("app");
+            let mut d = dep("dxvk");
+            let mut a = dxvk_archive();
+            set(&mut a);
+            d.archive = Some(a);
+            m.dependencies = vec![d];
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(err, MetaError::BadArchiveRecord(_) | MetaError::BadSha256 { .. }),
+                "{what}: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.len() < 128 && !msg.contains('\u{1b}') && !msg.contains("D3D11") && !msg.contains("a;b"),
+                "{what}: {msg:?}"
+            );
+            let bytes = serde_json::to_vec(&m).unwrap();
+            assert!(Metadata::parse(&bytes).is_err(), "read accepted {what}");
+            assert!(m.write_atomic(&tempfile::tempdir().unwrap().path().join("m")).is_err());
+        }
+        // The limits themselves are fine: 64 of each, a 32-byte previous value, an empty record.
+        let mut m = sample("app");
+        let mut d = dep("dxvk");
+        d.archive = Some(ArchiveRecord {
+            files: (0..MAX_RECORDED)
+                .map(|i| RecordedFile {
+                    path: format!("f{i}"),
+                    sha256: HASH_A.into(),
+                    replaced: false,
+                })
+                .collect(),
+            created_dirs: (0..MAX_RECORDED).map(|i| format!("d{i}")).collect(),
+            overrides: (0..MAX_RECORDED)
+                .map(|i| RecordedOverride {
+                    name: format!("o{i}"),
+                    previous: Some("a".repeat(32)),
+                })
+                .collect(),
+        });
+        m.dependencies = vec![d.clone()];
+        m.validate().unwrap();
+        d.archive = Some(ArchiveRecord::default());
+        m.dependencies = vec![d];
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_fields_in_the_archive_record_are_refused() {
+        let mut m = sample("app");
+        m.dependencies = vec![dep("dxvk")];
+        let mut v: serde_json::Value = serde_json::from_str(&json(&m)).unwrap();
+        v["dependencies"][0]["archive"] = serde_json::json!({"files": [], "createdDirs": [], "overrides": [], "x": 1});
+        assert!(Metadata::parse(&serde_json::to_vec(&v).unwrap()).is_err());
+        v["dependencies"][0]["archive"] = serde_json::json!({"files": [], "createdDirs": [], "overrides": []});
+        assert!(
+            Metadata::parse(&serde_json::to_vec(&v).unwrap()).unwrap().dependencies[0]
+                .archive
+                .is_some()
+        );
+        for (list, entry) in [
+            (
+                "files",
+                serde_json::json!({"path": "a", "sha256": HASH_A, "replaced": false, "x": 1}),
+            ),
+            ("overrides", serde_json::json!({"name": "a", "previous": null, "x": 1})),
+        ] {
+            let mut w = v.clone();
+            w["dependencies"][0]["archive"][list] = serde_json::json!([entry]);
+            assert!(Metadata::parse(&serde_json::to_vec(&w).unwrap()).is_err(), "{list}");
+        }
     }
 }
