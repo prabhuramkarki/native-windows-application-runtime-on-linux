@@ -6,7 +6,10 @@
 //! * B: the real `runtime` (copied from next to `runtimed`) with a fake Wine (`RUNTIME_WINE`/`RUNTIME_WINESERVER` in
 //!   the daemon's environment, which jobs inherit as `RUNTIME_*`): install, permissions, display, deps, run, remove,
 //!   and what the app sandbox would expose of `$XDG_RUNTIME_DIR` (spec D11).
-//! * C (`#[ignore]`, real Wine and bwrap): a sandboxed `apps.run` of `hello64.exe` whose output arrives as events.
+//! * C (`#[ignore]`, real Wine and bwrap): a sandboxed `apps.run` of `hello64.exe` whose output arrives as events,
+//!   and a `jobs.cancel` of a sandboxed `sleep64.exe` that leaves nothing behind (Phase 6E). These are not in CI's
+//!   `wine-e2e` job (it runs as root in a container; `runtimed --write` needs a user's 0700 `XDG_RUNTIME_DIR`):
+//!   run them locally with `cargo test -p runtime-daemon --test e2e_jobs -- --ignored`.
 //!
 //! Every run has its own scratch HOME, data dir and `XDG_RUNTIME_DIR` (never the user's).
 mod support;
@@ -483,4 +486,82 @@ fn a_real_sandboxed_run_streams_its_output() {
         "{ev:?}"
     );
     assert!(!ev.iter().any(|e| e.text.contains("WITHOUT a sandbox")));
+}
+
+/// Phase 6E (spec E11): a sandboxed `sleep64.exe` (prints `sleeping`, then sleeps up to 300 s) is cancelled through
+/// `jobs.cancel`. A clean end is proved by the app's own lock, not by scanning `/proc`: `apps.remove` refuses while
+/// the lock is held or a `wineserver` for the prefix exists, so its success shows nothing of the run is left. The
+/// remove is retried for up to 10 s because a `wineserver` may take a moment to exit after its sandbox's leader.
+/// Not in CI (see the module docs).
+#[test]
+#[ignore]
+fn a_real_sandboxed_run_is_cancelled_and_leaves_nothing() {
+    if !Path::new("/usr/bin/bwrap").exists() && std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_none() {
+        eprintln!("SKIPPED: no bwrap");
+        return;
+    }
+    let s = scratch(Ok(&real_runtime()));
+    let _d = s.daemon(&[]);
+    let mut c = s.client();
+    let exe = s.root.join("sleep64.exe");
+    fs::copy(fixture("sleep64.exe"), &exe).unwrap();
+    let id = c
+        .install(&InstallParams {
+            path: exe.to_str().unwrap().into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .job_id;
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!(info.state, JobState::Succeeded, "{ev:?}");
+    let app = ev
+        .iter()
+        .find_map(|e| e.text.strip_prefix("Installed: "))
+        .unwrap()
+        .to_owned();
+
+    let id = c.run_app(&app, &[]).unwrap().job_id;
+    // The program really runs: wait for its own output before cancelling.
+    let until = Instant::now() + Duration::from_secs(60);
+    let (mut after, mut seen) = (0, vec![]);
+    while !seen
+        .iter()
+        .any(|e: &JobEvent| e.kind == EventKind::Stdout && e.text.contains("sleeping"))
+    {
+        assert!(Instant::now() < until, "no `sleeping` from the program: {seen:?}");
+        let e = c.job_poll(&id, after, 1000).unwrap();
+        after = e.next_seq;
+        seen.extend(e.events);
+        assert!(
+            matches!(e.job.state, JobState::Queued | JobState::Running),
+            "the run ended before it was cancelled: {seen:?}"
+        );
+    }
+
+    let cancelled = Instant::now();
+    c.job_cancel(&id).unwrap();
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!(info.state, JobState::Cancelled, "{ev:?}");
+    assert!(
+        cancelled.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        cancelled.elapsed()
+    );
+    assert!(!ev.iter().any(|e| e.text.contains("WITHOUT a sandbox")), "{ev:?}");
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let id = c.remove(&app).unwrap().job_id;
+        let (info, ev) = follow(&mut c, &id);
+        if info.state == JobState::Succeeded {
+            break;
+        }
+        let busy = ev
+            .iter()
+            .any(|e| e.text.contains("is running") || e.text.contains("cannot remove"));
+        assert!(busy, "remove failed for another reason: {ev:?}");
+        assert!(Instant::now() < until, "the cancelled run left the app busy: {ev:?}");
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(c.app(&app).is_err(), "the app is still listed after its removal");
 }
