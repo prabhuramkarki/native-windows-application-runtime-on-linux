@@ -234,6 +234,7 @@ mod tests {
                 sha256: "0".repeat(64),
                 installed_at: 7,
                 consent: None,
+                archive: None,
             }];
         });
         let d = rt.app("h").unwrap();
@@ -288,6 +289,7 @@ mod tests {
                 sha256: "0".repeat(64),
                 installed_at: 5,
                 consent: None,
+                archive: None,
             }];
         });
         let d = rt.app("a").unwrap();
@@ -513,6 +515,7 @@ mod tests {
                 sha256: "0".repeat(64),
                 installed_at: 1,
                 consent: None,
+                archive: None,
             }];
             m.package = Some(rt_core::PackageMeta {
                 id: "r".into(),
@@ -661,6 +664,7 @@ mod tests {
             sha256: "0".repeat(64),
             installed_at: 1,
             consent: None,
+            archive: None,
         };
         add(&rt, "h1", |m| {
             m.name = HOSTILE.into();

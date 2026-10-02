@@ -26,6 +26,7 @@ fn rec(id: &str, version: &str) -> DependencyRecord {
         sha256: HASH_A.into(),
         installed_at: 1_800_000_000,
         consent: None,
+        archive: None,
     }
 }
 
@@ -103,6 +104,10 @@ fn record_marks_an_old_schema_file_as_current() {
     m.schema_version = 1;
     record(&mut m, rec("a", "1")).unwrap();
     assert_eq!(m.schema_version, SCHEMA_VERSION);
+    assert_eq!(
+        m.schema_version, 5,
+        "record writes schema 5 (the literal: a bump has to touch this test)"
+    );
 }
 
 #[test]

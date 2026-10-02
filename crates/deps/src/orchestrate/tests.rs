@@ -458,6 +458,7 @@ fn md_with_consent(version: &str, hash: String) -> Metadata {
                 given_at: OLD,
                 licence_text_sha256: hash,
             }),
+            archive: None,
         },
     )
     .unwrap();
@@ -537,6 +538,7 @@ fn an_installer_upgrade_is_refused_before_the_marker_check() {
             sha256: OTHER_SHA.into(),
             installed_at: OLD,
             consent: None,
+            archive: None,
         },
     )
     .unwrap();
@@ -783,6 +785,7 @@ fn a_full_dependency_list_is_failed_not_recorded() {
                 sha256: OTHER_SHA.into(),
                 installed_at: OLD,
                 consent: None,
+                archive: None,
             },
         )
         .unwrap();
@@ -1409,6 +1412,7 @@ fn installed_packages_come_from_metadata() {
             sha256: dxvk.sha256.clone(),
             installed_at: OLD,
             consent: None,
+            archive: None,
         },
     )
     .unwrap();
@@ -1476,6 +1480,7 @@ fn discard_of_a_recorded_package_is_refused() {
             sha256: OTHER_SHA.into(),
             installed_at: OLD,
             consent: None,
+            archive: None,
         },
     )
     .unwrap();
@@ -1716,6 +1721,7 @@ fn the_check_sees_and_the_install_follows_the_plan_as_it_is_under_the_lock() {
             sha256: perm.sha256.clone(),
             installed_at: OLD,
             consent: None,
+            archive: None,
         },
     )
     .unwrap();

@@ -786,6 +786,7 @@ fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Re
             sha256: pkg.sha256.clone(),
             installed_at: (o.now)(),
             consent,
+            archive: None,
         },
     )
     .map_err(|e| e.to_string())?;

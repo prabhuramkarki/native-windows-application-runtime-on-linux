@@ -2143,6 +2143,7 @@ fn record_installed(r: &Rig, id: &str, pkg: &str) {
             sha256: p.sha256.clone(),
             installed_at: 1,
             consent: None,
+            archive: None,
         },
     )
     .unwrap();

@@ -156,7 +156,7 @@ fn a_portable_exe_installs_end_to_end() {
     assert_eq!(md.architecture, "x86_64");
     assert_eq!(md.executable, "C:\\Program Files\\runtime-fixture\\hello64.exe");
     assert_eq!(md.environment, "default");
-    assert_eq!(md.schema_version, 4, "new installs write schema 4");
+    assert_eq!(md.schema_version, 5, "new installs write schema 5");
     assert_eq!(md.package, None);
     assert!(md.dependencies.is_empty());
     assert_eq!(md.backend.id, "fake");
@@ -1601,7 +1601,7 @@ fn a_package_subtree_installs_under_program_files_with_its_fixed_id_and_record()
     let md = f.store.read_metadata(&env).unwrap();
     assert_eq!(md.package, Some(package_meta()));
     assert_eq!(md.name, "Example App");
-    assert_eq!(md.schema_version, 4);
+    assert_eq!(md.schema_version, 5);
 }
 
 #[test]
