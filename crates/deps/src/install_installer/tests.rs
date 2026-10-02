@@ -115,11 +115,13 @@ fn launcher() -> Launcher {
 /// Real `bwrap`, or a loud skip (`RUNTIME_REQUIRE_BWRAP=1` makes it a failure), as in Phase 3's tests.
 fn require_real_bwrap() -> Option<PathBuf> {
     let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
-    match rt_installer::find_bwrap_on_path() {
-        Some(p) => Some(p),
-        None if require => panic!("bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set"),
-        None => {
-            eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox tests need bubblewrap installed");
+    match rt_sandbox::usable_bwrap_on_path() {
+        Ok(p) => Some(p),
+        Err(why) if require => panic!(
+            "RUNTIME_REQUIRE_BWRAP is set but {why}: the real-sandbox dependency installer tests must run for real"
+        ),
+        Err(why) => {
+            eprintln!("SKIPPED the real-sandbox dependency installer tests: {why}");
             None
         }
     }

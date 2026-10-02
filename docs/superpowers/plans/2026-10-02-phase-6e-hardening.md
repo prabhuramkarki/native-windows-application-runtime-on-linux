@@ -438,4 +438,94 @@ hosted run.
 
 ## As built
 
-(Filled in by the implementation.)
+Branch `phase-6e-hardening`, nothing pushed. Gates (fmt, both clippy runs, workspace tests with
+`RUNTIME_REQUIRE_BWRAP=1 RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE=1`, GUI tests under `xvfb-run`, `cargo deny`) passed
+after every commit, with the default `TMPDIR`. A `TMPDIR` under the repo makes socket paths longer than `SUN_LEN`
+and cuts one bounded message, so it was not used.
+
+| Task | Commit(s) |
+|---|---|
+| 1 Fallbacks | `e791860` |
+| 2 Version check | `4ddeb33`, review fixes `c627f52` |
+| 3 Re-digest | `589bda8` |
+| 4 Display capability | `6007ca5` |
+| 5 `daemon-status` | `e032f64` |
+| 6 Cancel e2e | `c12a26f` |
+| 7 CI audit and docs | the `ci:` commit on the branch tip |
+
+**Task 1.** As planned (spec 4.3's list was complete; `ErrorKind`, `JobKind`, `JobState`, `EventKind` already had
+their tests). `compat::Status::Unknown` is refused by `Record::check` before the evidence check. GUI: an unknown
+grant shows "unknown", an unknown plan entry shows "unknown" (it used to fall through to "blocked"), and neither is
+consentable. Deviation: the API.md text said "since 0.2.2" one commit before the bump landed in Task 2.
+
+**Task 2.** Deviations:
+- The probe reads on the calling thread with `poll(2)` up to the deadline; there is no reader thread at all. It runs
+  in its own process group, which is killed before the reap.
+- Startup: empty `--version` output is now "cannot check" instead of a mismatch.
+- Review fixes (`c627f52`):
+  - the group is reaped on success too, so a child the probe left behind is killed; a `setsid` escape is
+    documented;
+  - a non-zero exit after the right line is `unavailable`;
+  - a full or stopping daemon refuses before running the probe (`Shared::admit`, re-checked under the lock).
+
+**Task 3.** As planned. `PlanCheck<'a>` is a type alias (clippy `type_complexity`). The sandbox mark is still
+written before `install_plan`, as spec 4.2 keeps it: it is fail-closed, not consent.
+
+**Task 4.** As planned:
+- `backends::unknown(id)` was factored out so `select` and the display gate give the same message;
+- `display::run` now selects the backend by the recorded id, so there is no `backend_of` fallback to Wine.
+
+Deviation: unreadable metadata now fails `display` instead of falling back to Wine. The conformance check for
+`graphics_driver` without `sandboxable` is part of the existing `capabilities` check (as for `installers`). The
+read path without Wine is pinned by `display_reads_without_wine_installed`.
+
+**Task 5.** Spike: a client read deadline is `ClientError::Io(TimedOut)`. Deviations, so that a reachable daemon is
+never told to start:
+- a sixth outcome, `Failed`, printed as `reachable: yes, but the exchange failed (...)`. It covers a bad or cut
+  reply, a non-timeout I/O error, and other error codes; the plan left these unclassified, and before they printed
+  `reachable: no` with the hint;
+- `Unreachable { TimedOut }` (a listen backlog that stays full) is "not answering".
+
+The API.md outcomes are a bullet list, because the dispatch-table doc test parses table rows that start with a
+backtick.
+
+**Task 6.** `tools/fixtures/sleep.c` gives `sleep64.exe`, a PE32+ console program. The test is
+`a_real_sandboxed_run_is_cancelled_and_leaves_nothing`. Run on this host:
+- command: `TMPDIR=/tmp/claude-1000/t6 RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-daemon --test e2e_jobs --
+  --ignored a_real_sandboxed_run --test-threads=1 --nocapture`;
+- Wine 10.0 (Ubuntu 10.0~repack-12ubuntu1), bubblewrap 0.11.1;
+- both part C tests passed in 22.8 s (24 s wall);
+- no `sleep64`/`wineserver` process was left.
+
+It is not in CI, as the plan decided.
+
+**Task 7: audit.** The facility removal was simulated two ways. The whole non-ignored suite ran with
+`RUNTIME_REQUIRE_BWRAP=1` inside `bwrap --dev-bind / / --unshare-user --disable-userns` (bwrap then cannot create a
+namespace). Separately it ran with `XDG_RUNTIME_DIR` pointing at an empty directory (no user manager). The
+missing-bwrap path was checked by running a test binary with `PATH=/nonexistent`: it fails under
+`RUNTIME_REQUIRE_BWRAP=1` and prints `SKIPPED` without it.
+
+| Tests (non-ignored) | Needs | Class before | Now |
+|---|---|---|---|
+| `runtime-installer` sandbox `real_sandbox_*`, pipeline (9), uninstall (3); `runtime-deps` `install_installer` (19) | bwrap that works | 3: checked only that bwrap was on `PATH`, then failed with `NonZeroAndNoMarker`, `NeedsChoice([])` or raw bytes | 1/2: `rt_sandbox::usable_bwrap_on_path` probes first; panics under `RUNTIME_REQUIRE_BWRAP` with the reason, else `SKIPPED` |
+| `runtime-cli` `apps.rs`: two `deps --install` tests and one `doctor` prediction | a working sandbox | 3: an assertion on stdout without the cause | 1/2: `support::bwrap_works` first |
+| `runtime-sandbox` render `real_bwrap_*`, `runtime-cli` `e2e_sandbox` `syscall_escape_*` | bwrap | 1 (probe, `RUNTIME_REQUIRE_BWRAP=1 but <reason>`) | the reason now names the sysctl |
+| `runtime-sandbox` `probe_limits_on_this_host` | `systemd-run --user` | 1 (required under `RUNTIME_REQUIRE_BWRAP`) | the message names lingering and `XDG_RUNTIME_DIR` |
+| `runtime-sandbox` Landlock, init and render Landlock parts | Landlock | 1 ("Landlock is unavailable") | unchanged |
+| `runtime-sandbox` seccomp kernel tests | seccomp | 1 ("the filter cannot be installed here") | unchanged |
+| render's ptrace half; e2e_sandbox escapes | Yama | 2 (skip) / ignored | unchanged |
+
+Under the no-userns simulation, all 54 failing tests name `kernel.apparmor_restrict_unprivileged_userns` (the
+`probe_reason` text for a refused user namespace now ends with that hint). More tests fail than before (54 against
+47), because tests that used to pass vacuously on a broken bwrap now fail loudly. The no-session simulation fails
+only `probe_limits_on_this_host`. The second failure there, render's `tmp-private`, was an artifact of putting the
+fake `XDG_RUNTIME_DIR` under `/tmp`.
+
+**Task 7: CI and docs.**
+- `ci.yml` gained the userns step in `test` and `gui`, and a user-systemd-manager step in `test` only (the audit
+  found `probe_limits_on_this_host` in class 1). Both are marked UNVERIFIED, and the audit is summarised in a
+  comment.
+- `runtime-deps` gained `runtime-sandbox` as a dev-dependency: a workspace crate, so `Cargo.lock` adds one edge and
+  no package.
+- Roadmap: a 6E row; 6D marked merged; the 6B and 6D follow-ups closed; the CI bullets rewritten. The root cause
+  stays unconfirmed, the workaround is unverified, and nothing was pushed.

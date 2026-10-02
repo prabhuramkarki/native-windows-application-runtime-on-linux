@@ -4,6 +4,8 @@
 //! scripts written by [`Rig`]. The fake `wine wineboot -u` creates a minimal prefix; the fake `wine <exe> args`
 //! records its argv (NUL separated), cwd and environment, prints to stdout and stderr and then sources an optional
 //! `hook.sh` the test wrote (exit code, signals, sleeping). The spawned `runtime` gets a cleared environment.
+mod support;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -2259,6 +2261,10 @@ fn doctor_d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in() {
 
 #[test]
 fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded") {
+        return;
+    }
     let r = rig();
     r.wine_dlls(&[
         "kernel32.dll",
@@ -2644,6 +2650,10 @@ fn install_msvcp140(r: &Rig) -> String {
 
 #[test]
 fn deps_install_without_a_terminal_never_consents_even_when_stdin_says_yes() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("deps_install_without_a_terminal_never_consents_even_when_stdin_says_yes") {
+        return;
+    }
     let r = rig();
     let id = install_msvcp140(&r);
     // A file where the download cache belongs: a fetch fails on it before any network access (the fetcher checks
@@ -5012,6 +5022,10 @@ fn deps_install_with_a_stale_plan_digest_installs_nothing() {
 
 #[test]
 fn deps_install_with_the_reported_digest_behaves_exactly_as_without_it() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("deps_install_with_the_reported_digest_behaves_exactly_as_without_it") {
+        return;
+    }
     let r = rig();
     let id = install_msvcp140(&r);
     fs::write(r.data.join("deps-cache"), b"not a directory").unwrap();

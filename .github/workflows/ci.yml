@@ -27,6 +27,29 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: tools/build-fixtures.sh
+      # UNVERIFIED until the first hosted run (Phase 6E). Hypothesis for the 9cf1e27 `test` failure (log unread):
+      # Ubuntu 24.04 runners set kernel.apparmor_restrict_unprivileged_userns=1, so an unprivileged bwrap cannot
+      # create its user namespace. Alternative: AppArmor's bwrap-userns-restrict profile. The before/after values
+      # below are printed so the first hosted log confirms or refutes this.
+      - name: Allow unprivileged user namespaces for bwrap (unverified)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          bwrap --unshare-user --ro-bind / / true && echo "bwrap: user namespace OK" || echo "bwrap: STILL FAILS"
+      # UNVERIFIED until the first hosted run (Phase 6E). `runtime-sandbox`'s `probe_limits_on_this_host` is
+      # required under RUNTIME_REQUIRE_BWRAP and needs a user systemd manager reachable through $XDG_RUNTIME_DIR
+      # (`systemd-run --user --scope`). Whether a hosted runner has one is unknown: lingering starts it, and the
+      # step waits for its private socket and exports XDG_RUNTIME_DIR for the later steps.
+      - name: Start a user systemd manager (unverified)
+        run: |
+          sudo loginctl enable-linger "$USER"
+          dir="/run/user/$(id -u)"
+          for _ in $(seq 1 50); do [ -S "$dir/systemd/private" ] && break; sleep 0.2; done
+          ls -l "$dir/systemd/private" || echo "user manager: NOT RUNNING"
+          echo "XDG_RUNTIME_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
       # `runtime-gui` needs GTK 4 development files; the `gui` job below builds, lints and tests it.
       - run: cargo clippy --workspace --exclude runtime-gui --all-targets -- -D warnings
@@ -36,6 +59,18 @@ jobs:
       # `runtime-deps`' real-bwrap tests run the installer sandbox with the built `runtime` binary as its
       # `sandbox-init` shim (target/debug/runtime); `cargo test --workspace --exclude runtime-gui` builds it (runtime-cli has integration
       # tests), and those tests fail loudly when it is missing.
+      # Phase 6E audit of the non-`#[ignore]`d tests that need a host facility (verified locally by running the
+      # suite inside `bwrap --unshare-user --disable-userns`, where bwrap cannot create a namespace, and with
+      # XDG_RUNTIME_DIR pointing at an empty directory): every one fails under RUNTIME_REQUIRE_BWRAP=1 with a
+      # message naming the facility and the fix, or skips with `SKIPPED` on stderr where CI does not require it.
+      #   bwrap (user namespaces): runtime-installer sandbox/pipeline/uninstall, runtime-deps install_installer,
+      #     runtime-sandbox render real_bwrap_*, runtime-cli apps.rs (2 deps --install, 1 doctor) and e2e_sandbox
+      #     syscall_escape_*: probe first (rt_sandbox::usable_bwrap_on_path / bwrap_works); the reason names
+      #     kernel.apparmor_restrict_unprivileged_userns.
+      #   systemd-run --user: runtime-sandbox probe_limits_on_this_host (required; names linger/XDG_RUNTIME_DIR).
+      #   Landlock: runtime-sandbox landlock/init/render tests (required: "Landlock is unavailable").
+      #   seccomp: runtime-sandbox seccomp kernel tests (required: "the filter cannot be installed here").
+      #   Yama ptrace_scope: only the #[ignore]d e2e_sandbox escapes; render's ptrace half skips loudly.
       - run: cargo test --workspace --exclude runtime-gui
         env:
           RUNTIME_REQUIRE_BWRAP: "1"
@@ -122,6 +157,19 @@ jobs:
           components: clippy
       - run: tools/build-fixtures.sh
       - run: cargo clippy -p runtime-gui --all-targets -- -D warnings
+      # UNVERIFIED until the first hosted run (Phase 6E). Hypothesis for the 9cf1e27 `test` failure (log unread):
+      # Ubuntu 24.04 runners set kernel.apparmor_restrict_unprivileged_userns=1, so an unprivileged bwrap cannot
+      # create its user namespace. Alternative: AppArmor's bwrap-userns-restrict profile. The before/after values
+      # below are printed so the first hosted log confirms or refutes this.
+      - name: Allow unprivileged user namespaces for bwrap (unverified)
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          bwrap --unshare-user --ro-bind / / true && echo "bwrap: user namespace OK" || echo "bwrap: STILL FAILS"
+      # No user systemd manager step here: no GUI test runs `systemd-run --user` (the audit in the `test` job).
       - run: cargo build -p runtime-daemon -p runtime-cli
       - run: xvfb-run -a cargo test -p runtime-gui
         env:

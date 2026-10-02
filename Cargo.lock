@@ -1215,6 +1215,7 @@ dependencies = [
  "runtime-core",
  "runtime-installer",
  "runtime-pe",
+ "runtime-sandbox",
  "rustls",
  "ruzstd",
  "serde",

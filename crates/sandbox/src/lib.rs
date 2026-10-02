@@ -53,6 +53,14 @@ pub fn find_bwrap_on_path() -> Option<PathBuf> {
     find_bwrap(&|k| std::env::var_os(k), &is_executable)
 }
 
+/// A `bwrap` on `PATH` that can create a sandbox here ([`probe`]), or the one-line reason there is none. The
+/// real-sandbox tests use it so a host without user namespaces fails (or skips) with the reason, not with a
+/// confusing assertion further down.
+pub fn usable_bwrap_on_path() -> Result<PathBuf, String> {
+    let bwrap = find_bwrap_on_path().ok_or("bwrap is not on PATH (install bubblewrap)")?;
+    probe(&bwrap).map(|()| bwrap)
+}
+
 /// [`find_systemd_run`] over the real environment and filesystem (a regular, executable file).
 pub fn find_systemd_run_on_path() -> Option<PathBuf> {
     find_systemd_run(&|k| std::env::var_os(k), &is_executable)
@@ -310,7 +318,10 @@ const USERNS_MESSAGES: [&str; 4] = [
 /// The one-line reason for a failed probe: user namespaces only when bwrap says so, else the excerpt.
 fn probe_reason(text: &str, first: &str) -> String {
     if USERNS_MESSAGES.iter().any(|m| text.contains(m)) {
-        format!("user namespaces are disabled or restricted on this host ({first})")
+        format!(
+            "user namespaces are disabled or restricted on this host ({first}); on Ubuntu 23.10+ check \
+             kernel.apparmor_restrict_unprivileged_userns and AppArmor's bwrap profile"
+        )
     } else {
         format!("the sandbox could not be created ({first})")
     }
@@ -391,7 +402,11 @@ mod tests {
                 // the probe leaves no scope behind (`--collect`, and it exited)
             }
             Err(e) => {
-                assert!(!required, "RUNTIME_REQUIRE_BWRAP=1 but {e}");
+                assert!(
+                    !required,
+                    "RUNTIME_REQUIRE_BWRAP=1 but {e} (needs a user systemd manager reachable through \
+                     $XDG_RUNTIME_DIR: a login session, or `loginctl enable-linger $USER`)"
+                );
                 eprintln!("SKIPPED probe_limits_on_this_host: {e}");
             }
         }
@@ -411,6 +426,9 @@ mod tests {
         assert_eq!(e, "the sandbox could not be created (no output)");
         let userns = "bwrap: No permissions to create new namespace, likely because the kernel does not allow";
         assert!(probe_reason(userns, "x").starts_with("user namespaces are disabled"));
+        // Phase 6E: the reason names the setting to check (the hosted-runner hypothesis).
+        let why = probe_reason("bwrap: setting up uid map: Permission denied", "x");
+        assert!(why.contains("kernel.apparmor_restrict_unprivileged_userns"), "{why}");
         // an unrelated EPERM is not blamed on user namespaces
         assert_eq!(
             probe_reason("bwrap: Can't mount proc on /newroot/proc: Operation not permitted", "y"),

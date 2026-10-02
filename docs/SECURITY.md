@@ -1095,7 +1095,8 @@ The daemon is a local service for **one user**. The attackers considered are:
   - the socket is a socket, is the user's, and is closed to group and others;
   - once connected, the peer uid is the user's.
 
-  A socket planted by someone else never receives a request. Other client bounds:
+  A socket planted by someone else never receives a request; `daemon-status` then says `reachable: not checked`
+  and does not suggest starting a daemon (Phase 6E). Other client bounds:
   - The connect is non-blocking with a deadline.
   - A reply must be one line of at most 16 MiB and arrive whole within the call's deadline (40 s; 5 s for
     `daemon-status`). It must be valid JSON-RPC 2.0 for the call's id.

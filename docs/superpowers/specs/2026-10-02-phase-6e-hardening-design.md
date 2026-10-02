@@ -313,4 +313,16 @@ first confirms what a client-side read timeout surfaces as (`ClientError::Io` wi
 
 ## As built
 
-(Filled in by the implementation.)
+All seven items are implemented on `phase-6e-hardening` and nothing is pushed. The plan's "As built" has the commits,
+the gates, the Task 6 run and the audit table. Departures from this spec:
+- **E4:** the probe needs no reader thread at all (a `poll(2)` read on the calling thread, process group killed
+  before the reap). Empty output at startup is "cannot check", not a mismatch.
+- **E8:** `runtime display` selects its backend by the recorded id. Unreadable metadata now fails instead of
+  falling back to Wine.
+- **E9:** a fifth failure outcome, `reachable: yes, but the exchange failed (...)`, for a connected daemon whose
+  reply is bad or an unexpected error (no start hint). A listen backlog that never drains is "not answering".
+- **4.6:** the audit found the installer and deps real-sandbox tests checked only that bwrap was on `PATH`. They now
+  probe it (`rt_sandbox::usable_bwrap_on_path`). A refused user namespace's reason names
+  `kernel.apparmor_restrict_unprivileged_userns`. A user-systemd-manager step was added because
+  `probe_limits_on_this_host` is required under `RUNTIME_REQUIRE_BWRAP`.
+- The CI root cause stays unconfirmed, and the workaround is unverified until the first hosted run.
