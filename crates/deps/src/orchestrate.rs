@@ -758,7 +758,7 @@ fn install_one(
             return match recorded {
                 Ok(()) => Ok(Some(Vec::new())),
                 Err(e) => Err(
-                    match install_archive::undo_install(&done, &pkg.id, o.env, o.backend, o.launcher) {
+                    match install_archive::undo_install(&done, &previous, &pkg.id, o.env, o.backend, o.launcher) {
                         Ok(()) => {
                             format!("not installed: it could not be recorded ({e}); what it wrote was removed again")
                         }

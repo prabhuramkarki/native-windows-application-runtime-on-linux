@@ -370,7 +370,8 @@ pub fn record_of(
     })
 }
 
-/// Undoes what the CURRENT [`install_archive`] call `installed` (Decision R11): deletes its overrides, deletes the
+/// Undoes what the CURRENT [`install_archive`] call `installed` (Decision R11): puts each override back to its value
+/// in `previous` (as read before the download), deleting those that had none (R14), deletes the
 /// new files, restores replaced originals from the backup directory (then deletes the backups), removes the created
 /// directories that are empty, and deletes the journal. Nothing is verified: this is the same undo `install_archive`
 /// runs on its own errors, for the one case where its result could not be recorded (R12), in the same locked run
@@ -379,6 +380,7 @@ pub fn record_of(
 /// was attempted.
 pub(crate) fn undo_install(
     installed: &ArchiveInstalled,
+    previous: &[(String, Option<String>)],
     pkg_id: &str,
     env: &AppEnv,
     backend: &dyn CompatBackend,
@@ -391,6 +393,14 @@ pub(crate) fn undo_install(
         )));
     }
     check_record(installed)?;
+    if previous.iter().any(|(_, v)| {
+        v.as_deref()
+            .is_some_and(|v| !crate::wine_config::restorable_override(v))
+    }) {
+        return Err(ArchiveError::BadPackage(
+            "a previous override value is not one the runtime can restore".into(),
+        ));
+    }
     let mut ledger = Ledger::new(env, pkg_id);
     if installed.files.is_empty() && fs::symlink_metadata(ledger.journal_path()).is_ok() {
         return Err(ArchiveError::Journal(format!(
@@ -401,7 +411,20 @@ pub(crate) fn undo_install(
     ledger.done = installed.clone();
     // A record may list directories in any order: children first.
     ledger.done.created_dirs.sort_by_key(|d| d.components().count());
-    let mut failures = ledger.undo_overrides(env, backend, launcher);
+    // Newest first: an override that had a value before the install gets it back (Ruling 6F-1), one that had none
+    // is deleted.
+    let mut failures: Vec<ArchiveError> = installed
+        .overrides
+        .iter()
+        .rev()
+        .filter_map(|name| {
+            match previous.iter().find(|(n, _)| n == name).and_then(|(_, v)| v.as_deref()) {
+                Some(v) => restore_override(name, v, env, backend, launcher),
+                None => delete_override(name, env, backend, launcher, None),
+            }
+            .err()
+        })
+        .collect();
     failures.extend(ledger.undo_files());
     match failures.into_iter().next() {
         Some(first) => Err(first),
@@ -518,6 +541,13 @@ pub fn remove_archive(
             }
             Ok(Hashed::File(h)) if h != f.sha256 => {
                 out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
+            // Gone together with its backup: nothing to restore, and keeping it would fail every retry (Ruling
+            // 6F-2): left, and out of the record.
+            Ok(Hashed::Gone) if f.replaced && !ledger.backup_exists(rel) => {
+                out.left.push((path.clone(), "missing, nothing to restore".into()));
+                ledger.prune_backup_dirs(rel);
                 continue;
             }
             // Unchanged, or already gone: a replaced file gets its original back either way.
@@ -1246,8 +1276,14 @@ impl Ledger {
         let dest = dir.join(rel.file_name().unwrap_or_default());
         atomic_write(&dest, &mut open_nofollow(&target)?, None, 0o644)?;
         fs::remove_file(&target)?;
-        // Prune empty backup directories up to and including `deps-backup`.
+        self.prune_backup_dirs(rel);
+        Ok(())
+    }
+
+    /// Prunes the empty backup directories above the backup of `rel`, up to and including `deps-backup`.
+    fn prune_backup_dirs(&self, rel: &Path) {
         let top = self.app_root.join(BACKUP_DIR);
+        let target = self.app_root.join(&self.backups).join(rel);
         let mut dir = target.parent();
         while let Some(d) = dir
             && d.starts_with(&top)
@@ -1255,7 +1291,6 @@ impl Ledger {
         {
             dir = d.parent();
         }
-        Ok(())
     }
 
     /// The host path of `rel` under `drive_c` through real directories only (no symlinks); `None` if it is gone.
@@ -1273,6 +1308,15 @@ impl Ledger {
             Some(p) => Ok(fs::remove_file(p)?),
             None => Ok(()),
         }
+    }
+
+    /// Whether anything (even a symlink, which `restore` then refuses) is at the backup of `rel`. An error other
+    /// than "not found" counts as present, so `restore` reports it.
+    fn backup_exists(&self, rel: &Path) -> bool {
+        !matches!(
+            fs::symlink_metadata(self.app_root.join(&self.backups).join(rel)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        )
     }
 
     /// Removes the recorded directory `rel` if it is empty. `Ok(false)`: it is not a directory, or the path goes

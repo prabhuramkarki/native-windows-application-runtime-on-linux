@@ -1335,11 +1335,11 @@ fn a_reg_delete_failure_is_an_error_unless_the_value_is_already_gone() {
     };
     // delete fails, query says the value is absent: already removed, fine.
     let b = Settling::new(r#"[ "$1" = add ] && exit 0; exit 1"#);
-    undo_install(&done, "dxvk", &e.env, &b, &launcher()).unwrap();
+    undo_install(&done, &[], "dxvk", &e.env, &b, &launcher()).unwrap();
     assert_eq!(b.reg_calls(), [del("d3d11"), query("d3d11")]);
     // delete fails and the value is still there: an error.
     let b = Settling::new(r#"[ "$1" = delete ] && exit 1; exit 0"#);
-    let err = undo_install(&done, "dxvk", &e.env, &b, &launcher()).unwrap_err();
+    let err = undo_install(&done, &[], "dxvk", &e.env, &b, &launcher()).unwrap_err();
     assert!(matches!(err, ArchiveError::Registry(_)), "{err:?}");
 }
 
@@ -1500,7 +1500,7 @@ fn installed_records_round_trip_and_hostile_ones_are_refused_by_undo_install() {
     fs::write(e.tmp.path().join("victim"), b"V").unwrap();
     let before = e.snapshot();
     let bad = |f: ArchiveInstalled| {
-        let err = undo_install(&f, "dxvk", &e.env, &FakeBackend::new(), &launcher()).unwrap_err();
+        let err = undo_install(&f, &[], "dxvk", &e.env, &FakeBackend::new(), &launcher()).unwrap_err();
         assert!(matches!(err, ArchiveError::BadPackage(_)), "{f:?}: {err:?}");
     };
     for p in ["../../../../victim", "/etc/passwd", "a/../../x", "", "a\\..\\x", "con"] {
@@ -1528,6 +1528,7 @@ fn installed_records_round_trip_and_hostile_ones_are_refused_by_undo_install() {
     });
     let err = undo_install(
         &ArchiveInstalled::default(),
+        &[],
         "../x",
         &e.env,
         &FakeBackend::new(),
@@ -1830,6 +1831,27 @@ fn files_already_gone_count_as_removed_and_a_gone_replaced_file_gets_its_origina
     assert!(out.left.is_empty() && out.failed.is_empty(), "{out:?}");
     assert!(out.done.contains(&"removed new/d3d11.dll".to_owned()), "{out:?}");
     assert_eq!(fs::read(e.c("windows/system32/dxgi.dll")).unwrap(), b"placeholder");
+    assert!(!e.c("new").exists());
+    assert!(!e.env.root().join(BACKUP_DIR).exists());
+}
+
+#[test]
+fn a_replaced_file_gone_with_its_backup_is_left_as_missing_and_dropped_from_the_record() {
+    let (e, rec) = installed();
+    fs::remove_file(e.c("windows/system32/dxgi.dll")).unwrap();
+    fs::remove_file(e.backup("dxvk", "windows/system32/dxgi.dll")).unwrap();
+    let out = remove_with(&e, &rec, &Settling::new("exit 0"));
+    assert_eq!(
+        left(&out),
+        [("windows/system32/dxgi.dll", "missing, nothing to restore")]
+    );
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert_eq!(
+        out.remaining,
+        rt_core::ArchiveRecord::default(),
+        "a retry must not loop on it"
+    );
+    assert!(!e.c("windows/system32/dxgi.dll").exists());
     assert!(!e.c("new").exists());
     assert!(!e.env.root().join(BACKUP_DIR).exists());
 }
@@ -2587,6 +2609,7 @@ fn a_journal_of_another_archive_blocks_install_until_discarded() {
         // An empty record must not be used to "clean up": it would drop the journal and leak the killed run.
         let err = undo_install(
             &ArchiveInstalled::default(),
+            &[],
             "dxvk",
             &e.env,
             &FakeBackend::new(),

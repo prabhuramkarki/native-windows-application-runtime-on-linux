@@ -185,7 +185,7 @@ Nothing is pushed.
   `install_one` calls it, and only before the lock is released.
 - **Decision R12: if an install cannot be recorded, it is undone.** `record_of` or the metadata write can fail:
   for example `MetaError::TooLarge`, more than `MAX_RECORDED` (64) files, or a hash read error. Before 6F the files
-  stayed unrecorded. Now `install_one` calls `undo_install(&done, ..)` (R11) and then reports the failure. An
+  stayed unrecorded. Now `install_one` calls `undo_install(&done, &previous, ..)` (R11, R14) and then reports the failure. An
   archive package therefore never stays in a prefix without a record. The bundled packages record 2 to 5 files,
   about 1 KiB each.
 - **Decision R13: `deps.remove` params are `{"id": str, "packages": [str]}`.**
@@ -196,6 +196,18 @@ Nothing is pushed.
     0.2.0).
   - The daemon does not pre-check that the packages are recorded. The CLI decides that under the lock, and the
     job's events carry the refusal.
+
+- **Decision R14 (controller ruling during Task 2-3 review): `undo_install` restores previous override values.**
+  - R12's undo deleted every override the failed install set, so a pre-existing value (say `"d3d11"="builtin"`)
+    was lost when the record could not be written.
+  - `undo_install(&done, &previous, ..)` now takes the values read before the download (R5). An override that had
+    a value gets it back with `reg add ... /d <previous> /f`; only one that had none is deleted.
+  - `install_archive`'s own rollback on its errors is unchanged (it deletes, as since 4A): it runs inside the call
+    and has no previous values. Only the record-failure path of R12 restores.
+- **Decision R15 (controller ruling): a replaced file that is gone together with its backup is left, not failed.**
+  - R6 restores the original of a replaced file that is gone. When the backup is gone too, there is nothing to
+    restore: it is reported `left: <path>: missing, nothing to restore` (so the run exits 1 once) and is not in
+    `remaining`, so the record can be deleted and a retry never loops on it. Empty backup directories are pruned.
 
 ## 4. Behaviour
 
@@ -240,7 +252,8 @@ through `check_overrides`, and `previous` against the charset of R5.
    reason, and nothing is downloaded.
 3. Fetch, then `not_busy_now`, then `install_archive` (unchanged).
 4. **New:** `rec = record_of(&done, &previous, env)`, then the record is written with `archive: Some(rec)`. If
-   either fails, `undo_install(&done, ..)` takes the install away again (R12). The reason says "not installed: it
+   either fails, `undo_install(&done, &previous, ..)` takes the install away again (R12), putting previous override
+   values back (R14). The reason says "not installed: it
    could not be recorded (<e>); what it wrote was removed again", or the undo's own failure is appended, as
    `rollback_error` does.
 5. Report.
@@ -268,7 +281,8 @@ pub fn remove_archive(rec: &ArchiveRecord, pkg_id: &str, env: &AppEnv, backend: 
    - otherwise (another value, or absent): `left`, "changed since it was installed" or "already removed".
 3. **Files**, in reverse order:
    - `resolve` (no symlink in any component). A symlink or a non-regular file goes to `left`.
-   - Absent and not replaced: done. Absent and replaced: restore the backup.
+   - Absent and not replaced: done. Absent and replaced: restore the backup, or, when the backup is gone too,
+     `left` "missing, nothing to restore" (R15).
    - Present: open it `O_NOFOLLOW`, `fstat` that it is a regular file, and hash it.
      - The hash is equal and the file is not replaced: `remove_file`.
      - The hash is equal and the file is replaced: `restore`, the existing temp-and-rename from

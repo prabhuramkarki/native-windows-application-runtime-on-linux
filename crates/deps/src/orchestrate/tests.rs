@@ -962,6 +962,79 @@ fn an_install_that_cannot_be_recorded_takes_its_files_and_overrides_away_again()
     assert_eq!(fs::read(r.env.metadata_path()).unwrap(), before);
 }
 
+/// Fills the dependency list so the next record cannot be written.
+fn fill_dependencies(r: &Rig) {
+    let mut m = r.md();
+    for i in 0..MAX_DEPENDENCIES {
+        state::record(
+            &mut m,
+            DependencyRecord {
+                id: format!("x{i:03}"),
+                version: "1".into(),
+                sha256: OTHER_SHA.into(),
+                installed_at: OLD,
+                consent: None,
+                archive: None,
+            },
+        )
+        .unwrap();
+    }
+    r.set_md(&m);
+}
+
+#[test]
+fn an_unrecordable_install_puts_a_previous_override_value_back_instead_of_deleting_it() {
+    // Two overrides: d3d9 had no value before (deleted again), dxgi had "" (disabled: put back).
+    let r = override_rig(
+        vec![with_overrides(archive("a", false, &[], &["d3d9", "dxgi"]))],
+        "\"dxgi\"=\"\"",
+    );
+    fill_dependencies(&r);
+    let b = FakeBackend::new();
+    let rep = run_with(
+        &r,
+        &r.plan(&["d3d9", "dxgi"]),
+        &FakeFetcher::default(),
+        &Answers::default(),
+        &b,
+    )
+    .unwrap();
+    assert!(reason(&rep.failed, "a").contains("removed again"), "{rep:?}");
+    let k = install_archive::OVERRIDES_KEY;
+    assert_eq!(
+        reg_argv(&b),
+        [
+            format!("add {k} /v d3d9 /d native,builtin /f"),
+            format!("add {k} /v dxgi /d native,builtin /f"),
+            format!("add {k} /v dxgi /d  /f"),
+            format!("delete {k} /v d3d9 /f"),
+        ]
+    );
+    // And a pre-existing "builtin" survives a failed record write.
+    let r = override_rig(
+        vec![with_overrides(archive("b", false, &[], &["d3d11"]))],
+        "\"d3d11\"=\"builtin\"",
+    );
+    fill_dependencies(&r);
+    let b = FakeBackend::new();
+    let rep = run_with(
+        &r,
+        &r.plan(&["d3d11"]),
+        &FakeFetcher::default(),
+        &Answers::default(),
+        &b,
+    )
+    .unwrap();
+    assert!(reason(&rep.failed, "b").contains("removed again"), "{rep:?}");
+    assert_eq!(
+        reg_argv(&b),
+        [
+            format!("add {k} /v d3d11 /d native,builtin /f"),
+            format!("add {k} /v d3d11 /d builtin /f"),
+        ]
+    );
+}
+
 #[test]
 fn an_installer_package_is_recorded_without_an_archive_record() {
     if !have_bwrap() {
