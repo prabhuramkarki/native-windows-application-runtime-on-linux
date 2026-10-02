@@ -34,6 +34,8 @@ pub const MAX_ARGS: usize = 64;
 pub const ARGS_TOTAL_MAX: usize = 64 * 1024;
 /// Most consent items of one `deps.install`.
 pub const MAX_CONSENT: usize = 64;
+/// Most packages of one `deps.remove` (0.2.3).
+pub const MAX_REMOVE: usize = 16;
 
 // ------------------------------------------------------------------------------------------------ wire types
 
@@ -48,6 +50,8 @@ pub enum JobKind {
     Import,
     Remove,
     DepsInstall,
+    /// `deps.remove` (0.2.3).
+    DepsRemove,
     PermissionsSet,
     PermissionsReset,
     DisplaySet,
@@ -215,6 +219,12 @@ pub enum JobSpec {
         plan_digest: String,
         yes: Vec<String>,
     },
+    /// `packages`: 1 to [`MAX_REMOVE`] unique ids in the manifest id grammar (0.2.3). Whether they are recorded is
+    /// the CLI's to decide, under the app lock.
+    DepsRemove {
+        app: AppId,
+        packages: Vec<String>,
+    },
     PermissionsSet {
         app: AppId,
         set: Vec<String>,
@@ -289,6 +299,13 @@ struct SetParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DepsRemoveParams {
+    id: String,
+    packages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DisplayParams {
     id: String,
     driver: Driver,
@@ -351,6 +368,27 @@ impl JobSpec {
                         .collect::<Result<_, _>>()?,
                 }
             }
+            "deps.remove" => {
+                let p: DepsRemoveParams = shape(params)?;
+                let app = app_id(&p.id)?;
+                if p.packages.is_empty() || p.packages.len() > MAX_REMOVE {
+                    return Err(bad(format!("packages takes 1 to {MAX_REMOVE} package ids")).into());
+                }
+                if !p.packages.iter().all(|id| rt_deps::manifest::valid_id(id)) {
+                    return Err(bad("a package is not a package id (see `runtime deps list`)").into());
+                }
+                if p.packages
+                    .iter()
+                    .enumerate()
+                    .any(|(i, id)| p.packages[..i].contains(id))
+                {
+                    return Err(bad("a package is named twice").into());
+                }
+                JobSpec::DepsRemove {
+                    app,
+                    packages: p.packages,
+                }
+            }
             "permissions.reset" => JobSpec::PermissionsReset {
                 app: app_id(&shape::<IdParams>(params)?.id)?,
             },
@@ -372,6 +410,7 @@ impl JobSpec {
             JobSpec::Import { .. } => JobKind::Import,
             JobSpec::Remove { .. } => JobKind::Remove,
             JobSpec::DepsInstall { .. } => JobKind::DepsInstall,
+            JobSpec::DepsRemove { .. } => JobKind::DepsRemove,
             JobSpec::PermissionsSet { .. } => JobKind::PermissionsSet,
             JobSpec::PermissionsReset { .. } => JobKind::PermissionsReset,
             JobSpec::DisplaySet { .. } => JobKind::DisplaySet,
@@ -385,6 +424,7 @@ impl JobSpec {
             JobSpec::Run { app, .. }
             | JobSpec::Remove { app }
             | JobSpec::DepsInstall { app, .. }
+            | JobSpec::DepsRemove { app, .. }
             | JobSpec::PermissionsSet { app, .. }
             | JobSpec::PermissionsReset { app }
             | JobSpec::DisplaySet { app, .. } => Some(app),
@@ -434,6 +474,11 @@ impl JobSpec {
             JobSpec::DepsInstall { app, plan_digest, yes } => {
                 v.extend(["deps".into(), "--install".into(), flag("plan-digest", plan_digest)]);
                 v.extend(yes.iter().map(|y| flag("yes", y)));
+                v.extend(["--".into(), id(app)]);
+            }
+            JobSpec::DepsRemove { app, packages } => {
+                v.push("deps".into());
+                v.extend(packages.iter().map(|p| flag("remove", p)));
                 v.extend(["--".into(), id(app)]);
             }
             JobSpec::PermissionsSet { app, set } => {
@@ -682,6 +727,56 @@ mod tests {
                 app: AppId::parse("notepad").unwrap()
             }
         );
+    }
+
+    #[test]
+    fn deps_remove_takes_1_to_16_unique_package_ids() {
+        let ok = spec("deps.remove", json!({"id": "game", "packages": ["a", "b"]})).unwrap();
+        assert_eq!(
+            ok,
+            JobSpec::DepsRemove {
+                app: AppId::parse("game").unwrap(),
+                packages: vec!["a".into(), "b".into()],
+            }
+        );
+        assert_eq!(argv(&ok), ["deps", "--remove=a", "--remove=b", "--", "game"]);
+        let max: Vec<String> = (0..MAX_REMOVE).map(|i| format!("p{i}")).collect();
+        assert!(spec("deps.remove", json!({"id": "a", "packages": max})).is_ok());
+        for shape_bad in [
+            json!({}),
+            json!({"id": "a"}),
+            json!({"id": "a", "packages": [], "x": 1}),
+            json!({"id": "a", "packages": "dxvk"}),
+            json!({"id": "a", "packages": [1]}),
+            json!([]),
+        ] {
+            assert!(is_shape(&spec("deps.remove", shape_bad.clone())), "{shape_bad}");
+        }
+        let many: Vec<String> = (0..=MAX_REMOVE).map(|i| format!("p{i}")).collect();
+        for bad in [
+            json!([]),
+            json!(many),
+            json!(["a", "a"]),
+            json!(["-x"]),
+            json!(["A"]),
+            json!(["a b"]),
+            json!(["../x"]),
+            json!([""]),
+            json!(["a\u{1b}"]),
+        ] {
+            assert_eq!(
+                kind_of(spec("deps.remove", json!({"id": "a", "packages": bad.clone()}))),
+                Some(ErrorKind::InvalidArgument),
+                "{bad}"
+            );
+        }
+        for bad in BAD_IDS {
+            assert_eq!(
+                kind_of(spec("deps.remove", json!({"id": bad, "packages": ["dxvk"]}))),
+                Some(ErrorKind::InvalidArgument),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -976,6 +1071,14 @@ mod tests {
                     "notepad",
                 ],
                 JobKind::DepsInstall,
+            ),
+            (
+                JobSpec::DepsRemove {
+                    app: id(),
+                    packages: vec!["vkd3d-proton".into(), "dxvk".into()],
+                },
+                vec!["deps", "--remove=vkd3d-proton", "--remove=dxvk", "--", "notepad"],
+                JobKind::DepsRemove,
             ),
             (
                 JobSpec::PermissionsSet {
@@ -1359,6 +1462,7 @@ mod tests {
             (JobKind::Import, "import"),
             (JobKind::Remove, "remove"),
             (JobKind::DepsInstall, "depsInstall"),
+            (JobKind::DepsRemove, "depsRemove"),
             (JobKind::PermissionsSet, "permissionsSet"),
             (JobKind::PermissionsReset, "permissionsReset"),
             (JobKind::DisplaySet, "displaySet"),

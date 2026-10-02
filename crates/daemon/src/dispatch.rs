@@ -16,6 +16,7 @@
 //! | `deps.plan`         | `{"id": str}`                              | `deps_plan(id)`                  |
 //! | `apps.run` ... `display.set` | see `rt_api::jobs`                | `Jobs::start(JobSpec)`           |
 //! | `deps.install`      | `{"id", "planDigest", "consent"}`          | `deps_install_spec` + `start`    |
+//! | `deps.remove`       | `{"id": str, "packages": [str]}`           | `Jobs::start(JobSpec)` (0.2.3)   |
 //! | `jobs.poll`         | `{"jobId", "afterSeq", "waitMs"?}`         | `Jobs::poll` (long-poll)         |
 //! | `jobs.status`/`jobs.cancel` | `{"jobId"}`                        | `Jobs::status`/`Jobs::cancel`    |
 //! | `jobs.list`         | none                                       | `Jobs::list`                     |
@@ -44,6 +45,7 @@ pub const WRITE_METHODS: &[&str] = &[
     "apps.import",
     "apps.remove",
     "deps.install",
+    "deps.remove",
     "permissions.set",
     "permissions.reset",
     "display.set",
@@ -70,6 +72,7 @@ pub const METHODS: &[&str] = &[
     "apps.import",
     "apps.remove",
     "deps.install",
+    "deps.remove",
     "permissions.set",
     "permissions.reset",
     "display.set",
@@ -561,6 +564,8 @@ mod tests {
                 "deps.install",
                 json!({"id": "a", "planDigest": "x", "consent": [], "all": true}),
             ),
+            ("deps.remove", json!({"id": "a"})),
+            ("deps.remove", json!({"id": "a", "packages": ["dxvk"], "force": true})),
             ("jobs.poll", json!({"jobId": "x"})),
             ("jobs.poll", json!({"jobId": "x", "afterSeq": 0, "waitMs": 25001})),
             ("jobs.poll", json!({"jobId": "x", "afterSeq": -1})),
@@ -578,6 +583,9 @@ mod tests {
             ("apps.import", json!({"path": "/a/../p.wrun"})),
             ("permissions.set", json!({"id": "a", "set": ["a\nb"]})),
             ("deps.install", json!({"id": "a", "planDigest": "x", "consent": []})),
+            ("deps.remove", json!({"id": "a", "packages": ["-x"]})),
+            ("deps.remove", json!({"id": "a", "packages": []})),
+            ("deps.remove", json!({"id": "-a", "packages": ["dxvk"]})),
         ] {
             let v = call_line(&c, &req(m, Some(p.clone())));
             assert_eq!(
@@ -613,6 +621,30 @@ mod tests {
         assert_eq!((info.kind, info.app), (rt_api::jobs::JobKind::Import, None));
         let argv = std::fs::read(f.fake.join("argv._in_-x.wrun")).unwrap();
         assert_eq!(argv, b"import\0--silent\0--\0/in/-x.wrun\0");
+    }
+
+    #[test]
+    fn deps_remove_is_a_write_method_with_its_exact_argv() {
+        let (_d, _rt, c) = ro();
+        let v = call_line(
+            &c,
+            &req("deps.remove", Some(json!({"id": "game", "packages": ["dxvk"]}))),
+        );
+        assert_eq!((code(&v), v["error"]["data"]["kind"].as_str()), (-32000, Some(RO_KIND)));
+        let (_d, _rt, f, c) = rw();
+        let p = json!({"id": "game", "packages": ["vkd3d-proton", "dxvk"]});
+        let v = call_line(&c, &req("deps.remove", Some(p)));
+        let id = v["result"]["jobId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_owned();
+        let info = f.wait_end(&id);
+        assert_eq!(
+            (info.kind, info.app.as_deref()),
+            (rt_api::jobs::JobKind::DepsRemove, Some("game"))
+        );
+        let argv = std::fs::read(f.fake.join("argv.game")).unwrap();
+        assert_eq!(argv, b"deps\0--remove=vkd3d-proton\0--remove=dxvk\0--\0game\0");
     }
 
     #[test]
