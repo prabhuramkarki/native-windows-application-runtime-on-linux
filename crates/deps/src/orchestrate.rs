@@ -763,8 +763,9 @@ fn install_one(
     not_busy_now(o)?;
     let warnings = match pkg.kind {
         Kind::Archive => {
-            let done = install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
-                .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?;
+            let done =
+                install_archive::install_archive_with_previous(pkg, &file, o.env, o.backend, o.launcher, &previous)
+                    .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?;
             // Recorded from disk right after the install, under the lock (Decision R2). An archive package never
             // stays in the prefix without its record: if either step fails, what this call wrote is undone (R12).
             let recorded = install_archive::record_of(&done, &previous, o.env)
@@ -950,11 +951,18 @@ fn removal_order(env: &AppEnv, md: &Metadata, manifest: &Manifest, ids: &[String
                  uninstaller); recreate the environment to drop it"
             ));
         }
-        if rec.archive.is_none() {
+        let Some(archive) = &rec.archive else {
             return refuse(format!(
                 "`{id}` was installed by an older runtime that did not record what it wrote, so it cannot be \
                  removed safely; recreate the environment (`runtime remove {app}`, then install the app again) to \
                  drop it"
+            ));
+        };
+        // The record's meaning, checked for EVERY package before any is removed (R9; the metadata crate checked its
+        // shape only).
+        if let Err(e) = install_archive::check_archive_record(archive) {
+            return refuse(format!(
+                "`{id}`'s install record is not usable ({e}); nothing was removed: recreate the environment to drop it"
             ));
         }
     }
@@ -1018,14 +1026,22 @@ fn remove_one(
             .iter()
             .map(|(item, why)| (id.to_owned(), line(&format!("{item}: {why}")))),
     );
-    if out.remaining == rt_core::ArchiveRecord::default() {
+    let empty = out.remaining == rt_core::ArchiveRecord::default();
+    if out.failed.is_empty() {
         state::forget(&mut md, id);
-    } else if let Some(d) = md.dependencies.iter_mut().find(|d| d.id == id) {
+    } else if !empty && let Some(d) = md.dependencies.iter_mut().find(|d| d.id == id) {
         d.archive = Some(out.remaining.clone());
     }
-    store.write_metadata(env, &md).map_err(|e| {
-        format!("what was removed could not be recorded ({e}); a retry reports the restored items as left")
-    })?;
+    // Otherwise only the journal could not be deleted: the record stays as it was (fail closed), so a retry runs
+    // the whole removal again and deletes the journal then.
+    if out.failed.is_empty() || !empty {
+        store.write_metadata(env, &md).map_err(|e| {
+            format!(
+                "what was undone could not be recorded ({e}); removing it again finishes it, reporting what was \
+                 already undone as left"
+            )
+        })?;
+    }
     if !out.failed.is_empty() {
         let shown: Vec<String> = out
             .failed

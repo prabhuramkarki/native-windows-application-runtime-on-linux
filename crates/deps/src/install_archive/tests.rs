@@ -1327,6 +1327,38 @@ fn a_failing_reg_add_rolls_back_files_backups_and_earlier_overrides() {
 }
 
 #[test]
+fn a_failing_install_puts_previous_override_values_back_in_its_rollback() {
+    let e = Env::new();
+    let file = e.archive(
+        "a",
+        &files_in(ArchiveFormat::Zip, &[("d3d11.dll", b"D"), ("dxgi.dll", b"X")]),
+    );
+    let mut p = pkg_with(
+        ArchiveFormat::Zip,
+        &[("d3d11.dll", "d3d11.dll"), ("dxgi.dll", "dxgi.dll")],
+        &["d3d11", "dxgi"],
+        &["d3d11", "dxgi"],
+    );
+    p.size = fs::metadata(&file).unwrap().len();
+    let previous = vec![
+        ("d3d11".to_owned(), Some("builtin".to_owned())),
+        ("dxgi".to_owned(), None),
+    ];
+    let b = Settling::new(r#"[ "$1" = add ] && [ "$4" = dxgi ] && [ "$6" = native,builtin ] && exit 5; exit 0"#);
+    let err = install_archive_with_previous(&p, &file, &e.env, &b, &launcher(), &previous).unwrap_err();
+    assert!(matches!(err, ArchiveError::Registry(_)), "{err:?}");
+    assert_eq!(
+        b.reg_calls(),
+        [add("d3d11"), add("dxgi"), del("dxgi"), add_value("d3d11", "builtin")]
+    );
+    // An unrestorable previous value is refused before anything is written.
+    let before = e.snapshot();
+    let bad = vec![("d3d11".to_owned(), Some("a;b".to_owned()))];
+    assert!(install_archive_with_previous(&p, &file, &e.env, &b, &launcher(), &bad).is_err());
+    assert_eq!(e.snapshot(), before);
+}
+
+#[test]
 fn a_reg_delete_failure_is_an_error_unless_the_value_is_already_gone() {
     let e = Env::new();
     let done = ArchiveInstalled {
@@ -1854,6 +1886,58 @@ fn a_replaced_file_gone_with_its_backup_is_left_as_missing_and_dropped_from_the_
     assert!(!e.c("windows/system32/dxgi.dll").exists());
     assert!(!e.c("new").exists());
     assert!(!e.env.root().join(BACKUP_DIR).exists());
+}
+
+#[test]
+fn an_unchanged_replaced_file_whose_backup_is_missing_is_left_as_installed_and_never_loops() {
+    let (e, rec) = installed();
+    fs::remove_file(e.backup("dxvk", "windows/system32/dxgi.dll")).unwrap();
+    let out = remove_with(&e, &rec, &Settling::new("exit 0"));
+    assert_eq!(
+        left(&out),
+        [(
+            "windows/system32/dxgi.dll",
+            "its original backup is missing: left as installed"
+        )]
+    );
+    assert!(out.failed.is_empty(), "{out:?}");
+    assert_eq!(
+        out.remaining,
+        rt_core::ArchiveRecord::default(),
+        "a retry must not loop on it"
+    );
+    assert_eq!(fs::read(e.c("windows/system32/dxgi.dll")).unwrap(), b"DXGI");
+    assert!(!e.c("new").exists());
+    assert!(!e.env.root().join(BACKUP_DIR).exists());
+}
+
+#[test]
+fn a_changed_replaced_file_names_its_backup_only_while_the_backup_exists() {
+    let (e, rec) = installed();
+    put(&e.c("windows/system32/dxgi.dll"), b"tampered");
+    fs::remove_file(e.backup("dxvk", "windows/system32/dxgi.dll")).unwrap();
+    let out = remove_with(&e, &rec, &Settling::new("exit 0"));
+    assert_eq!(left(&out), [("windows/system32/dxgi.dll", CHANGED)]);
+}
+
+#[test]
+fn an_oversized_file_is_changed_without_being_read() {
+    let (e, rec) = installed();
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(e.c("new/d3d11.dll"))
+        .unwrap();
+    f.set_len(MAX_EXPANDED + 1).unwrap();
+    let t = std::time::Instant::now();
+    let out = remove_with(&e, &rec, &Settling::new("exit 0"));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(5),
+        "it was read: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(left(&out), [("new/d3d11.dll", CHANGED)]);
+    assert_eq!(fs::metadata(e.c("new/d3d11.dll")).unwrap().len(), MAX_EXPANDED + 1);
 }
 
 #[test]

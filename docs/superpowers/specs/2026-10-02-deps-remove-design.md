@@ -202,12 +202,25 @@ Nothing is pushed.
     was lost when the record could not be written.
   - `undo_install(&done, &previous, ..)` now takes the values read before the download (R5). An override that had
     a value gets it back with `reg add ... /d <previous> /f`; only one that had none is deleted.
-  - `install_archive`'s own rollback on its errors is unchanged (it deletes, as since 4A): it runs inside the call
-    and has no previous values. Only the record-failure path of R12 restores.
+  - `install_archive`'s own rollback on its errors restores them too (R19).
 - **Decision R15 (controller ruling): a replaced file that is gone together with its backup is left, not failed.**
   - R6 restores the original of a replaced file that is gone. When the backup is gone too, there is nothing to
     restore: it is reported `left: <path>: missing, nothing to restore` (so the run exits 1 once) and is not in
     `remaining`, so the record can be deleted and a retry never loops on it. Empty backup directories are pruned.
+
+- **Decisions R16-R19 (Tasks 1-4 review, I1, I2, M2, M3, M5).**
+  - **R16 (I1):** an UNCHANGED replaced file whose backup is missing has no original to put back. It is left as
+    installed (`left: <path>: its original backup is missing: left as installed`) and dropped from the record, as
+    R15, so a retry never loops. A left replaced file names its backup only while the backup exists.
+  - **R17 (I2):** the semantic record check (`check_archive_record`: paths, sha256, names, previous values) is one
+    of R9's pre-checks, run for EVERY package before any is removed, refusing with `CannotRemove`.
+  - **R18 (M3, fail closed):** when everything but the journal deletion succeeded, the package fails and its whole
+    record is KEPT, so the retry runs the removal again (noisy: what was undone is reported as left or removed)
+    and deletes the journal then. A record is never forgotten while its journal remains.
+  - **R19 (M2, M5):** a recorded file larger than any install writes (`MAX_EXPANDED`, 2 GiB) is "changed" without
+    being read. `install_archive`'s own rollback also puts previous override values back
+    (`install_archive_with_previous`, which `install_one` uses), so no path of 6F deletes a value that existed
+    before the install.
 
 ## 4. Behaviour
 

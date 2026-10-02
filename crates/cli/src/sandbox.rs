@@ -17,8 +17,9 @@
 //! and services, `DllOverrides` naming a native DLL it dropped. The next Wine session in that prefix runs them, and
 //! outside the sandbox that is the user's full access (Wine's `\\?\unix\` paths reach every host file). So once an
 //! app has run sandboxed ([`MARKER`] in its app root, which the sandbox never shows the program), the helpers that
-//! start a Wine session in its prefix (`reg.exe` for `runtime display` and archive packages of `runtime deps
-//! --install`) run through the SAME `AppSandbox` ([`helper_launcher`]); installer packages and uninstallers already
+//! start a Wine session in its prefix (`reg.exe` for `runtime display`, for archive packages of `runtime deps
+//! --install`, and for putting overrides back in `runtime deps --remove`) run through the SAME `AppSandbox`
+//! ([`helper_launcher`]); installer packages and uninstallers already
 //! run in the installer sandbox. `wineserver -k` is not a Wine session (no Windows code runs). What stays
 //! unsandboxed: `runtime run --unsandboxed` (it says so), and apps that never ran sandboxed. See docs/SECURITY.md.
 //!

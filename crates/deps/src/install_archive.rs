@@ -78,7 +78,7 @@
 //! attempt left).
 //!
 //! **Failure.** On any error [`install_archive`] undoes exactly what the call did (overrides deleted newest
-//! first, new files deleted, replaced files restored, created directories removed when empty) and returns the
+//! first, or put back to their previous values with [`install_archive_with_previous`], new files deleted, replaced files restored, created directories removed when empty) and returns the
 //! ORIGINAL error; if undoing fails too, the result is [`ArchiveError::Rollback`] carrying both. A process that is
 //! KILLED mid-install cannot roll back: earlier files, backups and the journal stay, and the next install (or its
 //! rollback) takes them over (see the journal). The caller records a package in the app's state only after
@@ -206,10 +206,26 @@ pub fn install_archive(
     backend: &dyn CompatBackend,
     launcher: &Launcher,
 ) -> Result<ArchiveInstalled, ArchiveError> {
+    install_archive_with_previous(pkg, file, env, backend, launcher, &[])
+}
+
+/// [`install_archive`] knowing each override's value before the install (`wine_config::read_dll_overrides`): a
+/// rollback puts those values back instead of deleting the overrides (as `undo_install` does, Decision R14). A
+/// previous value the runtime could not restore is refused before anything is written.
+pub fn install_archive_with_previous(
+    pkg: &Package,
+    file: &Path,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    previous: &[(String, Option<String>)],
+) -> Result<ArchiveInstalled, ArchiveError> {
     let (format, extract, overrides) = check_package(pkg)?;
     check_overrides(overrides, Some(&pkg.provides))?;
+    check_previous(previous)?;
     let src = open_archive(file, pkg.size)?;
     let mut ledger = Ledger::new(env, &pkg.id);
+    ledger.previous = previous.to_vec();
     ledger.sha256.clone_from(&pkg.sha256);
     ledger.adopt()?;
     let result = (|| {
@@ -335,6 +351,12 @@ pub fn record_of(
                     clip(&rel.to_string_lossy())
                 )));
             }
+            Hashed::Oversized => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is larger than an install writes",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
             Hashed::NotRegular => {
                 return Err(ArchiveError::Destination(format!(
                     "{:?} is not a regular file",
@@ -393,15 +415,9 @@ pub(crate) fn undo_install(
         )));
     }
     check_record(installed)?;
-    if previous.iter().any(|(_, v)| {
-        v.as_deref()
-            .is_some_and(|v| !crate::wine_config::restorable_override(v))
-    }) {
-        return Err(ArchiveError::BadPackage(
-            "a previous override value is not one the runtime can restore".into(),
-        ));
-    }
+    check_previous(previous)?;
     let mut ledger = Ledger::new(env, pkg_id);
+    ledger.previous = previous.to_vec();
     if installed.files.is_empty() && fs::symlink_metadata(ledger.journal_path()).is_ok() {
         return Err(ArchiveError::Journal(format!(
             "package {pkg_id:?} has an interrupted install; an empty record would drop its journal and leak it: use \
@@ -411,20 +427,9 @@ pub(crate) fn undo_install(
     ledger.done = installed.clone();
     // A record may list directories in any order: children first.
     ledger.done.created_dirs.sort_by_key(|d| d.components().count());
-    // Newest first: an override that had a value before the install gets it back (Ruling 6F-1), one that had none
-    // is deleted.
-    let mut failures: Vec<ArchiveError> = installed
-        .overrides
-        .iter()
-        .rev()
-        .filter_map(|name| {
-            match previous.iter().find(|(n, _)| n == name).and_then(|(_, v)| v.as_deref()) {
-                Some(v) => restore_override(name, v, env, backend, launcher),
-                None => delete_override(name, env, backend, launcher, None),
-            }
-            .err()
-        })
-        .collect();
+    // Newest first: an override that had a value before the install gets it back (R14), one that had none is
+    // deleted.
+    let mut failures = ledger.undo_overrides(env, backend, launcher);
     failures.extend(ledger.undo_files());
     match failures.into_iter().next() {
         Some(first) => Err(first),
@@ -447,7 +452,8 @@ pub struct RemoveOutcome {
     /// [`INSTALLED_OVERRIDE`]. Such items are no longer the runtime's: they are not in `remaining`.
     pub left: Vec<(String, String)>,
     /// `(item, error)`: hard failures (an I/O error, `reg.exe` failing or timing out; Decision R7). A failure to
-    /// delete the journal is reported as item `journal`, with nothing in `remaining` for it.
+    /// delete the journal is reported as item `journal`, with nothing in `remaining` for it: the caller then keeps
+    /// the whole record (fail closed), and a retry deletes the journal.
     pub failed: Vec<(String, String)>,
     /// Exactly the record entries whose step failed: what a retry has to work on. Empty when nothing failed.
     pub remaining: rt_core::ArchiveRecord,
@@ -529,8 +535,8 @@ pub fn remove_archive(
     for f in rec.files.iter().rev() {
         let rel = Path::new(&f.path);
         let path = clip(&f.path);
-        // A replaced file that is left keeps its backup, and the report says where it is.
-        let kept = |why: &str| match f.replaced {
+        // A replaced file that is left keeps its backup, and the report says where it is (only while it is there).
+        let kept = |why: &str| match f.replaced && ledger.backup_exists(rel) {
             true => format!("{why}; its original is kept at {BACKUP_DIR}/{pkg_id}/c/{path}"),
             false => why.to_owned(),
         };
@@ -539,8 +545,20 @@ pub fn remove_archive(
                 out.left.push((path.clone(), kept(NOT_FOLLOWED)));
                 continue;
             }
+            Ok(Hashed::Oversized) => {
+                out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
             Ok(Hashed::File(h)) if h != f.sha256 => {
                 out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
+            // Unchanged, but its original is gone: there is nothing to put back, so it stays as installed, and
+            // keeping it in the record would fail every retry (review I1, as R15): left, and out of the record.
+            Ok(Hashed::File(_)) if f.replaced && !ledger.backup_exists(rel) => {
+                out.left
+                    .push((path.clone(), "its original backup is missing: left as installed".into()));
+                ledger.prune_backup_dirs(rel);
                 continue;
             }
             // Gone together with its backup: nothing to restore, and keeping it would fail every retry (Ruling
@@ -665,6 +683,20 @@ fn valid_override(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// Every previous override value is one the runtime can restore (Decision R5).
+fn check_previous(previous: &[(String, Option<String>)]) -> Result<(), ArchiveError> {
+    let bad = |v: &Option<String>| {
+        v.as_deref()
+            .is_some_and(|v| !crate::wine_config::restorable_override(v))
+    };
+    if previous.iter().any(|(_, v)| bad(v)) {
+        return Err(ArchiveError::BadPackage(
+            "a previous override value is not one the runtime can restore".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Every name valid and unique; with `provides`, every name also in it.
 pub(crate) fn check_overrides(names: &[String], provides: Option<&[String]>) -> Result<(), ArchiveError> {
     if names.len() > MAX_LIST_LEN {
@@ -703,7 +735,7 @@ fn check_record(r: &ArchiveInstalled) -> Result<(), ArchiveError> {
 /// A persisted record is re-validated before [`remove_archive`] acts on it (the metadata crate checked its shape
 /// only): every path passes the Windows name rules inside `drive_c`, every sha256 is well-formed, override names are
 /// valid and unique, and previous values are restorable. The error never quotes a previous value.
-fn check_archive_record(r: &rt_core::ArchiveRecord) -> Result<(), ArchiveError> {
+pub(crate) fn check_archive_record(r: &rt_core::ArchiveRecord) -> Result<(), ArchiveError> {
     let bad = |why: String| ArchiveError::BadPackage(format!("recorded install: {why}"));
     let cap = rt_core::MAX_RECORDED;
     if r.files.len() > cap || r.created_dirs.len() > cap || r.overrides.len() > cap {
@@ -1023,6 +1055,8 @@ struct Ledger {
     adopted: Vec<PathBuf>,
     /// Files the killed attempt listed as replaced whose backup still exists: restored on rollback.
     adopted_replaced: Vec<PathBuf>,
+    /// Each override's value before the install: what undoing it puts back (`None`, or not listed: deleted).
+    previous: Vec<(String, Option<String>)>,
 }
 
 /// Appends one journal line and makes it durable before the step it announces.
@@ -1120,6 +1154,7 @@ impl Ledger {
             prior_files: HashSet::new(),
             adopted: Vec::new(),
             adopted_replaced: Vec::new(),
+            previous: Vec::new(),
         }
     }
 
@@ -1346,11 +1381,25 @@ impl Ledger {
         }
     }
 
-    /// Deletes the overrides in `done`, newest first, continuing past failures.
+    /// Undoes the overrides in `done`, newest first, continuing past failures: one with a value in `previous`
+    /// gets it back, any other is deleted.
     fn undo_overrides(&self, env: &AppEnv, backend: &dyn CompatBackend, launcher: &Launcher) -> Vec<ArchiveError> {
-        let deleted = self.done.overrides.iter().rev();
-        deleted
-            .filter_map(|name| delete_override(name, env, backend, launcher, None).err())
+        self.done
+            .overrides
+            .iter()
+            .rev()
+            .filter_map(|name| {
+                match self
+                    .previous
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .and_then(|(_, v)| v.as_deref())
+                {
+                    Some(v) => restore_override(name, v, env, backend, launcher),
+                    None => delete_override(name, env, backend, launcher, None),
+                }
+                .err()
+            })
             .collect()
     }
 
@@ -1394,6 +1443,8 @@ enum Hashed {
     File(String),
     /// Nothing there.
     Gone,
+    /// A regular file larger than any install writes ([`MAX_EXPANDED`]): changed, and not read.
+    Oversized,
     /// A symlink in any component, a directory, a special file, or a component that is not a directory: never
     /// followed and never read.
     NotRegular,
@@ -1423,8 +1474,14 @@ impl Ledger {
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Hashed::NotRegular),
             Err(e) => return Err(e.into()),
         };
-        if !file.metadata()?.file_type().is_file() {
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
             return Ok(Hashed::NotRegular);
+        }
+        // An install never writes more than this, so a bigger file has changed; reading it (a huge sparse file)
+        // would only hold the app lock for nothing.
+        if meta.len() > MAX_EXPANDED {
+            return Ok(Hashed::Oversized);
         }
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 64 * 1024];

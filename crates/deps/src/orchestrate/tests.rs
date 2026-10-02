@@ -2217,3 +2217,100 @@ fn a_tampered_file_is_reported_left_and_the_record_still_goes() {
     assert_eq!(fs::read(r.c("windows/system32/b.dll")).unwrap(), b"changed by the user");
     assert_eq!(r.recorded(), ["a"]);
 }
+
+#[test]
+fn an_invalid_record_of_a_later_package_refuses_before_anything_is_removed() {
+    type Spoil = fn(&mut rt_core::ArchiveRecord);
+    let spoils: [Spoil; 3] = [
+        |a| a.files[0].path = "../x".into(),
+        |a| a.overrides[0].previous = Some("X".into()),
+        |a| a.created_dirs = vec!["C:".into()],
+    ];
+    for spoil in spoils {
+        let r = removal_rig();
+        let mut m = r.md();
+        spoil(
+            m.dependencies
+                .iter_mut()
+                .find(|d| d.id == "a")
+                .unwrap()
+                .archive
+                .as_mut()
+                .unwrap(),
+        );
+        r.set_md(&m);
+        let before = (
+            fs::read(r.env.metadata_path()).unwrap(),
+            fs::read(r.c("windows/system32/b.dll")).unwrap(),
+        );
+        let b = FakeBackend::new();
+        match rm(&r, &["b", "a"], &b) {
+            Err(DepsError::CannotRemove(m)) => assert!(m.contains("`a`") && m.contains("record"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(reg_argv(&b).is_empty());
+        let after = (
+            fs::read(r.env.metadata_path()).unwrap(),
+            fs::read(r.c("windows/system32/b.dll")).unwrap(),
+        );
+        assert_eq!(after, before, "b was removed before a's record was checked");
+    }
+}
+
+#[test]
+fn a_wine_program_started_during_the_run_stops_it_before_the_next_package() {
+    let r = removal_rig();
+    let bin = tempfile::tempdir().unwrap();
+    let server = bin.path().join("wineserver");
+    let pidfile = bin.path().join("pid");
+    fs::write(
+        &server,
+        format!("#!/bin/sh\necho $$ > {}\nsleep 60\n", pidfile.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&server, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    // The first reg call (b's) starts a wineserver for the prefix, detached, and waits until it runs.
+    let b = FakeBackend::with_script(&format!(
+        "[ -s {pid} ] || {{ setsid -f env -i PATH=/usr/bin:/bin WINEPREFIX={prefix} {server} </dev/null >/dev/null \
+         2>&1; while [ ! -s {pid} ]; do sleep 0.01; done; }}; exit 0",
+        pid = pidfile.display(),
+        prefix = r.env.prefix().display(),
+        server = server.display(),
+    ));
+    let rep = rm(&r, &["a", "b"], &b);
+    let pid = fs::read_to_string(&pidfile).unwrap_or_default();
+    if let Ok(p) = pid.trim().parse::<i32>() {
+        // SAFETY: a plain signal to the test's own child process.
+        unsafe { libc::kill(p, libc::SIGKILL) };
+    }
+    let rep = rep.unwrap();
+    assert_eq!(rep.removed, ["b"], "{rep:?}");
+    assert!(
+        reason(&rep.failed, "a").contains("a Wine program is now running"),
+        "{rep:?}"
+    );
+    assert!(r.c("windows/system32/a.dll").exists());
+    assert_eq!(r.recorded(), ["a"]);
+}
+
+#[test]
+fn a_journal_that_cannot_be_deleted_fails_the_package_and_keeps_its_record() {
+    let r = removal_rig();
+    let journal = r.env.root().join(install_archive::BACKUP_DIR).join("b/journal");
+    fs::remove_file(&journal).unwrap();
+    fs::create_dir_all(journal.join("x")).unwrap();
+    let rec_before = r.md().dependency("b").cloned();
+    let rep = rm(&r, &["b"], &FakeBackend::new()).unwrap();
+    assert!(rep.removed.is_empty(), "{rep:?}");
+    assert!(reason(&rep.failed, "b").contains("journal"), "{rep:?}");
+    assert_eq!(
+        r.md().dependency("b").cloned(),
+        rec_before,
+        "fail closed: the record stays"
+    );
+    // Once the journal can go, a retry finishes.
+    fs::remove_dir_all(&journal).unwrap();
+    let rep = rm(&r, &["b"], &FakeBackend::new()).unwrap();
+    assert_eq!(rep.removed, ["b"], "{rep:?}");
+    assert_eq!(r.recorded(), ["a"]);
+}
