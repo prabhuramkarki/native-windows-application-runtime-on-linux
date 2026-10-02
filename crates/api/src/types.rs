@@ -208,6 +208,9 @@ impl PackageView {
 pub enum NetworkView {
     Deny,
     Allow,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +219,9 @@ pub enum NetworkView {
 pub enum AccessView {
     Ro,
     Rw,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +256,9 @@ pub enum PermSource {
     Default,
     /// A valid `permissions.toml`.
     File,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +390,9 @@ pub enum SubjectView {
         name: Option<String>,
         version: Option<String>,
     },
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One check: `area` (`architecture`, `pe`, `imports`, `graphics`, `audio`, `runtime`, `prefix`, `program`) and
@@ -468,7 +480,9 @@ pub struct GpuView {
 pub enum VulkanState {
     Usable,
     Unusable,
-    /// The device list could not be read: that never blocks anything.
+    /// The device list could not be read: that never blocks anything. Also what a value this client does not know
+    /// (a newer daemon's) reads as: deserialisation never fails on it.
+    #[serde(other)]
     Unknown,
 }
 
@@ -550,7 +564,12 @@ impl GraphicsView {
 #[non_exhaustive]
 pub enum Availability {
     Available,
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Availability {
@@ -624,6 +643,9 @@ pub enum PlanAction {
     Install,
     AlreadyInstalled,
     Blocked,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +655,9 @@ pub enum ConsentView {
     NotNeeded,
     Needed,
     Denied,
+    /// A value this client does not know (a newer daemon's): deserialisation never fails on it. Never produced.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -704,5 +729,138 @@ impl DepsPlanView {
             warnings: p.warnings.iter().map(|w| long(w)).collect(),
             digest: crate::jobs::plan_digest(id, p, manifest),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+
+    /// `future` reads as `unknown`, and every `known` value round-trips to its wire form.
+    fn falls_back<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
+        future: Value,
+        unknown: T,
+        known: Vec<(T, Value)>,
+    ) {
+        assert_eq!(serde_json::from_value::<T>(future).unwrap(), unknown);
+        for (v, j) in known {
+            assert_eq!(serde_json::to_value(&v).unwrap(), j);
+            assert_eq!(serde_json::from_value::<T>(j).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn network_view_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            NetworkView::Unknown,
+            vec![(NetworkView::Deny, json!("deny")), (NetworkView::Allow, json!("allow"))],
+        );
+    }
+
+    #[test]
+    fn access_view_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            AccessView::Unknown,
+            vec![(AccessView::Ro, json!("ro")), (AccessView::Rw, json!("rw"))],
+        );
+    }
+
+    #[test]
+    fn perm_source_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            PermSource::Unknown,
+            vec![
+                (PermSource::Default, json!("default")),
+                (PermSource::File, json!("file")),
+            ],
+        );
+    }
+
+    #[test]
+    fn plan_action_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            PlanAction::Unknown,
+            vec![
+                (PlanAction::Install, json!("install")),
+                (PlanAction::AlreadyInstalled, json!("alreadyInstalled")),
+                (PlanAction::Blocked, json!("blocked")),
+            ],
+        );
+    }
+
+    #[test]
+    fn consent_view_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            ConsentView::Unknown,
+            vec![
+                (ConsentView::NotNeeded, json!("notNeeded")),
+                (ConsentView::Needed, json!("needed")),
+                (ConsentView::Denied, json!("denied")),
+            ],
+        );
+    }
+
+    #[test]
+    fn vulkan_state_falls_back() {
+        falls_back(
+            json!("fromTheFuture"),
+            VulkanState::Unknown,
+            vec![
+                (VulkanState::Usable, json!("usable")),
+                (VulkanState::Unusable, json!("unusable")),
+                (VulkanState::Unknown, json!("unknown")),
+            ],
+        );
+    }
+
+    #[test]
+    fn subject_view_falls_back() {
+        falls_back(
+            json!({"kind": "fromTheFuture", "extra": 1}),
+            SubjectView::Unknown,
+            vec![
+                (SubjectView::System, json!({"kind": "system"})),
+                (
+                    SubjectView::App {
+                        id: "a".into(),
+                        name: None,
+                        version: Some("1".into()),
+                    },
+                    json!({"kind": "app", "id": "a", "name": null, "version": "1"}),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn availability_falls_back() {
+        falls_back(
+            json!({"state": "fromTheFuture"}),
+            Availability::Unknown,
+            vec![
+                (Availability::Available, json!({"state": "available"})),
+                (
+                    Availability::Unavailable { reason: "r".into() },
+                    json!({"state": "unavailable", "reason": "r"}),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_compat_record_reads_a_newer_status() {
+        let r: CompatRecord = serde_json::from_value(json!({
+            "app": "a", "version": null, "status": "fromTheFuture", "wine": "10", "gpu": null,
+            "graphics": false, "evidence": null, "notes": null
+        }))
+        .unwrap();
+        assert_eq!(r.status, crate::compat::Status::Unknown);
     }
 }

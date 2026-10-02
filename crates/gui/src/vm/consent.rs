@@ -103,7 +103,8 @@ impl ConsentState {
                 action: match e.action {
                     PlanAction::Install => "install",
                     PlanAction::AlreadyInstalled => "already installed",
-                    _ => "blocked",
+                    PlanAction::Blocked => "blocked",
+                    _ => "unknown",
                 },
                 note: match (&e.blocked_reason, e.consent) {
                     (Some(r), _) => Some(shown(r, super::MAX_SHOWN)),

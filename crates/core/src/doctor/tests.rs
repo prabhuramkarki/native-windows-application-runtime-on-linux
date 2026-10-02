@@ -418,9 +418,9 @@ fn a_hostile_wine_version_is_cleaned_and_shortened() {
     let c = one(&r, Area::Runtime, "Wine: wine-10");
     assert_eq!(c.status, Status::Ok);
     assert_tame(&c.text);
-    // 80 characters of version, then the fixed "; backend wine, interface 1".
+    // 80 characters of version, then the fixed "; backend wine, interface 2".
     assert!(c.text.chars().count() < 120, "{}", c.text.chars().count());
-    assert!(c.text.ends_with("; backend wine, interface 1"), "{}", c.text);
+    assert!(c.text.ends_with("; backend wine, interface 2"), "{}", c.text);
 }
 
 fn dev(api: (u32, u32)) -> crate::VulkanDevice {

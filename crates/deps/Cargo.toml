@@ -24,6 +24,7 @@ ruzstd.workspace = true
 
 [dev-dependencies]
 runtime-core = { path = "../core", features = ["testing"] }
+runtime-sandbox = { path = "../sandbox" }
 runtime-backend-wine = { path = "../backend-wine" }
 tempfile.workspace = true
 serde_json.workspace = true

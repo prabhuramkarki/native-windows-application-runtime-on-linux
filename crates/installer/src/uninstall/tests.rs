@@ -1,5 +1,4 @@
 use super::*;
-use crate::sandbox::find_bwrap_on_path;
 use rt_core::{AppId, FakeBackend, Store};
 use std::fs;
 
@@ -39,11 +38,13 @@ fn md_with_uninstall(env: &AppEnv, command: Option<&str>) -> Metadata {
 
 fn require_real_bwrap() -> Option<std::path::PathBuf> {
     let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
-    match find_bwrap_on_path() {
-        Some(p) => Some(p),
-        None if require => panic!("bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set"),
-        None => {
-            eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox uninstall tests need bubblewrap installed");
+    match rt_sandbox::usable_bwrap_on_path() {
+        Ok(p) => Some(p),
+        Err(why) if require => {
+            panic!("RUNTIME_REQUIRE_BWRAP is set but {why}: the real-sandbox uninstall tests must run for real")
+        }
+        Err(why) => {
+            eprintln!("SKIPPED the real-sandbox uninstall tests: {why}");
             None
         }
     }

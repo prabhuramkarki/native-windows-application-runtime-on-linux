@@ -1,7 +1,9 @@
 //! `runtime display <app> [auto|x11|wayland]`: shows or sets the Wine graphics driver of an app's prefix
 //! (`HKCU\Software\Wine\Drivers` `Graphics`).
 //!
-//! Reading takes no lock and writes nothing. Setting is validated BEFORE the app lock is taken and before
+//! Both paths first require the app's recorded backend to be known and to declare `graphics_driver`
+//! ([`require_graphics_driver`], from its constant capabilities: no backend is discovered, so reading works without
+//! Wine installed); a refusal touches nothing. Reading takes no lock and writes nothing. Setting is validated BEFORE the app lock is taken and before
 //! anything is written: `wayland` needs a Wayland session (the socket doctor looks for) and a Wine that has
 //! `winewayland` (a Wine whose files cannot be listed, or only partly, is "not verified", which never refuses).
 //! `x11` without a `DISPLAY` only warns. The exclusive lock only keeps other runtime commands out (`runtime run`
@@ -10,7 +12,7 @@
 use crate::CmdError;
 use crate::safe::{safe, shorten, warn};
 use rt_core::doctor::{HostFs, wayland_socket};
-use rt_core::{CompatBackend, GraphicsDriver, Launcher};
+use rt_core::{Capabilities, CompatBackend, GraphicsDriver, Launcher, Unsupported};
 use rt_deps::wine_config::{read_graphics_driver_from_prefix, set_graphics_driver};
 use std::ffi::OsString;
 
@@ -41,14 +43,39 @@ fn driver_text(d: &GraphicsDriver) -> String {
     }
 }
 
+/// The gate of both paths: the recorded backend (`caps` is `rt_api::backends::capabilities(id)`, which needs no
+/// installed backend) must be known and declare `graphics_driver`.
+fn require_graphics_driver(id: &str, caps: Option<Capabilities>) -> Result<(), CmdError> {
+    let caps = caps.ok_or_else(|| rt_api::backends::unknown(id))?;
+    if caps.graphics_driver {
+        return Ok(());
+    }
+    // `caps` is `Some` only for a known id, so this finds it; the fallback keeps the type `'static`.
+    let backend = rt_api::backends::KNOWN
+        .iter()
+        .copied()
+        .find(|k| *k == id)
+        .unwrap_or("recorded");
+    Err(Unsupported::Feature {
+        backend,
+        feature: "the graphics driver setting",
+    }
+    .into())
+}
+
 pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     let store = crate::store()?;
     let env = crate::deps::app_env(&store, app)?;
+    let md = store
+        .read_metadata(&env)
+        .map_err(|e| format!("cannot read {}'s metadata: {e}", env.id()))?;
+    // Before `user.reg` is read or the lock taken.
+    require_graphics_driver(&md.backend.id, rt_api::backends::capabilities(&md.backend.id))?;
     let launcher = Launcher::new();
     let Some(choice) = choice else {
         let driver =
             read_graphics_driver_from_prefix(&env).map_err(|e| format!("cannot read {}'s user.reg: {e}", env.id()))?;
-        let wl = match crate::backend_of(&store, &env, &launcher)
+        let wl = match rt_api::backends::select(&md.backend.id, &launcher)
             .ok()
             .and_then(|b| has_winewayland(&*b))
         {
@@ -64,7 +91,7 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     };
     let want = GraphicsDriver::parse_choice(choice)
         .ok_or_else(|| format!("unknown driver {:?}: choose auto, x11 or wayland", shorten(choice, 40)))?;
-    let backend = crate::backend_of(&store, &env, &launcher)?;
+    let backend = rt_api::backends::select(&md.backend.id, &launcher)?;
     match want {
         GraphicsDriver::Wayland => {
             if wayland_socket(&env_var, &HostFs).is_none() {
@@ -118,4 +145,26 @@ pub fn run(app: &str, choice: Option<&str>) -> Result<(), CmdError> {
     let helpers = crate::sandbox::helper_launcher(&env, &launcher, &*backend)?;
     set_graphics_driver(&env, &*backend, &helpers, &want).map_err(|e| e.to_string())?;
     crate::emit(&format!("graphics driver of {} set to {}\n", env.id(), want.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_graphics_driver_gate_refuses_an_unknown_backend_and_one_without_the_capability() {
+        let e = require_graphics_driver("null\u{1b}[31m", None).unwrap_err().to_string();
+        assert!(
+            e.contains("unknown compatibility backend") && e.contains("(known: wine)"),
+            "{e}"
+        );
+        assert!(!e.chars().any(char::is_control), "{e:?}");
+        let off = Capabilities {
+            graphics_driver: false,
+            ..backend_wine::CAPABILITIES
+        };
+        let e = require_graphics_driver("wine", Some(off)).unwrap_err().to_string();
+        assert_eq!(e, "the wine backend does not support the graphics driver setting");
+        assert!(require_graphics_driver("wine", Some(backend_wine::CAPABILITIES)).is_ok());
+    }
 }

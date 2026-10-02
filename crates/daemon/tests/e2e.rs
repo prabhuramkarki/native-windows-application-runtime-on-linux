@@ -223,6 +223,7 @@ fn rpc_and_daemon_status_against_the_real_daemon() {
         "{}",
         text(&o.stdout)
     );
+    assert!(text(&o.stdout).contains("start `runtimed`"), "{}", text(&o.stdout));
     let o = s.rpc(&sock, &["rpc.version"]);
     assert_eq!(o.status.code(), Some(1));
     assert!(text(&o.stderr).contains("no daemon at"), "{}", text(&o.stderr));
@@ -334,6 +335,10 @@ fn unsafe_sockets_never_receive_a_request_from_the_cli() {
             let all = text(&o.stdout) + &text(&o.stderr);
             assert!(all.contains("refusing"), "{what}: {all}");
         }
+        // Starting a daemon would not fix an unsafe socket: no hint.
+        let out = text(&s.status(&p).stdout);
+        assert!(out.contains("reachable: not checked (refusing"), "{what}: {out}");
+        assert!(!out.contains("start"), "{what}: {out}");
         assert!(l.accept().is_err(), "{what}: the CLI connected");
     }
 }
@@ -430,7 +435,47 @@ fn a_hostile_daemon_never_crashes_the_cli_or_reaches_the_terminal() {
     let o = s.status(&sock);
     assert_eq!(o.status.code(), Some(1));
     assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
-    assert!(text(&o.stdout).contains("reachable: no"), "{}", text(&o.stdout));
+    let out = text(&o.stdout);
+    assert!(out.contains("reachable: yes, not answering within 5 s"), "{out}");
+    assert!(!out.contains("start"), "{out}");
+}
+
+/// Phase 6E Task 5: a daemon whose connection slots are all held answers `daemon-status` with the busy line;
+/// that is "busy", not "unreachable", and starting another daemon is not suggested.
+#[test]
+fn daemon_status_says_busy_when_the_connection_cap_is_reached() {
+    let s = Scratch::new();
+    let (mut d, sock) = s.daemon();
+    // There is no --max-connections flag: hold connections until one gets the busy line (as the server tests do).
+    let mut held = Vec::new();
+    let busy = (0..200).any(|_| {
+        let c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut line = String::new();
+        let _ = BufReader::new(&c).read_line(&mut line);
+        if line.contains("-32001") {
+            return true;
+        }
+        held.push(c);
+        false
+    });
+    assert!(busy, "no busy line after {} held connections", held.len());
+    let o = s.status(&sock);
+    let out = text(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{out}");
+    assert!(
+        out.contains("reachable: yes, busy (connection limit reached): try again"),
+        "{out}"
+    );
+    assert!(!out.contains("start"), "{out}");
+    // A freed slot: answered again.
+    drop(held);
+    let until = Instant::now() + Duration::from_secs(10);
+    while s.status(&sock).status.code() != Some(0) {
+        assert!(Instant::now() < until, "the slots were not freed");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(d.stop().success());
 }
 
 #[test]

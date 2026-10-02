@@ -1,4 +1,5 @@
-//! `runtimed --write`: what must hold before a daemon may run mutations, checked once at startup.
+//! `runtimed --write`: what must hold before a daemon may run mutations, checked at startup (the `runtime` binary
+//! and its version are checked again before every job, in `crate::jobs`).
 //!
 //! * The socket is inside `$XDG_RUNTIME_DIR` (spec D11): every sandbox profile mounts an empty tmpfs over that
 //!   directory and no grant may name it, so no sandboxed program can reach a write-capable socket. A `--socket` in
@@ -13,15 +14,14 @@
 //!   that daemon serves the same socket (and this one is about to be refused by the socket lock) or another one.
 //!   Anything else there is left alone.
 //! * The sibling `runtime` passes `check_runtime_exe` and `runtime --version` prints this daemon's own version
-//!   within [`VERSION_TIMEOUT`] (its output read on a thread against the same deadline, at most 4 KiB) (spec D10).
-//!   The CLI's `--plan-digest` check still guards consent if the binary is replaced later.
-use crate::jobs::{JobsConfig, check_job_cwd, check_runtime_exe, child_env};
+//!   within [`VERSION_TIMEOUT`] (spec D10; [`crate::jobs::runtime_version`], the same probe `Jobs::start` runs
+//!   before every job, where a changed version is `runtime_mismatch`). The CLI's `--plan-digest` check still guards
+//!   consent.
+use crate::jobs::{JobsConfig, check_job_cwd, check_runtime_exe, child_env, runtime_version, wanted_version};
 use std::fs;
-use std::io::{BufRead, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long `runtime --version` may take.
 pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -211,9 +211,10 @@ pub(crate) fn prepare_with(
     check_job_cwd(&cwd, euid()).map_err(|e| format!("--write: {}", e.message))?;
     remove_dead_daemon_dirs(&cwd);
     check_runtime_exe(runtime_exe, euid()).map_err(|e| format!("--write: {}", e.message))?;
-    let want = format!("runtime {}", env!("CARGO_PKG_VERSION"));
-    let got = version_of(runtime_exe, &cwd, version_timeout)?;
-    if got != want {
+    let env = child_env(&|| std::env::vars_os().collect());
+    let got = runtime_version(runtime_exe, &cwd, &env, version_timeout)
+        .map_err(|why| format!("--write: cannot check {}'s version: {why}", shown(runtime_exe)))?;
+    if got != wanted_version() {
         return Err(format!(
             "--write: {} says {:?}; this runtimed is {}: install matching versions",
             shown(runtime_exe),
@@ -267,47 +268,6 @@ fn private_dir(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `exe --version`'s first line, with the job environment. Everything is bounded by `timeout`: the output is read
-/// on a thread (at most 4 KiB, up to the first newline), so a process it leaves holding stdout cannot hang startup;
-/// a child still running at the deadline is killed.
-fn version_of(exe: &Path, cwd: &Path, timeout: Duration) -> Result<String, String> {
-    let fail = |why: String| format!("--write: cannot check {}'s version: {why}", shown(exe));
-    let mut child = Command::new(exe)
-        .arg("--version")
-        .env_clear()
-        .envs(child_env(&|| std::env::vars_os().collect()))
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| fail(e.to_string()))?;
-    let until = Instant::now() + timeout;
-    let no_answer = || fail(format!("no answer within {} s", timeout.as_secs_f32()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(out) = child.stdout.take() {
-        // Left blocked (and leaked) only if something keeps the pipe open past the deadline: startup fails then.
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(out.take(4096)).read_line(&mut line);
-            let _ = tx.send(line);
-        });
-    }
-    let line = rx.recv_timeout(until.saturating_duration_since(Instant::now()));
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) if line.is_ok() => break,
-            Ok(None) if Instant::now() < until && line.is_ok() => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(no_answer());
-            }
-        }
-    }
-    Ok(line.unwrap_or_default().trim().to_owned())
-}
-
 /// The path an inherited listener is bound to (`None`: unnamed or abstract, which `--write` refuses).
 pub fn listener_path(l: &std::os::unix::net::UnixListener) -> Option<PathBuf> {
     l.local_addr().ok()?.as_pathname().map(Path::to_path_buf)
@@ -318,6 +278,7 @@ mod tests {
     use super::*;
     use crate::jobs::tests::write_script;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::time::Instant;
 
     struct W {
         _t: tempfile::TempDir,

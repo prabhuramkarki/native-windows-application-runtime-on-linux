@@ -4,7 +4,7 @@
 or a script asks it what the CLI would print, as typed JSON. By default it is **read-only**. Started with `--write`,
 it also runs, installs, imports and removes apps, installs dependencies and changes permissions and the display driver: each
 such change is a **job** that runs the `runtime` CLI next to `runtimed`, whose output clients follow by long-polling
-([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.1**.
+([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.2**.
 
 The CLI does not need the daemon. Every `runtime` command works on its own, except the two that exist to talk to it:
 `runtime rpc` and `runtime daemon-status`.
@@ -108,6 +108,10 @@ Member order is not significant; the daemon writes members in alphabetical order
   is not exactly `{package, version, sha256}` of a consent-gated package that plan installs (or names one twice).
 - `busy`: 4 jobs are already running. Nothing is queued: try again later.
 - `app_busy`: a job for this app is still running.
+- `runtime_mismatch`: (0.2.2) the `runtime` binary next to `runtimed --write` now answers `--version` with another
+  version than the daemon's (it was upgraded or replaced under the running daemon). Nothing was started. The remedy
+  is to restart `runtimed` (`systemctl --user restart runtimed`); read methods keep working. A version probe that
+  fails (no answer within 5 s, a spawn failure, no output) is `unavailable` instead.
 - `internal`: reserved.
 
 **Switch on `code` and `data.kind`, never on `message`.** A `message` is prose for people. It is cleaned (no
@@ -186,7 +190,8 @@ never signalled.
    an installed package, or a licence text changed since you showed it) or if any item is not exactly a
    consent-gated entry of it. Show the plan again and ask again.
 4. The job's `runtime deps --install --plan-digest=<digest>` recomputes the plan once more and refuses (exit 1,
-   nothing installed) if it changed in between. It prints the licence text in full before it accepts a package, so
+   nothing installed) if it changed in between, and again after it has taken the app lock, before any prompt or
+   download. It prints the licence text in full before it accepts a package, so
    the job's events show what was accepted.
 
 There is no "yes to all" and no consent that is not a concrete package, version and hash.
@@ -256,7 +261,7 @@ The API version (semver), the runtime's crate version, the protocol name, and wh
 methods (`runtimed --write`). A 0.1 daemon has no `write`: treat it as `false`.
 
 ```json
-{"api": "0.2.1", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
+{"api": "0.2.2", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
 ```
 
 ### `apps.list`
@@ -355,7 +360,7 @@ which is cached for 30 s.
 {
   "checks": [
     {"area": "architecture", "status": "ok", "text": "host architecture: x86-64"},
-    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1); backend wine, interface 1"},
+    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1); backend wine, interface 2"},
     {"area": "graphics", "status": "ok", "text": "Vulkan: 3 devices usable"}, ...
   ],
   "missingDependencies": 0, "notes": [], "subject": {"kind": "system"}, "verdict": "may_fail"
@@ -508,7 +513,8 @@ Params: `{"id"}`. Deletes the app's `permissions.toml` (back to the default), as
 ### `display.set`
 
 Params: `{"id", "driver": "auto" | "x11" | "wayland"}`. Sets the app's Wine graphics driver, as `runtime display`.
-Another `driver` is -32602.
+Another `driver` is -32602. An app whose recorded backend is unknown or lacks the `graphics_driver` capability ends
+`failed` with the CLI's message, and nothing is changed.
 
 ### `jobs.poll`
 
@@ -537,7 +543,7 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 
 ## Versioning and compatibility
 
-- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.1**. Until 1.0:
+- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.2**. Until 1.0:
   - a **breaking** change bumps the **minor** version: a method removed or renamed, a param changed, a result
     member removed or retyped, an enum value removed;
   - an **additive** change bumps the **patch** version: a new method, a new result member, a new enum value, a new
@@ -546,10 +552,16 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 - **Clients must ignore unknown members** in results and replies. The bundled client does.
 - An **unknown `data.kind`** deserialises as `ErrorKind::Unknown`: `ErrorKind` is `#[non_exhaustive]` with a serde
   fallback.
-- The job enums (`JobKind`, `JobState`, `EventKind`) also read an unknown value as `Unknown`. The other enums are
-  `#[non_exhaustive]` for Rust callers but have **no** serde fallback. A typed helper of an older client fails with a
-  protocol error ("the result does not have the expected shape") when a newer daemon sends a new enum value.
-  `Client::call` (raw JSON) always works. A client that must span versions checks `api` first.
+- **Every result enum reads an unknown value as `Unknown`** (since 0.2.2 for all of them; the job enums `JobKind`,
+  `JobState`, `EventKind` had it since 0.2.0): `NetworkView`, `AccessView`, `PermSource`, `VulkanState`,
+  `PlanAction`, `ConsentView`, the compat record's `status`, and the tagged `SubjectView` (`kind`) and
+  `Availability` (`state`). So a typed helper of an older client never fails because a newer daemon sends a new
+  value. `Unknown` is never produced by a daemon; it serialises as `"unknown"`. A client shows it as unknown and
+  never treats it as a known value: the bundled GUI labels an unknown grant access "unknown" (not read-only) and
+  never offers consent for an entry whose `action` or `consent` is unknown. The network switch is a boolean and shows
+  an unknown policy as off.
+- **Request enums stay strict**: `display.set`'s `driver` refuses an unknown value with `-32602`. A `compat.toml`
+  record with an unknown `status` (or the literal `unknown`) is still refused.
 - **0.2.0 is breaking** by the rule above: the mutating names that were `-32601` in 0.1 are now known methods, which
   a read-only daemon answers `read_only`. Everything else is additive: the write methods, `rpc.version.write`, and
   `deps.plan`'s `digest`, `sha256` and `consentText`. A 0.2 client reading a 0.1 daemon's `deps.plan` gets an
@@ -557,6 +569,9 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 - **0.2.1 is additive**: the `apps.import` method and its job kind `import`, `apps.get`'s `package` and
   `permissions.get`'s `requested`. A 0.2.0 daemon answers `apps.import` `-32601`; the GUI does not send a `.wrun` to a
   daemon older than 0.2.1 (it says why).
+- **0.2.2 is additive**: the `data.kind` `runtime_mismatch`, and the `Unknown` fallback on every result enum (a
+  client-side change: the wire is unchanged). An older client reads `runtime_mismatch` as `ErrorKind::Unknown` and
+  shows the message.
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
@@ -629,12 +644,24 @@ How it behaves:
 runtime rpc rpc.version
 runtime rpc apps.get '{"id": "notepad"}'
 runtime rpc doctor.system --socket /run/user/1000/rt-test.sock
-runtime daemon-status            # exit 0 when a daemon answers, 1 when none does; says "mode: write" or "read-only"
+runtime daemon-status            # exit 0 when a daemon answers, else 1; says "mode: write" or "read-only"
 runtime rpc apps.remove '{"id": "notepad"}'      # write mode: {"jobId": "..."}
 ```
 
 `runtime daemon-status` prints `mode: write`, `mode: read-only`, or, for a daemon older than 0.2,
 `mode: read-only (API <version>)`. There is no `runtime jobs` command: `runtime rpc jobs.*` covers scripts.
+
+Its `reachable:` line tells the outcomes apart (exit 0 only for the first; error text is escaped and bounded):
+
+- `reachable: yes` (then `api`, `runtime`, `protocol`, `mode`): the daemon answered `rpc.version`.
+- `reachable: yes, busy (connection limit reached): try again`: the daemon refused the connection with `-32001`.
+- `reachable: yes, not answering within 5 s`: connected, but no reply in time (or `-32002`, or a socket that never
+  accepts).
+- `reachable: yes, but the exchange failed (<error>)`: connected, but the reply was bad, cut short or another error.
+- `reachable: no (<error>)` plus a hint to start `runtimed`: nothing to connect to (no socket, no listener).
+- `reachable: not checked (<error>)`: refused before sending, because the socket or its directory is unsafe.
+
+Only `reachable: no` suggests starting `runtimed`.
 
 `runtime rpc` is a raw tool for debugging and scripts.
 
@@ -653,7 +680,7 @@ edge is used by these two commands alone.
 ```sh
 sock=$XDG_RUNTIME_DIR/runtime/runtimed.sock
 printf '%s\n' '{"jsonrpc":"2.0","method":"rpc.version","id":1}' | socat - UNIX-CONNECT:$sock
-# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.1","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
+# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.2","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
 printf '%s\n' '{"jsonrpc":"2.0","method":"apps.get","params":{"id":"nope"},"id":"a"}' | nc -U -N $sock
 # {"error":{"code":-32000,"data":{"kind":"not_found"},"message":"no app named nope is installed"},"id":"a","jsonrpc":"2.0"}
 ```

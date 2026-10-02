@@ -13,6 +13,8 @@
 //! |                    |                    | item is not exactly a consent-gated package of it                   |
 //! | `Busy`             | `busy`             | the daemon already runs its maximum of jobs                         |
 //! | `AppBusy`          | `app_busy`         | a job for this app is still live                                    |
+//! | `RuntimeMismatch`  | `runtime_mismatch` | the `runtime` binary next to `runtimed` is now another version      |
+//! |                    |                    | (upgraded under a running daemon): restart `runtimed` (0.2.2)       |
 //! | `Unknown`          | (any other string) | deserialisation fallback for a newer daemon's kind; never produced here |
 //! | `Internal`         | `internal`         | a bug: reserved for the daemon's catch-all (panic, serialisation)   |
 //!
@@ -32,6 +34,9 @@ pub enum ErrorKind {
     ConsentMismatch,
     Busy,
     AppBusy,
+    /// `runtimed --write`: the sibling `runtime` answers `--version` with another version than the daemon's (it was
+    /// replaced under the running daemon); nothing was started. Restarting `runtimed` fixes it. Since 0.2.2.
+    RuntimeMismatch,
     /// A kind this client does not know (a newer daemon's): deserialisation never fails on it.
     #[serde(other)]
     Unknown,
@@ -48,6 +53,7 @@ impl ErrorKind {
         ErrorKind::ConsentMismatch,
         ErrorKind::Busy,
         ErrorKind::AppBusy,
+        ErrorKind::RuntimeMismatch,
     ];
 }
 
@@ -86,15 +92,16 @@ mod tests {
             | ErrorKind::ReadOnly
             | ErrorKind::ConsentMismatch
             | ErrorKind::Busy
-            | ErrorKind::AppBusy => true,
+            | ErrorKind::AppBusy
+            | ErrorKind::RuntimeMismatch => true,
             ErrorKind::Unknown => false,
         };
         assert!(ErrorKind::ALL.iter().all(|k| listed(*k)));
-        // Each listed variant once: 8 arms above say true.
+        // Each listed variant once: 9 arms above say true.
         let mut names: Vec<String> = ErrorKind::ALL.iter().map(|k| format!("{k:?}")).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 8);
-        assert_eq!(ErrorKind::ALL.len(), 8);
+        assert_eq!(names.len(), 9);
+        assert_eq!(ErrorKind::ALL.len(), 9);
     }
 }

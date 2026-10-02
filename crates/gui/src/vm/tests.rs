@@ -716,6 +716,41 @@ fn a_hostile_plan_is_cleaned_for_display() {
     assert_eq!(e.action, "blocked");
 }
 
+#[test]
+fn a_newer_daemons_values_are_unknown_never_consentable_or_read_only() {
+    let mut m = ready(true);
+    let mut p = perms(&["/data"]);
+    p.filesystem[0].access = rt_api::AccessView::Unknown;
+    p.network = rt_api::NetworkView::Unknown;
+    m.update(Msg::AppLoaded(Box::new(AppData {
+        detail: detail("game"),
+        permissions: Ok(p),
+        doctor: Err(rpc("unavailable")),
+        graphics: Err(rpc("unavailable")),
+        sandbox: Err(rpc("unavailable")),
+    })));
+    let rows = m.page_permissions().unwrap().unwrap();
+    assert_eq!(rows.grants[0].access, "unknown");
+    assert!(
+        !rows.network,
+        "an unknown network policy is shown as off (a known bound)"
+    );
+
+    let mut odd_action = entry("a", ConsentView::Needed, Some(&["t"]));
+    odd_action.action = PlanAction::Unknown;
+    let odd_consent = entry("b", ConsentView::Unknown, Some(&["t"]));
+    let p = DepsPlanView {
+        entries: vec![odd_action, odd_consent],
+        unsatisfied: vec![],
+        warnings: vec![],
+        digest: DIGEST.into(),
+    };
+    let m = opened_plan(true, p);
+    let c = m.consent().unwrap();
+    assert!(c.choices().is_empty(), "neither entry can be consented to");
+    assert_eq!(c.entries()[0].action, "unknown");
+}
+
 // ------------------------------------------------------------------------------------------------ permissions
 
 fn perm(m: &mut Model, c: PermChange) -> Vec<Cmd> {

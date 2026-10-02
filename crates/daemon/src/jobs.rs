@@ -94,6 +94,8 @@ pub struct JobsConfig {
     pub keep_for: Duration,
     /// SIGKILL this long after SIGTERM.
     pub term_grace: Duration,
+    /// How long `runtime --version` may take before every job ([`check_runtime_version`]).
+    pub version_timeout: Duration,
     pub now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     /// The daemon's environment, filtered by [`child_env`].
     pub env: Arc<dyn Fn() -> Vec<(OsString, OsString)> + Send + Sync>,
@@ -108,6 +110,7 @@ impl std::fmt::Debug for JobsConfig {
             .field("keep_finished", &self.keep_finished)
             .field("keep_for", &self.keep_for)
             .field("term_grace", &self.term_grace)
+            .field("version_timeout", &self.version_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -122,6 +125,7 @@ impl JobsConfig {
             keep_finished: 100,
             keep_for: Duration::from_secs(3600),
             term_grace: Duration::from_secs(5),
+            version_timeout: crate::write::VERSION_TIMEOUT,
             now: Arc::new(SystemTime::now),
             env: Arc::new(|| std::env::vars_os().collect()),
         }
@@ -318,6 +322,25 @@ impl Shared {
         }
     }
 
+    /// Whether a job for `app` may start now: the daemon is not stopping, no live job for `app`, a free slot.
+    fn admit(&self, t: &mut Table, app: &Option<String>) -> Result<(), ApiError> {
+        if t.shutting_down {
+            return Err(ApiError::new(ErrorKind::Unavailable, "the daemon is stopping"));
+        }
+        self.evict(t);
+        let running: Vec<&Arc<Job>> = t.jobs.iter().filter(|j| live(lock(&j.data).state)).collect();
+        if app.is_some() && running.iter().any(|j| j.app == *app) {
+            return Err(ApiError::new(ErrorKind::AppBusy, "a job for this app is still running"));
+        }
+        if running.len() >= self.cfg.max_running {
+            return Err(ApiError::new(
+                ErrorKind::Busy,
+                format!("{} jobs are already running; try again later", self.cfg.max_running),
+            ));
+        }
+        Ok(())
+    }
+
     fn find(&self, id: &str) -> Result<Arc<Job>, ApiError> {
         let mut t = lock(&self.table);
         self.evict(&mut t);
@@ -340,8 +363,9 @@ impl Jobs {
         }
     }
 
-    /// Starts `spec` (`busy`, `app_busy`, or `unavailable` when the `runtime` binary or the job cwd is unsafe or the
-    /// daemon is stopping). A spawn failure is a `failed` job, not an error here.
+    /// Starts `spec` (`busy`, `app_busy`, `runtime_mismatch` when the `runtime` binary is now another version, or
+    /// `unavailable` when it or the job cwd is unsafe, its version cannot be checked, or the daemon is stopping). A
+    /// spawn failure is a `failed` job, not an error here.
     pub fn start(&self, spec: JobSpec) -> Result<JobStarted, ApiError> {
         let s = &self.s;
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -349,22 +373,19 @@ impl Jobs {
         check_runtime_exe(&s.cfg.runtime_exe, euid)?;
         check_job_cwd(&s.cfg.cwd, euid)?;
         let app = spec.app().map(|a| a.as_str().to_owned());
+        // A cheap refusal first, so a stopping or full daemon never spawns the probe; the authoritative check is
+        // repeated under the lock below.
+        s.admit(&mut lock(&s.table), &app)?;
+        // Outside the table lock: a slow binary never stalls polls.
+        check_runtime_version(
+            &s.cfg.runtime_exe,
+            &s.cfg.cwd,
+            &child_env(&*s.cfg.env),
+            s.cfg.version_timeout,
+        )?;
         let job = {
             let mut t = lock(&s.table);
-            if t.shutting_down {
-                return Err(ApiError::new(ErrorKind::Unavailable, "the daemon is stopping"));
-            }
-            s.evict(&mut t);
-            let running: Vec<&Arc<Job>> = t.jobs.iter().filter(|j| live(lock(&j.data).state)).collect();
-            if app.is_some() && running.iter().any(|j| j.app == app) {
-                return Err(ApiError::new(ErrorKind::AppBusy, "a job for this app is still running"));
-            }
-            if running.len() >= s.cfg.max_running {
-                return Err(ApiError::new(
-                    ErrorKind::Busy,
-                    format!("{} jobs are already running; try again later", s.cfg.max_running),
-                ));
-            }
+            s.admit(&mut t, &app)?;
             let now = s.now_ms();
             let job = Arc::new(Job {
                 id: new_id()?,
@@ -845,6 +866,131 @@ pub fn check_runtime_exe(p: &Path, euid: u32) -> Result<(), ApiError> {
         return Err(unavailable(&why));
     }
     Ok(())
+}
+
+/// The version line `runtime --version` must print: this daemon's own.
+pub(crate) fn wanted_version() -> String {
+    format!("runtime {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `exe --version`'s first line (trimmed, non-empty), run with exactly `env`, in `cwd`, in a process group of its
+/// own. Everything is bounded by `timeout` and happens on the calling thread: stdout is read with `poll(2)` (at most
+/// 4 KiB, up to the first newline) until the deadline, then dropped, so a process the probe leaves holding the pipe
+/// cannot hang the caller. The probe's whole group is killed when its leader has exited (or at the deadline), before
+/// the leader is reaped, so nothing it started outlives it. A non-zero exit is a failure. `Err`: why there is no
+/// answer.
+pub(crate) fn runtime_version(
+    exe: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    let mut child = Command::new(exe)
+        .arg("--version")
+        .env_clear()
+        .envs(env.iter().cloned())
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let until = Instant::now() + timeout;
+    let mut line: Option<Vec<u8>> = None;
+    if let Some(mut out) = child.stdout.take() {
+        let mut buf = Vec::new();
+        line = loop {
+            if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+                buf.truncate(i);
+                break Some(buf);
+            }
+            if buf.len() >= 4096 {
+                break Some(buf);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
+            let mut p = libc::pollfd {
+                fd: out.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for an fd we own.
+            let r = unsafe { libc::poll(&mut p, 1, left.as_millis().clamp(1, 60_000) as libc::c_int) };
+            if r <= 0 {
+                continue; // a timeout or EINTR: the deadline is checked above
+            }
+            let mut chunk = [0u8; 4096];
+            let room = 4096 - buf.len();
+            match out.read(&mut chunk[..room]) {
+                Ok(0) => break Some(buf),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break Some(buf),
+            }
+        };
+    }
+    // Every signal goes to the probe's group while its leader is unreaped (`leader_exited` looks with WNOWAIT), so
+    // the group id is still its own; the leader is reaped only after. On success too: nothing it started outlives it.
+    let pid = child.id() as libc::pid_t;
+    let reap = |child: &mut std::process::Child| {
+        // SAFETY: `pid` is our unreaped child (exited or not), so `-pid` is its own group.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        child.wait()
+    };
+    if line.is_none() {
+        let _ = reap(&mut child);
+        return Err(no_answer(timeout));
+    }
+    while !leader_exited(pid) {
+        if Instant::now() >= until {
+            let _ = reap(&mut child);
+            return Err(no_answer(timeout));
+        }
+        std::thread::sleep(CHILD_TICK);
+    }
+    match reap(&mut child) {
+        Ok(st) if st.success() => {}
+        Ok(st) => return Err(format!("it ended with {st} after printing its version")),
+        Err(e) => return Err(e.to_string()),
+    }
+    let line = String::from_utf8_lossy(&line.unwrap_or_default()).trim().to_owned();
+    if line.is_empty() {
+        return Err("it printed no version".into());
+    }
+    Ok(line)
+}
+
+fn no_answer(timeout: Duration) -> String {
+    format!("no answer within {} s", timeout.as_secs_f32())
+}
+
+/// `Ok` when `exe --version`'s first line is `runtime <CARGO_PKG_VERSION>`; `RuntimeMismatch` when it is another
+/// version (the binary was replaced under this daemon); `Unavailable` when the probe fails (spawn error, no line
+/// within `timeout`, empty output). The probe gets `env` (the job environment) and runs in `cwd`.
+pub fn check_runtime_version(
+    exe: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Result<(), ApiError> {
+    let got = runtime_version(exe, cwd, env, timeout)
+        .map_err(|why| unavailable(&format!("cannot check {}'s version: {why}", shown(exe))))?;
+    if got == wanted_version() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorKind::RuntimeMismatch,
+        format!(
+            "{} is now {:?}; this runtimed is {}: restart runtimed (systemctl --user restart runtimed)",
+            shown(exe),
+            rt_core::clean_text(&got, 128),
+            env!("CARGO_PKG_VERSION")
+        ),
+    ))
 }
 
 /// The shared job directory (spec D8): a directory (not a symlink) owned by `euid`, mode 0700. Each job runs in a

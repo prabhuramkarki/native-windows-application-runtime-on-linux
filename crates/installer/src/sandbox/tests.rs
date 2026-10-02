@@ -495,7 +495,7 @@ fn find_bwrap_is_none_without_a_match_or_without_path() {
 
 // ------------------------------------------------------------------------------ real bwrap execution
 
-/// `Some(path)` if a real `bwrap` is on `$PATH`; otherwise prints why the real-sandbox tests are skipped
+/// `Some(path)` if a real `bwrap` on `$PATH` can create a sandbox here; otherwise prints why the real-sandbox tests are skipped
 /// (loudly, per the plan: never a silent `#[ignore]`) and returns `None` so the caller does an early `return`
 /// (the test then still reports as passed — `cargo test` has no "skipped" outcome for a plain `#[test]`).
 ///
@@ -509,21 +509,20 @@ fn find_bwrap_is_none_without_a_match_or_without_path() {
 /// that also does real filesystem/process work.
 fn require_real_bwrap() -> Option<PathBuf> {
     let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
-    check_bwrap(find_bwrap_on_path(), require)
+    check_bwrap(rt_sandbox::usable_bwrap_on_path(), require)
 }
 
-/// The pure decision behind [`require_real_bwrap`]: `found` is what a real lookup returned, `require` is whether
-/// `$RUNTIME_REQUIRE_BWRAP` was set (non-empty). Kept separate so a test can drive the panic branch directly.
-fn check_bwrap(found: Option<PathBuf>, require: bool) -> Option<PathBuf> {
+/// The pure decision behind [`require_real_bwrap`]: `found` is a usable bwrap or why there is none (missing, or
+/// it cannot create a sandbox here: Phase 6E, a host without user namespaces fails with the reason, not later
+/// with a confusing assertion); `require` is whether `$RUNTIME_REQUIRE_BWRAP` was set (non-empty).
+fn check_bwrap(found: Result<PathBuf, String>, require: bool) -> Option<PathBuf> {
     match found {
-        Some(p) => Some(p),
-        None if require => {
-            panic!(
-                "bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set: the real-sandbox tests must run for real"
-            );
+        Ok(p) => Some(p),
+        Err(why) if require => {
+            panic!("RUNTIME_REQUIRE_BWRAP is set but {why}: the real-sandbox tests must run for real");
         }
-        None => {
-            eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox tests need bubblewrap installed");
+        Err(why) => {
+            eprintln!("SKIPPED the real-sandbox tests: {why}");
             None
         }
     }
@@ -531,7 +530,7 @@ fn check_bwrap(found: Option<PathBuf>, require: bool) -> Option<PathBuf> {
 
 #[test]
 fn check_bwrap_panics_with_a_clear_message_when_missing_and_required() {
-    let result = std::panic::catch_unwind(|| check_bwrap(None, true));
+    let result = std::panic::catch_unwind(|| check_bwrap(Err("bwrap is not on PATH".into()), true));
     let payload = result.expect_err("expected a panic when bwrap is missing and RUNTIME_REQUIRE_BWRAP is set");
     let msg = payload
         .downcast_ref::<&str>()
@@ -543,7 +542,7 @@ fn check_bwrap_panics_with_a_clear_message_when_missing_and_required() {
 
 #[test]
 fn check_bwrap_skips_quietly_without_panicking_when_missing_and_not_required() {
-    let result = std::panic::catch_unwind(|| check_bwrap(None, false));
+    let result = std::panic::catch_unwind(|| check_bwrap(Err("bwrap is not on PATH".into()), false));
     assert_eq!(
         result.expect("must not panic when RUNTIME_REQUIRE_BWRAP is unset"),
         None
@@ -553,8 +552,8 @@ fn check_bwrap_skips_quietly_without_panicking_when_missing_and_not_required() {
 #[test]
 fn check_bwrap_returns_the_path_when_found_regardless_of_require() {
     for require in [false, true] {
-        let found = Some(PathBuf::from("/x/bwrap"));
-        assert_eq!(check_bwrap(found.clone(), require), found);
+        let found = PathBuf::from("/x/bwrap");
+        assert_eq!(check_bwrap(Ok(found.clone()), require), Some(found));
     }
 }
 

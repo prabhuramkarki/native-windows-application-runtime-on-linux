@@ -7,12 +7,17 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::Command;
 use std::sync::atomic::AtomicU64;
 
-/// The fake `runtime`: records its argv (NUL separated), environment, cwd, stdin and process group under
+/// The fake `runtime`: `--version` runs `fake/version` (a shell snippet the test writes) or prints this workspace's
+/// version; anything else records its argv (NUL separated), environment, cwd, stdin and process group under
 /// `$RUNTIME_DATA_DIR/fake/`, keyed by its last argument (the app id), then acts on `fake/mode.<key>` (else
 /// `fake/mode`, else `ok`).
 const FAKE: &str = r#"#!/bin/sh
 [ "$1" = --probe ] && exit 0
 F="$RUNTIME_DATA_DIR/fake"
+if [ "$1" = --version ]; then
+  if [ -f "$F/version" ]; then . "$F/version"; else echo 'runtime @VERSION@'; fi
+  exit 0
+fi
 for a in "$@"; do last="$a"; done
 key=$(printf %s "$last" | tr -c 'a-z0-9.-' _)
 printf '%s\0' "$@" > "$F/argv.$key"
@@ -78,7 +83,10 @@ pub(crate) fn fx_with(tweak: impl FnOnce(&mut JobsConfig)) -> Fx {
     }
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-    write_script(&bin.join("runtime"), FAKE);
+    write_script(
+        &bin.join("runtime"),
+        &FAKE.replace("@VERSION@", env!("CARGO_PKG_VERSION")),
+    );
     let env: Vec<(OsString, OsString)> = [
         ("PATH", "/usr/bin:/bin".into()),
         ("RUNTIME_DATA_DIR", data.to_str().unwrap().to_owned()),
@@ -100,6 +108,7 @@ pub(crate) fn fx_with(tweak: impl FnOnce(&mut JobsConfig)) -> Fx {
         keep_finished: 100,
         keep_for: Duration::from_secs(3600),
         term_grace: Duration::from_millis(300),
+        version_timeout: Duration::from_secs(5),
         now: Arc::new(move || UNIX_EPOCH + Duration::from_millis(c.load(Ordering::SeqCst))),
         env: Arc::new(move || env.clone()),
     };
@@ -654,8 +663,16 @@ fn the_job_cwd_must_be_our_own_0700_directory_and_a_stray_file_blocks_nothing() 
 #[test]
 fn a_spawn_failure_is_a_failed_job_that_says_why() {
     let f = fx();
-    // A regular file we own that cannot be executed: passes the checks, exec fails.
-    fs::set_permissions(f.root.join("bin/runtime"), fs::Permissions::from_mode(0o644)).unwrap();
+    // A file that cannot be executed is refused by the version probe, before any job exists.
+    let exe = f.root.join("bin/runtime");
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o644)).unwrap();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("cannot check"), "{}", e.message);
+    assert!(f.jobs.list().is_empty());
+    // One that stops being executable after the probe (it removes its own x bit): passes the checks, exec fails.
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    version_is(&f, &format!("chmod 644 \"$0\"; {}", ours()));
     let id = f.start(remove("a"));
     let i = f.wait_end(&id);
     assert_eq!((i.state, i.exit_code, i.signal), (JobState::Failed, None, None));
@@ -824,4 +841,184 @@ fn a_cancel_right_after_a_failure_keeps_the_failure() {
             assert_eq!(i.state, JobState::Failed, "run {n}: {i:?}");
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------ version probe
+
+fn version_is(f: &Fx, snippet: &str) {
+    fs::write(f.fake.join("version"), snippet).unwrap();
+}
+
+fn ours() -> String {
+    format!("echo 'runtime {}'", env!("CARGO_PKG_VERSION"))
+}
+
+#[test]
+fn a_job_starts_only_while_the_runtime_has_this_daemons_version() {
+    let f = fx();
+    let id = f.start(remove("a"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    // The probe gets the job environment (never the daemon's own) and the job directory.
+    version_is(
+        &f,
+        &format!("env > \"$F/env.version\"; pwd > \"$F/cwd.version\"; {}", ours()),
+    );
+    let id = f.start(remove("b"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    let env = f.read("env", "version");
+    assert!(env.contains("RUNTIME_DATA_DIR=") && env.contains("LANG=C"), "{env}");
+    for bad in ["SECRET", "hunter2", "LISTEN_FDS", "LD_PRELOAD"] {
+        assert!(!env.contains(bad), "{bad} reached the probe: {env}");
+    }
+    assert_eq!(f.read("cwd", "version").trim(), f.cwd.to_str().unwrap());
+    // Swapped for another version under the running daemon: refused, nothing started.
+    let listed = f.jobs.list().len();
+    version_is(&f, "echo 'runtime 9.9.9'");
+    let e = f.jobs.start(remove("c")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::RuntimeMismatch, "{e:?}");
+    assert!(
+        e.message.contains("9.9.9") && e.message.contains("restart runtimed"),
+        "{}",
+        e.message
+    );
+    assert!(e.message.contains(env!("CARGO_PKG_VERSION")), "{}", e.message);
+    assert_eq!(f.jobs.list().len(), listed, "no job");
+    assert!(!f.fake.join("argv.c").exists(), "no child");
+    // A hostile version line is cleaned and bounded.
+    version_is(&f, &format!("printf 'runtime \\033[31m%s\\n' {}", "x".repeat(2000)));
+    let e = f.jobs.start(remove("c")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::RuntimeMismatch);
+    assert!(clean(&e.message) && e.message.len() <= 512, "{}", e.message);
+    // A probe that prints nothing is a failure to check, not a mismatch.
+    version_is(&f, "true");
+    let e = f.jobs.start(remove("c")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    // Restored: jobs start again.
+    fs::remove_file(f.fake.join("version")).unwrap();
+    let id = f.start(remove("c"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+}
+
+/// Tasks of this process whose name is `name` (a thread inherits its creator's name).
+fn threads_named(name: &str) -> usize {
+    fs::read_dir("/proc/self/task")
+        .unwrap()
+        .flatten()
+        .filter(|t| fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim() == name))
+        .count()
+}
+
+#[test]
+fn a_hanging_version_probe_is_unavailable_and_leaves_no_thread_or_process() {
+    let f = fx_with(|c| c.version_timeout = Duration::from_millis(300));
+    // It holds stdout open through a child of its own.
+    version_is(&f, "sleep 30 & echo $! >> \"$F/probe-pids\"; wait");
+    let t = Instant::now();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("no answer"), "{}", e.message);
+    let jobs = f.jobs.clone();
+    std::thread::Builder::new()
+        .name("vprobe-leak".into())
+        .spawn(move || {
+            for _ in 0..20 {
+                assert_eq!(jobs.start(remove("a")).unwrap_err().kind, ErrorKind::Unavailable);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    let pids: Vec<i32> = fs::read_to_string(f.fake.join("probe-pids"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(pids.len(), 21, "every probe ran");
+    loop {
+        let threads = threads_named("vprobe-leak");
+        let procs = pids.iter().filter(|p| alive(**p)).count();
+        if threads == 0 && procs == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "{threads} reader threads and {procs} probe processes outlived their probes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(f.jobs.list().is_empty());
+}
+
+#[test]
+fn a_probe_that_floods_trickles_fails_or_leaves_a_child_is_bounded_and_cleaned_up() {
+    let f = fx_with(|c| c.version_timeout = Duration::from_millis(500));
+    // A newline-free flood: the first 4 KiB is the "line"; another version, and a bounded message.
+    version_is(&f, "head -c 10000 /dev/zero | tr '\\0' x");
+    let t = Instant::now();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::RuntimeMismatch, "{e:?}");
+    assert!(
+        e.message.len() <= 512 && t.elapsed() < Duration::from_secs(3),
+        "{}",
+        e.message
+    );
+    // One byte at a time, no newline, past the deadline: no answer, close to the timeout.
+    version_is(&f, "while :; do printf r; sleep 0.05; done");
+    let t = Instant::now();
+    let e = f.jobs.start(remove("a")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("no answer"), "{}", e.message);
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    // The right line, one byte at a time within the deadline: accepted.
+    let line = format!("runtime {}", env!("CARGO_PKG_VERSION"));
+    let slow: String = line.chars().map(|c| format!("printf '{c}'; sleep 0.01; ")).collect();
+    version_is(&f, &format!("{slow}echo"));
+    let id = f.start(remove("a"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    // The right line, then a failing exit: refused.
+    version_is(&f, &format!("{}; exit 3", ours()));
+    let e = f.jobs.start(remove("b")).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Unavailable, "{e:?}");
+    assert!(e.message.contains("exit status: 3"), "{}", e.message);
+    // The right line, with a child left behind that does not hold stdout: accepted, and the child is gone.
+    version_is(
+        &f,
+        &format!("sleep 30 >/dev/null & echo $! > \"$F/left-pid\"; {}", ours()),
+    );
+    let id = f.start(remove("b"));
+    assert_eq!(f.wait_end(&id).state, JobState::Succeeded);
+    let left: i32 = fs::read_to_string(f.fake.join("left-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while alive(left) {
+        assert!(Instant::now() < until, "the probe's child {left} outlived it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_full_or_stopping_daemon_refuses_without_running_the_probe() {
+    let f = fx_with(|c| c.max_running = 1);
+    version_is(&f, &format!("echo x >> \"$F/probes\"; {}", ours()));
+    let probes = || {
+        fs::read_to_string(f.fake.join("probes"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    f.mode(Some("a"), "wait");
+    let id = f.start(remove("a"));
+    f.wait_for(&id, "ready");
+    assert_eq!(probes(), 1);
+    assert_eq!(f.jobs.start(remove("a")).unwrap_err().kind, ErrorKind::AppBusy);
+    assert_eq!(f.jobs.start(remove("b")).unwrap_err().kind, ErrorKind::Busy);
+    assert_eq!(probes(), 1, "a refused start ran the probe");
+    f.jobs.shutdown(Duration::from_secs(5));
+    assert_eq!(f.jobs.start(remove("b")).unwrap_err().kind, ErrorKind::Unavailable);
+    assert_eq!(probes(), 1);
 }

@@ -4,6 +4,8 @@
 //! scripts written by [`Rig`]. The fake `wine wineboot -u` creates a minimal prefix; the fake `wine <exe> args`
 //! records its argv (NUL separated), cwd and environment, prints to stdout and stderr and then sources an optional
 //! `hook.sh` the test wrote (exit code, signals, sleeping). The spawned `runtime` gets a cleared environment.
+mod support;
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt;
@@ -2259,6 +2261,10 @@ fn doctor_d3d11_and_d3d12_on_an_unusable_vulkan_are_both_built_in() {
 
 #[test]
 fn doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("doctor_predicts_the_built_in_route_for_a_32_bit_app_even_with_dxvk_recorded") {
+        return;
+    }
     let r = rig();
     r.wine_dlls(&[
         "kernel32.dll",
@@ -2644,6 +2650,10 @@ fn install_msvcp140(r: &Rig) -> String {
 
 #[test]
 fn deps_install_without_a_terminal_never_consents_even_when_stdin_says_yes() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("deps_install_without_a_terminal_never_consents_even_when_stdin_says_yes") {
+        return;
+    }
     let r = rig();
     let id = install_msvcp140(&r);
     // A file where the download cache belongs: a fetch fails on it before any network access (the fetcher checks
@@ -2775,6 +2785,44 @@ fn display_reads_auto_on_a_fresh_app() {
     );
     let o = wayland(&r).args(["display", "dapp"]).output().unwrap();
     assert_eq!(display_lines(&o)[1], "session: wayland socket wayland-1");
+    assert!(!reg_ran(&r));
+}
+
+#[test]
+fn display_reads_without_wine_installed() {
+    let r = rig().no_wine();
+    display_app(&r);
+    assert_eq!(
+        display_lines(&r.rt(&["display", "dapp"])),
+        ["graphics driver: auto", "session: none", "winewayland: not verified"]
+    );
+}
+
+/// Phase 6E Task 4: a recorded backend that is unknown (or lacks `graphics_driver`) is refused on both paths
+/// before `user.reg` is read or the lock taken; nothing reaches Wine and `user.reg` keeps its bytes and mtime.
+#[test]
+fn display_refuses_an_app_of_an_unknown_backend_on_both_paths_and_touches_nothing() {
+    let r = rig();
+    let prefix = display_app(&r);
+    user_reg(&prefix, "\"Graphics\"=\"x11\"");
+    let md_path = r.apps().join("dapp/metadata.json");
+    let mut md: serde_json::Value = serde_json::from_slice(&fs::read(&md_path).unwrap()).unwrap();
+    md["backend"]["id"] = "null".into();
+    fs::write(&md_path, serde_json::to_vec(&md).unwrap()).unwrap();
+    let reg = prefix.join("user.reg");
+    let (before, mtime) = (fs::read(&reg).unwrap(), fs::metadata(&reg).unwrap().modified().unwrap());
+    for args in [&["display", "dapp"][..], &["display", "dapp", "x11"]] {
+        let o = r.rt(args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", s(&o.stderr));
+        let err = s(&o.stderr);
+        assert!(
+            err.contains("unknown compatibility backend \"null\"") && err.contains("(known: wine)"),
+            "{args:?}: {err}"
+        );
+        assert!(s(&o.stdout).is_empty(), "{args:?}");
+    }
+    assert_eq!(fs::read(&reg).unwrap(), before);
+    assert_eq!(fs::metadata(&reg).unwrap().modified().unwrap(), mtime);
     assert!(!reg_ran(&r));
 }
 
@@ -4974,6 +5022,10 @@ fn deps_install_with_a_stale_plan_digest_installs_nothing() {
 
 #[test]
 fn deps_install_with_the_reported_digest_behaves_exactly_as_without_it() {
+    // Needs a sandbox (`deps --install` refuses without one; `doctor` reports it): fail with the reason (Phase 6E).
+    if !support::bwrap_works("deps_install_with_the_reported_digest_behaves_exactly_as_without_it") {
+        return;
+    }
     let r = rig();
     let id = install_msvcp140(&r);
     fs::write(r.data.join("deps-cache"), b"not a directory").unwrap();

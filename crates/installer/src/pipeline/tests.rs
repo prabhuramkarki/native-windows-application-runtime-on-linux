@@ -63,18 +63,18 @@ fn fake_backend(script: &str) -> FakeBackend {
     FakeBackend::with_script(script).with_dll_dirs(vec![PathBuf::from("/bin")])
 }
 
-/// `Some(path)` if a real `bwrap` is on `$PATH`; otherwise skips loudly (never a silent pass) and returns `None`,
+/// `Some(path)` if a real `bwrap` on `$PATH` can create a sandbox here; otherwise skips loudly (never a silent pass) and returns `None`,
 /// same discipline as `crate::sandbox::tests::require_real_bwrap` (duplicated here: it is `mod tests`-private
 /// over there). `RUNTIME_REQUIRE_BWRAP=1` turns a missing `bwrap` into a hard failure for CI.
 fn require_real_bwrap() -> Option<PathBuf> {
     let require = std::env::var_os("RUNTIME_REQUIRE_BWRAP").is_some_and(|v| !v.is_empty());
-    match find_bwrap_on_path() {
-        Some(p) => Some(p),
-        None if require => {
-            panic!("bwrap not found on $PATH and RUNTIME_REQUIRE_BWRAP is set: the pipeline tests must run for real")
+    match rt_sandbox::usable_bwrap_on_path() {
+        Ok(p) => Some(p),
+        Err(why) if require => {
+            panic!("RUNTIME_REQUIRE_BWRAP is set but {why}: the real-sandbox pipeline tests must run for real")
         }
-        None => {
-            eprintln!("SKIP: bwrap not found on $PATH; the real-sandbox pipeline tests need bubblewrap installed");
+        Err(why) => {
+            eprintln!("SKIPPED the real-sandbox pipeline tests: {why}");
             None
         }
     }

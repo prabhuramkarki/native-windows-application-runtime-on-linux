@@ -21,6 +21,8 @@ for arch in x86_64 i686; do
     "$cc" $flags -o "$out/probe64.exe" tools/fixtures/probe.c -lws2_32 -lntdll
     # A hostile reg.exe stand-in for the installer-sandbox escape test (e2e_installers.rs).
     "$cc" $flags -o "$out/escape-reg64.exe" tools/fixtures/escape-reg.c
+    # A long-running program for the real-Wine jobs.cancel e2e (e2e_jobs.rs).
+    "$cc" $flags -o "$out/sleep64.exe" tools/fixtures/sleep.c
   fi
   rm -f "$out/hello$tag.res.o"
 done

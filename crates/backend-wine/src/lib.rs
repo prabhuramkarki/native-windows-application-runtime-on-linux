@@ -38,6 +38,19 @@ pub mod harden;
 /// [`CompatBackend::id`] of [`WineBackend`]: what `metadata.json` records as `backend.id`.
 pub const BACKEND_ID: &str = "wine";
 
+/// What [`WineBackend::capabilities`] returns: 32- and 64-bit GUI and console programs (a `win64` prefix with
+/// WoW64); Wine Mono, the installer pipeline, dependency packages and the graphics-driver setting all work on its
+/// prefix layout. A constant so `rt_api::backends::capabilities` can answer without discovering Wine.
+pub const CAPABILITIES: Capabilities = Capabilities {
+    arches: &[Arch::X86, Arch::X86_64],
+    subsystems: &[Subsystem::Gui, Subsystem::Console],
+    dotnet: true,
+    installers: true,
+    dependency_packages: true,
+    sandboxable: true,
+    graphics_driver: true,
+};
+
 /// Wine's own `WINEDLLOVERRIDES` for every process but a managed app's program: no menu spam, no Mono/Gecko
 /// download dialogs. `mscoree=d` also keeps Wine's own Mono prompt (and any Mono) off installers, helpers,
 /// `prepare` and native programs.
@@ -343,17 +356,8 @@ impl CompatBackend for WineBackend {
         parse_version(&out.output).ok_or_else(|| BackendError::failed("wine --version", &out.output))
     }
 
-    /// 32- and 64-bit GUI and console programs (a `win64` prefix with WoW64); Wine Mono, the installer pipeline
-    /// and dependency packages all work on its prefix layout.
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            arches: &[Arch::X86, Arch::X86_64],
-            subsystems: &[Subsystem::Gui, Subsystem::Console],
-            dotnet: true,
-            installers: true,
-            dependency_packages: true,
-            sandboxable: true,
-        }
+        CAPABILITIES
     }
 
     /// `wineboot -u` (deadline 120 s, `WINEDEBUG=-all`), then ALWAYS `wineserver -k` (also after a failure or

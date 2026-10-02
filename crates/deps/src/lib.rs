@@ -16,7 +16,7 @@ pub use fetch::{FetchError, FetchOpts, cached, fetch};
 pub use manifest::{ArchiveFormat, Extract, Install, Kind, Manifest, ManifestError, Marker, Package};
 pub use orchestrate::{
     ALREADY_INSTALLED, AppLock, AppPlan, ConsentProvider, DepsError, Fetcher, LOCK_FILE, MARKER_PRESENT, NetFetcher,
-    Orchestrator, REQUESTED_REASON, RunReport, VulkanFor, X64_ONLY_CAPS, check_backend, consent_text,
+    Orchestrator, PlanCheck, REQUESTED_REASON, RunReport, VulkanFor, X64_ONLY_CAPS, check_backend, consent_text,
     discard_interrupted_for, drop_present_installers, install_plan, lock_app, lock_app_shared, plan_for_app,
     plan_for_pe, unix_now, wineservers_for,
 };

@@ -176,7 +176,7 @@ Only `runtime-api` and `runtime-cli` name the Wine backend.
 ## The backend seam
 
 `rt_core::CompatBackend` is the only execution seam. Its contract is in the module docs of
-[`crates/core/src/backend.rs`](../crates/core/src/backend.rs), version `BACKEND_API_VERSION = 1`, which `runtime
+[`crates/core/src/backend.rs`](../crates/core/src/backend.rs), version `BACKEND_API_VERSION = 2`, which `runtime
 doctor` prints. The contract covers:
 
 - the id grammar, and when `prepare`, `command`, `stop`, `settle` and `dll_dirs` may do what;
@@ -185,8 +185,8 @@ doctor` prints. The contract covers:
 - a backend never reads `permissions.toml`, never decides sandboxing, never downloads.
 
 A backend declares **capabilities**: guest architectures, subsystems, `dotnet`, `installers`,
-`dependency_packages` and `sandboxable`. The platform refuses what they exclude before it creates or starts anything,
-in `rt_core::install`, `install_via_installer`, `rt_deps` and `rt_core::run`.
+`dependency_packages`, `sandboxable` and `graphics_driver`. The platform refuses what they exclude before it creates
+or starts anything, in `rt_core::install`, `install_via_installer`, `rt_deps`, `rt_core::run` and `runtime display`.
 
 The **conformance suite** (`rt_core::backend::conformance`: `static_checks`, `live_checks`) runs the same named
 checks over the Wine backend (the static tier with fake paths, the live tier in the real-Wine e2e), `FakeBackend`
@@ -197,8 +197,8 @@ contract (never spawning in `command`, never reading `permissions.toml`) are rev
 The **registry** (`rt_api::backends`) maps a recorded id to a compiled-in backend. There is no user-facing backend
 choice while it lists one entry, and test doubles are never in it.
 
-What still assumes Wine (`doctor`'s Wine checks, `runtime display`, the `wineserver` busy checks) is listed in the
-contract docs as "Wine-specific, stays concrete". A second backend brings its own. `runtime display` is not yet
-gated by a capability; that is to do when a second backend arrives. Only `CompatBackend` is defined: the roadmap's
+What still assumes Wine (`doctor`'s Wine checks, the `wineserver` busy checks) is listed in the contract docs as
+"Wine-specific, stays concrete". A second backend brings its own. `runtime display` is gated by `graphics_driver`
+(interface 2). Only `CompatBackend` is defined: the roadmap's
 graphics, window, audio and CPU backend traits have no second implementation and no caller yet, so they are not
 guessed at (spec Decision B2).

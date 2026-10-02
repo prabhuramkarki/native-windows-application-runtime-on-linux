@@ -8,8 +8,10 @@
 //!    ([`DepsError::LockHeld`]) and no `wineserver` serving this prefix ([`DepsError::PrefixBusy`]: installing
 //!    under a running app blocks on `wineserver -w`, swaps DLLs under it and lets its later registry flush
 //!    overwrite the installer's writes; the user closes the app, the runtime never kills it).
-//! 3. The plan is resolved again from the metadata read under the lock, then every `Install` entry is decided up
-//!    front (dependency order; never a `Blocked` or `AlreadyInstalled` entry, nor one behind a refusal):
+//! 3. The plan is resolved again from the metadata read under the lock (with [`Orchestrator::plan_check`] set: the
+//!    whole plan is recomputed with [`plan_for_app`] and checked first, and the run follows that plan), then every
+//!    `Install` entry is decided up front (dependency order; never a `Blocked` or `AlreadyInstalled` entry, nor one
+//!    behind a refusal):
 //!    - UPGRADES ARE REFUSED (Ruling 13): a package the metadata already records (at another version or sha256,
 //!      or it would be `AlreadyInstalled`) is refused without a prompt: the kept install journal and an installer's
 //!      marker would make the new version fail anyway, after a wasted download. The user recreates the
@@ -131,6 +133,11 @@ pub struct Orchestrator<'a> {
     /// This runtime's own executable (the CLI's `std::env::current_exe()`): installer packages run in the installer
     /// sandbox with it as the `sandbox-init` shim ([`rt_installer::InstallerSandbox::new`]).
     pub runtime_exe: &'a Path,
+    /// `Some`: [`install_plan`] recomputes the plan with [`plan_for_app`] under the app lock (the metadata and the
+    /// executable read again), hands it to this check before any prompt, download or write, and installs from that
+    /// fresh plan; an `Err` is [`DepsError::PlanChanged`]. The CLI's `--plan-digest` check (this crate cannot
+    /// compute the API's digest). `None`: the plan's own facts are re-resolved, as before.
+    pub plan_check: Option<PlanCheck<'a>>,
 }
 
 /// Unix seconds (0 if the clock is before 1970).
@@ -187,6 +194,9 @@ pub enum DepsError {
     Recorded(String),
     #[error("cannot discard what the interrupted install left: {0}")]
     Discard(#[source] ArchiveError),
+    /// The plan check of [`Orchestrator::plan_check`] refused the plan as it is under the lock: its message.
+    #[error("{0}")]
+    PlanChanged(String),
     /// The app's backend cannot take dependency packages (checked before any lock, prompt or download).
     #[error("{0}")]
     Unsupported(#[from] rt_core::backend::Unsupported),
@@ -297,6 +307,9 @@ pub fn drop_present_installers(env: &AppEnv, manifest: &Manifest, app: &mut AppP
         app.warnings.push(line(&format!("{}: {MARKER_PRESENT}", e.package)));
     }
 }
+
+/// A check of the plan as it is under the app lock ([`Orchestrator::plan_check`]); `Err` is the refusal's message.
+pub type PlanCheck<'a> = &'a dyn Fn(&AppPlan) -> Result<(), String>;
 
 /// The host's Vulkan verdict for a minimum API version; asked lazily, once per distinct minimum (see
 /// [`block_for_vulkan`]), so a caller can probe the host only when a package actually needs Vulkan.
@@ -550,11 +563,22 @@ pub fn install_plan(o: &Orchestrator, app: &AppPlan) -> Result<RunReport, DepsEr
     let _lock = lock_app(o.env)?;
     check_not_busy(o.env)?;
     let md = o.store.read_metadata(o.env).map_err(DepsError::Metadata)?;
+    // With a plan check: the plan as it is now, under the lock, checked before any prompt, download or write; the
+    // run then follows it, never the facts it was handed.
+    let fresh;
+    let facts = match o.plan_check {
+        Some(check) => {
+            fresh = plan_for_app(o.env, &md, o.manifest, o.vulkan);
+            check(&fresh).map_err(DepsError::PlanChanged)?;
+            &fresh.facts
+        }
+        None => &app.facts,
+    };
     let installed = state::installed_set(&md);
-    let mut first = resolve(&app.facts, &installed, &[], o.manifest);
+    let mut first = resolve(facts, &installed, &[], o.manifest);
     block_for_vulkan(&mut first, o.manifest, o.vulkan);
     let d = decide(o, &md, &first);
-    let mut plan = resolve(&app.facts, &installed, &d.denied, o.manifest);
+    let mut plan = resolve(facts, &installed, &d.denied, o.manifest);
     block_for_vulkan(&mut plan, o.manifest, o.vulkan);
     Ok(execute(o, &plan, &d, &md.dependencies))
 }

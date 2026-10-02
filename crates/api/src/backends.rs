@@ -1,7 +1,7 @@
 //! The backend registry: a recorded `backend.id` mapped to a backend compiled into this workspace. There are no
 //! plugins (see `rt_core::backend`): a backend is a Rust type added here by a reviewed change. Test doubles
 //! (`FakeBackend`, the conformance suite's null backend) are never listed, so none reaches a release build.
-use rt_core::{BackendError, CompatBackend, Detail, Launcher, clean_text};
+use rt_core::{BackendError, Capabilities, CompatBackend, Detail, Launcher, clean_text};
 
 /// The ids [`select`] knows.
 pub const KNOWN: &[&str] = &["wine"];
@@ -13,14 +13,28 @@ pub const DEFAULT: &str = "wine";
 pub fn select(id: &str, launcher: &Launcher) -> Result<Box<dyn CompatBackend>, BackendError> {
     match id {
         "wine" => Ok(Box::new(backend_wine::WineBackend::discover_with(launcher.clone())?)),
-        other => Err(BackendError::Unavailable(Detail::from_bytes(
-            format!(
-                "unknown compatibility backend \"{}\" (known: {})",
-                clean_text(other, 64),
-                KNOWN.join(", ")
-            )
-            .as_bytes(),
-        ))),
+        other => Err(unknown(other)),
+    }
+}
+
+/// The refusal of an id that is not in [`KNOWN`]: `Unavailable` naming it (cleaned, bounded) and the known ones.
+pub fn unknown(id: &str) -> BackendError {
+    BackendError::Unavailable(Detail::from_bytes(
+        format!(
+            "unknown compatibility backend \"{}\" (known: {})",
+            clean_text(id, 64),
+            KNOWN.join(", ")
+        )
+        .as_bytes(),
+    ))
+}
+
+/// The capabilities of a known backend id, without discovering or starting it; `None` for an unknown id. For a
+/// check that must work when the backend is not installed (`runtime display`'s read path).
+pub fn capabilities(id: &str) -> Option<Capabilities> {
+    match id {
+        "wine" => Some(backend_wine::CAPABILITIES),
+        _ => None,
     }
 }
 
@@ -47,6 +61,17 @@ mod tests {
         }
         let long = "x".repeat(10_000);
         assert!(select(&long, &l).err().unwrap().to_string().len() < 200);
+    }
+
+    #[test]
+    fn capabilities_map_a_known_id_without_discovering_it() {
+        assert_eq!(capabilities("wine"), Some(backend_wine::CAPABILITIES));
+        for id in ["null", "fake", "Wine", ""] {
+            assert_eq!(capabilities(id), None, "{id:?}");
+        }
+        for id in KNOWN {
+            assert!(capabilities(id).is_some(), "{id}");
+        }
     }
 
     #[test]

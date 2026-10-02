@@ -1095,7 +1095,8 @@ The daemon is a local service for **one user**. The attackers considered are:
   - the socket is a socket, is the user's, and is closed to group and others;
   - once connected, the peer uid is the user's.
 
-  A socket planted by someone else never receives a request. Other client bounds:
+  A socket planted by someone else never receives a request; `daemon-status` then says `reachable: not checked`
+  and does not suggest starting a daemon (Phase 6E). Other client bounds:
   - The connect is non-blocking with a deadline.
   - A reply must be one line of at most 16 MiB and arrive whole within the call's deadline (40 s; 5 s for
     `daemon-status`). It must be valid JSON-RPC 2.0 for the call's id.
@@ -1174,6 +1175,10 @@ must not exist, and why it does not:
   exact `{package, version, sha256}`. The daemon recomputes the plan and refuses anything else (`consent_mismatch`);
   only package ids that matched reach `--yes=`. The CLI recomputes the plan once more under `--plan-digest` and
   refuses before installing anything if it changed, which also covers a `runtime` replaced after the daemon started.
+  Since Phase 6E it checks the digest a second time after it has taken the app lock, on a plan recomputed from the
+  metadata and the executable read under that lock, before any prompt, download or metadata write, and installs
+  from that plan; so a change between the first check and the lock installs nothing either (exit 1, the same
+  message). Only the sandbox mark (fail closed) may be written before that second check.
   There is no "yes to all" parameter.
 - **An unsandboxed or debug run**: no parameter maps to `--unsandboxed` or `--debug`. Program arguments go after
   `--`, so `--unsandboxed` there is an argument of the program (tested end to end: the run stays sandboxed).
@@ -1203,11 +1208,19 @@ must not exist, and why it does not:
   fill them; that is the user hurting themselves. `apps.run` holds a running slot for as long as the app runs.
 - **A `runtime` started at a terminal is invisible to the job table.** The app lock and the running-app refusals of
   the CLI are the real guard between the two, as between two terminals.
-- **The version is checked at startup only.** A `runtime` upgraded under a running daemon is run without a new
-  version check (its file mode and owner are still checked before each job). The consent path is re-checked by the
-  CLI itself. With the directory check, only the user (or root) can swap the file.
-- **Check-then-exec.** The binary is checked by path, then executed by path. Only the user or root can write the file
-  or its directory, so only they could swap it between the two.
+- **The version is checked before every job** (Phase 6E; at startup too). Before each spawn (and after the cheap
+  busy/stopping checks) the daemon checks the `runtime` file's owner, mode and directory, then runs `runtime
+  --version`: the job environment, the job directory, 5 s, at most 4 KiB read on the calling thread with `poll(2)`,
+  in a process group of its own. That group gets SIGKILL when the leader exits (or at the deadline), before the
+  leader is reaped, so the probe leaves no thread behind and nothing in its group outlives it (a process that left
+  the group with `setsid` is the binary's own doing). Another version is refused with `runtime_mismatch` (restart
+  `runtimed`) and nothing is spawned; a probe that fails (no line in time, no output, a non-zero exit) is
+  `unavailable`. A same-version replacement (a reinstall) is accepted:
+  the owner, mode and directory checks are the trust guard, and the version check is against protocol skew. The
+  consent path is also re-checked by the CLI itself.
+- **Check-then-exec.** The binary is checked by path, then executed by path. The per-job version probe narrows the
+  window to the time between the probe and the spawn, but does not close it. Only the user or root can write the
+  file or its directory, so only they could swap it between the two.
 - **Group-writable installs are refused.** A umask of 002 makes cargo install `runtime` and `~/.cargo/bin`
   group-writable; `runtimed --write` refuses to start and names `chmod g-w,o-w <path>`. A private group with only
   the user in it would be harmless, but the check does not try to tell.
@@ -1313,6 +1326,10 @@ the channel or keep the main loop busy without end.
 - **GTK's own session-bus use** (accessibility, portals, `GApplication` uniqueness) is GTK's, not this project's.
 - **A narrow window** collapses to one pane; keyboard and screen-reader use are only checked by hand
   (docs/GUI-CHECKLIST.md). An accessibility pass is a follow-up.
+- **A newer daemon's enum value reads as `Unknown`** (Phase 6E). The GUI labels an unknown grant access "unknown"
+  (never "read-only") and never offers consent for an entry whose action or consent state is unknown. The network
+  switch is a boolean and shows an unknown policy as off; toggling it sends the value the user picked. The permissions
+  editor sends only the change the user made, so an unknown value is never written back.
 
 ## Backends and `.wrun` packages (Phase 6D)
 
@@ -1334,7 +1351,7 @@ could be considered after 1.0, with its own threat model.
 
 ### The backend contract and capabilities
 
-The contract (module docs of `crates/core/src/backend.rs`, `BACKEND_API_VERSION = 1`) says that a backend:
+The contract (module docs of `crates/core/src/backend.rs`, `BACKEND_API_VERSION = 2`) says that a backend:
 
 - describes a process and never spawns one in `command`;
 - keeps the program and its working directory inside `drive_c`. `rt_core::backend::inside_drive_c` refuses `..`
@@ -1356,7 +1373,8 @@ anything:
 | `installers` | `install_via_installer`, before it reads the file |
 | `dependency_packages` | `rt_deps::check_backend`, from `install_plan` and from `runtime deps --install` before the sandbox marker is written |
 | `dotnet` | `rt_core::run`, for an app with Wine Mono recorded |
-| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. That `installers` and `dependency_packages` require it is checked by the conformance check `capabilities` only; at run time a backend that breaks this fails closed later, when the sandbox builder finds no `WINEPREFIX`. |
+| `graphics_driver` (Wine's `Graphics` value in `user.reg`; interface 2) | `runtime display`, read and set (and so `display.set` jobs): the recorded `backend.id` is looked up with `rt_api::backends::capabilities` (a constant, no backend is discovered) before `user.reg` is read or the lock taken. An unknown id refuses with the registry's message; a backend without it refuses with "does not support the graphics driver setting". |
+| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. That `installers`, `dependency_packages` and `graphics_driver` require it is checked by the conformance check `capabilities` only; at run time a backend that breaks this fails closed later, when the sandbox builder finds no `WINEPREFIX`. |
 
 Wine declares all of them. The refusals are exercised by tests with `FakeBackend` and the null backend.
 
@@ -1414,8 +1432,7 @@ A `.wrun` is hostile input from someone the user may not know. Its format is in 
   metadata schema 4, which an older runtime refuses. This is the existing schema policy.
 - **The manifest's `arch` for installer packages** is checked against the backend's capabilities but not against the
   program the installer wrote; the metadata records the program's real architecture.
-- **Contract gaps.** Parts of the backend contract are reviewed, not proven (above). `runtime display` writes Wine's
-  own configuration and is not gated by a capability yet; that is to do with a second backend.
+- **Contract gaps.** Parts of the backend contract are reviewed, not proven (above).
 
 ## Roadmap
 
