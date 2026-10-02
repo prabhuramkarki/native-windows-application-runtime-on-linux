@@ -360,7 +360,7 @@ which is cached for 30 s.
 {
   "checks": [
     {"area": "architecture", "status": "ok", "text": "host architecture: x86-64"},
-    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1); backend wine, interface 1"},
+    {"area": "runtime", "status": "ok", "text": "Wine: wine-10.0 (Ubuntu 10.0~repack-12ubuntu1); backend wine, interface 2"},
     {"area": "graphics", "status": "ok", "text": "Vulkan: 3 devices usable"}, ...
   ],
   "missingDependencies": 0, "notes": [], "subject": {"kind": "system"}, "verdict": "may_fail"
@@ -513,7 +513,8 @@ Params: `{"id"}`. Deletes the app's `permissions.toml` (back to the default), as
 ### `display.set`
 
 Params: `{"id", "driver": "auto" | "x11" | "wayland"}`. Sets the app's Wine graphics driver, as `runtime display`.
-Another `driver` is -32602.
+Another `driver` is -32602. An app whose recorded backend is unknown or lacks the `graphics_driver` capability ends
+`failed` with the CLI's message, and nothing is changed.
 
 ### `jobs.poll`
 

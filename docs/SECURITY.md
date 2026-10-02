@@ -1347,7 +1347,7 @@ could be considered after 1.0, with its own threat model.
 
 ### The backend contract and capabilities
 
-The contract (module docs of `crates/core/src/backend.rs`, `BACKEND_API_VERSION = 1`) says that a backend:
+The contract (module docs of `crates/core/src/backend.rs`, `BACKEND_API_VERSION = 2`) says that a backend:
 
 - describes a process and never spawns one in `command`;
 - keeps the program and its working directory inside `drive_c`. `rt_core::backend::inside_drive_c` refuses `..`
@@ -1369,7 +1369,8 @@ anything:
 | `installers` | `install_via_installer`, before it reads the file |
 | `dependency_packages` | `rt_deps::check_backend`, from `install_plan` and from `runtime deps --install` before the sandbox marker is written |
 | `dotnet` | `rt_core::run`, for an app with Wine Mono recorded |
-| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. That `installers` and `dependency_packages` require it is checked by the conformance check `capabilities` only; at run time a backend that breaks this fails closed later, when the sandbox builder finds no `WINEPREFIX`. |
+| `graphics_driver` (Wine's `Graphics` value in `user.reg`; interface 2) | `runtime display`, read and set (and so `display.set` jobs): the recorded `backend.id` is looked up with `rt_api::backends::capabilities` (a constant, no backend is discovered) before `user.reg` is read or the lock taken. An unknown id refuses with the registry's message; a backend without it refuses with "does not support the graphics driver setting". |
+| `sandboxable` (the command carries `WINEPREFIX = env.prefix()`, from which `rt_sandbox` derives the app) | `rt_core::run` refuses a sandboxed run without it; only `--unsandboxed` runs such a backend. That `installers`, `dependency_packages` and `graphics_driver` require it is checked by the conformance check `capabilities` only; at run time a backend that breaks this fails closed later, when the sandbox builder finds no `WINEPREFIX`. |
 
 Wine declares all of them. The refusals are exercised by tests with `FakeBackend` and the null backend.
 
@@ -1427,8 +1428,7 @@ A `.wrun` is hostile input from someone the user may not know. Its format is in 
   metadata schema 4, which an older runtime refuses. This is the existing schema policy.
 - **The manifest's `arch` for installer packages** is checked against the backend's capabilities but not against the
   program the installer wrote; the metadata records the program's real architecture.
-- **Contract gaps.** Parts of the backend contract are reviewed, not proven (above). `runtime display` writes Wine's
-  own configuration and is not gated by a capability yet; that is to do with a second backend.
+- **Contract gaps.** Parts of the backend contract are reviewed, not proven (above).
 
 ## Roadmap
 

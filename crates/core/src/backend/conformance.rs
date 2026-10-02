@@ -198,7 +198,7 @@ pub fn static_checks(b: &dyn CompatBackend, scratch: &Scratch) -> Vec<Failure> {
         !caps.arches.is_empty()
             && !caps.subsystems.is_empty()
             && b.capabilities() == caps
-            && (caps.sandboxable || !(caps.installers || caps.dependency_packages)),
+            && (caps.sandboxable || !(caps.installers || caps.dependency_packages || caps.graphics_driver)),
         "capabilities",
         || format!("empty, not constant, or sandboxed features without `sandboxable`: {caps:?}"),
     );

@@ -26,7 +26,9 @@
 //!   starts anything: `rt_core::install` (architecture, subsystem), `rt_installer::install_via_installer`
 //!   (`installers`; the installed program's architecture), `rt_deps::install_plan` and `runtime deps --install`
 //!   (`dependency_packages`), `rt_core::run` (the recorded architecture; `dotnet` for an app with Wine Mono
-//!   recorded; `sandboxable` for a sandboxed run).
+//!   recorded; `sandboxable` for a sandboxed run), `runtime display` and so `display.set` jobs
+//!   (`graphics_driver`, read and set, checked by the recorded id through `rt_api::backends::capabilities`
+//!   before `user.reg` is read or the lock taken).
 //! * `prepare`: creates the prefix so that `env.drive_c()` exists and is the guest's `C:`; idempotent; helpers
 //!   only through the backend's `Launcher`.
 //! * `command`: describes and never spawns; never calls `env_clear`; refuses an exe or cwd outside `env.drive_c()`
@@ -47,13 +49,13 @@
 //! Gated by a capability because they read or write Wine's own layout: the installer pipeline (`system.reg`,
 //! `user.reg`, `.lnk` files, `msiexec.exe` in `system32`: `installers`); dependency packages (DLL overrides and
 //! Wine configuration in `user.reg`, `reg.exe`, the `wineserver`-in-`/proc` busy check: `dependency_packages`);
-//! Wine Mono (`dotnet`).
+//! Wine Mono (`dotnet`); the graphics driver in `user.reg` (`graphics_driver`).
 //!
 //! **Wine-specific, stays concrete** (Decision B5; a second backend brings its own): `doctor`'s Wine checks
 //! (`backend_wine::harden::audit_prefix`, `check_app_home`, Wine's driver modules), the Wine-shaped fallback
 //! command of `runtime sandbox` when Wine is missing (`rt_api::host::sandbox`), `backend_wine::harden_cause`,
-//! `runtime display` (Wine's graphics driver in `user.reg`), and the `wineserver` checks of `remove`,
-//! `uninstall` and `permissions --set` (they find no `wineserver` for another backend, so they refuse nothing).
+//! and the `wineserver` checks of `remove`, `uninstall` and `permissions --set` (they find no `wineserver` for
+//! another backend, so they refuse nothing).
 use crate::{AppEnv, RunError};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -65,7 +67,7 @@ use std::process::Command;
 pub mod conformance;
 
 /// The version of the contract above; bumped on any change a backend must react to. `runtime doctor` prints it.
-pub const BACKEND_API_VERSION: u32 = 1;
+pub const BACKEND_API_VERSION: u32 = 2;
 
 /// What a backend can run and take (see the module docs for where each is enforced).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,8 +84,12 @@ pub struct Capabilities {
     pub dependency_packages: bool,
     /// Its program command may run in the app sandbox: it sets `WINEPREFIX` to `env.prefix()`, from which
     /// `rt_sandbox` derives the app. Without it `rt_core::run` refuses a sandboxed run before anything starts
-    /// (only `--unsandboxed` runs it). `installers` and `dependency_packages` need it (their programs run sandboxed).
+    /// (only `--unsandboxed` runs it). `installers`, `dependency_packages` and `graphics_driver` need it (their
+    /// programs run sandboxed).
     pub sandboxable: bool,
+    /// Its prefix has Wine's graphics-driver setting (`HKCU\Software\Wine\Drivers` `Graphics` in `user.reg`, set
+    /// with `reg.exe`): `runtime display` reads and sets it. Interface 2.
+    pub graphics_driver: bool,
 }
 
 impl Capabilities {
@@ -496,6 +502,7 @@ mod tests {
             installers: false,
             dependency_packages: false,
             sandboxable: false,
+            graphics_driver: false,
         };
         assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Gui), Ok(()));
         assert_eq!(caps.check("t", Arch::X86_64, Subsystem::Console), Ok(()));

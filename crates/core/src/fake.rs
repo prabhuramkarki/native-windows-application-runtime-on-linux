@@ -56,6 +56,7 @@ pub const FAKE_CAPABILITIES: Capabilities = Capabilities {
     installers: true,
     dependency_packages: true,
     sandboxable: true,
+    graphics_driver: true,
 };
 
 impl Default for FakeBackend {

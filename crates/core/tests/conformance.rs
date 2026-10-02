@@ -23,6 +23,7 @@ const NULL_CAPABILITIES: Capabilities = Capabilities {
     installers: false,
     dependency_packages: false,
     sandboxable: false,
+    graphics_driver: false,
 };
 
 impl CompatBackend for NullBackend {
@@ -134,6 +135,7 @@ enum Break {
     FollowsFinalSymlink,
     SandboxableWithoutPrefix,
     InstallersWithoutSandbox,
+    GraphicsDriverWithoutSandbox,
 }
 
 struct Broken(Break);
@@ -160,6 +162,10 @@ impl CompatBackend for Broken {
             },
             Break::InstallersWithoutSandbox => Capabilities {
                 installers: true,
+                ..NULL_CAPABILITIES
+            },
+            Break::GraphicsDriverWithoutSandbox => Capabilities {
+                graphics_driver: true,
                 ..NULL_CAPABILITIES
             },
             _ => NULL_CAPABILITIES,
@@ -251,6 +257,7 @@ fn each_broken_backend_fails_exactly_its_check() {
         (Break::FollowsFinalSymlink, "outside-symlink"),
         (Break::SandboxableWithoutPrefix, "command-sandboxable"),
         (Break::InstallersWithoutSandbox, "capabilities"),
+        (Break::GraphicsDriverWithoutSandbox, "capabilities"),
     ] {
         assert_eq!(checks(&Broken(b)), [want]);
     }
@@ -338,7 +345,7 @@ fn the_null_backend_refuses_what_its_capabilities_exclude_and_creates_nothing() 
     // Dependency packages and Wine Mono: refused by the same flags (the orchestrator and run tests use
     // `FakeBackend::with_capabilities` with each one off).
     let caps = b.capabilities();
-    assert!(!caps.dependency_packages && !caps.dotnet && !caps.installers);
+    assert!(!caps.dependency_packages && !caps.dotnet && !caps.installers && !caps.graphics_driver);
 }
 
 // ---------------------------------------------------------------- no plugins

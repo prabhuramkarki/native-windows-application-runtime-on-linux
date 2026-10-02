@@ -2779,6 +2779,44 @@ fn display_reads_auto_on_a_fresh_app() {
 }
 
 #[test]
+fn display_reads_without_wine_installed() {
+    let r = rig().no_wine();
+    display_app(&r);
+    assert_eq!(
+        display_lines(&r.rt(&["display", "dapp"])),
+        ["graphics driver: auto", "session: none", "winewayland: not verified"]
+    );
+}
+
+/// Phase 6E Task 4: a recorded backend that is unknown (or lacks `graphics_driver`) is refused on both paths
+/// before `user.reg` is read or the lock taken; nothing reaches Wine and `user.reg` keeps its bytes and mtime.
+#[test]
+fn display_refuses_an_app_of_an_unknown_backend_on_both_paths_and_touches_nothing() {
+    let r = rig();
+    let prefix = display_app(&r);
+    user_reg(&prefix, "\"Graphics\"=\"x11\"");
+    let md_path = r.apps().join("dapp/metadata.json");
+    let mut md: serde_json::Value = serde_json::from_slice(&fs::read(&md_path).unwrap()).unwrap();
+    md["backend"]["id"] = "null".into();
+    fs::write(&md_path, serde_json::to_vec(&md).unwrap()).unwrap();
+    let reg = prefix.join("user.reg");
+    let (before, mtime) = (fs::read(&reg).unwrap(), fs::metadata(&reg).unwrap().modified().unwrap());
+    for args in [&["display", "dapp"][..], &["display", "dapp", "x11"]] {
+        let o = r.rt(args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", s(&o.stderr));
+        let err = s(&o.stderr);
+        assert!(
+            err.contains("unknown compatibility backend \"null\"") && err.contains("(known: wine)"),
+            "{args:?}: {err}"
+        );
+        assert!(s(&o.stdout).is_empty(), "{args:?}");
+    }
+    assert_eq!(fs::read(&reg).unwrap(), before);
+    assert_eq!(fs::metadata(&reg).unwrap().modified().unwrap(), mtime);
+    assert!(!reg_ran(&r));
+}
+
+#[test]
 fn display_wayland_is_refused_without_a_session_and_writes_nothing() {
     let r = rig();
     let prefix = display_app(&r);
