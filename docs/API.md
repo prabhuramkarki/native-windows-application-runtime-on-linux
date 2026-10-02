@@ -546,10 +546,16 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 - **Clients must ignore unknown members** in results and replies. The bundled client does.
 - An **unknown `data.kind`** deserialises as `ErrorKind::Unknown`: `ErrorKind` is `#[non_exhaustive]` with a serde
   fallback.
-- The job enums (`JobKind`, `JobState`, `EventKind`) also read an unknown value as `Unknown`. The other enums are
-  `#[non_exhaustive]` for Rust callers but have **no** serde fallback. A typed helper of an older client fails with a
-  protocol error ("the result does not have the expected shape") when a newer daemon sends a new enum value.
-  `Client::call` (raw JSON) always works. A client that must span versions checks `api` first.
+- **Every result enum reads an unknown value as `Unknown`** (since 0.2.2 for all of them; the job enums `JobKind`,
+  `JobState`, `EventKind` had it since 0.2.0): `NetworkView`, `AccessView`, `PermSource`, `VulkanState`,
+  `PlanAction`, `ConsentView`, the compat record's `status`, and the tagged `SubjectView` (`kind`) and
+  `Availability` (`state`). So a typed helper of an older client never fails because a newer daemon sends a new
+  value. `Unknown` is never produced by a daemon; it serialises as `"unknown"`. A client shows it as unknown and
+  never treats it as a known value: the bundled GUI labels an unknown grant access "unknown" (not read-only) and
+  never offers consent for an entry whose `action` or `consent` is unknown. The network switch is a boolean and shows
+  an unknown policy as off.
+- **Request enums stay strict**: `display.set`'s `driver` refuses an unknown value with `-32602`. A `compat.toml`
+  record with an unknown `status` (or the literal `unknown`) is still refused.
 - **0.2.0 is breaking** by the rule above: the mutating names that were `-32601` in 0.1 are now known methods, which
   a read-only daemon answers `read_only`. Everything else is additive: the write methods, `rpc.version.write`, and
   `deps.plan`'s `digest`, `sha256` and `consentText`. A 0.2 client reading a 0.1 daemon's `deps.plan` gets an

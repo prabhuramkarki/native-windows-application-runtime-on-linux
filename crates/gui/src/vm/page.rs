@@ -74,10 +74,11 @@ fn perm_rows(p: &PermissionsView) -> PermRows {
             .map(|g| GrantRow {
                 path: g.path.clone(),
                 shown: shown(&g.path, rt_api::PATH_MAX),
-                access: if g.access == AccessView::Rw {
-                    "read-write"
-                } else {
-                    "read-only"
+                access: match g.access {
+                    AccessView::Rw => "read-write",
+                    AccessView::Ro => "read-only",
+                    // A newer daemon's value: never shown as read-only.
+                    _ => "unknown",
                 },
             })
             .collect(),

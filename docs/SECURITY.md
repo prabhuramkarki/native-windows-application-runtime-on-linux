@@ -1313,6 +1313,10 @@ the channel or keep the main loop busy without end.
 - **GTK's own session-bus use** (accessibility, portals, `GApplication` uniqueness) is GTK's, not this project's.
 - **A narrow window** collapses to one pane; keyboard and screen-reader use are only checked by hand
   (docs/GUI-CHECKLIST.md). An accessibility pass is a follow-up.
+- **A newer daemon's enum value reads as `Unknown`** (Phase 6E). The GUI labels an unknown grant access "unknown"
+  (never "read-only") and never offers consent for an entry whose action or consent state is unknown. The network
+  switch is a boolean and shows an unknown policy as off; toggling it sends the value the user picked. The permissions
+  editor sends only the change the user made, so an unknown value is never written back.
 
 ## Backends and `.wrun` packages (Phase 6D)
 

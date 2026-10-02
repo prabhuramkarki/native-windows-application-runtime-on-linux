@@ -31,6 +31,10 @@ pub enum Status {
     Partial,
     Broken,
     Untested,
+    /// A status this client does not know (a newer daemon's `compat` result): deserialisation never fails on it.
+    /// Never produced, and never valid in `compat.toml` (`Record` validation refuses it, so a typo stays an error).
+    #[serde(other)]
+    Unknown,
 }
 
 impl Status {
@@ -40,6 +44,7 @@ impl Status {
             Status::Partial => "partial",
             Status::Broken => "broken",
             Status::Untested => "untested",
+            Status::Unknown => "unknown",
         }
     }
 }
@@ -164,6 +169,12 @@ impl Record {
             record: record(),
             field,
         };
+        if self.status == Status::Unknown {
+            return Err(CompatError::Toml(format!(
+                "record {:?}: unknown status (works, partial, broken or untested)",
+                record()
+            )));
+        }
         let text = |field, v: &Option<String>, max| match v {
             Some(s) if !valid_text(s, max) => Err(bad(field)),
             _ => Ok(()),
@@ -309,8 +320,13 @@ evidence = "ci:x"
     fn rejects_unknown_fields_and_unknown_status() {
         let e = Compat::parse(&one("status = \"untested\"\nextra = 1")).unwrap_err();
         assert!(matches!(e, CompatError::UnknownField(_)), "{e:?}");
-        let e = Compat::parse(&one("status = \"fine\"")).unwrap_err();
-        assert!(matches!(e, CompatError::Toml(_)), "{e:?}");
+        // The wire fallback (`Status::Unknown`) never makes a typo or `unknown` itself a valid record.
+        for s in ["fine", "workz", "unknown"] {
+            for evidence in ["", "\nevidence = \"ci:x\""] {
+                let e = Compat::parse(&one(&format!("status = \"{s}\"{evidence}"))).unwrap_err();
+                assert!(matches!(e, CompatError::Toml(_)), "{s}: {e:?}");
+            }
+        }
         let e = Compat::parse("[[record]]\napp = \"a\"\nstatus = \"untested\"\nwine = \"1\"\n[other]\n").unwrap_err();
         assert!(matches!(e, CompatError::UnknownField(_)), "{e:?}");
     }

@@ -635,6 +635,25 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_daemons_enum_values_parse_as_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = fake(d.path(), |s, req| {
+            let result = json!({
+                "source": "file", "network": "lan", "display": true, "audio": false, "gpu": false,
+                "filesystem": [{"path": "/data", "access": "append"}],
+                "limits": {"memoryMb": null, "cpuPercent": null, "tasks": 512, "tasksDefault": true, "explicit": false}
+            });
+            write(
+                s,
+                format!("{}\n", json!({"jsonrpc": "2.0", "id": req["id"], "result": result})).as_bytes(),
+            );
+        });
+        let p = Client::connect_with(&sock, SHORT).unwrap().permissions("game").unwrap();
+        assert_eq!(p.network, rt_api::NetworkView::Unknown);
+        assert_eq!(p.filesystem[0].access, rt_api::AccessView::Unknown);
+    }
+
+    #[test]
     fn a_long_poll_gets_a_deadline_past_its_wait() {
         assert_eq!(poll_timeout(0), TIMEOUT);
         assert_eq!(poll_timeout(25_000), Duration::from_secs(40));
