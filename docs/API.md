@@ -644,12 +644,24 @@ How it behaves:
 runtime rpc rpc.version
 runtime rpc apps.get '{"id": "notepad"}'
 runtime rpc doctor.system --socket /run/user/1000/rt-test.sock
-runtime daemon-status            # exit 0 when a daemon answers, 1 when none does; says "mode: write" or "read-only"
+runtime daemon-status            # exit 0 when a daemon answers, else 1; says "mode: write" or "read-only"
 runtime rpc apps.remove '{"id": "notepad"}'      # write mode: {"jobId": "..."}
 ```
 
 `runtime daemon-status` prints `mode: write`, `mode: read-only`, or, for a daemon older than 0.2,
 `mode: read-only (API <version>)`. There is no `runtime jobs` command: `runtime rpc jobs.*` covers scripts.
+
+Its `reachable:` line tells the outcomes apart (exit 0 only for the first; error text is escaped and bounded):
+
+- `reachable: yes` (then `api`, `runtime`, `protocol`, `mode`): the daemon answered `rpc.version`.
+- `reachable: yes, busy (connection limit reached): try again`: the daemon refused the connection with `-32001`.
+- `reachable: yes, not answering within 5 s`: connected, but no reply in time (or `-32002`, or a socket that never
+  accepts).
+- `reachable: yes, but the exchange failed (<error>)`: connected, but the reply was bad, cut short or another error.
+- `reachable: no (<error>)` plus a hint to start `runtimed`: nothing to connect to (no socket, no listener).
+- `reachable: not checked (<error>)`: refused before sending, because the socket or its directory is unsafe.
+
+Only `reachable: no` suggests starting `runtimed`.
 
 `runtime rpc` is a raw tool for debugging and scripts.
 
