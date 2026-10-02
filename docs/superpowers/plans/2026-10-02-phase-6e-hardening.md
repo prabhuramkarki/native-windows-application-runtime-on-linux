@@ -451,7 +451,7 @@ and cuts one bounded message, so it was not used.
 | 4 Display capability | `6007ca5` |
 | 5 `daemon-status` | `e032f64` |
 | 6 Cancel e2e | `c12a26f` |
-| 7 CI audit and docs | the `ci:` commit on the branch tip |
+| 7 CI audit and docs | `6605cf0` |
 
 **Task 1.** As planned (spec 4.3's list was complete; `ErrorKind`, `JobKind`, `JobState`, `EventKind` already had
 their tests). `compat::Status::Unknown` is refused by `Record::check` before the evidence check. GUI: an unknown
