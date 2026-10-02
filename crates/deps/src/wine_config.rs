@@ -26,9 +26,35 @@ pub(crate) fn restorable_override(v: &str) -> bool {
     v.len() <= MAX_RESTORABLE_LEN && v.bytes().all(|b| b.is_ascii_lowercase() || b == b',' || b == b' ')
 }
 
+/// The value of DLL override `name` in `reg` (case-insensitive key and value names, the last spelling wins).
+fn override_value<'a>(reg: &'a WineReg, name: &str) -> Option<&'a RegValue> {
+    reg.keys
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(OVERRIDES_HIVE_KEY))
+        .flat_map(|(_, key)| key.values.iter())
+        .rfind(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+/// For each of `names`, whether its DLL override in the prefix's `user.reg` is the string `value` exactly:
+/// `Some(true)`, `Some(false)` (another value of any type), or `None` (absent, or no `user.reg`). Read like
+/// [`read_dll_overrides`]; `Err` (fixed text) only for an unreadable, oversized or symlinked hive. No value is
+/// returned, so none can be quoted.
+pub(crate) fn dll_overrides_equal(env: &AppEnv, names: &[String], value: &str) -> Result<Vec<Option<bool>>, String> {
+    let reg = read_hive(&env.prefix(), "user.reg").map_err(|e| format!("cannot read the prefix's user.reg: {e}"))?;
+    Ok(names
+        .iter()
+        .map(|name| {
+            reg.as_ref()
+                .and_then(|r| override_value(r, name))
+                .map(|v| matches!(v, RegValue::Str(s) if s == value))
+        })
+        .collect())
+}
+
 /// For each of `names`, the current value under `HKCU\Software\Wine\DllOverrides` in the prefix's `user.reg`
 /// (read with the no-follow, regular-file-only, size-capped hive reader), `None` when absent (or when there is no
-/// `user.reg`). Name match as [`overrides_in`]. `Err` (fixed text, never a value): an unreadable, oversized or
+/// `user.reg`). Name match as `overrides_in`. `Err` (fixed text, never a value): an unreadable, oversized or
 /// symlinked hive, or a value the runtime cannot restore.
 pub fn read_dll_overrides(env: &AppEnv, names: &[String]) -> Result<Vec<(String, Option<String>)>, String> {
     match read_hive(&env.prefix(), "user.reg")
@@ -45,23 +71,14 @@ pub fn read_dll_overrides(env: &AppEnv, names: &[String]) -> Result<Vec<(String,
 pub(crate) fn overrides_in(reg: &WineReg, names: &[String]) -> Result<Vec<(String, Option<String>)>, String> {
     names
         .iter()
-        .map(|name| {
-            let value = reg
-                .keys
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(OVERRIDES_HIVE_KEY))
-                .flat_map(|(_, key)| key.values.iter())
-                .rfind(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v);
-            match value {
-                None => Ok((name.clone(), None)),
-                Some(RegValue::Str(v)) if restorable_override(v) => Ok((name.clone(), Some(v.clone()))),
-                Some(_) => Err(format!(
-                    "the existing DLL override `{}` has a value the runtime cannot restore; reset it (winecfg, \
+        .map(|name| match override_value(reg, name) {
+            None => Ok((name.clone(), None)),
+            Some(RegValue::Str(v)) if restorable_override(v) => Ok((name.clone(), Some(v.clone()))),
+            Some(_) => Err(format!(
+                "the existing DLL override `{}` has a value the runtime cannot restore; reset it (winecfg, \
                      Libraries) and install again",
-                    crate::manifest::clip(name)
-                )),
-            }
+                crate::manifest::clip(name)
+            )),
         })
         .collect()
 }

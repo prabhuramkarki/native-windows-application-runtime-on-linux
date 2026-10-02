@@ -56,13 +56,16 @@
 //!
 //! * if the retry SUCCEEDS but selects less than the killed run wrote (the selection comes from the manifest's
 //!   `extract`, which can change while the archive stays pinned), the listed files it did not write again are
-//!   still recorded in `files` (and listed replaced ones in `replaced`), so [`remove_archive`] removes them too.
+//!   still recorded in `files` (and listed replaced ones in `replaced`), so [`record_of`] records them and
+//!   [`remove_archive`] removes them too.
 //!
 //! The `F`/`D`/`R` entries are facts about the prefix, not about an archive. A journal written for a DIFFERENT
 //! archive of the package (another sha256) is still [`ArchiveError::Journal`] for [`install_archive`]: the way out
-//! is [`discard_interrupted`], which undoes exactly what the journal lists and deletes it. Calling
-//! [`remove_archive`] with an empty record instead would delete the journal and make the next install back up the
-//! killed run's files as originals, so it refuses (with [`ArchiveError::Journal`]) while a journal exists.
+//! is [`discard_interrupted`], which undoes exactly what the journal lists and deletes it. Calling `undo_install`
+//! with an empty result instead would delete the journal and make the next install back up the killed run's files
+//! as originals, so it refuses (with [`ArchiveError::Journal`]) while a journal exists. [`remove_archive`] has no
+//! such case: it only ever gets the record of a package the app records, and a recorded package is never installed
+//! again (upgrades are refused), so its journal is that install's own.
 //!
 //! The journal is read defensively (regular file only, `O_NOFOLLOW`, at most 4 MiB and 16384 entries, UTF-8, a
 //! header naming a valid sha256, strict `F `/`D `/`R ` lines whose paths pass the same rules as a recorded
@@ -70,8 +73,9 @@
 //! newline is dropped, because it was being appended when the process died and the step it announced had not
 //! started; before appending to such a journal, the torn tail is cut off (`ftruncate`), so reading and appending
 //! agree. A torn HEADER cannot come from a crash (the journal is created atomically) and is an error. The journal
-//! stays after a successful install (the caller may die before recording it) and is deleted by a successful
-//! [`remove_archive`] and by a fully rolled-back install (which also removes what the killed attempt left).
+//! stays after a successful install (the caller may die before recording it) and is deleted by a
+//! [`remove_archive`] without hard failures and by a fully rolled-back install (which also removes what the killed
+//! attempt left).
 //!
 //! **Failure.** On any error [`install_archive`] undoes exactly what the call did (overrides deleted newest
 //! first, new files deleted, replaced files restored, created directories removed when empty) and returns the
@@ -85,16 +89,23 @@
 //! written by Wine's own `reg.exe` in the prefix, run through the backend:
 //! `reg add HKCU\Software\Wine\DllOverrides /v <name> /d native,builtin /f`, wrapped by
 //! [`CompatBackend::settle`] (so `wineserver` has flushed `user.reg` before the call returns) and run by
-//! [`Launcher::run_helper`] with a deadline; a non-zero exit is [`ArchiveError::Registry`]. Removal runs
-//! `reg delete ... /v <name> /f`; if that fails, `reg query ... /v <name>` decides whether the value is already
+//! [`Launcher::run_helper`] with a deadline; a non-zero exit is [`ArchiveError::Registry`]. Removal puts a recorded
+//! previous value back with `reg add ... /v <name> /d <previous> /f`, or runs `reg delete ... /v <name> /f` when the
+//! override did not exist before; if a delete fails, `reg query ... /v <name>` decides whether the value is already
 //! gone (then it is not an error, so removal can be retried). Verified on real Wine 10.0 by the ignored test
 //! `e2e_real_wine_zip_and_tar_gz_with_a_dll_override`: `reg.exe` exists in a fresh prefix, the value is in
 //! `user.reg` once the settled command returns, and `reg delete` removes it. The `user.reg` writer the ruling
 //! also allowed was therefore not needed.
 //!
-//! **Recording.** [`ArchiveInstalled`] is (de)serialisable so the caller can persist it; [`remove_archive`]
-//! re-validates every recorded path and name (and the list sizes) before touching anything, since a recorded
-//! state file is not trusted either.
+//! **Recording (metadata schema 5).** [`ArchiveInstalled`] is what one call did; it is not persisted. What is
+//! persisted is [`rt_core::ArchiveRecord`], built by [`record_of`] right after the install under the app lock: each
+//! file with the sha256 of its bytes as hashed from disk, whether it replaced a file, the created directories, and
+//! each override with its value before the install (read by `wine_config::read_dll_overrides` before the download;
+//! a value the runtime could not restore refuses the install). [`remove_archive`] takes that record, re-validates
+//! every path, name and previous value (the list sizes too) before touching anything, since `metadata.json` is not
+//! trusted either, and then verifies each entry against the prefix: what changed since the install is left in
+//! place and reported, never deleted. If the record cannot be written, the orchestrator undoes the install with
+//! `undo_install` (the unverified undo of the current call), so an archive package never stays unrecorded.
 //!
 //! **Not covered** (as for `rt_core::unzip` and `winpath`): a process that can write inside `drive_c` WHILE this
 //! runs could swap a checked directory for a symlink. Callers install only while no Windows program runs in the
@@ -137,7 +148,8 @@ const MAX_JOURNAL_ENTRIES: usize = 4 * MAX_ENTRIES;
 /// Most rollback failures quoted in an error.
 const MAX_REPORTED: usize = 5;
 
-/// What one [`install_archive`] call put into the prefix: exactly what [`remove_archive`] takes away again. Paths
+/// What one [`install_archive`] call put into the prefix: what [`record_of`] records and `undo_install` takes away
+/// again. Paths
 /// are relative to `drive_c`, with the real on-disk spelling of existing components.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,7 +230,7 @@ pub fn install_archive(
         Ok(()) => {
             // The selection comes from the manifest, not the archive: a retry may select less than the killed run
             // wrote. Whatever it did not write again stays ours (the file on disk is the killed run's copy, the
-            // backup the original), so it is recorded and `remove_archive` takes it away too.
+            // backup the original), so it is recorded and removal takes it away too.
             for f in &ledger.adopted {
                 if !ledger.done.files.contains(f) {
                     ledger.done.files.push(f.clone());
@@ -397,6 +409,181 @@ pub(crate) fn undo_install(
     }
 }
 
+/// Why an unchanged-looking item was left in place ([`RemoveOutcome::left`]).
+const CHANGED: &str = "changed since it was installed";
+const NOT_FOLLOWED: &str = "not a regular file, or reached through a symbolic link: left in place, not followed";
+
+/// What [`remove_archive`] did with one package's record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    /// `removed <path>`, `restored <path>`, `override <name> restored` or `override <name> deleted`, in the order
+    /// done.
+    pub done: Vec<String>,
+    /// `(item, why)`: what changed since the install and was left in place (Decision R6): a file whose hash
+    /// differs, a path that is not a regular file or goes through a symlink, an override whose value is not
+    /// [`INSTALLED_OVERRIDE`]. Such items are no longer the runtime's: they are not in `remaining`.
+    pub left: Vec<(String, String)>,
+    /// `(item, error)`: hard failures (an I/O error, `reg.exe` failing or timing out; Decision R7). A failure to
+    /// delete the journal is reported as item `journal`, with nothing in `remaining` for it.
+    pub failed: Vec<(String, String)>,
+    /// Exactly the record entries whose step failed: what a retry has to work on. Empty when nothing failed.
+    pub remaining: rt_core::ArchiveRecord,
+}
+
+/// Removes what `rec` records for package `pkg_id`, verifying each entry against the prefix first (spec 4.3):
+/// 1. the id and the whole record are validated (paths through the Windows name rules inside `drive_c`, override
+///    names, previous values in the restorable charset); `Err` means nothing was touched;
+/// 2. overrides, newest first: `user.reg` is read once; an override whose value is exactly [`INSTALLED_OVERRIDE`]
+///    gets its previous value back (`reg add ... /d <previous> /f`) or is deleted when it had none, each argument
+///    one argv element, through `launcher`; any other value, or none, is left;
+/// 3. files, newest first: reached with no symlink in any component, opened `O_NOFOLLOW`, `fstat`ed to be a
+///    regular file and hashed. Equal to the record: deleted (a new file) or replaced by its backup (a replaced
+///    one). Different: left, and a replaced file's backup is kept. Already gone: removed, or for a replaced file
+///    its original is restored. A symlink, a directory or a special file is left, never followed;
+/// 4. created directories, children first, removed only when empty;
+/// 5. when nothing failed, the journal is deleted (and empty backup directories pruned).
+///
+/// Nothing that is not in the record is deleted or changed; nothing is listed or walked.
+pub fn remove_archive(
+    rec: &rt_core::ArchiveRecord,
+    pkg_id: &str,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+) -> Result<RemoveOutcome, ArchiveError> {
+    if !manifest::valid_id(pkg_id) {
+        return Err(ArchiveError::BadPackage(format!(
+            "invalid package id {:?}",
+            clip(pkg_id)
+        )));
+    }
+    check_archive_record(rec)?;
+    let ledger = Ledger::new(env, pkg_id);
+    let mut out = RemoveOutcome::default();
+    let fail = |out: &mut RemoveOutcome, item: String, e: &dyn std::fmt::Display| {
+        out.failed.push((item, clip(&e.to_string())));
+    };
+
+    let names: Vec<String> = rec.overrides.iter().map(|o| o.name.clone()).collect();
+    let mut failed_overrides = HashSet::new();
+    match crate::wine_config::dll_overrides_equal(env, &names, INSTALLED_OVERRIDE) {
+        Err(e) => {
+            for o in &rec.overrides {
+                fail(&mut out, format!("override {}", o.name), &e);
+                failed_overrides.insert(o.name.as_str());
+            }
+        }
+        Ok(states) => {
+            for (o, state) in rec.overrides.iter().zip(states).rev() {
+                let item = format!("override {}", o.name);
+                match state {
+                    Some(true) => {
+                        let (undone, verb) = match &o.previous {
+                            Some(v) => (restore_override(&o.name, v, env, backend, launcher), "restored"),
+                            None => (delete_override(&o.name, env, backend, launcher, None), "deleted"),
+                        };
+                        match undone {
+                            Ok(()) => out.done.push(format!("{item} {verb}")),
+                            Err(e) => {
+                                fail(&mut out, item, &e);
+                                failed_overrides.insert(o.name.as_str());
+                            }
+                        }
+                    }
+                    Some(false) => out.left.push((item, CHANGED.into())),
+                    None => out.left.push((item, "already removed".into())),
+                }
+            }
+        }
+    }
+    out.remaining.overrides = rec
+        .overrides
+        .iter()
+        .filter(|o| failed_overrides.contains(o.name.as_str()))
+        .cloned()
+        .collect();
+
+    for f in rec.files.iter().rev() {
+        let rel = Path::new(&f.path);
+        let path = clip(&f.path);
+        // A replaced file that is left keeps its backup, and the report says where it is.
+        let kept = |why: &str| match f.replaced {
+            true => format!("{why}; its original is kept at {BACKUP_DIR}/{pkg_id}/c/{path}"),
+            false => why.to_owned(),
+        };
+        let step = match ledger.hash(rel) {
+            Ok(Hashed::NotRegular) => {
+                out.left.push((path.clone(), kept(NOT_FOLLOWED)));
+                continue;
+            }
+            Ok(Hashed::File(h)) if h != f.sha256 => {
+                out.left.push((path.clone(), kept(CHANGED)));
+                continue;
+            }
+            // Unchanged, or already gone: a replaced file gets its original back either way.
+            Ok(Hashed::File(_) | Hashed::Gone) if f.replaced => ledger.restore(rel).map(|()| "restored"),
+            Ok(Hashed::File(_)) => ledger.remove_file(rel).map(|()| "removed"),
+            Ok(Hashed::Gone) => Ok("removed"),
+            Err(e) => Err(e),
+        };
+        match step {
+            Ok(verb) => out.done.push(format!("{verb} {path}")),
+            Err(e) => {
+                fail(&mut out, path, &e);
+                out.remaining.files.insert(0, f.clone());
+            }
+        }
+    }
+
+    let mut dirs: Vec<&String> = rec.created_dirs.iter().collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(Path::new(d).components().count()));
+    for d in dirs {
+        match ledger.remove_created_dir(Path::new(d)) {
+            Ok(true) => {}
+            Ok(false) => out
+                .left
+                .push((clip(d), NOT_FOLLOWED.replace("a regular file", "a directory"))),
+            Err(e) => {
+                fail(&mut out, clip(d), &e);
+                out.remaining.created_dirs.push(d.clone());
+            }
+        }
+    }
+    // Keep the record's order (parents first) for a retry.
+    out.remaining
+        .created_dirs
+        .sort_by_key(|d| rec.created_dirs.iter().position(|r| r == d));
+
+    if out.failed.is_empty()
+        && let Err(e) = ledger.drop_journal()
+    {
+        fail(&mut out, "journal".into(), &e);
+    }
+    Ok(out)
+}
+
+/// Puts DLL override `name` back to `value` (a restorable previous value): `reg add ... /v <name> /d <value> /f`.
+fn restore_override(
+    name: &str,
+    value: &str,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+) -> Result<(), ArchiveError> {
+    let (ok, detail) = reg(
+        &["add", OVERRIDES_KEY, "/v", name, "/d", value, "/f"],
+        env,
+        backend,
+        launcher,
+        None,
+    )?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ArchiveError::Registry(format!("reg add {name}: {detail}")))
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ validation
 
 fn bad_package(pkg: &Package, why: &str) -> ArchiveError {
@@ -465,7 +652,7 @@ pub(crate) fn check_overrides(names: &[String], provides: Option<&[String]>) -> 
     Ok(())
 }
 
-/// A recorded install is re-validated before [`remove_archive`] acts on it.
+/// An install result is re-validated before `undo_install` acts on it.
 fn check_record(r: &ArchiveInstalled) -> Result<(), ArchiveError> {
     let bad = |why: String| ArchiveError::BadPackage(format!("recorded install: {why}"));
     if r.files.len() > MAX_ENTRIES || r.created_dirs.len() > MAX_ENTRIES || r.replaced.len() > r.files.len() {
@@ -481,6 +668,35 @@ fn check_record(r: &ArchiveInstalled) -> Result<(), ArchiveError> {
         )));
     }
     check_overrides(&r.overrides, None).map_err(|e| bad(e.to_string()))
+}
+
+/// A persisted record is re-validated before [`remove_archive`] acts on it (the metadata crate checked its shape
+/// only): every path passes the Windows name rules inside `drive_c`, every sha256 is well-formed, override names are
+/// valid and unique, and previous values are restorable. The error never quotes a previous value.
+fn check_archive_record(r: &rt_core::ArchiveRecord) -> Result<(), ArchiveError> {
+    let bad = |why: String| ArchiveError::BadPackage(format!("recorded install: {why}"));
+    let cap = rt_core::MAX_RECORDED;
+    if r.files.len() > cap || r.created_dirs.len() > cap || r.overrides.len() > cap {
+        return Err(bad("too many entries".into()));
+    }
+    for p in r.files.iter().map(|f| &f.path).chain(&r.created_dirs) {
+        win_path(Path::new(p)).map_err(|_| bad(format!("unsafe path {:?}", clip(p))))?;
+    }
+    if r.files.iter().any(|f| !manifest::valid_sha256(&f.sha256)) {
+        return Err(bad("a file's sha256 is not 64 lowercase hex digits".into()));
+    }
+    let names: Vec<String> = r.overrides.iter().map(|o| o.name.clone()).collect();
+    check_overrides(&names, None).map_err(|e| bad(e.to_string()))?;
+    if r.overrides.iter().any(|o| {
+        o.previous
+            .as_deref()
+            .is_some_and(|v| !crate::wine_config::restorable_override(v))
+    }) {
+        return Err(bad(
+            "a previous override value is not one the runtime can restore".into()
+        ));
+    }
+    Ok(())
 }
 
 /// A `drive_c`-relative path as a [`WinPath`]: plain UTF-8 components only, then the full Windows name rules.
@@ -1056,6 +1272,23 @@ impl Ledger {
         match self.resolve(rel)? {
             Some(p) => Ok(fs::remove_file(p)?),
             None => Ok(()),
+        }
+    }
+
+    /// Removes the recorded directory `rel` if it is empty. `Ok(false)`: it is not a directory, or the path goes
+    /// through a symlink (left, never followed); gone or not empty is `Ok(true)` (nothing to do).
+    fn remove_created_dir(&self, rel: &Path) -> Result<bool, ArchiveError> {
+        let path = match resolve_under(&self.drive_c, &win_path(rel)?) {
+            Ok(p) => p,
+            Err(ResolveError::NotFound) => return Ok(true),
+            Err(ResolveError::Symlink | ResolveError::SpecialFile | ResolveError::NotADirectory) => return Ok(false),
+            Err(e) => return Err(resolve_err(rel, e)),
+        };
+        match fs::remove_dir(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTEMPTY) || e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => Ok(false),
+            Err(e) => Err(e.into()),
         }
     }
 

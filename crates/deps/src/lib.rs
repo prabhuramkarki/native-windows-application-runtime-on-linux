@@ -13,6 +13,7 @@ pub mod wine_config;
 
 pub use capabilities::capability_for;
 pub use fetch::{FetchError, FetchOpts, cached, fetch};
+pub use install_archive::{INSTALLED_OVERRIDE, RemoveOutcome, record_of, remove_archive};
 pub use manifest::{ArchiveFormat, Extract, Install, Kind, Manifest, ManifestError, Marker, Package};
 pub use orchestrate::{
     ALREADY_INSTALLED, AppLock, AppPlan, ConsentProvider, DepsError, Fetcher, LOCK_FILE, MARKER_PRESENT, NetFetcher,
