@@ -1,4 +1,5 @@
-//! `runtime deps <app> [--install [--yes <pkg>]...] [--discard-interrupted <pkg>]`, `runtime deps list`,
+//! `runtime deps <app> [--install [--yes <pkg>]...] [--remove <pkg>]... [--discard-interrupted <pkg>]`,
+//! `runtime deps list`,
 //! `runtime deps cache [--clear]`, and the one-line missing-dependency hint `install` and `doctor` print
 //! (not `run`: it would read the whole executable on every start).
 //!
@@ -9,6 +10,11 @@
 //!   shows its consent text in full, then asks y/N when stdin AND stdout are terminals. Otherwise only
 //!   `--yes <pkg>` consents (the text is still printed). Every `--yes` must name a package the plan installs and that needs consent,
 //!   checked before anything else happens.
+//! * `--remove <pkg>` (repeatable) removes recorded archive packages through `rt_deps::remove_packages`: under the
+//!   app lock, verifying each file's hash and each override against the install record; what changed since the
+//!   install is left and reported. Installer packages and packages installed before schema 5 are refused, as is a
+//!   package another recorded package needs (unless both are named). No plan is printed. Exit 0 only when every
+//!   package was removed with nothing left.
 //! * A package you do not consent to is skipped together with everything that needs it; the packages IT needs
 //!   still install ([`DENIED_NOTE`], spec §4).
 //! * The hint ([`missing_hint`], [`hint_for`]) is computed with `plan_for_app` / `plan_for_pe` only (doctor
@@ -60,6 +66,9 @@ pub struct DepsArgs {
     /// Undo what an interrupted (killed) install of PKG left in the prefix, so it can be installed again
     #[arg(long, value_name = "PKG", conflicts_with = "install")]
     pub(crate) discard_interrupted: Option<String>,
+    /// Remove an installed archive package (dxvk, vkd3d-proton), verifying what its install wrote; repeat for each
+    #[arg(long, value_name = "PKG", value_parser = parse_package_id, conflicts_with_all = ["install", "yes", "plan_digest", "discard_interrupted"])]
+    pub(crate) remove: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -78,6 +87,14 @@ pub fn run(args: DepsArgs) -> Result<u8, CmdError> {
     match (args.sub, args.app) {
         (Some(DepsSub::List), _) => crate::emit(&format_manifest(Manifest::bundled())).map(|()| 0),
         (Some(DepsSub::Cache { clear }), _) => cache(&cache_dir()?, clear),
+        (None, Some(app)) if !args.remove.is_empty() => {
+            if let Some(dup) = duplicate_remove(&args.remove) {
+                // A usage error, as clap reports one (exit 2).
+                eprintln!("error: --remove {} is given twice", safe(&dup));
+                return Ok(2);
+            }
+            run_remove(&app, &args.remove)
+        }
         (None, Some(app)) => run_app(
             &app,
             args.install,
@@ -105,6 +122,56 @@ pub(crate) fn app_env(store: &Store, arg: &str) -> Result<AppEnv, CmdError> {
         Err(StoreError::NotFound) => Err(format!("no app named {id} is installed (see `runtime list`)").into()),
         other => Ok(other?),
     }
+}
+
+/// `--remove`: a package id in the manifest's id grammar (never a flag, never a path).
+fn parse_package_id(s: &str) -> Result<String, String> {
+    if rt_deps::manifest::valid_id(s) {
+        Ok(s.to_owned())
+    } else {
+        Err("must be a package id (lowercase letters, digits, `.`, `_` and `-`; see `runtime deps list`)".into())
+    }
+}
+
+/// The first package `--remove` names twice.
+pub(crate) fn duplicate_remove(ids: &[String]) -> Option<String> {
+    ids.iter()
+        .enumerate()
+        .find(|(i, id)| ids[..*i].contains(id))
+        .map(|(_, id)| id.clone())
+}
+
+/// `runtime deps <app> --remove <pkg>...` (spec 4.4): the same backend, sandbox and lock rules as `--install`.
+fn run_remove(app: &str, ids: &[String]) -> Result<u8, CmdError> {
+    let store = crate::store()?;
+    let env = app_env(&store, app)?;
+    let md = store.read_metadata(&env)?;
+    let launcher = Launcher::new();
+    let backend = rt_api::backends::select(&md.backend.id, &launcher)?;
+    rt_deps::check_backend(&*backend)?;
+    crate::sandbox::print_hardening_caveat();
+    // A marked app's `reg.exe` runs in its sandbox; without a working bwrap this refuses before anything ran.
+    let launcher = crate::sandbox::helper_launcher(&env, &launcher, &*backend)?;
+    let report = rt_deps::remove_packages(&store, &env, &*backend, &launcher, Manifest::bundled(), ids)
+        .map_err(|e| e.to_string())?;
+    let (text, code) = format_remove_report(&report);
+    crate::emit(&text)?;
+    Ok(code)
+}
+
+/// The report of a removal and its exit code: 0 only when everything was removed with nothing left.
+pub(crate) fn format_remove_report(r: &rt_deps::RemoveReport) -> (String, u8) {
+    let mut o = String::new();
+    for id in &r.removed {
+        let _ = writeln!(o, "removed {}", safe(id));
+    }
+    for (label, list) in [("left", &r.left), ("failed", &r.failed), ("skipped", &r.skipped)] {
+        for (id, why) in list {
+            let _ = writeln!(o, "{label} {}: {}", safe(id), safe(why));
+        }
+    }
+    let clean = r.left.is_empty() && r.failed.is_empty() && r.skipped.is_empty();
+    (o, u8::from(!clean))
 }
 
 /// `--plan-digest`: 64 lowercase hex digits (`rt_api::jobs::plan_digest`'s form).

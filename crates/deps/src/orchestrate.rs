@@ -36,6 +36,18 @@
 //!    if it cannot be recorded, what it wrote is undone again. The first failure stops the run; the rest are
 //!    skipped.
 //!
+//! **Removal** ([`remove_packages`], Phase 6F):
+//! 1. [`check_backend`], then the exclusive app lock, then no `wineserver` for the prefix, then the metadata is
+//!    read under the lock;
+//! 2. every pre-check, before anything changes ([`DepsError::CannotRemove`]): each id recorded; not an installer
+//!    package (that would run a vendor uninstaller); recorded with an install record (schema 5); and no recorded
+//!    package outside the set needs one inside it (by the bundled manifest's `requires`; a recorded package the
+//!    manifest does not know refuses, since its needs are unknown);
+//! 3. dependents first: a package is removed before every package of the set it requires;
+//! 4. per package: the busy check again, then [`install_archive::remove_archive`] (verifying; what changed is left
+//!    and reported), then the metadata: the record is deleted, or, after a hard failure, shrunk to what failed. Any
+//!    failure fails the package and stops the run; the rest are skipped with their records unchanged.
+//!
 //! Library code prints nothing; every report string is one line, bounded, with control and format characters
 //! escaped (callers still print through their sanitiser).
 
@@ -203,6 +215,9 @@ pub enum DepsError {
     /// The app's backend cannot take dependency packages (checked before any lock, prompt or download).
     #[error("{0}")]
     Unsupported(#[from] rt_core::backend::Unsupported),
+    /// [`remove_packages`] refused before changing anything (fixed text with validated, clipped ids).
+    #[error("{0}")]
+    CannotRemove(String),
 }
 
 impl DepsError {
@@ -864,6 +879,167 @@ fn installer_reason(e: InstallerPkgError) -> String {
         | E::Marker(_)
         | E::DllOverride(_) => format!("{}; {VENDOR_PARTIAL}", line(&e.to_string())),
     }
+}
+
+// ------------------------------------------------------------------------------------------------ removal
+
+/// What [`remove_packages`] did, per package id, in removal order. Reasons are bounded single lines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveReport {
+    /// Packages whose record is gone (possibly with `left` items).
+    pub removed: Vec<String>,
+    /// `(package, "<item>: <why>")`: what changed since the install and was left in place.
+    pub left: Vec<(String, String)>,
+    pub failed: Vec<(String, String)>,
+    /// Not attempted after a failure; their records are unchanged.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Removes the recorded archive packages `ids` from the app (see the module docs, "Removal"). `Err` only for
+/// run-level refusals, all decided before anything changed; package failures are in the report.
+pub fn remove_packages(
+    store: &Store,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    manifest: &Manifest,
+    ids: &[String],
+) -> Result<RemoveReport, DepsError> {
+    check_backend(backend)?;
+    let _lock = lock_app(env)?;
+    check_not_busy(env)?;
+    let md = store.read_metadata(env).map_err(DepsError::Metadata)?;
+    let order = removal_order(env, &md, manifest, ids)?;
+    let mut report = RemoveReport::default();
+    for id in order {
+        if !report.failed.is_empty() {
+            report
+                .skipped
+                .push((id, "not attempted: an earlier package failed".into()));
+            continue;
+        }
+        if let Err(why) = remove_one(store, env, backend, launcher, &id, &mut report) {
+            report.failed.push((id, line(&why)));
+        }
+    }
+    Ok(report)
+}
+
+/// The pre-checks of [`remove_packages`] (R3, R4, R8) and the removal order: dependents first.
+fn removal_order(env: &AppEnv, md: &Metadata, manifest: &Manifest, ids: &[String]) -> Result<Vec<String>, DepsError> {
+    let refuse = |s: String| Err(DepsError::CannotRemove(line(&s)));
+    let app = env.id();
+    if ids.is_empty() {
+        return refuse("no package to remove".into());
+    }
+    let mut set: Vec<&str> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !manifest::valid_id(id) {
+            return refuse(format!("{:?} is not a package id", manifest::clip(id)));
+        }
+        if set.contains(&id.as_str()) {
+            return refuse(format!("`{id}` is named twice"));
+        }
+        set.push(id);
+        let Some(rec) = md.dependency(id) else {
+            return refuse(format!("`{id}` is not installed in {app} (see `runtime deps {app}`)"));
+        };
+        if manifest.get(id).is_some_and(|p| p.kind == Kind::Installer) {
+            return refuse(format!(
+                "`{id}` is an installer package: the runtime cannot remove it (that would run the vendor's \
+                 uninstaller); recreate the environment to drop it"
+            ));
+        }
+        if rec.archive.is_none() {
+            return refuse(format!(
+                "`{id}` was installed by an older runtime that did not record what it wrote, so it cannot be \
+                 removed safely; recreate the environment (`runtime remove {app}`, then install the app again) to \
+                 drop it"
+            ));
+        }
+    }
+    let requires = |id: &str| manifest.get(id).map(|p| p.requires.as_slice());
+    for other in md.dependencies.iter().filter(|d| !set.contains(&d.id.as_str())) {
+        let x = manifest::clip(&other.id);
+        match requires(&other.id) {
+            None => return refuse(format!("cannot tell whether `{x}` needs `{}`", set[0])),
+            Some(reqs) => {
+                if let Some(b) = set.iter().find(|b| reqs.iter().any(|r| r == *b)) {
+                    return refuse(format!(
+                        "`{x}` needs `{b}`; remove both: `runtime deps {app} --remove {x} --remove {b}`"
+                    ));
+                }
+            }
+        }
+    }
+    // Dependents first: repeatedly take the first package that nothing still pending in the set requires.
+    let mut pending = set;
+    let mut order = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let needed = |c: &str| {
+            pending
+                .iter()
+                .any(|p| requires(p).is_some_and(|r| r.iter().any(|x| x == c)))
+        };
+        let next = pending.iter().position(|c| !needed(c)).unwrap_or(0);
+        order.push(pending.remove(next).to_owned());
+    }
+    Ok(order)
+}
+
+/// Removes one package and updates its record; `Err` is the report reason (then the run stops).
+fn remove_one(
+    store: &Store,
+    env: &AppEnv,
+    backend: &dyn CompatBackend,
+    launcher: &Launcher,
+    id: &str,
+    report: &mut RemoveReport,
+) -> Result<(), String> {
+    match wineservers_for(&env.prefix()) {
+        Ok(pids) if pids.is_empty() => {}
+        Ok(_) => {
+            return Err(
+                "not removed: a Wine program is now running in this app's prefix; close the app first, \
+                        then try again"
+                    .into(),
+            );
+        }
+        Err(e) => return Err(format!("not removed: cannot check for running Wine programs: {e}")),
+    }
+    let mut md = store.read_metadata(env).map_err(|e| e.to_string())?;
+    let rec = md
+        .dependency(id)
+        .and_then(|d| d.archive.clone())
+        .ok_or("its record changed during the run; nothing was removed")?;
+    let out = install_archive::remove_archive(&rec, id, env, backend, launcher).map_err(|e| e.to_string())?;
+    report.left.extend(
+        out.left
+            .iter()
+            .map(|(item, why)| (id.to_owned(), line(&format!("{item}: {why}")))),
+    );
+    if out.remaining == rt_core::ArchiveRecord::default() {
+        state::forget(&mut md, id);
+    } else if let Some(d) = md.dependencies.iter_mut().find(|d| d.id == id) {
+        d.archive = Some(out.remaining.clone());
+    }
+    store.write_metadata(env, &md).map_err(|e| {
+        format!("what was removed could not be recorded ({e}); a retry reports the restored items as left")
+    })?;
+    if !out.failed.is_empty() {
+        let shown: Vec<String> = out
+            .failed
+            .iter()
+            .take(5)
+            .map(|(item, e)| format!("{item}: {e}"))
+            .collect();
+        return Err(format!(
+            "removal failed ({}); what failed stays recorded, so removing it again retries only that",
+            shown.join("; ")
+        ));
+    }
+    report.removed.push(id.to_owned());
+    Ok(())
 }
 
 /// [`install_archive::discard_interrupted`] behind the run guards, for the CLI to offer after a journal error:

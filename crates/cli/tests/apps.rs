@@ -5187,3 +5187,182 @@ fn the_installer_sandbox_never_binds_the_daemons_socket() {
 
 #[path = "apps/package.rs"]
 mod package;
+
+// ================================================================ deps --remove (6F)
+
+/// Plants what `deps --install` of the bundled DXVK would leave for `id` (without downloading): its DLLs in
+/// `drive_c` (each `DLL <name>`), its overrides at `native,builtin` in `user.reg`, a reg.exe, and its record with an
+/// install record. The fake `reg.exe` only logs its argv. Returns the recorded file paths.
+fn plant_dxvk(r: &Rig, id: &str) -> Vec<String> {
+    use sha2::Digest;
+    let store = rt_core::Store::new(r.apps()).unwrap();
+    let env = store.get(&rt_core::AppId::parse(id).unwrap()).unwrap();
+    let p = rt_deps::Manifest::bundled().get("dxvk").unwrap();
+    let rt_deps::Install::Archive {
+        extract, dll_overrides, ..
+    } = &p.install
+    else {
+        panic!("dxvk is an archive package")
+    };
+    let drive_c = env.drive_c();
+    fs::create_dir_all(drive_c.join("windows/system32")).unwrap();
+    fs::write(drive_c.join("windows/system32/reg.exe"), b"MZ").unwrap();
+    let mut files = vec![];
+    for e in extract {
+        let bytes = format!("DLL {}", e.to).into_bytes();
+        fs::write(drive_c.join(&e.to), &bytes).unwrap();
+        let sha256 = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        files.push(rt_core::RecordedFile {
+            path: e.to.clone(),
+            sha256,
+            replaced: false,
+        });
+    }
+    let lines: String = dll_overrides
+        .iter()
+        .map(|n| format!("\"{n}\"=\"native,builtin\"\n"))
+        .collect();
+    fs::write(
+        env.prefix().join("user.reg"),
+        format!("WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\DllOverrides] 1\n{lines}\n"),
+    )
+    .unwrap();
+    let mut md = store.read_metadata(&env).unwrap();
+    rt_deps::record(
+        &mut md,
+        rt_core::DependencyRecord {
+            id: p.id.clone(),
+            version: p.version.clone(),
+            sha256: p.sha256.clone(),
+            installed_at: 1,
+            consent: None,
+            archive: Some(rt_core::ArchiveRecord {
+                files: files.clone(),
+                created_dirs: vec![],
+                overrides: dll_overrides
+                    .iter()
+                    .map(|n| rt_core::RecordedOverride {
+                        name: n.clone(),
+                        previous: None,
+                    })
+                    .collect(),
+            }),
+        },
+    )
+    .unwrap();
+    store.write_metadata(&env, &md).unwrap();
+    r.hook(r#"printf '%s\n' "$*" >> "$(dirname "$0")/../log/reg-argv.txt""#);
+    files.into_iter().map(|f| f.path).collect()
+}
+
+fn recorded_ids(r: &Rig, id: &str) -> Vec<String> {
+    let md: serde_json::Value =
+        serde_json::from_slice(&fs::read(r.apps().join(id).join("metadata.json")).unwrap()).unwrap();
+    md["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn deps_remove_takes_dxvk_away_and_doctor_predicts_the_built_in_route_again() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let files = plant_dxvk(&r, &id);
+    assert_eq!(files.len(), 5);
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    assert!(route_lines(&out)[0].contains("DXVK"), "{out}");
+    let o = r.rt(&["deps", &id, "--remove", "dxvk"]);
+    assert_ok(&o);
+    assert_eq!(s(&o.stdout), "removed dxvk\n");
+    for f in &files {
+        assert!(!r.apps().join(&id).join("prefix/drive_c").join(f).exists(), "{f}");
+    }
+    let regs = reg_argv(&r);
+    assert_eq!(regs.len(), 5, "{regs:?}");
+    assert!(
+        regs.iter()
+            .all(|l| l.starts_with(r"delete HKCU\Software\Wine\DllOverrides /v ") && l.ends_with(" /f")),
+        "{regs:?}"
+    );
+    assert!(recorded_ids(&r, &id).is_empty());
+    // Doctor reads the records only: the built-in route again, with the hint.
+    let out = s(&r.desktop().args(["doctor", &id]).output().unwrap().stdout);
+    let l = route_lines(&out);
+    assert_eq!(l.len(), 1, "{out}");
+    assert!(
+        l[0].contains("[warn]") && l[0].contains("Direct3D 11") && l[0].contains("built-in"),
+        "{out}"
+    );
+}
+
+#[test]
+fn deps_remove_leaves_a_tampered_dll_and_exits_1() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    plant_dxvk(&r, &id);
+    let d3d11 = r.apps().join(&id).join("prefix/drive_c/windows/system32/d3d11.dll");
+    fs::write(&d3d11, b"changed").unwrap();
+    let o = r.rt(&["deps", &id, "--remove", "dxvk"]);
+    assert_eq!(o.status.code(), Some(1), "{}", s(&o.stderr));
+    let out = s(&o.stdout);
+    assert!(out.contains("removed dxvk\n"), "{out}");
+    assert!(
+        out.contains("left dxvk: windows/system32/d3d11.dll: changed since it was installed\n"),
+        "{out}"
+    );
+    assert_eq!(fs::read(&d3d11).unwrap(), b"changed");
+    assert!(recorded_ids(&r, &id).is_empty());
+}
+
+#[test]
+fn deps_remove_of_a_marked_app_without_bwrap_is_refused_before_any_reg_call() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    let files = plant_dxvk(&r, &id);
+    fs::write(r.apps().join(&id).join("ran-sandboxed"), "").unwrap();
+    let err = assert_fails(&no_bwrap(&r).args(["deps", &id, "--remove", "dxvk"]).output().unwrap());
+    assert!(err.contains("must run sandboxed too"), "{err}");
+    assert!(reg_argv(&r).is_empty());
+    assert!(r.apps().join(&id).join("prefix/drive_c").join(&files[0]).exists());
+    assert_eq!(recorded_ids(&r, &id), ["dxvk"]);
+}
+
+#[test]
+fn deps_remove_refuses_installer_packages_and_records_of_an_older_runtime() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    record_installed(&r, &id, "vcrun2022");
+    let err = assert_fails(&r.rt(&["deps", &id, "--remove", "vcrun2022"]));
+    assert!(
+        err.contains("`vcrun2022` is an installer package") && err.contains("recreate the environment"),
+        "{err}"
+    );
+    record_installed(&r, &id, "dxvk");
+    let err = assert_fails(&r.rt(&["deps", &id, "--remove", "dxvk"]));
+    assert!(
+        err.contains("installed by an older runtime") && err.contains("recreate the environment"),
+        "{err}"
+    );
+    assert!(reg_argv(&r).is_empty());
+    assert_eq!(recorded_ids(&r, &id), ["dxvk", "vcrun2022"]);
+}
+
+#[test]
+fn deps_remove_usage_errors_are_exit_2() {
+    let r = rig();
+    let (id, _) = install_d3d11(&r);
+    for args in [
+        &["deps", &id, "--remove", "dxvk", "--install"][..],
+        &["deps", &id, "--remove", "dxvk", "--remove", "dxvk"],
+        &["deps", &id, "--remove", "../x"],
+    ] {
+        let o = r.rt(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", s(&o.stderr));
+    }
+}

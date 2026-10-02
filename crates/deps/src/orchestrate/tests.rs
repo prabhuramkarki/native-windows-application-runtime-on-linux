@@ -18,38 +18,45 @@ fn sha(bytes: &[u8]) -> String {
 
 /// A stored (method 0) zip with one entry.
 fn zip_one(name: &str, data: &[u8]) -> Vec<u8> {
-    let mut crc = flate2::Crc::new();
-    crc.update(data);
-    let mut common = Vec::new();
-    for v in [0u16, 0, 0, 33] {
-        common.extend_from_slice(&v.to_le_bytes());
+    zip_of(&[(name, data)])
+}
+
+/// A stored (method 0) zip with these entries.
+fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, data) in entries {
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        let mut common = Vec::new();
+        for v in [0u16, 0, 0, 33] {
+            common.extend_from_slice(&v.to_le_bytes());
+        }
+        common.extend_from_slice(&crc.sum().to_le_bytes());
+        common.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        common.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        common.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        common.extend_from_slice(&0u16.to_le_bytes());
+        let offset = out.len() as u32;
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&common);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&common);
+        central.extend_from_slice(&[0u8; 6]);
+        central.extend_from_slice(&((0o100_644u32) << 16).to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
     }
-    common.extend_from_slice(&crc.sum().to_le_bytes());
-    common.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    common.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    common.extend_from_slice(&(name.len() as u16).to_le_bytes());
-    common.extend_from_slice(&0u16.to_le_bytes());
-    let mut out = Vec::new();
-    out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-    out.extend_from_slice(&20u16.to_le_bytes());
-    out.extend_from_slice(&common);
-    out.extend_from_slice(name.as_bytes());
-    out.extend_from_slice(data);
-    let mut central = Vec::new();
-    central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-    central.extend_from_slice(&((3u16 << 8) | 20).to_le_bytes());
-    central.extend_from_slice(&20u16.to_le_bytes());
-    central.extend_from_slice(&common);
-    central.extend_from_slice(&[0u8; 6]);
-    central.extend_from_slice(&((0o100_644u32) << 16).to_le_bytes());
-    central.extend_from_slice(&0u32.to_le_bytes());
-    central.extend_from_slice(name.as_bytes());
     let cd_offset = out.len() as u32;
     out.extend_from_slice(&central);
     out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
     out.extend_from_slice(&[0u8; 4]);
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
     out.extend_from_slice(&(central.len() as u32).to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -2002,4 +2009,211 @@ fn the_check_sees_and_the_install_follows_the_plan_as_it_is_under_the_lock() {
     assert!(rep.completed.is_empty() && rep.failed.is_empty(), "{rep:?}");
     assert!(f.calls().is_empty(), "{:?}", f.calls());
     assert!(r.recorded().is_empty());
+}
+
+// ------------------------------------------------------------------------------------------------ removal (6F)
+
+/// `a` (d3d9) and `b` (d3d11, requires `a`), both installed for real through `install_plan` with the fake backend
+/// (so recorded with their install records), plus the installer package `vc` in the manifest. `user.reg` then holds
+/// both overrides as the install left them.
+fn removal_rig() -> Rig {
+    let r = override_rig(
+        vec![
+            with_overrides(archive("a", false, &[], &["d3d9"])),
+            with_overrides(archive("b", false, &["a"], &["d3d11"])),
+            installer("vc", &["vcruntime140"]),
+        ],
+        "",
+    );
+    let rep = run(&r, &r.plan(&["d3d11"]), &FakeFetcher::default(), &Answers::default()).unwrap();
+    assert_eq!(rep.completed, ["a", "b"], "{rep:?}");
+    fs::write(
+        r.env.prefix().join("user.reg"),
+        "WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\DllOverrides] 1\n\"d3d9\"=\"native,builtin\"\n\
+         \"d3d11\"=\"native,builtin\"\n\n",
+    )
+    .unwrap();
+    r
+}
+
+fn rm(r: &Rig, ids: &[&str], b: &FakeBackend) -> Result<RemoveReport, DepsError> {
+    let ids: Vec<String> = ids.iter().map(|s| (*s).to_owned()).collect();
+    remove_packages(&r.store, &r.env, b, &launcher(), &r.manifest, &ids)
+}
+
+/// Adds a record (no install record) for `id`.
+fn record_plain(r: &Rig, id: &str) {
+    let mut m = r.md();
+    state::record(
+        &mut m,
+        DependencyRecord {
+            id: id.into(),
+            version: "1.0".into(),
+            sha256: OTHER_SHA.into(),
+            installed_at: OLD,
+            consent: None,
+            archive: None,
+        },
+    )
+    .unwrap();
+    r.set_md(&m);
+}
+
+#[test]
+fn every_removal_refusal_is_decided_before_anything_changes() {
+    type Setup = fn(&Rig);
+    let cases: Vec<(&[&str], Setup, &str)> = vec![
+        (&["zz"], |_| {}, "`zz` is not installed in app (see `runtime deps app`)"),
+        (&["A"], |_| {}, "is not a package id"),
+        (&["a", "a"], |_| {}, "named twice"),
+        (
+            &["vc"],
+            |r| record_plain(r, "vc"),
+            "`vc` is an installer package: the runtime cannot remove it (that would run the vendor's uninstaller); \
+             recreate the environment to drop it",
+        ),
+        (
+            &["b", "a"],
+            |r| {
+                let mut m = r.md();
+                m.dependencies.iter_mut().find(|d| d.id == "a").unwrap().archive = None;
+                r.set_md(&m);
+            },
+            "`a` was installed by an older runtime that did not record what it wrote, so it cannot be removed \
+             safely; recreate the environment (`runtime remove app`, then install the app again) to drop it",
+        ),
+        (
+            &["a"],
+            |_| {},
+            "`b` needs `a`; remove both: `runtime deps app --remove b --remove a`",
+        ),
+        (
+            &["a", "b"],
+            |r| record_plain(r, "zz"),
+            "cannot tell whether `zz` needs `a`",
+        ),
+    ];
+    for (ids, setup, want) in cases {
+        let r = removal_rig();
+        setup(&r);
+        let before = (
+            fs::read(r.env.metadata_path()).unwrap(),
+            fs::read(r.c("windows/system32/a.dll")).unwrap(),
+            fs::read(r.c("windows/system32/b.dll")).unwrap(),
+            fs::read(r.env.prefix().join("user.reg")).unwrap(),
+        );
+        let b = FakeBackend::new();
+        match rm(&r, ids, &b) {
+            Err(DepsError::CannotRemove(m)) => assert!(m.contains(want), "{ids:?}: {m}"),
+            other => panic!("{ids:?}: {other:?}"),
+        }
+        let after = (
+            fs::read(r.env.metadata_path()).unwrap(),
+            fs::read(r.c("windows/system32/a.dll")).unwrap(),
+            fs::read(r.c("windows/system32/b.dll")).unwrap(),
+            fs::read(r.env.prefix().join("user.reg")).unwrap(),
+        );
+        assert_eq!(after, before, "{ids:?} changed something");
+        assert!(reg_argv(&b).is_empty(), "{ids:?}");
+    }
+}
+
+#[test]
+fn dependents_are_removed_first_whatever_the_order_given() {
+    for ids in [&["a", "b"][..], &["b", "a"]] {
+        let r = removal_rig();
+        record_plain(&r, "vc");
+        let b = FakeBackend::new();
+        let rep = rm(&r, ids, &b).unwrap();
+        assert_eq!(
+            rep,
+            RemoveReport {
+                removed: vec!["b".into(), "a".into()],
+                ..RemoveReport::default()
+            }
+        );
+        let k = install_archive::OVERRIDES_KEY;
+        assert_eq!(
+            reg_argv(&b),
+            [format!("delete {k} /v d3d11 /f"), format!("delete {k} /v d3d9 /f")],
+            "{ids:?}"
+        );
+        assert!(!r.c("windows/system32/a.dll").exists() && !r.c("windows/system32/b.dll").exists());
+        // Only the removed records are gone; the schema stays 5.
+        let md = r.md();
+        assert_eq!(r.recorded(), ["vc"]);
+        assert_eq!(md.schema_version, 5);
+    }
+}
+
+#[test]
+fn removal_takes_the_same_run_guards_as_install() {
+    let r = removal_rig();
+    let shared = lock_app_shared(&r.env).unwrap();
+    assert!(matches!(
+        rm(&r, &["b"], &FakeBackend::new()),
+        Err(DepsError::AppRunning)
+    ));
+    drop(shared);
+    let held = lock_app(&r.env).unwrap();
+    assert!(matches!(rm(&r, &["b"], &FakeBackend::new()), Err(DepsError::LockHeld)));
+    drop(held);
+    let bin = tempfile::tempdir().unwrap();
+    let server = FakeServer::start(bin.path(), Some(&r.env.prefix()), None);
+    assert!(matches!(
+        rm(&r, &["b"], &FakeBackend::new()),
+        Err(DepsError::PrefixBusy { .. })
+    ));
+    drop(server);
+    assert!(r.c("windows/system32/b.dll").exists());
+    assert_eq!(r.recorded(), ["a", "b"]);
+    let no_deps = FakeBackend::new().with_capabilities(rt_core::backend::Capabilities {
+        dependency_packages: false,
+        ..FakeBackend::new().capabilities()
+    });
+    assert!(matches!(rm(&r, &["b"], &no_deps), Err(DepsError::Unsupported(_))));
+}
+
+#[test]
+fn a_failure_in_the_first_package_shrinks_its_record_and_skips_the_rest() {
+    let r = removal_rig();
+    let a_before = r.md().dependency("a").cloned();
+    let b = FakeBackend::with_script(r#"[ "$1" = delete ] && [ "$4" = d3d11 ] && exit 5; exit 0"#);
+    let rep = rm(&r, &["a", "b"], &b).unwrap();
+    assert!(rep.removed.is_empty(), "{rep:?}");
+    assert_eq!(ids(&rep.failed), ["b"]);
+    assert!(reason(&rep.failed, "b").contains("override d3d11"), "{rep:?}");
+    assert_eq!(
+        rep.skipped,
+        [("a".to_owned(), "not attempted: an earlier package failed".to_owned())]
+    );
+    let md = r.md();
+    let b_rec = md.dependency("b").unwrap().archive.clone().unwrap();
+    assert!(b_rec.files.is_empty() && b_rec.created_dirs.is_empty(), "{b_rec:?}");
+    assert_eq!(b_rec.overrides.len(), 1);
+    assert_eq!(b_rec.overrides[0].name, "d3d11");
+    assert_eq!(md.dependency("a").cloned(), a_before);
+    assert!(!r.c("windows/system32/b.dll").exists());
+    assert!(r.c("windows/system32/a.dll").exists());
+    // A retry works on what failed only, and finishes.
+    let rep = rm(&r, &["a", "b"], &FakeBackend::new()).unwrap();
+    assert_eq!(rep.removed, ["b", "a"], "{rep:?}");
+    assert!(r.recorded().is_empty());
+}
+
+#[test]
+fn a_tampered_file_is_reported_left_and_the_record_still_goes() {
+    let r = removal_rig();
+    fs::write(r.c("windows/system32/b.dll"), b"changed by the user").unwrap();
+    let rep = rm(&r, &["b"], &FakeBackend::new()).unwrap();
+    assert_eq!(rep.removed, ["b"]);
+    assert_eq!(
+        rep.left,
+        [(
+            "b".to_owned(),
+            "windows/system32/b.dll: changed since it was installed".to_owned()
+        )]
+    );
+    assert_eq!(fs::read(r.c("windows/system32/b.dll")).unwrap(), b"changed by the user");
+    assert_eq!(r.recorded(), ["a"]);
 }

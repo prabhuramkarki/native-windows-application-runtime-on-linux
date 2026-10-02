@@ -39,10 +39,28 @@ fn dll_archive(id: &str, dll: &str, gated: bool, body: &[u8], url: String) -> Pa
     p
 }
 
+/// [`TWO`]: `x/rta.dll` and `x/rtb.dll` into `windows/system32`, overriding rta, rtb and rtc.
+fn two_dll_archive(body: &[u8], url: String) -> Package {
+    let (mut p, _) = archive(TWO, false, &[], &["rta", "rtb", "rtc"]);
+    p.sha256 = sha(body);
+    p.size = body.len() as u64;
+    p.url = url;
+    p.install = Install::Archive {
+        format: ArchiveFormat::Zip,
+        extract: vec![Extract {
+            from: "x/".into(),
+            to: "windows/system32".into(),
+        }],
+        dll_overrides: vec!["rta".into(), "rtb".into(), "rtc".into()],
+    };
+    p
+}
+
 const DLL: &str = "dllpkg"; // gated archive, d3d11, consented
 const INST: &str = "instpkg"; // NSIS installer (dep-installer.exe), vcruntime140
 const DENIED: &str = "deniedpkg"; // gated archive, msvcp140, consent refused
 const TAMPERED: &str = "tamperpkg"; // archive, dxgi, the server sends other bytes
+const TWO: &str = "twopkg"; // archive, two DLLs (rta, rtb) and three overrides (rta, rtb, rtc): removal
 
 /// A fresh real Wine prefix in a scratch store (never `~/.local/share` or `~/.wine`), the test manifest's four
 /// packages served by the local HTTPS server, and a scratch download cache.
@@ -66,7 +84,9 @@ impl WineRig {
         let mut evil = tampered_zip.clone();
         let at = evil.len() / 3;
         evil[at] ^= 0x20; // same size, other sha256
+        let two_zip = zip_of(&[("x/rta.dll", &dll), ("x/rtb.dll", &dll)]);
         let server = Server::start(vec![
+            ("/twopkg.zip", honest(&two_zip)),
             ("/dllpkg.zip", honest(&dll_zip)),
             ("/instpkg.exe", honest(&inst)),
             ("/deniedpkg.zip", honest(&denied_zip)),
@@ -87,6 +107,7 @@ impl WineRig {
                 installer_pkg,
                 dll_archive(DENIED, "msvcp140", true, &denied_zip, server.url("/deniedpkg.zip")),
                 dll_archive(TAMPERED, "dxgi", false, &tampered_zip, server.url("/tamperpkg.zip")),
+                two_dll_archive(&two_zip, server.url("/twopkg.zip")),
             ],
         };
         let launcher = Launcher::new();
@@ -139,6 +160,10 @@ impl WineRig {
     }
 
     fn run(&self, imports: &[&str], answers: &Answers) -> RunReport {
+        self.run_plan(&self.plan(imports), answers)
+    }
+
+    fn run_plan(&self, app: &AppPlan, answers: &Answers) -> RunReport {
         let fetcher = LocalFetcher(self.server.cert.clone());
         let cache = self.cache();
         let o = Orchestrator {
@@ -156,8 +181,8 @@ impl WineRig {
             plan_check: None,
         };
         let t = Instant::now();
-        let rep = install_plan(&o, &self.plan(imports)).unwrap();
-        eprintln!("run {imports:?}: {rep:?} in {:?}", t.elapsed());
+        let rep = install_plan(&o, app).unwrap();
+        eprintln!("run {:?}: {rep:?} in {:?}", app.facts, t.elapsed());
         self.assert_no_wineserver("the run");
         rep
     }
@@ -415,4 +440,119 @@ fn e2e_real_wine_killed_install_is_discarded_and_then_installs() {
     assert_eq!(r.store.read_metadata(&r.env).unwrap().dependencies.len(), 1);
     // The download was verified once and reused from the cache by every retry.
     assert_eq!(r.requests("/dllpkg.zip"), 1);
+}
+
+/// Phase 6F on real Wine: an archive install records exactly what it wrote, including each override's previous
+/// value; `remove_packages` then deletes the untouched DLL, leaves (and reports) a tampered one, puts `"builtin"`
+/// and `""` (disabled) back with Wine's own `reg.exe`, deletes the override that had no value, and drops the record.
+#[test]
+#[ignore = "needs Wine and the mingw fixtures"]
+fn e2e_real_wine_remove_restores_overrides_and_leaves_a_tampered_file() {
+    let r = WineRig::new();
+    let k = install_archive::OVERRIDES_KEY;
+    for (name, value) in [("rta", "builtin"), ("rtc", "")] {
+        let (ok, detail) = install_archive::reg(
+            &["add", k, "/v", name, "/d", value, "/f"],
+            &r.env,
+            &r.backend,
+            &r.launcher,
+            None,
+        )
+        .unwrap();
+        assert!(ok, "{detail}");
+    }
+    r.backend.stop(&r.env).unwrap();
+    r.assert_no_wineserver("the setup");
+    let before = r.overrides();
+    eprintln!("before:\n{before}");
+    assert!(
+        before.contains("\"rta\"=\"builtin\"") && before.contains("\"rtc\"=\"\""),
+        "{before}"
+    );
+
+    let facts = Facts {
+        imports: vec![],
+        extra_capabilities: vec!["rta".into()],
+        requested: vec![],
+    };
+    let md = r.store.read_metadata(&r.env).unwrap();
+    let plan = resolve(&facts, &state::installed_set(&md), &[], &r.manifest);
+    let rep = r.run_plan(
+        &AppPlan {
+            facts,
+            plan,
+            warnings: vec![],
+        },
+        &Answers::default(),
+    );
+    assert_eq!(rep.completed, [TWO], "{rep:?}");
+    let dll = fixture("exports64.dll");
+    let rec = r
+        .store
+        .read_metadata(&r.env)
+        .unwrap()
+        .dependency(TWO)
+        .unwrap()
+        .archive
+        .clone()
+        .expect("an install record");
+    let file = |p: &str| rt_core::RecordedFile {
+        path: p.into(),
+        sha256: sha(&dll),
+        replaced: false,
+    };
+    let ov = |n: &str, prev: Option<&str>| rt_core::RecordedOverride {
+        name: n.into(),
+        previous: prev.map(str::to_owned),
+    };
+    assert_eq!(
+        rec,
+        rt_core::ArchiveRecord {
+            files: vec![file("windows/system32/rta.dll"), file("windows/system32/rtb.dll")],
+            created_dirs: vec![],
+            overrides: vec![ov("rta", Some("builtin")), ov("rtb", None), ov("rtc", Some(""))],
+        }
+    );
+    let installed = r.overrides();
+    for n in ["rta", "rtb", "rtc"] {
+        assert!(
+            installed.contains(&format!("\"{n}\"=\"native,builtin\"")),
+            "{installed}"
+        );
+    }
+
+    fs::write(r.c("windows/system32/rtb.dll"), b"tampered by the user").unwrap();
+    let t = Instant::now();
+    let rep = remove_packages(
+        &r.store,
+        &r.env,
+        &r.backend,
+        &r.launcher,
+        &r.manifest,
+        &[TWO.to_owned()],
+    )
+    .unwrap();
+    eprintln!("remove: {rep:?} in {:?}", t.elapsed());
+    r.assert_no_wineserver("the removal");
+    assert_eq!(rep.removed, [TWO], "{rep:?}");
+    assert!(rep.failed.is_empty() && rep.skipped.is_empty(), "{rep:?}");
+    assert_eq!(
+        rep.left,
+        [(
+            TWO.to_owned(),
+            "windows/system32/rtb.dll: changed since it was installed".to_owned()
+        )]
+    );
+    assert!(!r.c("windows/system32/rta.dll").exists());
+    assert_eq!(
+        fs::read(r.c("windows/system32/rtb.dll")).unwrap(),
+        b"tampered by the user"
+    );
+    let after = r.overrides();
+    eprintln!("after:\n{after}");
+    assert!(after.contains("\"rta\"=\"builtin\""), "{after}");
+    assert!(after.contains("\"rtc\"=\"\""), "{after}");
+    assert!(!after.contains("\"rtb\""), "{after}");
+    assert!(r.store.read_metadata(&r.env).unwrap().dependency(TWO).is_none());
+    assert!(!r.env.root().join(install_archive::BACKUP_DIR).exists());
 }

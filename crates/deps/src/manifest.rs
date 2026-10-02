@@ -294,7 +294,7 @@ pub(crate) fn valid_sha256(s: &str) -> bool {
 }
 
 /// `[a-z0-9][a-z0-9._-]{0,63}`
-pub(crate) fn valid_id(s: &str) -> bool {
+pub fn valid_id(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty()
         && b.len() <= MAX_NAME_LEN
