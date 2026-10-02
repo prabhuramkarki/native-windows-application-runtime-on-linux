@@ -11,10 +11,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The fake `runtime` of A: answers `--version`, else records its argv (NUL separated) and pid keyed by its last
-/// argument, then acts on `$RUNTIME_DATA_DIR/fake/mode.<key>` (default: print one line).
+/// The fake `runtime` of A: answers `--version` with the line in the file `version` beside it (default: this
+/// workspace's version), else records its argv (NUL separated) and pid keyed by its last argument, then acts on
+/// `$RUNTIME_DATA_DIR/fake/mode.<key>` (default: print one line).
 pub const FAKE_RUNTIME: &str = r#"#!/bin/sh
-[ "$1" = --version ] && { echo "runtime @VERSION@"; exit 0; }
+[ "$1" = --version ] && { cat "${0%/*}/version" 2>/dev/null || echo "runtime @VERSION@"; exit 0; }
 F="$RUNTIME_DATA_DIR/fake"
 for a in "$@"; do last="$a"; done
 key=$(printf %s "$last" | tr -c 'a-z0-9.-' _)

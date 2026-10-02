@@ -94,6 +94,8 @@ pub struct JobsConfig {
     pub keep_for: Duration,
     /// SIGKILL this long after SIGTERM.
     pub term_grace: Duration,
+    /// How long `runtime --version` may take before every job ([`check_runtime_version`]).
+    pub version_timeout: Duration,
     pub now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     /// The daemon's environment, filtered by [`child_env`].
     pub env: Arc<dyn Fn() -> Vec<(OsString, OsString)> + Send + Sync>,
@@ -108,6 +110,7 @@ impl std::fmt::Debug for JobsConfig {
             .field("keep_finished", &self.keep_finished)
             .field("keep_for", &self.keep_for)
             .field("term_grace", &self.term_grace)
+            .field("version_timeout", &self.version_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -122,6 +125,7 @@ impl JobsConfig {
             keep_finished: 100,
             keep_for: Duration::from_secs(3600),
             term_grace: Duration::from_secs(5),
+            version_timeout: crate::write::VERSION_TIMEOUT,
             now: Arc::new(SystemTime::now),
             env: Arc::new(|| std::env::vars_os().collect()),
         }
@@ -340,14 +344,22 @@ impl Jobs {
         }
     }
 
-    /// Starts `spec` (`busy`, `app_busy`, or `unavailable` when the `runtime` binary or the job cwd is unsafe or the
-    /// daemon is stopping). A spawn failure is a `failed` job, not an error here.
+    /// Starts `spec` (`busy`, `app_busy`, `runtime_mismatch` when the `runtime` binary is now another version, or
+    /// `unavailable` when it or the job cwd is unsafe, its version cannot be checked, or the daemon is stopping). A
+    /// spawn failure is a `failed` job, not an error here.
     pub fn start(&self, spec: JobSpec) -> Result<JobStarted, ApiError> {
         let s = &self.s;
         // SAFETY: geteuid has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         check_runtime_exe(&s.cfg.runtime_exe, euid)?;
         check_job_cwd(&s.cfg.cwd, euid)?;
+        // Outside the table lock: a slow binary never stalls polls.
+        check_runtime_version(
+            &s.cfg.runtime_exe,
+            &s.cfg.cwd,
+            &child_env(&*s.cfg.env),
+            s.cfg.version_timeout,
+        )?;
         let app = spec.app().map(|a| a.as_str().to_owned());
         let job = {
             let mut t = lock(&s.table);
@@ -845,6 +857,125 @@ pub fn check_runtime_exe(p: &Path, euid: u32) -> Result<(), ApiError> {
         return Err(unavailable(&why));
     }
     Ok(())
+}
+
+/// The version line `runtime --version` must print: this daemon's own.
+pub(crate) fn wanted_version() -> String {
+    format!("runtime {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `exe --version`'s first line (trimmed, non-empty), run with exactly `env`, in `cwd`, in a process group of its
+/// own. Everything is bounded by `timeout` and happens on the calling thread: stdout is read with `poll(2)` (at most
+/// 4 KiB, up to the first newline) until the deadline, then dropped, so a process the probe leaves holding the pipe
+/// cannot hang the caller; at the deadline the probe's whole group is killed (while its leader is unreaped, so the
+/// group id is still its own) and the leader reaped. `Err`: why there is no answer.
+pub(crate) fn runtime_version(
+    exe: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    let mut child = Command::new(exe)
+        .arg("--version")
+        .env_clear()
+        .envs(env.iter().cloned())
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let until = Instant::now() + timeout;
+    let mut line: Option<Vec<u8>> = None;
+    if let Some(mut out) = child.stdout.take() {
+        let mut buf = Vec::new();
+        line = loop {
+            if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+                buf.truncate(i);
+                break Some(buf);
+            }
+            if buf.len() >= 4096 {
+                break Some(buf);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break None;
+            }
+            let mut p = libc::pollfd {
+                fd: out.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for an fd we own.
+            let r = unsafe { libc::poll(&mut p, 1, left.as_millis().clamp(1, 60_000) as libc::c_int) };
+            if r <= 0 {
+                continue; // a timeout or EINTR: the deadline is checked above
+            }
+            let mut chunk = [0u8; 4096];
+            let room = 4096 - buf.len();
+            match out.read(&mut chunk[..room]) {
+                Ok(0) => break Some(buf),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break Some(buf),
+            }
+        };
+    }
+    let kill = |child: &mut std::process::Child| {
+        // SAFETY: `child` is not reaped yet (only `try_wait` reaps, and it saw it running or was not called), so its
+        // pid is still its own group's id.
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.wait();
+        Err(no_answer(timeout))
+    };
+    if line.is_none() {
+        return kill(&mut child);
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => std::thread::sleep(CHILD_TICK),
+            Ok(None) => return kill(&mut child),
+            // Not our child any more (cannot happen): nothing is signalled.
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let line = String::from_utf8_lossy(&line.unwrap_or_default()).trim().to_owned();
+    if line.is_empty() {
+        return Err("it printed no version".into());
+    }
+    Ok(line)
+}
+
+fn no_answer(timeout: Duration) -> String {
+    format!("no answer within {} s", timeout.as_secs_f32())
+}
+
+/// `Ok` when `exe --version`'s first line is `runtime <CARGO_PKG_VERSION>`; `RuntimeMismatch` when it is another
+/// version (the binary was replaced under this daemon); `Unavailable` when the probe fails (spawn error, no line
+/// within `timeout`, empty output). The probe gets `env` (the job environment) and runs in `cwd`.
+pub fn check_runtime_version(
+    exe: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Result<(), ApiError> {
+    let got = runtime_version(exe, cwd, env, timeout)
+        .map_err(|why| unavailable(&format!("cannot check {}'s version: {why}", shown(exe))))?;
+    if got == wanted_version() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ErrorKind::RuntimeMismatch,
+        format!(
+            "{} is now {:?}; this runtimed is {}: restart runtimed (systemctl --user restart runtimed)",
+            shown(exe),
+            rt_core::clean_text(&got, 128),
+            env!("CARGO_PKG_VERSION")
+        ),
+    ))
 }
 
 /// The shared job directory (spec D8): a directory (not a symlink) owned by `euid`, mode 0700. Each job runs in a

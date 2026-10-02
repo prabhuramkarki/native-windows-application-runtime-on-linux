@@ -1203,11 +1203,16 @@ must not exist, and why it does not:
   fill them; that is the user hurting themselves. `apps.run` holds a running slot for as long as the app runs.
 - **A `runtime` started at a terminal is invisible to the job table.** The app lock and the running-app refusals of
   the CLI are the real guard between the two, as between two terminals.
-- **The version is checked at startup only.** A `runtime` upgraded under a running daemon is run without a new
-  version check (its file mode and owner are still checked before each job). The consent path is re-checked by the
-  CLI itself. With the directory check, only the user (or root) can swap the file.
-- **Check-then-exec.** The binary is checked by path, then executed by path. Only the user or root can write the file
-  or its directory, so only they could swap it between the two.
+- **The version is checked before every job** (Phase 6E; at startup too). Before each spawn the daemon checks the
+  `runtime` file's owner, mode and directory, then runs `runtime --version` (the job environment, the job directory,
+  5 s, its own process group, read on the calling thread with `poll(2)` and killed as a group at the deadline, so a
+  probe leaves no thread or process behind). Another version is refused with `runtime_mismatch` (restart `runtimed`)
+  and nothing is spawned; a probe that fails is `unavailable`. A same-version replacement (a reinstall) is accepted:
+  the owner, mode and directory checks are the trust guard, and the version check is against protocol skew. The
+  consent path is also re-checked by the CLI itself.
+- **Check-then-exec.** The binary is checked by path, then executed by path. The per-job version probe narrows the
+  window to the time between the probe and the spawn, but does not close it. Only the user or root can write the
+  file or its directory, so only they could swap it between the two.
 - **Group-writable installs are refused.** A umask of 002 makes cargo install `runtime` and `~/.cargo/bin`
   group-writable; `runtimed --write` refuses to start and names `chmod g-w,o-w <path>`. A private group with only
   the user in it would be harmless, but the check does not try to tell.

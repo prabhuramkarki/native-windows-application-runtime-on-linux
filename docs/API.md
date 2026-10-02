@@ -4,7 +4,7 @@
 or a script asks it what the CLI would print, as typed JSON. By default it is **read-only**. Started with `--write`,
 it also runs, installs, imports and removes apps, installs dependencies and changes permissions and the display driver: each
 such change is a **job** that runs the `runtime` CLI next to `runtimed`, whose output clients follow by long-polling
-([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.1**.
+([Write mode and jobs](#write-mode-and-jobs)). API version **0.2.2**.
 
 The CLI does not need the daemon. Every `runtime` command works on its own, except the two that exist to talk to it:
 `runtime rpc` and `runtime daemon-status`.
@@ -108,6 +108,10 @@ Member order is not significant; the daemon writes members in alphabetical order
   is not exactly `{package, version, sha256}` of a consent-gated package that plan installs (or names one twice).
 - `busy`: 4 jobs are already running. Nothing is queued: try again later.
 - `app_busy`: a job for this app is still running.
+- `runtime_mismatch`: (0.2.2) the `runtime` binary next to `runtimed --write` now answers `--version` with another
+  version than the daemon's (it was upgraded or replaced under the running daemon). Nothing was started. The remedy
+  is to restart `runtimed` (`systemctl --user restart runtimed`); read methods keep working. A version probe that
+  fails (no answer within 5 s, a spawn failure, no output) is `unavailable` instead.
 - `internal`: reserved.
 
 **Switch on `code` and `data.kind`, never on `message`.** A `message` is prose for people. It is cleaned (no
@@ -256,7 +260,7 @@ The API version (semver), the runtime's crate version, the protocol name, and wh
 methods (`runtimed --write`). A 0.1 daemon has no `write`: treat it as `false`.
 
 ```json
-{"api": "0.2.1", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
+{"api": "0.2.2", "protocol": "jsonrpc-2.0-ndjson", "runtime": "0.0.1", "write": false}
 ```
 
 ### `apps.list`
@@ -537,7 +541,7 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 
 ## Versioning and compatibility
 
-- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.1**. Until 1.0:
+- `API_VERSION` (from `rpc.version`) is semver, currently **0.2.2**. Until 1.0:
   - a **breaking** change bumps the **minor** version: a method removed or renamed, a param changed, a result
     member removed or retyped, an enum value removed;
   - an **additive** change bumps the **patch** version: a new method, a new result member, a new enum value, a new
@@ -563,6 +567,9 @@ Params: none. `{"jobs": [JobInfo, ...]}`: live jobs first (oldest first), then f
 - **0.2.1 is additive**: the `apps.import` method and its job kind `import`, `apps.get`'s `package` and
   `permissions.get`'s `requested`. A 0.2.0 daemon answers `apps.import` `-32601`; the GUI does not send a `.wrun` to a
   daemon older than 0.2.1 (it says why).
+- **0.2.2 is additive**: the `data.kind` `runtime_mismatch`, and the `Unknown` fallback on every result enum (a
+  client-side change: the wire is unchanged). An older client reads `runtime_mismatch` as `ErrorKind::Unknown` and
+  shows the message.
 - The protocol name `jsonrpc-2.0-ndjson` changes only if the framing does.
 
 ## Running it
@@ -659,7 +666,7 @@ edge is used by these two commands alone.
 ```sh
 sock=$XDG_RUNTIME_DIR/runtime/runtimed.sock
 printf '%s\n' '{"jsonrpc":"2.0","method":"rpc.version","id":1}' | socat - UNIX-CONNECT:$sock
-# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.1","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
+# {"id":1,"jsonrpc":"2.0","result":{"api":"0.2.2","protocol":"jsonrpc-2.0-ndjson","runtime":"0.0.1","write":true}}
 printf '%s\n' '{"jsonrpc":"2.0","method":"apps.get","params":{"id":"nope"},"id":"a"}' | nc -U -N $sock
 # {"error":{"code":-32000,"data":{"kind":"not_found"},"message":"no app named nope is installed"},"id":"a","jsonrpc":"2.0"}
 ```

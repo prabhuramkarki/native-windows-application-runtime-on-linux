@@ -1410,6 +1410,7 @@ mod tests {
             (ErrorKind::ConsentMismatch, "consent_mismatch"),
             (ErrorKind::Busy, "busy"),
             (ErrorKind::AppBusy, "app_busy"),
+            (ErrorKind::RuntimeMismatch, "runtime_mismatch"),
         ] {
             assert_eq!(round_trip(ApiError::new(k, "m"))["kind"], s);
         }

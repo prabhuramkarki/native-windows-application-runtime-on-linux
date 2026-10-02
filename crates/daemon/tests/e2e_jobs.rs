@@ -1,7 +1,8 @@
 //! End to end for `runtimed --write` (Phase 6B): the real `runtimed` binary, copied into a scratch `bin/` next to a
 //! `runtime` (the production sibling mechanism; there is no environment override), driven through the real client.
 //!
-//! * A: a fake `runtime` script: the exact argv, cancel, SIGTERM and SIGKILL of the daemon at process level.
+//! * A: a fake `runtime` script: the exact argv, cancel, SIGTERM and SIGKILL of the daemon at process level, and a
+//!   `runtime` of another version swapped in under a running daemon (`runtime_mismatch`).
 //! * B: the real `runtime` (copied from next to `runtimed`) with a fake Wine (`RUNTIME_WINE`/`RUNTIME_WINESERVER` in
 //!   the daemon's environment, which jobs inherit as `RUNTIME_*`): install, permissions, display, deps, run, remove,
 //!   and what the app sandbox would expose of `$XDG_RUNTIME_DIR` (spec D11).
@@ -133,6 +134,31 @@ fn jobs_run_the_sibling_runtime_with_the_exact_argv_and_die_with_the_daemon() {
     assert!(d.wait(Duration::from_secs(7)).success(), "{}", s.log());
     assert!(pids.iter().all(|p| !alive(*p)), "a job outlived the daemon");
     assert!(!s.sock().exists());
+}
+
+/// Phase 6E: the sibling `runtime` replaced by another version under a running daemon is refused before every job
+/// (`runtime_mismatch`), and nothing is spawned; put back, jobs start again.
+#[test]
+fn a_runtime_of_another_version_swapped_in_under_the_daemon_runs_nothing() {
+    let s = scratch(Err(&fake_runtime()));
+    let _d = s.daemon(&[]);
+    let mut c = s.client();
+    fs::write(s.bin.join("version"), "runtime 9.9.9\n").unwrap();
+    let e = c.remove("a").unwrap_err();
+    let api = e.api_error().unwrap();
+    assert_eq!(api.kind, rt_api::ErrorKind::RuntimeMismatch, "{e:?}");
+    assert!(
+        api.message.contains("9.9.9") && api.message.contains("restart runtimed"),
+        "{}",
+        api.message
+    );
+    assert!(s.fake("argv", "a").is_empty(), "a child was started");
+    assert!(c.jobs().unwrap().is_empty());
+    assert!(c.version().is_ok(), "read methods still answer");
+    fs::remove_file(s.bin.join("version")).unwrap();
+    let id = c.remove("a").unwrap().job_id;
+    let (info, ev) = follow(&mut c, &id);
+    assert_eq!(info.state, JobState::Succeeded, "{ev:?}");
 }
 
 #[test]
