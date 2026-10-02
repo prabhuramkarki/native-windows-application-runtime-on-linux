@@ -260,6 +260,7 @@ fn run_with(r: &Rig, app: &AppPlan, f: &FakeFetcher, a: &Answers, b: &FakeBacken
         now,
         vulkan: &|_| VulkanVerdict::Unknown,
         runtime_exe: &crate::test_runtime_path(),
+        plan_check: None,
     };
     install_plan(&o, app)
 }
@@ -332,6 +333,7 @@ fn a_vulkan_blocked_package_is_never_fetched_or_installed_next_to_an_installable
         now,
         vulkan: &unusable,
         runtime_exe: &crate::test_runtime_path(),
+        plan_check: None,
     };
     let rep = install_plan(&o, &app).unwrap();
     assert_eq!(f.calls(), ["other"], "something Vulkan-blocked was downloaded");
@@ -1560,6 +1562,7 @@ fn execute_never_fetches_a_gated_install_without_consent() {
         now,
         vulkan: &|_| VulkanVerdict::Unknown,
         runtime_exe: &crate::test_runtime_path(),
+        plan_check: None,
     };
     let plan = Plan {
         entries: vec![PlanEntry {
@@ -1612,4 +1615,128 @@ fn plan_for_pe_plans_requested_dependencies_as_roots_and_warns_about_unknown_ids
         .find(|w| w.contains("gone"))
         .expect("a warning for the unknown id");
     assert!(!warning.contains('\u{1b}'), "{warning:?}");
+}
+
+// ---------------------------------------------------------------- Phase 6E: the plan re-checked under the lock
+
+fn run_checked(r: &Rig, app: &AppPlan, f: &FakeFetcher, a: &Answers, check: PlanCheck) -> Result<RunReport, DepsError> {
+    let (l, b) = (launcher(), FakeBackend::new());
+    let o = Orchestrator {
+        manifest: &r.manifest,
+        cache_dir: &r.tmp.path().join("files"),
+        env: &r.env,
+        store: &r.store,
+        backend: &b,
+        launcher: &l,
+        fetcher: f,
+        consent: a,
+        now,
+        vulkan: &|_| VulkanVerdict::Unknown,
+        runtime_exe: &crate::test_runtime_path(),
+        plan_check: Some(check),
+    };
+    install_plan(&o, app)
+}
+
+/// `three()` with the app's (imported) package requesting `ids`: `plan_for_app` plans them without an executable.
+fn requesting(r: &Rig, ids: &[&str]) {
+    let mut md = r.md();
+    md.package = Some(rt_core::PackageMeta {
+        id: "app".into(),
+        version: "1".into(),
+        digest: "ab".repeat(32),
+        requested_dependencies: ids.iter().map(|s| (*s).to_owned()).collect(),
+        requested_permissions: vec![],
+    });
+    r.set_md(&md);
+}
+
+fn fresh_plan(r: &Rig) -> AppPlan {
+    plan_for_app(&r.env, &r.md(), &r.manifest, &|_| VulkanVerdict::Unknown)
+}
+
+#[test]
+fn a_refused_plan_check_installs_asks_and_fetches_nothing() {
+    let r = three();
+    requesting(&r, &["perm", "gated"]);
+    let app = fresh_plan(&r);
+    let (f, a) = (
+        FakeFetcher::default(),
+        Answers {
+            never: vec!["perm", "gated", "gdep"],
+            ..Answers::default()
+        },
+    );
+    let meta = r.env.root().join("metadata.json");
+    let before = fs::read(&meta).unwrap();
+    let e = run_checked(&r, &app, &f, &a, &|_| Err("the plan changed (test)".into())).unwrap_err();
+    assert!(
+        matches!(&e, DepsError::PlanChanged(m) if m == "the plan changed (test)"),
+        "{e:?}"
+    );
+    assert_eq!(e.to_string(), "the plan changed (test)");
+    assert!(f.calls().is_empty() && a.asked().is_empty());
+    assert_eq!(fs::read(&meta).unwrap(), before, "the metadata was written");
+    assert!(!r.c("windows/system32/perm.dll").exists());
+}
+
+#[test]
+fn the_plan_check_runs_under_the_app_lock() {
+    let r = three();
+    requesting(&r, &["perm"]);
+    let app = fresh_plan(&r);
+    let (f, a) = (FakeFetcher::default(), Answers::default());
+    let seen = RefCell::new(None);
+    let check = |_: &AppPlan| {
+        *seen.borrow_mut() = Some(lock_app(&r.env).map(|_| ()));
+        Ok(())
+    };
+    run_checked(&r, &app, &f, &a, &check).unwrap();
+    let seen = seen.into_inner().expect("the check ran");
+    assert!(
+        matches!(seen, Err(DepsError::LockHeld | DepsError::AppRunning)),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn the_check_sees_and_the_install_follows_the_plan_as_it_is_under_the_lock() {
+    let r = three();
+    requesting(&r, &["perm"]);
+    let app = fresh_plan(&r);
+    assert_eq!(app.plan.entries[0].action, Action::Install);
+    // Between the plan shown and the install: `perm` got recorded as installed.
+    let mut md = r.md();
+    let perm = r.manifest.get("perm").unwrap();
+    state::record(
+        &mut md,
+        DependencyRecord {
+            id: perm.id.clone(),
+            version: perm.version.clone(),
+            sha256: perm.sha256.clone(),
+            installed_at: OLD,
+            consent: None,
+        },
+    )
+    .unwrap();
+    r.set_md(&md);
+    let got = RefCell::new(None);
+    let (f, a) = (FakeFetcher::default(), Answers::default());
+    let check = |p: &AppPlan| {
+        *got.borrow_mut() = Some(p.clone());
+        Ok(())
+    };
+    run_checked(&r, &app, &f, &a, &check).unwrap();
+    let got = got.into_inner().expect("the check ran");
+    assert_eq!(got.plan.entries[0].package, "perm");
+    assert_eq!(got.plan.entries[0].action, Action::AlreadyInstalled, "{got:?}");
+    // The run installs from the fresh plan, not the stale facts: the package no longer requests `perm` at all.
+    requesting(&r, &[]);
+    let mut md = r.md();
+    md.dependencies.clear();
+    r.set_md(&md);
+    let rep = run_checked(&r, &app, &f, &a, &|_| Ok(())).unwrap();
+    assert!(rep.completed.is_empty() && rep.failed.is_empty(), "{rep:?}");
+    assert!(f.calls().is_empty(), "{:?}", f.calls());
+    assert!(r.recorded().is_empty());
 }

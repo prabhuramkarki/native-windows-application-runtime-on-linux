@@ -128,6 +128,7 @@ impl Rig {
             vulkan: &|_| rt_core::VulkanVerdict::Unknown,
             // No installer package runs in these tests.
             runtime_exe: std::path::Path::new("/nonexistent/runtime"),
+            plan_check: None,
         };
         install_report(&o, app).unwrap()
     }

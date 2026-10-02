@@ -168,6 +168,8 @@ fn run_app(
     let answers: Option<Box<dyn BufRead>> =
         can_ask(stdin.is_terminal(), io::stdout().is_terminal()).then(|| Box::new(stdin.lock()) as Box<dyn BufRead>);
     let consent = CliConsent::new(yes, Box::new(io::stdout()), answers);
+    // `--plan-digest`: checked again under the app lock, on the plan as it is then (before any prompt or download).
+    let recheck = |p: &AppPlan| check_plan_digest(env.id(), p, manifest, plan_digest);
     let o = Orchestrator {
         manifest,
         cache_dir: &cache,
@@ -180,6 +182,7 @@ fn run_app(
         now: rt_deps::unix_now,
         vulkan: &rt_api::host::graphics::verdict_for,
         runtime_exe: &crate::runtime_exe(),
+        plan_check: plan_digest.is_some().then_some(&recheck as rt_deps::PlanCheck),
     };
     let (text, code) = install_report(&o, &plan)?;
     crate::emit(&text)?;
@@ -193,7 +196,8 @@ pub(crate) fn install_report(o: &Orchestrator, plan: &AppPlan) -> Result<(String
 }
 
 /// `--plan-digest`: the plan about to be installed must be the one the client showed (and got consent for); checked
-/// before `--yes`, the mark, the lock or any network.
+/// before `--yes`, the mark, the lock or any network, and again under the app lock on the plan as it is then
+/// ([`Orchestrator::plan_check`]: the same message, exit 1).
 pub(crate) fn check_plan_digest(
     id: &AppId,
     plan: &AppPlan,

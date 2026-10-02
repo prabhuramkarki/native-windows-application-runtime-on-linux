@@ -1174,6 +1174,10 @@ must not exist, and why it does not:
   exact `{package, version, sha256}`. The daemon recomputes the plan and refuses anything else (`consent_mismatch`);
   only package ids that matched reach `--yes=`. The CLI recomputes the plan once more under `--plan-digest` and
   refuses before installing anything if it changed, which also covers a `runtime` replaced after the daemon started.
+  Since Phase 6E it checks the digest a second time after it has taken the app lock, on a plan recomputed from the
+  metadata and the executable read under that lock, before any prompt, download or metadata write, and installs
+  from that plan; so a change between the first check and the lock installs nothing either (exit 1, the same
+  message). Only the sandbox mark (fail closed) may be written before that second check.
   There is no "yes to all" parameter.
 - **An unsandboxed or debug run**: no parameter maps to `--unsandboxed` or `--debug`. Program arguments go after
   `--`, so `--unsandboxed` there is an argument of the program (tested end to end: the run stays sandboxed).

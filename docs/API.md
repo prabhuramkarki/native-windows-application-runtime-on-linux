@@ -190,7 +190,8 @@ never signalled.
    an installed package, or a licence text changed since you showed it) or if any item is not exactly a
    consent-gated entry of it. Show the plan again and ask again.
 4. The job's `runtime deps --install --plan-digest=<digest>` recomputes the plan once more and refuses (exit 1,
-   nothing installed) if it changed in between. It prints the licence text in full before it accepts a package, so
+   nothing installed) if it changed in between, and again after it has taken the app lock, before any prompt or
+   download. It prints the licence text in full before it accepts a package, so
    the job's events show what was accepted.
 
 There is no "yes to all" and no consent that is not a concrete package, version and hash.
