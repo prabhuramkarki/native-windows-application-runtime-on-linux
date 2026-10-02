@@ -70,6 +70,7 @@ The binary is `runtime` (`cargo run -p runtime-cli -- <command>`).
 | `doctor [app\|file]` | Read-only checks: Wine, the sandbox (and an app's profile), its seccomp filter and Landlock, its resource limits (`systemd-run --user` scopes), architecture, DLL imports, prefix hardening, display, the app's graphics driver setting, Vulkan, audio (the PulseAudio-compatible socket Wine uses; `pipewire-pulse` provides it). Exit 1 when a check fails. |
 | `analyze [--json] <file>` | Reports what a PE file or installer is and needs (header-based, extension ignored). |
 | `deps <app> [--install] [--yes PKG]... [--discard-interrupted PKG]` | Plans (no network, no changes) and with `--install` downloads, verifies and installs the packages an app needs, see below. |
+| `deps <app> --remove PKG [--remove PKG]...` | Removes installed archive packages (DXVK, VKD3D-Proton): each file and DLL override the install recorded is checked first; what changed since is left in place and reported (exit 1). Installer packages and packages installed by an older runtime are refused (recreate the environment). |
 | `deps list` / `deps cache [--clear]` | Shows the bundled package manifest / the download cache (`--clear` deletes completed downloads). |
 | `rpc <method> [json-params] [--socket PATH]` / `daemon-status [--socket PATH]` | Calls a running `runtimed` / says whether one answers (see "API and daemon" below). |
 
@@ -129,6 +130,7 @@ runtime deps game                      # the plan: what the app's imports need, 
 runtime deps game --install            # download, verify and install it; consent-gated packages ask first
 runtime deps game --install --yes vcrun2022   # no terminal: consent to that one package (its text is printed)
 runtime deps game --discard-interrupted dxvk  # undo what a killed install left, then install again
+runtime deps game --remove dxvk        # remove an installed archive package (files and overrides it recorded)
 runtime deps list                      # the bundled manifest
 runtime deps cache --clear             # delete cached downloads
 ```
@@ -167,8 +169,9 @@ Core / .NET 5+ are not Mono). `runtime doctor <app>` says whether Wine Mono is r
 
 Known gaps: `d3dcompiler_47` (no verifiable redistributable
 source), Gecko (no package; `mshtml` stays disabled), 32-bit apps (x64 DLLs only; the plan warns), no
-package upgrades (a newer pinned version is refused: recreate the app) and no removal of a single package (removing
-the app removes everything). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
+package upgrades (a newer pinned version is refused: recreate the app), and removal of a single package for archive
+packages only (`deps --remove`; an installer package, or one installed before metadata schema 5, needs the app
+recreated). A component the app's own installer already put in the prefix (e.g. the VC++ runtime) is
 left alone: the runtime neither installs it nor sets its DLL overrides (`deps` and `doctor` say so).
 
 **Rendering check (manual only).** `real_net_wine_d3d11_renders_via_dxvk` downloads and installs the bundled DXVK

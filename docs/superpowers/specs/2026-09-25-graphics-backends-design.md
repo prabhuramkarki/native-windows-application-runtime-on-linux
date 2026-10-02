@@ -25,7 +25,7 @@ Success criteria:
 
 | Decision | Choice | Why |
 |---|---|---|
-| Backend choice | No new per-app setting. DXVK/VKD3D installed = used; not installed = wined3d. Opt-out is deferred: removal needs the `ArchiveInstalled` record persisted (a Metadata change) and its own design. | The prefix state IS the choice; a second setting could disagree with it. Avoids a Metadata v4 migration. |
+| Backend choice | No new per-app setting. DXVK/VKD3D installed = used; not installed = wined3d. Opt-out is deferred: removal needs the `ArchiveInstalled` record persisted (a Metadata change) and its own design (done in 6F: `deps --remove`). | The prefix state IS the choice; a second setting could disagree with it. Avoids a Metadata v4 migration. |
 | Vulkan probe | Run `vulkaninfo --summary` (bounded time and output, sandbox not needed: read-only host query), parse; fall back to "loader present" from the existing doctor check. Not `ash`. | `ash` means `dlopen` of a driver stack in our process. A bounded subprocess keeps driver crashes out of the runtime. |
 | `.tar.zst` | Add `ruzstd` (pure Rust) as a streaming decoder in front of the existing hardened `tarball::walk`, with a window-size cap, output cap and the same ratio guard as gzip. | VKD3D-Proton ships only `.tar.zst`. Pure Rust adds no C attack surface; the tar layer is already hardened. |
 | 32-bit DXVK | Deferred to Phase 9 (WoW64). | Prefix is win64; 32-bit needs its own design. Recorded as a known gap, unchanged. |

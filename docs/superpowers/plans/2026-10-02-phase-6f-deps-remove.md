@@ -450,3 +450,68 @@ Task 1, then Task 2, then Task 3, then Task 4, then Task 5, then Task 6.
   - R13 is Task 5;
   - R10 is Task 6 (roadmap).
 - No placeholders. Every type named in a later task is produced by an earlier one.
+
+## As built
+
+Branch `phase-6f-deps-remove`, nothing pushed. Gates passed after every commit, with the default `TMPDIR`:
+- fmt and both clippy runs;
+- the workspace tests with `RUNTIME_REQUIRE_BWRAP=1 RUNTIME_REQUIRE_DESKTOP_FILE_VALIDATE=1`;
+- `cargo deny`;
+- the GUI tests under `xvfb-run` at least once per task. The last run was on `3b8a093`.
+
+| Task | Commit(s) |
+|---|---|
+| 1 Schema 5 | `655a996` |
+| 2 Install record | `78b6063`, ruling fix `75d57d7` (R14) |
+| 3 Verifying remover | `4e9fb70`, ruling fix `75d57d7` (R15) |
+| 4 `remove_packages`, `deps --remove` | `f90933b`, review fixes `caab4b7` (R16-R19) |
+| 5 `deps.remove` job (API 0.2.3) | `3b8a093` |
+| 6 Docs | this commit |
+
+**Task 1.** As planned. Deviation: `archive` is `skip_serializing_if = "Option::is_none"`, so rewriting a schema 4
+file keeps it byte for byte (`FROZEN_V4`, produced by running the code at `088595a`).
+
+**Task 2.** Deviations:
+- Hashing reads in a loop. The plan said `io::copy` into `Sha256`, but the workspace builds `sha2` without `std`.
+- A missing `user.reg` reads as "no previous values", as the graphics-driver read does.
+- Controller ruling R14: `undo_install` puts each previous override value back, and deletes only the overrides that
+  had none.
+- Review M5 (R19): `install_archive_with_previous` makes `install_archive`'s own rollback restore previous values
+  too.
+
+**Task 3.** Deviations:
+- The old empty-record journal guard stays on `undo_install` only. On `remove_archive` it would block a legitimate
+  retry of a record that holds only overrides; a recorded package is never installed again, so its journal is that
+  install's own.
+- Controller ruling R15: a replaced file that is gone together with its backup is left, not failed.
+- Review fixes:
+  - I1 (R16): an unchanged replaced file whose backup is missing is left as installed and dropped from the record;
+  - M2 (R19): a file over `MAX_EXPANDED` is "changed" and not read;
+  - M4: the "kept at deps-backup/..." text appears only while the backup exists.
+
+**Task 4.** As planned. Deviations and decisions:
+- `--remove` also conflicts with `--yes` and `--plan-digest`. clap let `--remove x --yes y` through, because `--yes`
+  is declared `requires = "install"`, which did not reject it here.
+- A duplicate `--remove` is printed as an `error:` line with exit 2 after parsing (clap cannot see across values).
+- Ruling 3 and review M3 (R18): any `failed` entry fails the package. If only the journal deletion failed, the whole
+  record is kept (fail closed).
+- Review I2 (R17): `check_archive_record` runs for every package in `removal_order`.
+- Review M1: the per-package busy re-check now has a test, which kills the reviewer's mutation.
+- **Real Wine.** `RUNTIME_REQUIRE_BWRAP=1 cargo test -p runtime-deps --lib -- --ignored e2e_real_wine_remove
+  --test-threads=1 --nocapture` passed on `wine-10.0 (Ubuntu 10.0~repack-12ubuntu1)` in 13.3 s.
+  - The install recorded previous values `Some("builtin")`, `None` and `Some("")`.
+  - After the removal, `user.reg` showed `"rta"="builtin"` and `"rtc"=""` again and no `rtb`. So
+    `reg add /d ""` restores an empty value on Wine 10.0, and the R5 charset keeps `""`.
+  - The tampered `rtb.dll` stayed and was reported `left`; the record and `deps-backup` were gone.
+  - All 10 `e2e_real_wine` tests of runtime-deps pass with the extended `WineRig` (about 155 s).
+
+**Task 5.** As planned. `MAX_REMOVE = 16`. A `deps.remove` package that is not in the manifest id grammar, a
+duplicate, and 0 or 17 packages are `invalid_argument`. The GUI's job-kind match has a wildcard, so no label was
+added (a `depsRemove` job shows as "job").
+
+**Task 6.** The docs updated:
+- `docs/SECURITY.md`: a "Removal (Phase 6F)" subsection, the helper table row, and the override sentence;
+- `README.md`: the `deps --remove` row and example, and the known-gaps sentence;
+- `docs/API.md`: done in Task 5;
+- the 4B spec's opt-out cell;
+- the roadmap: a 6F row, 6E marked merged, the follow-up closed with its three new follow-ups, and API 0.2.3.

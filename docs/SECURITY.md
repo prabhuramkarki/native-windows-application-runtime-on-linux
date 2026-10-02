@@ -450,7 +450,8 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
   sandbox bounds what it can touch (its own prefix, read-write); inside the prefix it can do anything, including
   registering programs that Wine starts on its own later (services, `RunOnce` entries, ...). **Only the runtime's own
   steps are sandboxed.** Any later Wine session in the prefix outside a sandbox (`runtime run --unsandboxed`; and, for
-  an app that has never run sandboxed, the `reg.exe` runs that set an ARCHIVE package's overrides and `runtime display
+  an app that has never run sandboxed, the `reg.exe` runs that set an ARCHIVE package's overrides or put them back on
+  removal, and `runtime display
   <app> <choice>`: see "Wine helpers in a prefix the app has written" below) starts whatever a vendor installer
   registered, unsandboxed, with the user's network and files. Success is judged
   by the package's marker (a file or registry value), which is the installer's own claim: a hostile installer can
@@ -479,8 +480,8 @@ and never downloaded. Open-licence packages (DXVK, VKD3D-Proton) need no consent
 - **Wine builtin versus native DLLs.** A DLL in `system32` is not necessarily loaded: Wine prefers its own builtins for
   many names. Each package declares its `dll_overrides`, set to `native,builtin` in `HKCU\Software\Wine\DllOverrides`
   through the prefix's `reg.exe` (for an installer package in the installer sandbox, for an archive package through
-  the backend like any Wine helper). There is no per-DLL policy beyond that list, and overrides are never removed
-  (there is no dependency removal).
+  the backend like any Wine helper). There is no per-DLL policy beyond that list. An archive package's overrides
+  are put back to their previous values on removal (see "Removal (Phase 6F)"); an installer package's never are.
 - **Dependencies of a denied package still install** (spec rule: only the denied package and what needs it are
   skipped).
 - **Upgrades are not supported.** A package recorded at another version or sha256 is refused before any download;
@@ -497,6 +498,51 @@ refreshes it; the weekly `verify-pins` workflow notices). TLS uses rustls with t
 build time, no revocation checks, system and enterprise CAs ignored (a TLS-intercepting proxy fails closed); TLS is
 defence in depth behind the pin. The trust placed in a pinned vendor installer is trust in the vendor. The download
 cache is shared by all apps of the user and trusted only after re-verification.
+
+**Removal (Phase 6F).** `runtime deps <app> --remove <pkg>...` (and the `deps.remove` daemon job, which runs it)
+removes ARCHIVE packages (DXVK, VKD3D-Proton) using a record of exactly what their install wrote:
+- **The record and what it trusts.** Since metadata schema 5, an archive install records each file it wrote
+  (`drive_c`-relative path, the sha256 of its bytes, whether it replaced a file), each directory it created, and
+  each DLL override with the value it had before. Files are hashed from disk right after the install, under the
+  exclusive app lock with no `wineserver` for the prefix (`record_of`: no symlink in any component, `O_NOFOLLOW`,
+  regular files only). Previous override values are read from `user.reg` before the download with the bounded,
+  no-follow hive reader. An install whose record cannot be written is undone in the same locked run, with the
+  previous override values put back, so an archive package never stays unrecorded. `metadata.json` is not trusted
+  on read: the metadata crate checks the record's shape, and the remover re-validates its meaning (every path under
+  the Windows name rules inside `drive_c`, sha256 form, override names `[a-z0-9_]{1,32}`, previous values
+  `[a-z, ]{0,32}`) for EVERY named package before anything is removed. So each `reg.exe` argument is one argv
+  element that cannot read as an option. Registry values are never quoted in messages.
+- **Verified, then left and reported.** A file is deleted (or replaced by its backup) only when its current sha256
+  equals the recorded one. An override is put back (`reg add ... /d <previous>`, or deleted when it had no value) only
+  when its current value is exactly `native,builtin`. A file that changed, a path that is not a regular file or goes
+  through a symlink (never followed), a file larger than any install writes (2 GiB; not read), and an override that
+  changed are left in place and reported (`left <pkg>: <item>: <why>`, exit 1). They then leave the record: they are
+  no longer the runtime's. A changed replaced file's backup is kept and named. A replaced file whose backup is gone
+  is left as installed (nothing to restore), reported once, and dropped from the record, so no retry loops on it.
+- **Never outside the record.** Removal deletes or changes only recorded paths and overrides. Nothing is listed,
+  walked or globbed. Created directories are removed only when empty.
+- **Refusals, decided under the lock before anything changes:**
+  - a package that is not recorded;
+  - an installer package: removing it would run the vendor's uninstaller (new trust), and what it leaves cannot be
+    verified;
+  - a package installed before schema 5: no record, so it is never guessed; recreate the environment;
+  - a package another recorded package needs, unless both are named (dependents go first);
+  - a recorded package unknown to the bundled manifest (its needs are unknown);
+  - an invalid record.
+  The guards are those of `--install`: the exclusive app lock (`AppRunning`, `LockHeld`), no `wineserver` for the
+  prefix (checked again before each package), the backend's `dependency_packages` capability, and the helper
+  launcher. A marked app's `reg.exe` runs in its app sandbox, and the command refuses without a working bwrap.
+- **Hard failures** (an I/O error, `reg.exe` failing): the record shrinks to exactly what failed and the run stops.
+  A retry works only on that. If only the install journal cannot be deleted, the whole record is kept (fail closed)
+  and a retry runs the removal again.
+- **Bounds.**
+  - Noisy retry: if the metadata write after a removal fails, the record still lists what was already undone, and
+    a retry reports those items as left. Nothing wrong is deleted, and the run converges.
+  - Check-then-act: between a hash and the delete, the window is the same path-based TOCTOU as every 4A write. It
+    is closed by the app lock, the busy check and the sandbox, not by the remover.
+  - New install refusal: an existing override for one of the package's DLLs whose value the runtime could not
+    restore (not a string in `[a-z, ]{0,32}`, e.g. a hand-written dword) refuses the install before the download.
+    Reset it with winecfg.
 
 **Zstd archives (Phase 4B).** VKD3D-Proton ships only `.tar.zst`. It goes through the same bounded tar walker as gzip,
 with a pure-Rust decoder (`ruzstd`, no C code). Caps: the frame's window (64 MiB, `max_zstd_window`; refused before
@@ -647,6 +693,7 @@ your full access (`\\?\unix\` paths reach every file). Which commands start a Wi
 | `runtime run <file>` | `wineboot -u` in a brand-new prefix, then the program | install: no (nothing app-written yet); program: yes |
 | `runtime display <app> <choice>` | `reg.exe` | once the app ran sandboxed: yes, the app sandbox; before: no |
 | `runtime deps <app> --install` (archive package) | `reg.exe` (DLL overrides, rollback) | once the app ran sandboxed: yes, the app sandbox; before: no |
+| `runtime deps <app> --remove` (archive packages) | `reg.exe` (putting overrides back) | once the app ran sandboxed: yes, the app sandbox; before: no |
 | `runtime deps <app> --install` (installer package) | the installer, `reg.exe` | yes, the installer sandbox (offline) |
 | `runtime uninstall <app>` | the recorded uninstaller | yes, the installer sandbox |
 | `runtime remove`/`uninstall` (stop) | `wineserver -k`: not a session, runs no Windows code | no (not needed) |
