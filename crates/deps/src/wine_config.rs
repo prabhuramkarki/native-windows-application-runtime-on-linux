@@ -14,6 +14,57 @@ use rt_installer::{RegValue, WineReg};
 
 /// The key as it is spelled in `user.reg` (no hive prefix).
 const HIVE_KEY: &str = r"Software\Wine\Drivers";
+/// `HKCU\Software\Wine\DllOverrides` as it is spelled in `user.reg`.
+const OVERRIDES_HIVE_KEY: &str = r"Software\Wine\DllOverrides";
+/// Longest DLL override value the runtime records and restores, in bytes.
+const MAX_RESTORABLE_LEN: usize = 32;
+
+/// A DLL override value the runtime can record and later restore exactly (Decision R5): a string of at most 32
+/// bytes in `[a-z, ]`, which covers `native,builtin`, `n,b`, `builtin` and `""` (disabled). Also safe as one argv
+/// element of `reg.exe`.
+pub(crate) fn restorable_override(v: &str) -> bool {
+    v.len() <= MAX_RESTORABLE_LEN && v.bytes().all(|b| b.is_ascii_lowercase() || b == b',' || b == b' ')
+}
+
+/// For each of `names`, the current value under `HKCU\Software\Wine\DllOverrides` in the prefix's `user.reg`
+/// (read with the no-follow, regular-file-only, size-capped hive reader), `None` when absent (or when there is no
+/// `user.reg`). Name match as [`overrides_in`]. `Err` (fixed text, never a value): an unreadable, oversized or
+/// symlinked hive, or a value the runtime cannot restore.
+pub fn read_dll_overrides(env: &AppEnv, names: &[String]) -> Result<Vec<(String, Option<String>)>, String> {
+    match read_hive(&env.prefix(), "user.reg")
+        .map_err(|e| format!("cannot read the prefix's user.reg to save the existing DLL overrides: {e}"))?
+    {
+        Some(reg) => overrides_in(&reg, names),
+        None => Ok(names.iter().map(|n| (n.clone(), None)).collect()),
+    }
+}
+
+/// [`read_dll_overrides`] on a parsed hive. Key and value names match case-insensitively; when several spellings
+/// exist, the last in the parser's (sorted) order wins, as for the graphics driver. A value that is not a string
+/// passing [`restorable_override`] is `Err`, naming the override but never quoting the value.
+pub(crate) fn overrides_in(reg: &WineReg, names: &[String]) -> Result<Vec<(String, Option<String>)>, String> {
+    names
+        .iter()
+        .map(|name| {
+            let value = reg
+                .keys
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(OVERRIDES_HIVE_KEY))
+                .flat_map(|(_, key)| key.values.iter())
+                .rfind(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v);
+            match value {
+                None => Ok((name.clone(), None)),
+                Some(RegValue::Str(v)) if restorable_override(v) => Ok((name.clone(), Some(v.clone()))),
+                Some(_) => Err(format!(
+                    "the existing DLL override `{}` has a value the runtime cannot restore; reset it (winecfg, \
+                     Libraries) and install again",
+                    crate::manifest::clip(name)
+                )),
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WineConfigError {
@@ -320,6 +371,81 @@ mod tests {
         // hostile bytes: no panic, some answer
         fs::write(p.join("user.reg"), [0xffu8, b'[', b'\\', 0, b'\n', b'"'].repeat(500)).unwrap();
         let _ = read_graphics_driver_from_prefix(&env);
+    }
+
+    fn overrides(lines: &str) -> Vec<u8> {
+        file(&format!(
+            "[Software\\\\Wine\\\\DllOverrides] 1790095421\n#time=1dd\n{lines}\n\n"
+        ))
+    }
+
+    fn prev(user_reg: &[u8], names: &[&str]) -> Result<Vec<(String, Option<String>)>, String> {
+        let names: Vec<String> = names.iter().map(|s| (*s).to_owned()).collect();
+        overrides_in(&WineReg::parse(user_reg).unwrap(), &names)
+    }
+
+    #[test]
+    fn previous_dll_overrides_are_read_case_insensitively_and_absent_is_none() {
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(prev(&file(""), &["d3d11"]), Ok(vec![("d3d11".into(), None)]));
+        assert_eq!(
+            prev(&overrides("\"dxgi\"=\"builtin\""), &["d3d11", "dxgi"]),
+            Ok(vec![("d3d11".into(), None), ("dxgi".into(), some("builtin"))])
+        );
+        assert_eq!(
+            prev(&overrides("\"D3D11\"=\"n,b\""), &["d3d11"]),
+            Ok(vec![("d3d11".into(), some("n,b"))])
+        );
+        assert_eq!(
+            prev(&overrides("\"d3d11\"=\"\""), &["d3d11"]),
+            Ok(vec![("d3d11".into(), some(""))])
+        );
+        assert_eq!(
+            prev(&overrides("\"d3d11\"=\"native, builtin\""), &["d3d11"]),
+            Ok(vec![("d3d11".into(), some("native, builtin"))])
+        );
+        let at_cap = "a".repeat(32);
+        assert_eq!(
+            prev(&overrides(&format!("\"d3d11\"=\"{at_cap}\"")), &["d3d11"]),
+            Ok(vec![("d3d11".into(), Some(at_cap))])
+        );
+        // Another key's value of the same name is not it.
+        let other = file("[Software\\\\Wine\\\\DllOverrides2] 1\n\"d3d11\"=\"builtin\"\n\n");
+        assert_eq!(prev(&other, &["d3d11"]), Ok(vec![("d3d11".into(), None)]));
+    }
+
+    #[test]
+    fn an_unrestorable_previous_override_is_an_error_naming_it_but_never_quoting_it() {
+        for (value, quoted) in [
+            ("dword:00000001", "00000001"),
+            ("\"a;b\"", "a;b"),
+            (&format!("\"{}\"", "q".repeat(33)), "qqqq"),
+            ("\"Native\"", "Native"),
+            ("\"x\\n\"", "x\n"),
+        ] {
+            let err = prev(&overrides(&format!("\"d3d11\"={value}")), &["dxgi", "d3d11"]).unwrap_err();
+            assert!(
+                err.contains("`d3d11`") && err.contains("cannot restore"),
+                "{value}: {err}"
+            );
+            assert!(!err.contains(quoted), "{value}: {err}");
+        }
+    }
+
+    #[test]
+    fn previous_overrides_of_a_prefix_missing_symlinked_and_present() {
+        let (_t, env) = app();
+        let names = vec!["d3d11".to_owned()];
+        assert_eq!(read_dll_overrides(&env, &names), Ok(vec![("d3d11".into(), None)]));
+        fs::write(env.prefix().join("elsewhere"), overrides("\"d3d11\"=\"builtin\"")).unwrap();
+        symlink(env.prefix().join("elsewhere"), env.prefix().join("user.reg")).unwrap();
+        assert!(read_dll_overrides(&env, &names).unwrap_err().contains("symlink"));
+        fs::remove_file(env.prefix().join("user.reg")).unwrap();
+        fs::write(env.prefix().join("user.reg"), overrides("\"d3d11\"=\"builtin\"")).unwrap();
+        assert_eq!(
+            read_dll_overrides(&env, &names),
+            Ok(vec![("d3d11".into(), Some("builtin".into()))])
+        );
     }
 
     #[test]

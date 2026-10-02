@@ -119,6 +119,8 @@ use std::time::Duration;
 pub const BACKUP_DIR: &str = "deps-backup";
 /// Where Wine reads per-DLL load order.
 pub const OVERRIDES_KEY: &str = r"HKCU\Software\Wine\DllOverrides";
+/// The value an archive install gives each of its DLL overrides.
+pub const INSTALLED_OVERRIDE: &str = "native,builtin";
 /// Deadline of one `reg.exe` run (including the settle wait for `wineserver`).
 const REG_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most entries in a zip, and most recorded files or directories in an [`ArchiveInstalled`].
@@ -288,11 +290,82 @@ pub fn discard_interrupted(pkg_id: &str, env: &AppEnv) -> Result<DiscardReport, 
     }
 }
 
-/// Removes what `installed` records for package `pkg_id`: deletes the overrides, deletes exactly the recorded new
-/// files, restores replaced originals from the backup directory (then deletes the backups) and removes the
-/// recorded directories that are empty. Files and directories already gone are fine, so it can be retried. The
-/// record is validated first; on failures the first one is returned after everything else was attempted.
-pub fn remove_archive(
+/// The persisted record of `done` (Decision R2): each file hashed from disk as it is NOW (reached with no symlink in
+/// any component, opened `O_NOFOLLOW`, a regular file only), each override paired with its value before the install
+/// from `previous` (`read_dll_overrides`, read before the download). The caller holds the app lock and no
+/// `wineserver` serves the prefix, so the files are exactly what the install left, including those adopted from a
+/// killed earlier attempt. `Err`: a file gone, unreadable or not a regular file, more than [`rt_core::MAX_RECORDED`]
+/// files, directories or overrides, a path that is not UTF-8, or an override without a previous entry.
+pub fn record_of(
+    done: &ArchiveInstalled,
+    previous: &[(String, Option<String>)],
+    env: &AppEnv,
+) -> Result<rt_core::ArchiveRecord, ArchiveError> {
+    let cap = rt_core::MAX_RECORDED;
+    if done.files.len() > cap || done.created_dirs.len() > cap || done.overrides.len() > cap {
+        return Err(ArchiveError::BadPackage(format!(
+            "the install wrote more than {cap} files, directories or overrides: too many to record"
+        )));
+    }
+    let text = |p: &Path| {
+        p.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| ArchiveError::Destination(format!("{:?} is not UTF-8", clip(&p.to_string_lossy()))))
+    };
+    let ledger = Ledger::new(env, "");
+    let mut files = Vec::with_capacity(done.files.len());
+    for rel in &done.files {
+        let sha256 = match ledger.hash(rel)? {
+            Hashed::File(h) => h,
+            Hashed::Gone => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is gone right after the install",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
+            Hashed::NotRegular => {
+                return Err(ArchiveError::Destination(format!(
+                    "{:?} is not a regular file",
+                    clip(&rel.to_string_lossy())
+                )));
+            }
+        };
+        files.push(rt_core::RecordedFile {
+            path: text(rel)?,
+            sha256,
+            replaced: done.replaced.contains(rel),
+        });
+    }
+    let created_dirs = done.created_dirs.iter().map(|d| text(d)).collect::<Result<_, _>>()?;
+    let overrides = done
+        .overrides
+        .iter()
+        .map(|name| match previous.iter().find(|(n, _)| n == name) {
+            Some((_, prev)) => Ok(rt_core::RecordedOverride {
+                name: name.clone(),
+                previous: prev.clone(),
+            }),
+            None => Err(ArchiveError::BadOverrideName(format!(
+                "{}: its previous value was not read",
+                clip(name)
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(rt_core::ArchiveRecord {
+        files,
+        created_dirs,
+        overrides,
+    })
+}
+
+/// Undoes what the CURRENT [`install_archive`] call `installed` (Decision R11): deletes its overrides, deletes the
+/// new files, restores replaced originals from the backup directory (then deletes the backups), removes the created
+/// directories that are empty, and deletes the journal. Nothing is verified: this is the same undo `install_archive`
+/// runs on its own errors, for the one case where its result could not be recorded (R12), in the same locked run
+/// with no gap in which anyone else could write. Only the orchestrator's `install_one` calls it. A persisted record
+/// is removed by the verifying `remove_archive` instead. On failures the first one is returned after everything else
+/// was attempted.
+pub(crate) fn undo_install(
     installed: &ArchiveInstalled,
     pkg_id: &str,
     env: &AppEnv,
@@ -1037,6 +1110,59 @@ impl Ledger {
     }
 }
 
+/// What [`Ledger::hash`] found at a recorded path.
+#[derive(Debug, PartialEq, Eq)]
+enum Hashed {
+    /// A regular file, with the lowercase hex sha256 of its bytes.
+    File(String),
+    /// Nothing there.
+    Gone,
+    /// A symlink in any component, a directory, a special file, or a component that is not a directory: never
+    /// followed and never read.
+    NotRegular,
+}
+
+impl Ledger {
+    /// Hashes the file at `rel` under `drive_c`: reached with no symlink in any component, opened `O_NOFOLLOW` (and
+    /// `O_NONBLOCK`, so a FIFO swapped in cannot hang the open), checked with `fstat` to be a regular file, then read
+    /// to the end.
+    fn hash(&self, rel: &Path) -> Result<Hashed, ArchiveError> {
+        use sha2::{Digest, Sha256};
+        let path = match resolve_under(&self.drive_c, &win_path(rel)?) {
+            Ok(p) => p,
+            Err(ResolveError::NotFound) => return Ok(Hashed::Gone),
+            Err(ResolveError::Symlink | ResolveError::SpecialFile | ResolveError::NotADirectory) => {
+                return Ok(Hashed::NotRegular);
+            }
+            Err(e) => return Err(resolve_err(rel, e)),
+        };
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Hashed::Gone),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Hashed::NotRegular),
+            Err(e) => return Err(e.into()),
+        };
+        if !file.metadata()?.file_type().is_file() {
+            return Ok(Hashed::NotRegular);
+        }
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(Hashed::File(crate::fetch::hex(&hasher.finalize())))
+    }
+}
+
 fn open_nofollow(p: &Path) -> Result<File, ArchiveError> {
     Ok(OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(p)?)
 }
@@ -1101,7 +1227,7 @@ pub(crate) fn reg(
     Ok((out.status.success(), clip(&detail)))
 }
 
-/// Sets `name` to `native,builtin`; `sandbox` as for [`reg`].
+/// Sets `name` to [`INSTALLED_OVERRIDE`]; `sandbox` as for [`reg`].
 pub(crate) fn set_override(
     name: &str,
     env: &AppEnv,
@@ -1110,7 +1236,7 @@ pub(crate) fn set_override(
     sandbox: Option<&InstallerSandbox>,
 ) -> Result<(), ArchiveError> {
     let (ok, detail) = reg(
-        &["add", OVERRIDES_KEY, "/v", name, "/d", "native,builtin", "/f"],
+        &["add", OVERRIDES_KEY, "/v", name, "/d", INSTALLED_OVERRIDE, "/f"],
         env,
         backend,
         launcher,

@@ -767,8 +767,15 @@ fn metadata_unreadable_after_a_successful_install_is_failed_not_recorded() {
     let rep = run(&r, &r.plan(ABC), &f, &Answers::default()).unwrap();
     assert_eq!(rep.completed, ["a"]);
     let why = reason(&rep.failed, "b");
-    assert!(why.contains("installed but not recorded"), "{why}");
-    assert!(r.c("windows/system32/b.dll").is_file(), "the install itself succeeded");
+    assert!(
+        why.contains("not installed: it could not be recorded") && why.contains("removed again"),
+        "{why}"
+    );
+    assert!(
+        !r.c("windows/system32/b.dll").exists(),
+        "an unrecorded install was left"
+    );
+    assert!(!r.env.root().join(install_archive::BACKUP_DIR).join("b").exists());
     assert_eq!(ids(&rep.skipped), ["c"]);
 }
 
@@ -793,11 +800,188 @@ fn a_full_dependency_list_is_failed_not_recorded() {
     r.set_md(&m);
     let rep = run(&r, &r.plan(&["d3d9"]), &FakeFetcher::default(), &Answers::default()).unwrap();
     assert!(rep.completed.is_empty());
-    assert!(
-        reason(&rep.failed, "a").contains("installed but not recorded"),
-        "{rep:?}"
-    );
+    assert!(reason(&rep.failed, "a").contains("removed again"), "{rep:?}");
     assert_eq!(r.md().dependencies.len(), MAX_DEPENDENCIES);
+    assert!(!r.c("windows/system32/a.dll").exists());
+}
+
+// ------------------------------------------------------------------------------------------------ install record (6F)
+
+/// The archive package with every capability it provides as a DLL override.
+fn with_overrides(mut pb: (Package, Vec<u8>)) -> (Package, Vec<u8>) {
+    if let Install::Archive { dll_overrides, .. } = &mut pb.0.install {
+        dll_overrides.clone_from(&pb.0.provides);
+    }
+    pb
+}
+
+/// A rig whose prefix has a (stand-in) reg.exe and a `user.reg` with these `DllOverrides` lines.
+fn override_rig(pkgs: Vec<(Package, Vec<u8>)>, overrides: &str) -> Rig {
+    let r = Rig::new(pkgs);
+    fs::write(r.c("windows/system32/reg.exe"), b"MZ fake").unwrap();
+    fs::write(
+        r.env.prefix().join("user.reg"),
+        format!("WINE REGISTRY Version 2\n\n[Software\\\\Wine\\\\DllOverrides] 1\n{overrides}\n\n"),
+    )
+    .unwrap();
+    r
+}
+
+/// The argv of every command the fake backend ran (the `reg.exe` calls).
+fn reg_argv(b: &FakeBackend) -> Vec<String> {
+    b.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            rt_core::Call::Command { args, .. } => {
+                Some(args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_archive_install_records_its_files_hashes_and_previous_overrides() {
+    let r = override_rig(
+        vec![
+            with_overrides(archive("a", false, &[], &["d3d9"])),
+            with_overrides(archive("b", false, &[], &["d3d11"])),
+        ],
+        "\"D3D11\"=\"builtin\"",
+    );
+    fs::write(r.c("windows/system32/b.dll"), b"wine placeholder").unwrap();
+    let b = FakeBackend::new();
+    let rep = run_with(
+        &r,
+        &r.plan(&["d3d9", "d3d11"]),
+        &FakeFetcher::default(),
+        &Answers::default(),
+        &b,
+    )
+    .unwrap();
+    assert_eq!(rep.completed, ["a", "b"], "{rep:?}");
+    let md = r.md();
+    assert_eq!(md.schema_version, 5);
+    let rec = |id: &str| md.dependency(id).unwrap().archive.clone().unwrap();
+    let file = |id: &str, replaced| rt_core::RecordedFile {
+        path: format!("windows/system32/{id}.dll"),
+        sha256: sha(format!("dll of {id}").as_bytes()),
+        replaced,
+    };
+    let ov = |name: &str, previous: Option<&str>| rt_core::RecordedOverride {
+        name: name.into(),
+        previous: previous.map(str::to_owned),
+    };
+    assert_eq!(
+        rec("a"),
+        rt_core::ArchiveRecord {
+            files: vec![file("a", false)],
+            created_dirs: vec![],
+            overrides: vec![ov("d3d9", None)],
+        }
+    );
+    assert_eq!(
+        rec("b"),
+        rt_core::ArchiveRecord {
+            files: vec![file("b", true)],
+            created_dirs: vec![],
+            overrides: vec![ov("d3d11", Some("builtin"))],
+        }
+    );
+}
+
+#[test]
+fn an_unrestorable_previous_override_refuses_the_package_before_its_download() {
+    for value in ["dword:00000001", "\"x;y\""] {
+        let r = override_rig(
+            vec![with_overrides(archive("b", false, &[], &["d3d11"]))],
+            &format!("\"d3d11\"={value}"),
+        );
+        let (f, b) = (FakeFetcher::default(), FakeBackend::new());
+        let rep = run_with(&r, &r.plan(&["d3d11"]), &f, &Answers::default(), &b).unwrap();
+        let why = reason(&rep.failed, "b");
+        assert!(
+            why.contains("`d3d11`") && why.contains("cannot restore") && !why.contains("x;y") && !why.contains("0001"),
+            "{why}"
+        );
+        assert!(f.calls().is_empty(), "downloaded: {:?}", f.calls());
+        assert!(reg_argv(&b).is_empty());
+        assert!(r.recorded().is_empty());
+        assert!(!r.c("windows/system32/b.dll").exists());
+    }
+}
+
+#[test]
+fn an_install_that_cannot_be_recorded_takes_its_files_and_overrides_away_again() {
+    let r = override_rig(vec![with_overrides(archive("b", false, &[], &["d3d11"]))], "");
+    fs::write(r.c("windows/system32/b.dll"), b"wine placeholder").unwrap();
+    let mut m = r.md();
+    for i in 0..MAX_DEPENDENCIES {
+        state::record(
+            &mut m,
+            DependencyRecord {
+                id: format!("x{i:03}"),
+                version: "1".into(),
+                sha256: OTHER_SHA.into(),
+                installed_at: OLD,
+                consent: None,
+                archive: None,
+            },
+        )
+        .unwrap();
+    }
+    r.set_md(&m);
+    let before = fs::read(r.env.metadata_path()).unwrap();
+    let b = FakeBackend::new();
+    let rep = run_with(
+        &r,
+        &r.plan(&["d3d11"]),
+        &FakeFetcher::default(),
+        &Answers::default(),
+        &b,
+    )
+    .unwrap();
+    let why = reason(&rep.failed, "b");
+    assert!(
+        why.contains("not installed: it could not be recorded") && why.contains("removed again"),
+        "{why}"
+    );
+    assert_eq!(fs::read(r.c("windows/system32/b.dll")).unwrap(), b"wine placeholder");
+    assert!(
+        !r.env.root().join(install_archive::BACKUP_DIR).exists(),
+        "backup or journal left"
+    );
+    let k = install_archive::OVERRIDES_KEY;
+    assert_eq!(
+        reg_argv(&b),
+        [
+            format!("add {k} /v d3d11 /d native,builtin /f"),
+            format!("delete {k} /v d3d11 /f"),
+        ]
+    );
+    assert_eq!(fs::read(r.env.metadata_path()).unwrap(), before);
+}
+
+#[test]
+fn an_installer_package_is_recorded_without_an_archive_record() {
+    if !have_bwrap() {
+        return;
+    }
+    let r = Rig::new(vec![installer("vc", &["vcruntime140"])]);
+    let b = FakeBackend::with_script("mkdir -p windows/system32 && echo ok > windows/system32/vc-marker.dll")
+        .with_dll_dirs(vec![PathBuf::from("/bin")]);
+    let rep = run_with(
+        &r,
+        &r.plan(&["vcruntime140"]),
+        &FakeFetcher::default(),
+        &Answers::default(),
+        &b,
+    )
+    .unwrap();
+    assert_eq!(rep.completed, ["vc"], "{rep:?}");
+    let md = r.md();
+    assert_eq!(md.dependency("vc").unwrap().archive, None);
+    assert_eq!(md.schema_version, 5);
 }
 
 #[test]

@@ -345,7 +345,7 @@ fn install(e: &Env, p: Package, file: &Path) -> Result<ArchiveInstalled, Archive
 }
 
 fn remove(e: &Env, done: &ArchiveInstalled) -> Result<(), ArchiveError> {
-    remove_archive(done, "dxvk", &e.env, &FakeBackend::new(), &launcher())
+    undo_install(done, "dxvk", &e.env, &FakeBackend::new(), &launcher())
 }
 
 fn paths(list: &[&str]) -> Vec<PathBuf> {
@@ -1276,7 +1276,7 @@ fn overrides_run_reg_add_with_the_exact_argv_through_settle() {
     // Every reg command was wrapped by `settle` (so wineserver flushes the registry before the call returns).
     assert_eq!(b.settled.lock().unwrap().len(), 2);
     // remove deletes the overrides with the exact argv, again through settle.
-    remove_archive(&done, "dxvk", &e.env, &b, &launcher()).unwrap();
+    undo_install(&done, "dxvk", &e.env, &b, &launcher()).unwrap();
     assert_eq!(b.reg_calls()[2..], [del("dxgi"), del("d3d11")], "newest first");
     assert_eq!(b.settled.lock().unwrap().len(), 4);
     assert!(!e.c("windows/system32/d3d11.dll").exists());
@@ -1321,11 +1321,11 @@ fn a_reg_delete_failure_is_an_error_unless_the_value_is_already_gone() {
     };
     // delete fails, query says the value is absent: already removed, fine.
     let b = Settling::new(r#"[ "$1" = add ] && exit 0; exit 1"#);
-    remove_archive(&done, "dxvk", &e.env, &b, &launcher()).unwrap();
+    undo_install(&done, "dxvk", &e.env, &b, &launcher()).unwrap();
     assert_eq!(b.reg_calls(), [del("d3d11"), query("d3d11")]);
     // delete fails and the value is still there: an error.
     let b = Settling::new(r#"[ "$1" = delete ] && exit 1; exit 0"#);
-    let err = remove_archive(&done, "dxvk", &e.env, &b, &launcher()).unwrap_err();
+    let err = undo_install(&done, "dxvk", &e.env, &b, &launcher()).unwrap_err();
     assert!(matches!(err, ArchiveError::Registry(_)), "{err:?}");
 }
 
@@ -1512,7 +1512,7 @@ fn installed_records_round_trip_and_hostile_ones_are_refused_by_remove() {
         files: vec![PathBuf::from("x"); MAX_ENTRIES + 1],
         ..ArchiveInstalled::default()
     });
-    let err = remove_archive(
+    let err = undo_install(
         &ArchiveInstalled::default(),
         "../x",
         &e.env,
@@ -1522,6 +1522,126 @@ fn installed_records_round_trip_and_hostile_ones_are_refused_by_remove() {
     .unwrap_err();
     assert!(matches!(err, ArchiveError::BadPackage(_)), "{err:?}");
     assert_eq!(e.snapshot(), before);
+}
+
+// ------------------------------------------------------------------------------------------------ record_of
+
+fn sha_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    crate::fetch::hex(&sha2::Sha256::digest(bytes))
+}
+
+/// A zip installing `new/d3d11.dll` (in a directory it creates) and `windows/system32/dxgi.dll` over a placeholder,
+/// with both overrides; `previous` is what `read_dll_overrides` would have said.
+fn two_file_install(e: &Env) -> (ArchiveInstalled, Vec<(String, Option<String>)>) {
+    put(&e.c("windows/system32/dxgi.dll"), b"placeholder");
+    let file = e.archive(
+        "a",
+        &files_in(ArchiveFormat::Zip, &[("d3d11.dll", b"D3D"), ("dxgi.dll", b"DXGI")]),
+    );
+    let p = pkg_with(
+        ArchiveFormat::Zip,
+        &[
+            ("d3d11.dll", "new/d3d11.dll"),
+            ("dxgi.dll", "windows/system32/dxgi.dll"),
+        ],
+        &["d3d11", "dxgi"],
+        &["d3d11", "dxgi"],
+    );
+    let done = install(e, p, &file).unwrap();
+    let previous = vec![
+        ("d3d11".to_owned(), Some("builtin".to_owned())),
+        ("dxgi".to_owned(), None),
+    ];
+    (done, previous)
+}
+
+#[test]
+fn record_of_hashes_each_file_from_disk_and_pairs_overrides_with_their_previous_values() {
+    let e = Env::new();
+    let (done, previous) = two_file_install(&e);
+    let rec = record_of(&done, &previous, &e.env).unwrap();
+    assert_eq!(
+        rec,
+        rt_core::ArchiveRecord {
+            files: vec![
+                rt_core::RecordedFile {
+                    path: "new/d3d11.dll".into(),
+                    sha256: sha_of(b"D3D"),
+                    replaced: false,
+                },
+                rt_core::RecordedFile {
+                    path: "windows/system32/dxgi.dll".into(),
+                    sha256: sha_of(b"DXGI"),
+                    replaced: true,
+                },
+            ],
+            created_dirs: vec!["new".into()],
+            overrides: vec![
+                rt_core::RecordedOverride {
+                    name: "d3d11".into(),
+                    previous: Some("builtin".into()),
+                },
+                rt_core::RecordedOverride {
+                    name: "dxgi".into(),
+                    previous: None,
+                },
+            ],
+        }
+    );
+    // The hash is of what is on disk now, not of what was written: the file is read again.
+    put(&e.c("new/d3d11.dll"), b"changed");
+    assert_eq!(
+        record_of(&done, &previous, &e.env).unwrap().files[0].sha256,
+        sha_of(b"changed")
+    );
+}
+
+#[test]
+fn record_of_refuses_a_symlink_a_missing_file_an_unpaired_override_and_too_many_entries() {
+    let e = Env::new();
+    let (done, previous) = two_file_install(&e);
+    // A recorded file swapped for a symlink: never followed.
+    fs::write(e.tmp.path().join("target"), b"T").unwrap();
+    fs::remove_file(e.c("new/d3d11.dll")).unwrap();
+    symlink(e.tmp.path().join("target"), e.c("new/d3d11.dll")).unwrap();
+    assert!(record_of(&done, &previous, &e.env).is_err());
+    // Gone.
+    fs::remove_file(e.c("new/d3d11.dll")).unwrap();
+    assert!(record_of(&done, &previous, &e.env).is_err());
+    put(&e.c("new/d3d11.dll"), b"D3D");
+    record_of(&done, &previous, &e.env).unwrap();
+    // A symlinked parent directory.
+    fs::rename(e.c("new"), e.tmp.path().join("moved")).unwrap();
+    symlink(e.tmp.path().join("moved"), e.c("new")).unwrap();
+    assert!(record_of(&done, &previous, &e.env).is_err());
+    fs::remove_file(e.c("new")).unwrap();
+    fs::rename(e.tmp.path().join("moved"), e.c("new")).unwrap();
+    // A directory in place of a file.
+    fs::remove_file(e.c("new/d3d11.dll")).unwrap();
+    fs::create_dir(e.c("new/d3d11.dll")).unwrap();
+    assert!(record_of(&done, &previous, &e.env).is_err());
+    fs::remove_dir(e.c("new/d3d11.dll")).unwrap();
+    put(&e.c("new/d3d11.dll"), b"D3D");
+    // Every override needs its previous value.
+    assert!(record_of(&done, &previous[..1], &e.env).is_err());
+    // At most MAX_RECORDED of each.
+    let many = |n: usize| (0..n).map(|i| PathBuf::from(format!("f{i}"))).collect::<Vec<_>>();
+    for f in many(rt_core::MAX_RECORDED + 1) {
+        put(&e.c(&f.to_string_lossy()), b"x");
+    }
+    let mut big = done.clone();
+    big.files = many(rt_core::MAX_RECORDED + 1);
+    big.replaced.clear();
+    assert!(record_of(&big, &previous, &e.env).is_err());
+    big.files = many(rt_core::MAX_RECORDED);
+    assert_eq!(
+        record_of(&big, &previous, &e.env).unwrap().files.len(),
+        rt_core::MAX_RECORDED
+    );
+    let mut big = done.clone();
+    big.created_dirs = many(rt_core::MAX_RECORDED + 1);
+    assert!(record_of(&big, &previous, &e.env).is_err());
 }
 
 // ------------------------------------------------------------------------------------------------ fuzz
@@ -1720,7 +1840,7 @@ fn e2e_real_wine_zip_and_tar_gz_with_a_dll_override() {
             .expect("DllOverrides section");
         eprintln!("{format:?}: user.reg after install:\n{section}");
         assert!(section.contains("\"exports64\"=\"native,builtin\""), "{section}");
-        remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
+        undo_install(&done, &p.id, &env, &backend, &launcher).unwrap();
         wait_no_server("remove");
         assert!(!installed.exists());
         let user_reg = fs::read_to_string(env.prefix().join("user.reg")).unwrap();
@@ -1771,7 +1891,7 @@ fn real_net_wine_bundled_installs_and_removes(id: &str) {
     for name in &p.provides {
         assert!(user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")), "{name}");
     }
-    remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
+    undo_install(&done, &p.id, &env, &backend, &launcher).unwrap();
     for (e, old) in extract.iter().zip(&before) {
         assert_eq!(fs::read(env.drive_c().join(&e.to)).ok(), *old, "{} not restored", e.to);
     }
@@ -1917,7 +2037,7 @@ fn e2e_real_wine_vkd3d_manifest_shape() {
     for name in ["d3d12", "d3d12core"] {
         assert!(user_reg.contains(&format!("\"{name}\"=\"native,builtin\"")), "{name}");
     }
-    remove_archive(&done, &p.id, &env, &backend, &launcher).unwrap();
+    undo_install(&done, &p.id, &env, &backend, &launcher).unwrap();
     backend.stop(&env).unwrap();
 }
 

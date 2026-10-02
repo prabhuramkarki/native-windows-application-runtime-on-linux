@@ -30,8 +30,11 @@
 //!    them. What a denied package itself NEEDS still installs (spec §4: only the denied package and its dependents
 //!    are blocked).
 //! 5. Packages install in plan order: busy re-check, the installer marker check again (right before the download),
-//!    fetch, install, then record (read, `state::record`, atomic
-//!    write) after EACH success. The first failure stops the run; the rest are skipped.
+//!    for an archive package its DLL overrides' current values (a value the runtime could not restore refuses it
+//!    before the download), fetch, install, then record (read, `state::record`, atomic write) after EACH success.
+//!    An archive package's record says exactly what it wrote ([`install_archive::record_of`], hashed from disk);
+//!    if it cannot be recorded, what it wrote is undone again. The first failure stops the run; the rest are
+//!    skipped.
 //!
 //! Library code prints nothing; every report string is one line, bounded, with control and format characters
 //! escaped (callers still print through their sanitiser).
@@ -721,6 +724,15 @@ fn install_one(
     }
     // Before the download (saves it) and again right before installing: an app may start while it downloads.
     not_busy_now(o)?;
+    // An archive package's overrides as they are before it is installed, under the lock with the prefix idle (so
+    // `user.reg` is current and stays so until the install sets them), and before anything is downloaded: a value
+    // the runtime could not restore on removal refuses the package here (Decision R5).
+    let previous = match &pkg.install {
+        manifest::Install::Archive { dll_overrides, .. } if pkg.kind == Kind::Archive => {
+            crate::wine_config::read_dll_overrides(o.env, dll_overrides)?
+        }
+        _ => Vec::new(),
+    };
     // Under the lock, the prefix idle: an installer whose marker is there already has nothing to do (Ruling 15).
     if pkg.kind == Kind::Installer
         && install_installer::marker_already_present(pkg, o.env).map_err(|e| {
@@ -735,9 +747,28 @@ fn install_one(
         .map_err(|e| format!("download failed: {e}"))?;
     not_busy_now(o)?;
     let warnings = match pkg.kind {
-        Kind::Archive => install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
-            .map(|_| Vec::new())
-            .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?,
+        Kind::Archive => {
+            let done = install_archive::install_archive(pkg, &file, o.env, o.backend, o.launcher)
+                .map_err(|e| archive_reason(e, o.env.id().as_str(), &pkg.id))?;
+            // Recorded from disk right after the install, under the lock (Decision R2). An archive package never
+            // stays in the prefix without its record: if either step fails, what this call wrote is undone (R12).
+            let recorded = install_archive::record_of(&done, &previous, o.env)
+                .map_err(|e| e.to_string())
+                .and_then(|rec| record(o, pkg, consent, Some(rec)));
+            return match recorded {
+                Ok(()) => Ok(Some(Vec::new())),
+                Err(e) => Err(
+                    match install_archive::undo_install(&done, &pkg.id, o.env, o.backend, o.launcher) {
+                        Ok(()) => {
+                            format!("not installed: it could not be recorded ({e}); what it wrote was removed again")
+                        }
+                        Err(u) => format!(
+                            "not installed: it could not be recorded ({e}); removing what it wrote also failed: {u}"
+                        ),
+                    },
+                ),
+            };
+        }
         Kind::Installer => {
             match install_installer::install_installer_pkg(pkg, &file, o.env, o.backend, o.launcher, o.runtime_exe) {
                 Ok(done) => {
@@ -753,7 +784,7 @@ fn install_one(
             }
         }
     };
-    record(o, pkg, consent).map_err(|e| {
+    record(o, pkg, consent, None).map_err(|e| {
         format!(
             "installed but not recorded ({e}); the runtime does not count it as installed, and installing it \
              again may be refused: recreate the environment if that happens"
@@ -776,7 +807,13 @@ fn not_busy_now(o: &Orchestrator) -> Result<(), String> {
 }
 
 /// Records `pkg` in the app's metadata: read, edit, atomic write. Only called after the installer returned `Ok`.
-fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Result<(), String> {
+/// `archive`: what an archive package's install wrote ([`install_archive::record_of`]); `None` for an installer.
+fn record(
+    o: &Orchestrator,
+    pkg: &Package,
+    consent: Option<ConsentRecord>,
+    archive: Option<rt_core::ArchiveRecord>,
+) -> Result<(), String> {
     let mut md = o.store.read_metadata(o.env).map_err(|e| e.to_string())?;
     state::record(
         &mut md,
@@ -786,7 +823,7 @@ fn record(o: &Orchestrator, pkg: &Package, consent: Option<ConsentRecord>) -> Re
             sha256: pkg.sha256.clone(),
             installed_at: (o.now)(),
             consent,
-            archive: None,
+            archive,
         },
     )
     .map_err(|e| e.to_string())?;
