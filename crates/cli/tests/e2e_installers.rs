@@ -316,11 +316,19 @@ fn e2e_install_without_silent_never_silently_forces_silent_mode() {
 ///
 /// The payload here (`escape-reg64.exe`) writes a canary to the app ROOT (the parent of the prefix), which no
 /// sandbox binds writable; it stays inside the test's temp base, never the real home. Marked (the real path): the
-/// canary is NOT created. With the marker removed (the control): it IS created — so the test bites.
+/// canary is NOT created. With the marker removed (the control): it IS created — so the test bites. An in-prefix
+/// marker records the attempt's result in both runs; a helper refused before execution must not pass this test.
 #[test]
 #[ignore = "needs Wine, bwrap and nsis-built fixtures; run with --ignored --test-threads=1"]
 fn e2e_a_planted_reg_exe_cannot_escape_the_helper_sandbox_after_a_sandboxed_install() {
-    let rig = Rig::new();
+    // /tmp is a writable private tmpfs inside the sandbox. A write there can succeed against a private copy of
+    // the app-root path without reaching the host. Keep the target outside /tmp to observe an actual refusal.
+    let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    assert!(
+        !tmp.canonicalize().unwrap().starts_with("/tmp"),
+        "CARGO_TARGET_TMPDIR must be outside /tmp (set CARGO_TARGET_DIR)"
+    );
+    let rig = Rig::new_in(tmp);
     let xdg = rig.xdg_data_home();
     let xdg_env = [("XDG_DATA_HOME", xdg.to_str().unwrap())];
 
@@ -341,11 +349,22 @@ fn e2e_a_planted_reg_exe_cannot_escape_the_helper_sandbox_after_a_sandboxed_inst
     reg.push_str("\n[Software\\\\Wine\\\\DllOverrides] 1700000000\n\"reg.exe\"=\"native\"\n");
     std::fs::write(&user_reg, reg).unwrap();
     let canary = root.join("escape-canary");
+    let inside = rig.drive_c(&id).join("escape-reg-ran");
     assert!(!canary.exists());
+    assert!(!inside.exists());
 
+    // Exercise the same helper without a desktop in both runs. `wayland` would refuse before executing reg.exe
+    // on headless CI; setting `x11` only warns when there is no display.
+    let headless = [("DISPLAY", ""), ("WAYLAND_DISPLAY", "")];
     // Marked: `runtime display` runs reg.exe in the app sandbox, which does not bind the app root writable.
-    let ran = rig.rt(&["display", &id, "wayland"]);
+    let ran = rig.rt_env(&["display", &id, "x11"], &headless);
     eprintln!("display (marked): {}", ran.report());
+    ran.expect_ok();
+    assert_eq!(
+        std::fs::read_to_string(&inside).unwrap(),
+        "blocked",
+        "the payload must run inside the sandbox and attempt the outside write"
+    );
     assert!(
         !canary.exists(),
         "SANDBOX ESCAPE: the planted reg.exe wrote outside the prefix while sandboxed"
@@ -353,13 +372,17 @@ fn e2e_a_planted_reg_exe_cannot_escape_the_helper_sandbox_after_a_sandboxed_inst
 
     // Control: remove the marker so the helper runs UNSANDBOXED (an app that never ran sandboxed), and the same
     // payload now writes the canary — proving the test bites and the marker is what closes the hole.
+    std::fs::remove_file(&inside).unwrap();
     std::fs::remove_file(&marker).unwrap();
-    let ran = rig.rt(&["display", &id, "x11"]);
+    let ran = rig.rt_env(&["display", &id, "x11"], &headless);
     eprintln!("display (unmarked control): {}", ran.report());
+    ran.expect_ok();
+    assert_eq!(std::fs::read_to_string(&inside).unwrap(), "escaped");
     assert!(
         canary.exists(),
         "the control did not write the canary: the payload never ran, so the test proves nothing"
     );
+    assert_eq!(std::fs::read_to_string(&canary).unwrap(), "escaped");
     std::fs::remove_file(&canary).ok();
 
     rig.rt_env(&["uninstall", &id], &xdg_env).expect_ok();

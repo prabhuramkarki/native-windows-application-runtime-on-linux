@@ -10,7 +10,7 @@ pub use consent::{ConsentChoice, ConsentState, EntryRow};
 pub use forms::{InstallForm, PermChange, is_package};
 pub use page::{GrantRow, Line, PermRows};
 
-use rt_api::jobs::{ConsentItem, EventKind, JobEvents, JobInfo, JobKind, JobState};
+use rt_api::jobs::{ConsentItem, Driver, EventKind, JobEvents, JobInfo, JobKind, JobState};
 use rt_api::{
     AppDetail, AppList, DepsPlanView, DoctorView, ErrorKind, GraphicsView, PermissionsView, SandboxView, VersionInfo,
 };
@@ -29,6 +29,7 @@ pub const PLAN_REPLACED: &str = "The dependency plan changed while it was shown.
 pub const PLAN_CHANGED: &str = "The dependency plan changed since it was shown. Review it again.";
 /// Why a `.wrun` is not sent to a daemon older than API 0.2.1 (it has no `apps.import`).
 pub const NO_IMPORT: &str = "This runtimed cannot import .wrun packages (it needs API 0.2.1); update the runtime.";
+pub const NO_DEPS_REMOVE: &str = "This runtimed cannot remove dependencies (it needs API 0.2.3); update the runtime.";
 /// Most lines kept per job log (spec D11).
 pub const LOG_MAX: usize = 5000;
 /// Most followed job logs kept (the oldest ended one goes first).
@@ -96,9 +97,15 @@ pub enum Msg {
     Plan,
     Accept(String, bool),
     InstallDeps,
+    /// The app and package shown in the confirmation, not whichever app is now open.
+    RemoveDependency {
+        id: String,
+        package: String,
+    },
     Install(InstallForm),
     Permission(PermChange),
     ResetPermissions,
+    SetDisplay(Driver),
     Cancel(String),
     Retry,
     Refresh,
@@ -149,11 +156,19 @@ pub enum Cmd {
         digest: String,
         consent: Vec<ConsentItem>,
     },
+    DepsRemove {
+        id: String,
+        package: String,
+    },
     PermSet {
         id: String,
         set: Vec<String>,
     },
     PermReset(String),
+    DisplaySet {
+        id: String,
+        driver: Driver,
+    },
     ListJobs,
     Follow(String),
 }
@@ -167,7 +182,9 @@ pub enum Action {
     Remove,
     Plan,
     InstallDeps,
+    RemoveDependency,
     EditPermissions,
+    SetDisplay,
     Cancel,
 }
 
@@ -360,6 +377,23 @@ impl Model {
             }),
             Msg::Remove => self.gated(Action::Remove, |m| Cmd::Remove(m.page_id())),
             Msg::Plan => self.gated(Action::Plan, |m| Cmd::Plan(m.page_id())),
+            Msg::RemoveDependency { id, package } => {
+                if let Err(why) = self.can(Action::RemoveDependency) {
+                    return self.refuse(why);
+                }
+                let installed = self
+                    .page
+                    .as_ref()
+                    .filter(|p| p.id == id)
+                    .and_then(|p| p.data.as_ref())
+                    .is_some_and(|d| d.detail.dependencies.iter().any(|p| p.id == package));
+                if !installed {
+                    return self.refuse("The app or installed package changed; review it again.");
+                }
+                self.plan = None;
+                self.consent_open = false;
+                vec![Cmd::DepsRemove { id, package }]
+            }
             Msg::Accept(package, yes) => {
                 // Only a box in the open dialog accepts anything.
                 if let Some(p) = self.plan.as_mut().filter(|_| self.consent_open) {
@@ -421,6 +455,10 @@ impl Model {
                 }
             }
             Msg::ResetPermissions => self.gated(Action::EditPermissions, |m| Cmd::PermReset(m.page_id())),
+            Msg::SetDisplay(driver) => self.gated(Action::SetDisplay, |m| Cmd::DisplaySet {
+                id: m.page_id(),
+                driver,
+            }),
             Msg::Cancel(job) => self.gated(Action::Cancel, |_| Cmd::Cancel(job)),
             Msg::Retry => {
                 self.conn = Conn::Connecting;
@@ -671,8 +709,19 @@ impl Model {
                 Some(_) if self.app_busy() => Err(APP_BUSY),
                 Some(_) => Ok(()),
             },
-            Action::Run | Action::Remove | Action::EditPermissions if self.app_busy() => Err(APP_BUSY),
-            Action::Run | Action::Remove | Action::EditPermissions => Ok(()),
+            Action::RemoveDependency => {
+                if !matches!(&self.conn, Conn::Ready { api, .. } if api_at_least(api, [0, 2, 3])) {
+                    Err(NO_DEPS_REMOVE)
+                } else if self.app_busy() {
+                    Err(APP_BUSY)
+                } else {
+                    Ok(())
+                }
+            }
+            Action::Run | Action::Remove | Action::EditPermissions | Action::SetDisplay if self.app_busy() => {
+                Err(APP_BUSY)
+            }
+            Action::Run | Action::Remove | Action::EditPermissions | Action::SetDisplay => Ok(()),
         }
     }
 
@@ -695,9 +744,13 @@ const APP_BUSY: &str = "A job for this app is still running; try again when it e
 /// The app a write command changes (the commands that make an app busy).
 fn write_target(c: &Cmd) -> Option<&str> {
     match c {
-        Cmd::Run(id) | Cmd::Remove(id) | Cmd::PermReset(id) | Cmd::PermSet { id, .. } | Cmd::DepsInstall { id, .. } => {
-            Some(id)
-        }
+        Cmd::Run(id)
+        | Cmd::Remove(id)
+        | Cmd::PermReset(id)
+        | Cmd::PermSet { id, .. }
+        | Cmd::DepsInstall { id, .. }
+        | Cmd::DepsRemove { id, .. }
+        | Cmd::DisplaySet { id, .. } => Some(id),
         _ => None,
     }
 }
@@ -741,6 +794,8 @@ fn label(c: &Cmd) -> &'static str {
         Cmd::Install(_) => "Install",
         Cmd::Import(_) => "Import",
         Cmd::DepsInstall { .. } => "Installing dependencies",
+        Cmd::DepsRemove { .. } => "Removing dependency",
+        Cmd::DisplaySet { .. } => "Changing display driver",
         Cmd::PermSet { .. } | Cmd::PermReset(_) => "Changing permissions",
         Cmd::ListJobs => "Listing jobs",
         Cmd::Follow(_) => "Following a job",

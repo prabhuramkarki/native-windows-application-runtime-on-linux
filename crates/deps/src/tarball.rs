@@ -5,12 +5,13 @@
 //! it asks `select` whether the caller wants it and, for [`Selection::Take`], hands `sink` a reader limited to
 //! exactly the entry's size. Everything else is discarded while streaming. Memory is one 512-byte header block,
 //! one [`CHUNK`] discard buffer, the decoder's own state (an input buffer of [`CHUNK`], plus gzip's 32 KiB window or
-//! zstd's window of at most [`TarLimits::max_zstd_window`]) and at most one extended-header payload (capped, see
+//! zstd's window of at most [`TarLimits::max_zstd_window`] plus its block/literal/sequence workspace) and at most one extended-header payload (capped, see
 //! below). [`walk`] reads gzip; [`walk_codec`] picks the [`Codec`].
 //!
 //! **Compression layer.** Decompressed bytes are counted as they stream and the walk stops at
 //! [`TarLimits::max_total_bytes`] (headers and padding count too), whatever the stream would still produce. Each
-//! single read from the decoder is at most [`CHUNK`] bytes, so the work done past the cap is at most one chunk.
+//! single read from the decoder returns at most [`CHUNK`] bytes, so counted output overshoots by at most one
+//! chunk. This does not bound allocations or work inside the decoder.
 //! Compressed bytes are counted on the input side and capped at [`TarLimits::max_compressed_bytes`]. Once more
 //! than [`TarLimits::ratio_floor`] bytes have been decompressed, `decompressed > compressed_so_far * max_ratio`
 //! is [`TarError::RatioExceeded`] (the floor lets small, highly compressible archives, whose zero padding alone
@@ -23,8 +24,10 @@
 //! caps and the ratio guard above apply unchanged. `ruzstd` checks the frame header's window size (for a
 //! single-segment frame, its content size) against the limit it is given BEFORE allocating the window, so a frame
 //! declaring more than [`TarLimits::max_zstd_window`] is [`TarError::Zstd`] without allocating it. The decoder
-//! holds back one window of output until the frame ends, so it may decode up to one window plus one 128 KiB block
-//! beyond what was counted: bounded by that cap, not by the stream. Exactly one frame is read: after it, no input
+//! holds back one window of output until the frame ends. Version 0.9.1 bounds sequence expansion per block
+//! (RUSTSEC-2026-0344); the outer stream caps alone cannot prevent decoder-internal allocations. Literal-only
+//! blocks can still exceed the declared window, up to the format's 20-bit literal count (less than 1 MiB), so
+//! the window limit is not a total memory cap. Exactly one frame is read: after it, no input
 //! is the end, a zstd magic first byte is [`TarError::TooManyFrames`] and anything else is
 //! [`TarError::TrailingGarbage`]. Skippable frames (and dictionary frames) are refused as [`TarError::Zstd`], an
 //! input that ends inside the frame is [`TarError::Truncated`]. The content checksum, when present, is read but not

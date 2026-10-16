@@ -1320,6 +1320,39 @@ fn zstd_window_over_the_cap_is_refused_up_front() {
 }
 
 #[test]
+fn zstd_compressed_block_cannot_expand_past_its_window() {
+    // RUSTSEC-2026-0344: the outer stream caps cannot bound a decoder's internal block allocation.
+    // Keep this regression safe even with an old decoder: one literal and a 1027-byte repeated match
+    // expand to only 1028 bytes against a declared 1 KiB window. The RLE sequence tables specify
+    // literal-length code 1, repeated-offset code 0, match-length code 46; the ten extra match bits are zero.
+    let frame = |window_descriptor| {
+        let body = [8, 0, 1, 0x54, 1, 0, 46, 0, 4];
+        [
+            zst_header(window_descriptor),
+            zst_block(true, 2, body.len() as u32, &body),
+        ]
+        .concat()
+    };
+    // The same block is valid with a 2 KiB window: two tar end blocks plus four trailing zero bytes.
+    assert!(collect_zst(&frame(8), &lim()).unwrap().is_empty());
+    let r = collect_zst(&frame(0), &lim());
+    assert!(matches!(r, Err(TarError::Zstd(_))), "oversized block accepted: {r:?}");
+}
+
+#[test]
+fn zstd_literal_only_block_still_obeys_the_outer_output_cap() {
+    // ruzstd 0.9.1 accepts a literal-only block larger than the declared window. Keep our output cap
+    // effective on that path too, while allowing a future decoder to reject the malformed block earlier.
+    let frame = [zst_header(0), zst_block(true, 2, 4, &[0x05, 0x80, 0, 0])].concat();
+    let limits = TarLimits {
+        max_total_bytes: 1024,
+        ..lim()
+    };
+    let r = collect_zst(&frame, &limits);
+    assert!(matches!(r, Err(TarError::TooLarge | TarError::Zstd(_))), "{r:?}");
+}
+
+#[test]
 fn zstd_truncated_anywhere_is_truncated() {
     let input = zst(&two_files());
     for cut in 0..input.len() {

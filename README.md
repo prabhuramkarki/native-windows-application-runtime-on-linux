@@ -7,7 +7,9 @@ front end, a local daemon and a GTK desktop client.
 
 **Phases 0 to 6 of the [roadmap](docs/superpowers/plans/2026-09-21-runtime-master-roadmap.md) are implemented, as
 scoped by their plans. This is not a 1.0 release.** The crates are at version 0.0.1 and none is published to crates.io.
-`main` was last pushed to GitHub at the Phase 4D merge (`9cf1e27`); Phases 4F to 6D are local only. Left out on purpose, and recorded in the roadmap: portal "ask" flows (5C, deferred), desktop notifications,
+As checked on 2026-10-14, hosted CI has reached the Phase 6D merge (`f9c8246`); local `main` includes Phases 6E
+and 6F and is 21 commits ahead of the recorded `origin/main`. See the [validation record](docs/VALIDATION.md).
+Left out on purpose, and recorded in the roadmap: portal "ask" flows (5C, deferred), desktop notifications,
 clipboard and drag-and-drop through Wine's Wayland support, nightly compatibility runs in CI, package signing, and any
 backend other than Wine.
 
@@ -18,19 +20,21 @@ Wine Mono); `runtimed` (a JSON-RPC API over an owner-only Unix socket, read-only
 packages (`pack`, `inspect`, `unpack`, `import`); and a written, conformance-tested backend contract with Wine as its
 only real backend.
 
-What is not claimed: that any particular real-world application or game works. The
-[compatibility matrix](docs/COMPAT.md) lists only test fixtures (console programs, installers, a D3D11 clear, a .NET
-console program), every one recorded by hand on one development host.
+The [compatibility matrix](docs/COMPAT.md) records 7-Zip 26.04 console archive operations from both a portable
+x86 executable and an x64 MSI install, plus test fixtures (console programs, installers, a D3D11 clear, a .NET
+console program). All evidence is local to one development host; 7-Zip's GUI and shell integration are untested.
 
 The v1.0 exit criteria that are still open:
 
-- **At least 25 matrix apps tested with statuses** (roadmap, Phase 6 exit). The matrix has no real application yet.
+- **At least 25 matrix apps tested with statuses** (roadmap, Phase 6 exit). One real application family is recorded;
+  its two package variants do not count as two applications.
 - **Install, launch and uninstall from the GUI on GNOME and KDE.** The manual [GUI checklist](docs/GUI-CHECKLIST.md)
   has not been run on either desktop.
-- **Green CI on a hosted runner.** The one hosted run (on `9cf1e27`) passed `wine-e2e` and `deny`, but the `test` job
-  FAILED at `cargo test --workspace`, and the cause has not been investigated yet. The `gui` job has never run on a
-  hosted runner. Every compatibility record is from local runs.
-- **A semver-stable API.** The daemon API is at 0.2.1 and may still change.
+- **Green CI on a hosted runner.** The latest full CI run, at `f9c8246` on 2026-09-28, failed the `test`, `gui`
+  and `wine-e2e` jobs; `deny` passed. Subsequent green `verify-pins` runs check dependency downloads, not the
+  test suites. The failure causes remain unconfirmed without authenticated job logs. Every compatibility
+  record is from local runs. See the [validation record](docs/VALIDATION.md) for evidence.
+- **A semver-stable API.** The daemon API is at 0.2.3 and may still change.
 
 ## Sandbox
 
@@ -216,12 +220,16 @@ runtime rpc jobs.poll '{"jobId": "<id>", "afterSeq": 0, "waitMs": 10000}'
 ## GUI (`runtime-gui`)
 
 `runtime-gui` is a GTK 4 + libadwaita desktop client of `runtimed`. It lists your apps (with search), runs and stops
-them, installs a program from a file, removes an app, and plans and installs an app's dependencies. Every package that
+them, installs a program from a file, removes an app, and plans, installs and removes an app's dependencies. Every package that
 needs consent is shown with its version, sha256 and full terms, and has its own unchecked box. It also changes
 permissions and follows each job's output. It talks only to `runtimed` (it never runs `runtime` itself and never
 starts a daemon), so changes need a `runtimed --write` (the systemd unit passes it). With a read-only daemon every
 change control is disabled with the reason; with no daemon it shows how to start one. `--socket PATH` picks another
 socket (and opens its own window: a plain second launch only raises the first).
+
+Installed dependencies appear separately from the installation plan. Remove… confirms the package and app, then
+follows the removal job (daemon API 0.2.3 or newer). Only recorded archive packages are removable; installer
+packages and older records are refused. Modified files are kept and reported in the job output.
 
 Building it needs the GTK >= 4.12 and libadwaita >= 1.5 development files (`apt install libgtk-4-dev
 libadwaita-1-dev`) and Rust 1.92 or newer. It is not a default workspace member: plain `cargo build` never needs GTK.

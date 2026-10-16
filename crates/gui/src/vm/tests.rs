@@ -1182,3 +1182,108 @@ fn another_jobs_start_does_not_free_a_pending_app() {
     m.update(Msg::JobList(vec![]));
     assert!(m.update(Msg::Run).is_empty(), "game is still pending");
 }
+
+fn removal_ready(write: bool, api: &str) -> Model {
+    let mut m = ready(write);
+    m.update(Msg::Connected(version(write, api)));
+    m.page
+        .as_mut()
+        .unwrap()
+        .data
+        .as_mut()
+        .unwrap()
+        .detail
+        .dependencies
+        .push(rt_api::DependencyView {
+            id: "dxvk".into(),
+            version: "3.1.1".into(),
+            installed_at: 1,
+        });
+    m
+}
+
+fn remove_dependency(id: &str, package: &str) -> Msg {
+    Msg::RemoveDependency {
+        id: id.into(),
+        package: package.into(),
+    }
+}
+
+#[test]
+fn dependency_removal_checks_connection_version_busy_and_confirmed_target() {
+    for (write, api, reason) in [(false, "0.2.3", READ_ONLY), (true, "0.2.2", NO_DEPS_REMOVE)] {
+        let mut m = removal_ready(write, api);
+        assert!(m.update(remove_dependency("game", "dxvk")).is_empty());
+        assert_eq!(m.notice(), Some(reason));
+    }
+    let mut m = removal_ready(true, "0.2.3");
+    for (id, package) in [("other", "dxvk"), ("game", "missing")] {
+        assert!(m.update(remove_dependency(id, package)).is_empty());
+        assert!(m.notice().unwrap().contains("changed"));
+    }
+    m.update(Msg::JobList(vec![job("j1", JobKind::Run, "game", JobState::Running)]));
+    assert!(m.update(remove_dependency("game", "dxvk")).is_empty());
+    assert_eq!(m.notice(), Some(APP_BUSY));
+    m.update(Msg::ConnectFailed(ConnError {
+        socket: "socket".into(),
+        error: ClientError::NoRuntimeDir,
+    }));
+    assert!(m.update(remove_dependency("game", "dxvk")).is_empty());
+}
+
+#[test]
+fn dependency_removal_invalidates_the_plan_blocks_double_clicks_and_reloads_on_completion() {
+    let mut m = removal_ready(true, "0.2.3");
+    m.update(Msg::PlanLoaded {
+        id: "game".into(),
+        plan: plan(),
+    });
+    m.update(Msg::ConsentOpened);
+    let cmd = Cmd::DepsRemove {
+        id: "game".into(),
+        package: "dxvk".into(),
+    };
+    assert_eq!(m.update(remove_dependency("game", "dxvk")), vec![cmd.clone()]);
+    assert!(m.consent().is_none());
+    assert!(!m.consent_open());
+    assert!(m.update(remove_dependency("game", "dxvk")).is_empty());
+    assert_eq!(m.can(Action::Run), Err(APP_BUSY));
+    assert_eq!(
+        m.update(Msg::JobStarted {
+            what: cmd,
+            job_id: "j1".into()
+        }),
+        vec![Cmd::Follow("j1".into()), Cmd::ListJobs]
+    );
+    let mut ev = events("j1", JobState::Failed, 0, &["left modified DLL"], 0);
+    ev.job.kind = JobKind::DepsRemove;
+    assert_eq!(
+        m.update(Msg::JobEvents(ev)),
+        vec![Cmd::ListApps, Cmd::ListJobs, Cmd::LoadApp("game".into())]
+    );
+    assert_eq!(m.log("j1").unwrap().lines().collect::<Vec<_>>(), ["left modified DLL"]);
+    assert!(m.can(Action::RemoveDependency).is_ok());
+}
+
+#[test]
+fn display_changes_are_typed_and_blocked_while_a_write_is_pending() {
+    let mut read_only = ready(false);
+    assert!(read_only.update(Msg::SetDisplay(Driver::X11)).is_empty());
+    assert_eq!(read_only.notice(), Some(READ_ONLY));
+    for driver in [Driver::Auto, Driver::X11, Driver::Wayland] {
+        let mut m = ready(true);
+        let cmd = Cmd::DisplaySet {
+            id: "game".into(),
+            driver,
+        };
+        assert_eq!(m.update(Msg::SetDisplay(driver)), vec![cmd.clone()]);
+        assert!(m.update(Msg::SetDisplay(driver)).is_empty());
+        assert_eq!(m.can(Action::Run), Err(APP_BUSY));
+        m.update(Msg::Failed {
+            what: cmd,
+            error: rpc("unsupported"),
+        });
+        assert!(m.can(Action::SetDisplay).is_ok());
+        assert!(m.notice().unwrap().starts_with("Changing display driver:"));
+    }
+}

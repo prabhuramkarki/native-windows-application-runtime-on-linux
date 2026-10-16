@@ -9,7 +9,8 @@ Start with the top-level [README](../README.md) (what the runtime does, the comm
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The crates, their dependency graph, the install, run and daemon-job flows, the trust boundaries and the backend seam. |
 | [SECURITY.md](SECURITY.md) | The security model: the threat model, what each sandbox layer enforces and does not, dependency downloads, the daemon, the GUI, backends and `.wrun` packages, and the known bounds. |
-| [API.md](API.md) | The `runtimed` JSON-RPC API: methods, types, errors, jobs, versioning (0.2.1) and setup. |
+| [API.md](API.md) | The `runtimed` JSON-RPC API: methods, types, errors, jobs, versioning (0.2.3) and setup. |
+| [VALIDATION.md](VALIDATION.md) | Local phase checks through 2026-10-16, security fixes, pinned 7-Zip tests, hosted CI evidence, and remaining release checks. |
 | [WRUN.md](WRUN.md) | The `.wrun` v1 package format for package authors: the container, the manifest, `runtime pack` and what a package cannot do. |
 | [COMPAT.md](COMPAT.md) | The compatibility matrix: only what was really run, with its evidence (generated from `crates/api/compat.toml`). |
 | [THIRD_PARTY.md](THIRD_PARTY.md) | The project's licence, every third-party crate with its licence and purpose, and the bundled dependency packages. |
@@ -34,6 +35,8 @@ Start with the top-level [README](../README.md) (what the runtime does, the comm
 | [phase-6b](superpowers/plans/2026-09-27-phase-6b-daemon-write-and-jobs.md) | The daemon's write methods and jobs. |
 | [phase-6c](superpowers/plans/2026-09-27-phase-6c-gui-client.md) | The GTK 4 + libadwaita GUI client. |
 | [phase-6d](superpowers/plans/2026-09-27-phase-6d-backend-and-wrun.md) | The backend contract and conformance suite, `.wrun` packages, licences and these docs. |
+| [phase-6e](superpowers/plans/2026-10-02-phase-6e-hardening.md) | Daemon and backend hardening, cancellation checks, and the CI host-facility audit. |
+| [phase-6f](superpowers/plans/2026-10-02-phase-6f-deps-remove.md) | Recorded archive dependency removal, rollback, and the `deps.remove` job. |
 
 The Phase 6 plans end with an "As built" section, and the roadmap's status table records where earlier phases departed from their plans.
 

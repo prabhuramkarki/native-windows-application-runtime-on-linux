@@ -12,7 +12,7 @@ never execute or load anything, and it never writes: the input is bytes, the out
 other crate depends on it: `runtime-core`, `-installer`, `-desktop`, `-deps`, `-package`, `-api` and `-cli`.
 
 **`runtime-core` (`rt_core`).** It owns app ids (`AppId`), the data directory, Windows path handling (`WinPath`,
-`resolve_under`), `metadata.json` (schema 4, validated on every read and write) and the `Store`. It also holds the
+`resolve_under`), `metadata.json` (schema 5, validated on every read and write) and the `Store`. It also holds the
 portable-exe and zip install service (`install`, including the `.wrun` subtree mode), the run service (`run`) and
 the hardened zip planner (`unzip`). The `Launcher` is the one place a Windows program, a backend command or a Wine helper is started: it
 clears the environment, applies an allowlist and attaches the sandbox hook. (Other processes are started elsewhere:

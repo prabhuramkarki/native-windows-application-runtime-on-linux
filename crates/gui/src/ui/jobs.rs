@@ -17,6 +17,7 @@ fn kind(k: rt_api::jobs::JobKind) -> &'static str {
         K::Install => "install",
         K::Remove => "remove",
         K::DepsInstall => "dependencies",
+        K::DepsRemove => "dependency removal",
         K::PermissionsSet | K::PermissionsReset => "permissions",
         K::DisplaySet => "display",
         _ => "job",

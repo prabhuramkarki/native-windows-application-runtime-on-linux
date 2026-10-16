@@ -7,6 +7,24 @@
 #   cargo run -q -p runtime-cli -- compat > docs/COMPAT.md
 # (the test `compat_md_matches_records` fails until you do).
 
+# Real application, tested locally on 2026-10-15 with e2e_real_apps. Official assets are SHA-256 pinned;
+# sources, hashes and commands are in docs/VALIDATION.md. These two observations are ONE application family.
+[[record]]
+app = "7-Zip reduced console (7zr.exe, portable x86)"
+version = "26.04"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-10-15"
+notes = "Portable install, create/test/extract a 7z archive under the default sandbox, byte-identical binary and spaced-name text roundtrip, then remove. Console only. Pinned sample and opt-in test command: docs/VALIDATION.md."
+
+[[record]]
+app = "7-Zip console (7z.exe, x64 MSI)"
+version = "26.04"
+status = "works"
+wine = "10.0 (Ubuntu 10.0~repack-12ubuntu1)"
+evidence = "manual:2026-10-15"
+notes = "Silent sandboxed MSI install with explicit 7z.exe entry; valid desktop file; archive roundtrip under default sandbox; recorded MSI uninstall without warnings; prefix and desktop entry removed. GUI/shell integration untested. Pinned sample and test: docs/VALIDATION.md."
+
 # The records below were run by hand on 2026-09-26 (Ubuntu Wine 10.0~repack-12ubuntu1, a record without a `gpu` field is
 # not a graphics test) with the two test commands of the `wine-e2e` CI job. That job passed once on a hosted runner (commit 9cf1e27,
 # 2026-09-26, the last push), but its log was not read, so which tests ran there (rather than skipped) is not recorded and

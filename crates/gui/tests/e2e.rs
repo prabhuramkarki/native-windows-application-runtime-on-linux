@@ -269,6 +269,19 @@ fn the_real_runtime_installs_edits_plans_and_removes() {
             .is_some_and(|p| p.network == rt_api::NetworkView::Allow)
     });
 
+    // Display selection reaches the real CLI and its prefix registry helper.
+    // The fake wineboot omits reg.exe; the fake Wine script handles its calls.
+    let system32 = s.data.join("apps").join(&id).join("prefix/drive_c/windows/system32");
+    std::fs::create_dir_all(&system32).unwrap();
+    std::fs::write(system32.join("reg.exe"), b"MZ").unwrap();
+    g.user(Msg::SetDisplay(rt_api::jobs::Driver::X11));
+    let (state, lines) = g.job_ends("the display change");
+    assert_eq!(state, JobState::Succeeded, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("set to x11")), "{lines:?}");
+    let registry = std::fs::read_to_string(s.data.join("apps").join(&id).join("prefix/user.reg")).unwrap();
+    assert!(registry.contains("\"Graphics\"=\"x11\""), "{registry}");
+    g.until("the display reload", |text, _| text.starts_with("AppLoaded"));
+
     // The (empty) plan installs; a tampered digest is refused and planned again, nothing re-sent.
     g.user(Msg::Plan);
     g.until("the plan", |_, m| m.consent().is_some());
@@ -345,4 +358,64 @@ fn the_install_form_imports_a_package() {
         Some("Requested by the package (not granted): gpu=off")
     );
     assert_eq!(g.model.page().unwrap().title(), "Demo");
+}
+
+#[test]
+fn dependency_removal_uses_the_real_runtime_and_reports_preserved_files_and_old_records() {
+    use rt_core::{AppId, ArchiveRecord, DependencyRecord, RecordedFile, Store};
+    for case in ["remove", "modified", "old"] {
+        let (s, env) = support::real(&runtimed());
+        s.plant("game", "Game");
+        let store = Store::new(s.data.join("apps")).unwrap();
+        let app = store.get(&AppId::parse("game").unwrap()).unwrap();
+        let file = app.drive_c().join("windows/system32/test.dll");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, if case == "modified" { &b"changed"[..] } else { &b""[..] }).unwrap();
+        let mut md = store.read_metadata(&app).unwrap();
+        md.dependencies.push(DependencyRecord {
+            id: "dxvk".into(),
+            version: "3.1.1".into(),
+            sha256: "a".repeat(64),
+            installed_at: 1,
+            consent: None,
+            archive: (case != "old").then(|| ArchiveRecord {
+                files: vec![RecordedFile {
+                    path: "windows/system32/test.dll".into(),
+                    sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+                    replaced: false,
+                }],
+                ..Default::default()
+            }),
+        });
+        store.write_metadata(&app, &md).unwrap();
+        let _d = s.daemon(&refs(&env));
+        let mut g = Gui::new(s.sock());
+        assert!(g.ready());
+        g.open("game");
+        g.user(Msg::RemoveDependency {
+            id: "game".into(),
+            package: "dxvk".into(),
+        });
+        let (state, lines) = g.job_ends("dependency removal");
+        let expected = if case == "remove" {
+            JobState::Succeeded
+        } else {
+            JobState::Failed
+        };
+        assert_eq!(state, expected, "{case}: {lines:?}");
+        g.until("the reloaded dependencies", |text, _| text.starts_with("AppLoaded"));
+        let recorded = &g.model.page().unwrap().data().unwrap().detail.dependencies;
+        assert_eq!(recorded.is_empty(), case != "old", "{case}: {lines:?}");
+        match case {
+            "remove" => assert!(!file.exists()),
+            "modified" => {
+                assert_eq!(std::fs::read(&file).unwrap(), b"changed");
+                assert!(lines.iter().any(|l| l.contains("changed since")), "{lines:?}");
+            }
+            _ => {
+                assert!(file.exists());
+                assert!(lines.iter().any(|l| l.contains("older runtime")), "{lines:?}");
+            }
+        }
+    }
 }

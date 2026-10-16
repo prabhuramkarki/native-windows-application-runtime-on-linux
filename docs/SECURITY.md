@@ -549,7 +549,10 @@ with a pure-Rust decoder (`ruzstd`, no C code). Caps: the frame's window (64 MiB
 decoding), decompressed bytes (total, per entry, and the decompressed/compressed ratio after a floor, all as for
 gzip), compressed input, exactly one frame (a second is `TooManyFrames`, other trailing bytes `TrailingGarbage`),
 skippable and dictionary frames refused, a truncated frame is an error. The content checksum is not verified by the
-decoder; the package's sha256 already covers the bytes.
+decoder; the package's sha256 already covers the bytes. The decoder minimum is 0.9.1, fixing the unbounded
+sequence-expansion issue RUSTSEC-2026-0344. The window cap does not include its separate block/literal/sequence
+workspace. In 0.9.1, literal-only blocks can exceed the declared window up to the format's 20-bit literal count
+(less than 1 MiB); the outer total-output cap still applies. This is not a total process-memory limit.
 
 **Host graphics probe (Phase 4B).** `runtime graphics info` and `doctor` run `vulkaninfo --summary` on the host,
 outside the sandbox (a read-only query). The runner scrubs the environment (only PATH, HOME, XDG_RUNTIME_DIR,

@@ -515,3 +515,16 @@ added (a `depsRemove` job shows as "job").
 - `docs/API.md`: done in Task 5;
 - the 4B spec's opt-out cell;
 - the roadmap: a 6F row, 6E marked merged, the follow-up closed with its three new follow-ups, and API 0.2.3.
+
+
+### GUI follow-up — 2026-10-16 (working tree)
+
+R10's deferred GUI action is now implemented. The app page lists installed packages from `apps.get` separately
+from its install plan, confirms the app/package pair, and sends `deps.remove` through the existing client.
+API < 0.2.3, read-only/disconnected daemons and busy apps cannot send removal. A stale confirmation cannot target
+another app. The existing job follower displays output and refreshes the page; the old install plan is discarded.
+The job-kind label now says "dependency removal". Backend removal rules and the wire format are unchanged.
+
+The GUI removes one package per action. A dependent-package refusal remains visible in the job log, including
+the CLI command for removing a required group together. Installer packages and pre-schema-5 records remain
+unsupported. Validation is recorded in `docs/VALIDATION.md`; manual GNOME/KDE verification remains open.

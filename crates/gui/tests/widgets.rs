@@ -395,6 +395,9 @@ fn read_only_disables_the_app_page_writes() {
         "btn-run",
         "btn-remove",
         "btn-deps",
+        "btn-display-auto",
+        "btn-display-x11",
+        "btn-display-wayland",
         "perm-network",
         "perm-display",
         "perm-audio",
@@ -421,6 +424,108 @@ fn remove_asks_first_and_cancel_is_the_default() {
     d.emit_by_name::<()>("response", &[&"remove"]);
     assert!(sent.borrow().contains(&Cmd::Remove("game".into())));
     close(ui);
+}
+
+fn dependency_removal_confirms_the_target_and_rejects_stale_dialogs() {
+    let (ui, sent) = recorded();
+    opened(&ui, true, canned_plan());
+    let mut data = app_data("game");
+    data.detail.dependencies.push(rt_api::DependencyView {
+        id: "dxvk".into(),
+        version: HOSTILE.into(),
+        installed_at: 1,
+    });
+    ui.dispatch(Msg::AppLoaded(Box::new(data)));
+    let remove = get(&ui, "btn-dep-remove-0");
+    assert!(!remove.is_sensitive(), "API 0.2.0 has no deps.remove");
+    assert_eq!(remove.tooltip_text().as_deref(), Some(rt_gui::vm::NO_DEPS_REMOVE));
+    ui.dispatch(Msg::Connected(VersionInfo {
+        api: "0.2.3".into(),
+        runtime: "0.0.1".into(),
+        protocol: rt_api::PROTOCOL.into(),
+        write: true,
+    }));
+    let literal = labels(ui.window().upcast_ref())
+        .into_iter()
+        .find(|l| l.text() == HOSTILE)
+        .unwrap();
+    assert!(!literal.uses_markup());
+    click(&ui, "btn-dep-remove-0");
+    let d = dialog(&ui, "remove-dependency-dialog");
+    assert_eq!(d.default_response().as_deref(), Some("cancel"));
+    assert_eq!(d.close_response(), "cancel");
+    assert!(!d.is_body_use_markup());
+    assert!(d.body().contains("dxvk"));
+    assert!(d.body().contains("Modified files are kept"));
+    d.emit_by_name::<()>("response", &[&"cancel"]);
+    d.force_close();
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Cmd::DepsRemove { .. })));
+
+    click(&ui, "btn-dep-remove-0");
+    let d = dialog(&ui, "remove-dependency-dialog");
+    d.emit_by_name::<()>("response", &[&"remove"]);
+    d.force_close();
+    let commands: Vec<_> = sent
+        .borrow()
+        .iter()
+        .filter(|c| matches!(c, Cmd::DepsRemove { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        commands,
+        [Cmd::DepsRemove {
+            id: "game".into(),
+            package: "dxvk".into()
+        }]
+    );
+    assert!(
+        !get(&ui, "btn-dep-remove-0").is_sensitive(),
+        "pending job blocks another click"
+    );
+    close(ui);
+
+    let (ui, sent) = recorded();
+    opened(&ui, true, canned_plan());
+    ui.dispatch(Msg::Connected(VersionInfo {
+        api: "0.2.3".into(),
+        runtime: "0.0.1".into(),
+        protocol: rt_api::PROTOCOL.into(),
+        write: true,
+    }));
+    let mut data = app_data("game");
+    data.detail.dependencies.push(rt_api::DependencyView {
+        id: "dxvk".into(),
+        version: "3.1.1".into(),
+        installed_at: 1,
+    });
+    ui.dispatch(Msg::AppLoaded(Box::new(data)));
+    click(&ui, "btn-dep-remove-0");
+    let d = dialog(&ui, "remove-dependency-dialog");
+    ui.dispatch(Msg::Open("other".into()));
+    ui.dispatch(Msg::AppLoaded(Box::new(app_data("other"))));
+    d.emit_by_name::<()>("response", &[&"remove"]);
+    d.force_close();
+    assert!(!sent.borrow().iter().any(|c| matches!(c, Cmd::DepsRemove { .. })));
+    close(ui);
+}
+
+fn display_buttons_send_the_selected_driver() {
+    use rt_api::jobs::Driver;
+    for (name, driver) in [
+        ("btn-display-auto", Driver::Auto),
+        ("btn-display-x11", Driver::X11),
+        ("btn-display-wayland", Driver::Wayland),
+    ] {
+        let (ui, sent) = recorded();
+        opened(&ui, true, canned_plan());
+        click(&ui, name);
+        assert!(sent.borrow().contains(&Cmd::DisplaySet {
+            id: "game".into(),
+            driver
+        }));
+        assert!(!get(&ui, name).is_sensitive());
+        close(ui);
+    }
 }
 
 fn the_install_dialog_starts_with_everything_off() {
@@ -768,6 +873,14 @@ fn main() {
     adw::init().expect("adw init");
     let tests: &[(&str, fn())] = &[
         ("no_daemon_shows_how_to_start_it", no_daemon_shows_how_to_start_it),
+        (
+            "display_buttons_send_the_selected_driver",
+            display_buttons_send_the_selected_driver,
+        ),
+        (
+            "dependency_removal_confirms_the_target_and_rejects_stale_dialogs",
+            dependency_removal_confirms_the_target_and_rejects_stale_dialogs,
+        ),
         (
             "a_read_only_daemon_disables_writes_with_the_reason",
             a_read_only_daemon_disables_writes_with_the_reason,

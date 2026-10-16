@@ -211,8 +211,10 @@ fn request(c: &mut Client, cmd: &Cmd) -> Result<Msg, ClientError> {
         Cmd::Install(p) => started(c.install(p)),
         Cmd::Import(p) => started(c.import(p)),
         Cmd::DepsInstall { id, digest, consent } => started(c.deps_install(id, digest, consent)),
+        Cmd::DepsRemove { id, package } => started(c.deps_remove(id, std::slice::from_ref(package))),
         Cmd::PermSet { id, set } => started(c.permissions_set(id, set)),
         Cmd::PermReset(id) => started(c.permissions_reset(id)),
+        Cmd::DisplaySet { id, driver } => started(c.display_set(id, *driver)),
         Cmd::Cancel(job) => {
             c.job_cancel(job)?;
             c.jobs().map(Msg::JobList)
